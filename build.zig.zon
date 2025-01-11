@@ -1,6 +1,6 @@
 .{
     .name = .fenrir,
-    .version = "0.1.0",
+    .version = "0.0.1",
     .fingerprint = 0xb8054929e77b0e2a, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

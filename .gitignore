@@ -1,0 +1,6 @@
+*
+!*/
+!.gitignore
+!*.md
+!*.zig
+!build.zig.zon
