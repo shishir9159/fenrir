@@ -28,34 +28,33 @@ Týr still loses the hand. That part is not optional.
 | Name | Directory | Role | In the myth | |
 | --- | --- | --- | --- | --- |
 | **Fenrir** | — | the format, and this project | the wolf | |
-| **Gjöll** | `src/pdf/` | parser: objects, xref, filters, page tree | the boulder the fetter is anchored to | done |
+| **Gjöll** | `src/gjoll/` | parser: objects, xref, filters, page tree | the boulder the fetter is anchored to | done |
 | **Gelgja** | `src/gelgja/` | the display list: parser output, renderer input | the cord threaded through the rock | interface done |
-| **Gleipnir** | `src/gleipnir/` | rasteriser: content-stream interpreter, Vulkan backend | the ribbon that holds | — |
+| **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | rects done |
 | **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | interface done |
 | **Lyngvi** | `src/lyngvi/` | platform: window, input, surface | the island it happened on | — |
-| **Vánagandr** | `src/cli/` | the command-line tool | "monster of the river Ván", his other name | done |
+| **Vánagandr** | `src/vanagandr/` | the command-line tool | "monster of the river Ván", his other name | done |
 
 Directory and identifier names are ASCII-folded — `gjoll`, `tyr`,
 `vanagandr` — and the diacritics live only in prose. Zig will accept UTF-8
 identifiers; build systems, shells, and filesystems across three platforms
 are less reliable about it, and this is not the hill.
 
-`src/pdf/` and `src/cli/` still carry their descriptive names; the rename to
-`gjoll` and `vanagandr` is mechanical and has not landed yet.
-
-**Status: milestone 3, plus the Gelgja and Týr interfaces.** Gjöll is done:
+**Status: milestone 3, plus the Gelgja, Týr and Gleipnir-rect layers.** Gjöll is done:
 the container is fully readable and the page tree resolves into pages with
 their effective geometry. Gelgja's display list, builder, and trace backend
 are written and tested; nothing produces one yet, because the interpreter
 that will is milestone 4. Týr's two interfaces and its backend registry are
 written and tested, with one stand-in backend implementing them; the real
-glyph sources are behind build flags. Gleipnir and Lyngvi are not started.
+glyph sources are behind build flags. Gleipnir's rect pipeline is written and
+tested against a CPU reference rasteriser, with the GLSL checked in but never
+yet handed to a device; its path pipeline and Lyngvi are not started.
 
 ## Building
 
 ```
 zig build              # zig-out/bin/fenrir
-zig build test         # 144 tests
+zig build test         # 196 tests
 zig build run -- info file.pdf
 ```
 
@@ -89,6 +88,7 @@ fenrir xref <file> [--verify]           where every object lives
 fenrir extract <file> <N> [--raw]       a stream's decoded bytes
 fenrir extract <file> --page <N>        a page's content stream
 fenrir fonts                            what Týr can do in this build
+fenrir rects [--out F] [--size WxH]     a demo frame through the rect pipeline
 ```
 
 `fenrir extract file.pdf --page 1` prints a decoded content stream — the
@@ -108,10 +108,7 @@ inside of an object stream, and a content stream. Nothing at or below
 src/
   root.zig                  public library surface
   main.zig                  CLI entry and dispatch
-  cli/                      Vánagandr
-    Context.zig             allocator, Io, and the two writers
-    info.zig  dump.zig  pages.zig  xref.zig  extract.zig  fonts.zig
-  pdf/                      Gjöll
+  gjoll/                    Gjöll
     object.zig              the 8 object types; no allocation, no ownership
     Lexer.zig               bytes -> tokens
     Parser.zig              tokens -> objects; knows nothing of documents
@@ -131,6 +128,16 @@ src/
     DisplayList.zig         DrawCmd and the recorded list
     Builder.zig             the recording API the interpreter will call
     trace.zig               a display list as diffable text
+  gleipnir.zig  gleipnir/   Gleipnir
+    sdf.zig                 the distance field, in Zig; the shader mirrors it
+    rect.zig                the 96-byte instance and its packing
+    DrawList.zig            the call sites, the clip stack, the transform stack
+    software.zig            a CPU rasteriser, used as an oracle not a renderer
+    png.zig                 so the oracle's output can be looked at
+    pipeline.zig            bindings, push constants, blend state, features
+    shader/
+      rect.glsl             the instance layout, shared by both stages
+      rect.vert  rect.frag  the quad and the field
   tyr.zig  tyr/                   Týr
     Face.zig                glyph index -> outline, behind a runtime vtable
     Outline.zig             a glyph in Gelgja's verbs; quads elevated to cubics
@@ -142,6 +149,10 @@ src/
       freetype.zig          -Dfreetype
       stb.zig               -Dstb-truetype
       harfbuzz.zig          -Dharfbuzz; a Shaper, not a Face
+  vanagandr/                Vánagandr
+    Context.zig             allocator, Io, and the two writers
+    info.zig  dump.zig  pages.zig  xref.zig  extract.zig  fonts.zig
+    rects.zig               draws a demo frame with no GPU in the process
 ```
 
 Gelgja imports neither the PDF layer nor any graphics API, which is what lets
@@ -180,6 +191,11 @@ the ones with `#xx` or `\` escapes are copied into the arena.
 - Gelgja: the `DrawCmd` vocabulary, the recording builder, and the trace
   backend. Nothing produces a display list yet -- the interpreter is next --
   but the interface it must target is fixed and tested.
+- Gleipnir's rect pipeline: the instance format, the draw layer with its clip
+  and transform stacks, the distance field, and a CPU rasteriser that runs the
+  same arithmetic a fragment shader would. `fenrir rects` writes a frame to a
+  PNG. The GLSL is written and has never been compiled -- there is no device
+  to hand it to until Lyngvi exists.
 - Týr: the `Face` and `Shaper` interfaces, format sniffing, the outline sink,
   and the backend registry with its selection rules. The default build has one
   backend, which draws `.notdef` boxes; FreeType, stb_truetype and HarfBuzz
@@ -271,27 +287,96 @@ clip_push nonzero 5v/4p [36.00 36.00 576.00 756.00]
 clip_pop
 ```
 
-Still to come: **a CPU rasteriser to PNG**, pixel-diffed against `mutool draw`
-or `pdftoppm`. That is the ground truth, and it becomes the regression suite.
+Still to come: **a page rasteriser**, pixel-diffed against `mutool draw` or
+`pdftoppm`. That is the ground truth, and it becomes the regression suite. The
+PNG writer it needs already exists, in Gleipnir, for the rect pipeline's own
+CPU reference.
 
 There is deliberately no SVG backend. The browser was never the goal; the goal
 was a renderer trustworthy enough to bisect against, and SVG stops being
 trustworthy exactly where PDF gets hard — blend modes, soft masks, shading
 types 4–7, text rendering modes, dash phase.
 
-### 5–6. Lyngvi and Gleipnir — window and pixels
+### 5–6. Lyngvi and Gleipnir — window and pixels *(rect pipeline landed)*
 
 A platform layer of roughly fifteen functions: open a window, drain events
 into an arena, block until input, hand back a Vulkan surface. Win32 first,
 xcb second, and the xcb backend stubbed from day one so the abstraction stays
 honest rather than quietly Win32-shaped.
 
-Then one Vulkan pipeline: instanced quads with a rounded-rect signed distance
-field, per-corner radii and colours, border thickness, edge softness. That
-single primitive draws every panel, button, scrollbar, shadow, and — with the
-source rect pointing into a glyph atlas — every character. PDF paths need a
-second pipeline, stencil-then-cover, which handles nonzero and even-odd
-winding without triangulating anything.
+**The rect pipeline is written, minus the Vulkan calls.** One instance format
+draws every rectangle the reader will ever put on the screen — panels,
+buttons, scrollbars, shadows, image tiles, and, with the source rect pointing
+into a glyph atlas, every character — as a rounded box evaluated from a signed
+distance field, with per-corner radii, four corner colours, border thickness
+and edge softness. Ninety-six bytes each, no per-shape state, and therefore
+**one draw call for a whole frame**.
+
+Two decisions carry that claim.
+
+**The clip lives in the instance, not in the command buffer.** The obvious
+place for a scissor is `vkCmdSetScissor`, and it costs a draw call every time
+the clip changes — which in a UI is constantly: every scroll view, every list
+row that elides, every text field. A frame with two hundred clipped regions is
+two hundred draw calls. Sixteen bytes per instance buys all of them back. The
+vertex shader shrinks the quad to the intersection of the rect and its clip,
+so clipping is enforced by rasterisation instead of by state and instances
+with different clips sit next to each other in one buffer. It is also strictly
+*less* GPU work than a scissor test, because the clipped-away fragments are
+never generated.
+
+**The fragment shader reads the instance rather than a dozen varyings.** The
+vertex stage emits a position and one flat integer, and the fragment stage
+fetches the same struct out of the same storage buffer. That is not only
+smaller: a bilinear corner gradient cannot be passed as interpolated varyings
+at all, because a bilinear function over a quad is not two linear functions
+over its triangles, and the diagonal shows.
+
+The transform stack is scale and offset, not the full affine the interpreter
+works in. A rotated rectangle is not a rectangle, so it cannot be one
+instance, and the alternatives are six more floats and a matrix multiply per
+vertex, or silently drawing the wrong shape. `Xform.fromTransform` returns
+null for a matrix this layer cannot honour, so the interpreter finds out by
+being told rather than by looking at the output. The one rotation a reader
+really needs, `/Rotate 90` on a page, is a property of the whole frame and
+belongs in the projection.
+
+Anything genuinely rotated or skewed is a path, and paths are the second
+pipeline: stencil-then-cover, which handles nonzero and even-odd winding
+without triangulating anything. That one is not started. The split is not
+about rendering quality, it is about batching — a rect needs no per-shape
+state, so ten thousand of them are one draw call, while a path needs a stencil
+pass and so is at least two. Anything expressible as a rect must be one, or
+the frame rate is set by the chrome rather than by the document.
+
+Colours are sRGB-encoded bytes, decoded to linear in the shader and blended in
+linear light against an `_SRGB` swapchain. Eight bits is exactly the budget
+that encoding exists to fit; eight bits of *linear* light bands visibly in the
+darks. The known cost is that antialiased text blended in linear light looks
+thin when it is light on dark, and the fix for that is stem darkening in the
+glyph atlas, not blending in the wrong space.
+
+**None of it has touched a GPU**, because Lyngvi does not exist yet and there
+is no device to hand it to. What can still be checked is: the distance field
+is implemented in Zig and tested against known distances, then transliterated
+into GLSL line for line; a CPU rasteriser drives that same arithmetic over a
+framebuffer the way a fragment shader would, one pixel centre at a time, in
+submission order, with the same blend equation; and `pipeline.zig` writes down
+the bindings, push constants, blend factors and device features the shader
+assumes, each of which produces a black window and no error message when it is
+wrong. The first bring-up is then a diff rather than an investigation — same
+scene, two rasterisers, subtract.
+
+```
+fenrir rects --out frame.png
+67 instances, 129 culled, 1 draw call without descriptor indexing
+```
+
+That frame is built through the real call sites, stacks and all. The 129
+culled are list rows scrolled outside the panel's clip, dropped before they
+reach the buffer; the one draw call is what the fallback for a device without
+descriptor indexing *would* cost, which makes it a standing measure of how
+well the drawing was ordered.
 
 ### 7. Týr — fonts *(interfaces landed)*
 

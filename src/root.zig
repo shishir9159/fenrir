@@ -16,19 +16,23 @@
 
 const std = @import("std");
 
-pub const Document = @import("pdf/Document.zig");
-pub const Lexer = @import("pdf/Lexer.zig");
-pub const Page = @import("pdf/Page.zig");
-pub const Parser = @import("pdf/Parser.zig");
-pub const filter = @import("pdf/filter.zig");
-pub const pages = @import("pdf/pages.zig");
-pub const print = @import("pdf/print.zig");
-pub const xref = @import("pdf/xref.zig");
+pub const Document = @import("gjoll/Document.zig");
+pub const Lexer = @import("gjoll/Lexer.zig");
+pub const Page = @import("gjoll/Page.zig");
+pub const Parser = @import("gjoll/Parser.zig");
+pub const filter = @import("gjoll/filter.zig");
+pub const pages = @import("gjoll/pages.zig");
+pub const print = @import("gjoll/print.zig");
+pub const xref = @import("gjoll/xref.zig");
 
 /// Gelgja: the display list between the parser and the rasteriser. It imports
 /// nothing from the layers above, and nothing above imports it yet -- the
 /// interpreter that will fill it is milestone 4.
 pub const gelgja = @import("gelgja.zig");
+
+/// Gleipnir: the rasteriser. The rect pipeline and its CPU reference are
+/// written; the path pipeline and the Vulkan backend are not.
+pub const gleipnir = @import("gleipnir.zig");
 
 /// Týr: the font layer. Two runtime interfaces, `Face` for glyph outlines
 /// and `Shaper` for UI text, with the choice of backend made in one place.
@@ -37,7 +41,7 @@ pub const tyr = @import("tyr.zig");
 pub const Rect = Page.Rect;
 pub const Rotation = Page.Rotation;
 
-const object = @import("pdf/object.zig");
+const object = @import("gjoll/object.zig");
 
 pub const Array = object.Array;
 pub const Dict = object.Dict;
@@ -59,6 +63,7 @@ test {
     // re-exports above.
     _ = Document;
     _ = gelgja;
+    _ = gleipnir;
     _ = tyr;
     _ = Lexer;
     _ = Page;
@@ -68,7 +73,7 @@ test {
     _ = print;
     _ = xref;
     _ = object;
-    _ = @import("pdf/filter/ascii.zig");
-    _ = @import("pdf/filter/lzw.zig");
-    _ = @import("pdf/filter/predictor.zig");
+    _ = @import("gjoll/filter/ascii.zig");
+    _ = @import("gjoll/filter/lzw.zig");
+    _ = @import("gjoll/filter/predictor.zig");
 }

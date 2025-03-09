@@ -7,13 +7,14 @@
 const std = @import("std");
 const Io = std.Io;
 
-const Context = @import("cli/Context.zig");
-const dump = @import("cli/dump.zig");
-const extract = @import("cli/extract.zig");
-const fonts = @import("cli/fonts.zig");
-const info = @import("cli/info.zig");
-const pages = @import("cli/pages.zig");
-const xref = @import("cli/xref.zig");
+const Context = @import("vanagandr/Context.zig");
+const dump = @import("vanagandr/dump.zig");
+const extract = @import("vanagandr/extract.zig");
+const fonts = @import("vanagandr/fonts.zig");
+const info = @import("vanagandr/info.zig");
+const pages = @import("vanagandr/pages.zig");
+const rects = @import("vanagandr/rects.zig");
+const xref = @import("vanagandr/xref.zig");
 
 const Command = struct {
     name: []const u8,
@@ -29,6 +30,7 @@ const commands = [_]Command{
     .{ .name = "xref", .summary = "print the cross-reference table", .usage = xref.usage, .run = xref.run },
     .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
+    .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run },
 };
 
 pub fn main(init: std.process.Init) !void {

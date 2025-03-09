@@ -181,6 +181,36 @@ pub const Bounds = struct {
         };
     }
 
+    /// The other half of a clip stack. Unlike `unionWith`, an intersection
+    /// with an empty box is empty rather than the other operand, so a clip
+    /// that has been reduced to nothing stays nothing however deep it is
+    /// nested -- which is what lets a caller test `isEmpty` once and skip
+    /// building a whole subtree.
+    ///
+    /// The result can come back inverted (`max < min`); `isEmpty` reports
+    /// that, and nothing here silently repairs it, because an inverted clip
+    /// means the caller asked for a region that does not exist.
+    pub fn intersect(a: Bounds, b: Bounds) Bounds {
+        return .{
+            .min_x = @max(a.min_x, b.min_x),
+            .min_y = @max(a.min_y, b.min_y),
+            .max_x = @min(a.max_x, b.max_x),
+            .max_y = @min(a.max_y, b.max_y),
+        };
+    }
+
+    /// Everything, so that a clip stack has something to start from.
+    pub const infinite: Bounds = .{
+        .min_x = -std.math.inf(f32),
+        .min_y = -std.math.inf(f32),
+        .max_x = std.math.inf(f32),
+        .max_y = std.math.inf(f32),
+    };
+
+    pub fn contains(b: Bounds, p: Point) bool {
+        return p.x >= b.min_x and p.x <= b.max_x and p.y >= b.min_y and p.y <= b.max_y;
+    }
+
     pub fn width(b: Bounds) f32 {
         return if (b.isEmpty()) 0 else b.max_x - b.min_x;
     }
@@ -323,4 +353,30 @@ test "verb point counts" {
     try testing.expectEqual(@as(u8, 1), Verb.move.pointCount());
     try testing.expectEqual(@as(u8, 3), Verb.cubic.pointCount());
     try testing.expectEqual(@as(u8, 0), Verb.close.pointCount());
+}
+
+test "intersection with an empty box is empty, unlike union" {
+    const a: Bounds = .fromRect(0, 0, 10, 10);
+    try testing.expect(a.intersect(.empty).isEmpty());
+    try testing.expect(Bounds.empty.intersect(a).isEmpty());
+    try testing.expectEqual(a, a.intersect(.infinite));
+}
+
+test "nested clips only ever shrink" {
+    const outer: Bounds = .fromRect(0, 0, 100, 100);
+    const inner = outer.intersect(.fromRect(20, 20, 60, 60));
+    try testing.expectEqual(Bounds.fromRect(20, 20, 60, 60), inner);
+
+    // Disjoint: the result is inverted, and stays empty however far it is
+    // nested afterwards.
+    const gone = inner.intersect(.fromRect(200, 200, 300, 300));
+    try testing.expect(gone.isEmpty());
+    try testing.expect(gone.intersect(outer).isEmpty());
+}
+
+test "contains is inclusive on the boundary" {
+    const b: Bounds = .fromRect(0, 0, 10, 10);
+    try testing.expect(b.contains(.{ .x = 0, .y = 0 }));
+    try testing.expect(b.contains(.{ .x = 10, .y = 10 }));
+    try testing.expect(!b.contains(.{ .x = 10.5, .y = 5 }));
 }
