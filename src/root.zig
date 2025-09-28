@@ -30,6 +30,10 @@ pub const xref = @import("pdf/xref.zig");
 /// interpreter that will fill it is milestone 4.
 pub const gelgja = @import("gelgja.zig");
 
+/// Týr: the font layer. Two runtime interfaces, `Face` for glyph outlines
+/// and `Shaper` for UI text, with the choice of backend made in one place.
+pub const tyr = @import("tyr.zig");
+
 pub const Rect = Page.Rect;
 pub const Rotation = Page.Rotation;
 
@@ -55,6 +59,7 @@ test {
     // re-exports above.
     _ = Document;
     _ = gelgja;
+    _ = tyr;
     _ = Lexer;
     _ = Page;
     _ = Parser;

@@ -31,7 +31,7 @@ Týr still loses the hand. That part is not optional.
 | **Gjöll** | `src/pdf/` | parser: objects, xref, filters, page tree | the boulder the fetter is anchored to | done |
 | **Gelgja** | `src/gelgja/` | the display list: parser output, renderer input | the cord threaded through the rock | interface done |
 | **Gleipnir** | `src/gleipnir/` | rasteriser: content-stream interpreter, Vulkan backend | the ribbon that holds | — |
-| **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | — |
+| **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | interface done |
 | **Lyngvi** | `src/lyngvi/` | platform: window, input, surface | the island it happened on | — |
 | **Vánagandr** | `src/cli/` | the command-line tool | "monster of the river Ván", his other name | done |
 
@@ -43,21 +43,37 @@ are less reliable about it, and this is not the hill.
 `src/pdf/` and `src/cli/` still carry their descriptive names; the rename to
 `gjoll` and `vanagandr` is mechanical and has not landed yet.
 
-**Status: milestone 3, plus Gelgja's interface.** Gjöll is done: the container
-is fully readable and the page tree resolves into pages with their effective
-geometry. Gelgja's display list, builder, and trace backend are written and
-tested; nothing produces one yet, because the interpreter that will is
-milestone 4. Gleipnir, Týr and Lyngvi are not started.
+**Status: milestone 3, plus the Gelgja and Týr interfaces.** Gjöll is done:
+the container is fully readable and the page tree resolves into pages with
+their effective geometry. Gelgja's display list, builder, and trace backend
+are written and tested; nothing produces one yet, because the interpreter
+that will is milestone 4. Týr's two interfaces and its backend registry are
+written and tested, with one stand-in backend implementing them; the real
+glyph sources are behind build flags. Gleipnir and Lyngvi are not started.
 
 ## Building
 
 ```
 zig build              # zig-out/bin/fenrir
-zig build test         # 110 tests
+zig build test         # 144 tests
 zig build run -- info file.pdf
 ```
 
-Requires Zig 0.16.0.
+Requires Zig 0.16.0. The default build links no C at all.
+
+### Font backends
+
+```
+zig build -Dfreetype               # link FreeType as a glyph backend
+zig build -Dstb-truetype           # compile stb_truetype (vendor the header first)
+zig build -Dharfbuzz               # link HarfBuzz as the UI text shaper
+zig build -Dfont-backend=freetype  # which glyph backend to try first
+```
+
+These flags decide what is *linked*. Which backend opens a given font stays a
+runtime decision, so a build with two of them can render the same page each
+way and diff the results — which is the main reason to have two. `fenrir
+fonts` prints what the binary you have can actually do.
 
 ## The CLI
 
@@ -72,6 +88,7 @@ fenrir pages <file> [--verbose]         every page and its effective geometry
 fenrir xref <file> [--verify]           where every object lives
 fenrir extract <file> <N> [--raw]       a stream's decoded bytes
 fenrir extract <file> --page <N>        a page's content stream
+fenrir fonts                            what Týr can do in this build
 ```
 
 `fenrir extract file.pdf --page 1` prints a decoded content stream — the
@@ -93,7 +110,7 @@ src/
   main.zig                  CLI entry and dispatch
   cli/                      Vánagandr
     Context.zig             allocator, Io, and the two writers
-    info.zig  dump.zig  pages.zig  xref.zig  extract.zig
+    info.zig  dump.zig  pages.zig  xref.zig  extract.zig  fonts.zig
   pdf/                      Gjöll
     object.zig              the 8 object types; no allocation, no ownership
     Lexer.zig               bytes -> tokens
@@ -114,10 +131,24 @@ src/
     DisplayList.zig         DrawCmd and the recorded list
     Builder.zig             the recording API the interpreter will call
     trace.zig               a display list as diffable text
+  tyr.zig  tyr/                   Týr
+    Face.zig                glyph index -> outline, behind a runtime vtable
+    Outline.zig             a glyph in Gelgja's verbs; quads elevated to cubics
+    Shaper.zig              string -> positioned glyphs; UI only, never a page
+    format.zig              sniffing TrueType, CFF, Type 1 from the bytes
+    registry.zig            the one place that knows which backends are built
+    backend/
+      fallback.zig          always present; draws every glyph as a notdef box
+      freetype.zig          -Dfreetype
+      stb.zig               -Dstb-truetype
+      harfbuzz.zig          -Dharfbuzz; a Shaper, not a Face
 ```
 
 Gelgja imports neither the PDF layer nor any graphics API, which is what lets
-its tests run with no document and no GPU.
+its tests run with no document and no GPU. Týr imports Gelgja's geometry and
+nothing else — in particular it never sees a character code, only glyph
+indices and glyph names, so two backends can be diffed without their
+disagreements being confused with an encoding bug.
 
 ### Memory
 
@@ -149,6 +180,10 @@ the ones with `#xx` or `\` escapes are copied into the arena.
 - Gelgja: the `DrawCmd` vocabulary, the recording builder, and the trace
   backend. Nothing produces a display list yet -- the interpreter is next --
   but the interface it must target is fixed and tested.
+- Týr: the `Face` and `Shaper` interfaces, format sniffing, the outline sink,
+  and the backend registry with its selection rules. The default build has one
+  backend, which draws `.notdef` boxes; FreeType, stb_truetype and HarfBuzz
+  are written against the same interfaces but are not compiled here.
 
 ### Damage tolerance
 
@@ -258,14 +293,108 @@ source rect pointing into a glyph atlas — every character. PDF paths need a
 second pipeline, stencil-then-cover, which handles nonzero and even-odd
 winding without triangulating anything.
 
-### 7. Týr — fonts
+### 7. Týr — fonts *(interfaces landed)*
 
-TrueType `glyf` and CFF Type 2 charstrings for outlines; `/Encoding` and
-`/Differences` and CID CMaps for code-to-glyph; `/Widths` and `/W` for
-metrics, which come from the PDF and not the font file, and win when the two
-disagree; `/ToUnicode` for selection and search, which is a third mapping
-again. FreeType via `@cImport` first so the rest of the viewer can be built,
-replaced later.
+**Two interfaces, not one.** "Font backend" is usually said as though
+FreeType, stb_truetype and HarfBuzz were three answers to one question. They
+are answers to two.
+
+| | in | out | implementations |
+| --- | --- | --- | --- |
+| `Face` | glyph index | outline, advance | FreeType, stb_truetype, `fallback`, later a native parser |
+| `Shaper` | Unicode string | positioned glyphs | HarfBuzz, `simple` |
+
+FreeType cannot decide that `fi` should become one glyph. HarfBuzz cannot draw
+a glyph. Putting them behind one interface would mean every implementation
+stubbing out half of it.
+
+The sharper consequence: **a PDF page never needs shaping.** A content stream
+does not contain text, it contains glyph selectors and explicit positions. The
+producer ran a shaper years ago on another machine and baked the answer into
+`Tj` and `TJ`. Shaping it again would substitute our opinion of how the font
+should behave for the one the document was laid out with. So HarfBuzz is
+reached only for text Fenrir composes itself — menus, the search box, page
+labels — and never for page content. Extraction runs the other way, through
+`/ToUnicode`.
+
+**The choice of backend is build-time; the dispatch is runtime.** Which
+backends are in the binary has to be a compile-time fact, because you cannot
+dispatch to a library you did not link. Which one opens a given font does not,
+and should not be: the whole verification plan for Gleipnir is diffing two
+renderings of the same page, and the most valuable diff is the same page
+through two *font* backends. That needs both callable in one process, from one
+call site, selected by a string.
+
+So `Face` and `Shaper` are `std.mem.Allocator`-shaped — an opaque pointer and
+a table of function pointers — and there is exactly one `comptime` conditional
+in the whole layer, in `registry.zig`:
+
+```zig
+pub const compiled: []const *const Backend = blk: {
+    var list: []const *const Backend = &.{};
+    if (options.tyr_freetype) list = list ++ .{&@import("backend/freetype.zig").backend};
+    if (options.tyr_stb_truetype) list = list ++ .{&@import("backend/stb.zig").backend};
+    list = list ++ .{&fallback.backend};
+    break :blk list;
+};
+```
+
+No call site above this branches on which backend was built. Adding a fourth
+is a new file and two lines here. The indirect call is paid once per glyph
+decode, which is dwarfed by the charstring interpreter behind it.
+
+The rejected alternatives are worth recording. *Comptime dispatch* — a `Face`
+that is a concrete type chosen by build flag — costs nothing at runtime and
+makes the cross-backend diff impossible, so it is not cheaper, it is broken.
+*`std.DynLib` at startup* — no build flags, one binary, FreeType used if the
+system has it — is genuinely attractive and stays possible later, since it
+only changes the body of one backend's `open`; it is not the default because
+it means hand-writing the symbol table with no compiler checking the C ABI,
+and because it cannot work for stb_truetype, which is a header rather than a
+library.
+
+**Capabilities are not decoration.** Backends differ in ways that decide
+correctness, so each declares what it can do and the registry selects on it:
+
+```
+freetype   truetype cff type1 names cmap hinting
+stb        truetype cff cmap
+fallback   truetype cff type1
+```
+
+The gap that matters is `names`. stb_truetype has no
+`FindGlyphIndexByName`, because it parses neither the `post` table nor the CFF
+charset — and every Type 1 and CFF font selected through an `/Encoding`
+`/Differences` array names its glyphs. The other is `cff`: most subsetted PDF
+fonts are bare CFF, so a TrueType-only backend must never be handed one. The
+format is sniffed from the bytes rather than trusted from the descriptor,
+because files that declare `/FontFile2` and contain CFF are not rare.
+
+Selection order is: the preferred backend if it can take this format, then the
+rest in registration order, then the fallback. A backend that accepts the
+format but fails on the bytes does not end the search. The result is that
+opening a font cannot fail for any reason except running out of memory.
+
+**Outlines are the shared primitive, and rasterising is optional.** Every
+backend decomposes glyphs into the same `Outline` — Gelgja's verbs, in font
+units, quadratics elevated to cubics exactly. Two conversions live there
+rather than in each backend, because a bug in one copy would be invisible next
+to a correct one. Gleipnir will fill glyph outlines with its own scanline code
+so that glyph edges and vector edges get identical coverage; a backend's own
+rasteriser is used only for small UI text, where hinting beats an unhinted
+fill by a visible margin at eleven pixels.
+
+**What Týr's core keeps for itself: character codes.** `/Encoding`,
+`/Differences`, CMaps, `/CIDToGIDMap` — that machinery is the same whichever
+backend renders the result, so backends are handed indices and names only.
+`/Widths` and `/W` come from the PDF, not the font, and win when the two
+disagree, which in subsetted fonts they routinely do; `Face.advance` is the
+fallback for non-embedded standard-14 faces, never the first source of truth.
+
+Still to write: the encoding tables, the standard-14 metrics, Type 3 glyphs
+(whose outlines are content streams and so run through Gelgja, not Týr), and
+eventually Týr's own `glyf` and Type 2 charstring parsers — diffed glyph by
+glyph against FreeType, which is what the multi-backend design is for.
 
 ### 8. The UI
 
