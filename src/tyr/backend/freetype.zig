@@ -37,7 +37,10 @@ const c = @cImport({
 // macros, which translate-c renders inconsistently across FreeType versions.
 const FT_LOAD_NO_SCALE: i32 = 1 << 0;
 const FT_LOAD_NO_HINTING: i32 = 1 << 1;
-const FT_LOAD_RENDER: i32 = 1 << 2;
+const FT_LOAD_NO_BITMAP: i32 = 1 << 3;
+// `FT_LOAD_TARGET_( x )` is `( ( x & 15 ) << 16 )`, and `FT_RENDER_MODE_LIGHT`
+// is 1. Spelled out for the same reason as the flags above.
+const FT_LOAD_TARGET_LIGHT: i32 = 1 << 16;
 const FT_FACE_FLAG_FIXED_WIDTH: c_long = 1 << 2;
 const FT_FACE_FLAG_GLYPH_NAMES: c_long = 1 << 9;
 
@@ -243,13 +246,42 @@ fn outline(ptr: *anyopaque, gpa: Allocator, g: GlyphIndex, out: *Outline) Face.E
     try out.close(gpa);
 }
 
-fn rasterize(ptr: *anyopaque, g: GlyphIndex, px_size: f32) Face.Error!Face.Bitmap {
+fn rasterize(ptr: *anyopaque, g: GlyphIndex, req: Face.Render) Face.Error!Face.Bitmap {
     const face = stateOf(ptr).face;
-    const px: c_uint = @intFromFloat(@max(1, @round(px_size)));
-    if (c.FT_Set_Pixel_Sizes(face, 0, px) != 0) return error.BackendFailed;
-    if (c.FT_Load_Glyph(face, g, FT_LOAD_RENDER) != 0) return error.Unsupported;
+
+    // `FT_Set_Char_Size` rather than `FT_Set_Pixel_Sizes`, because the latter
+    // takes whole pixels and a UI on a fractional display scale asks for 13.5
+    // as readily as 13. Twenty-six-six fixed point at 72 dpi makes one point
+    // one pixel, so the number passed is the pixel size.
+    const size: c_long = @intFromFloat(@round(@max(req.px_size, 1) * 64.0));
+    if (c.FT_Set_Char_Size(face, 0, size, 72, 72) != 0) return error.BackendFailed;
+
+    // Loaded without rendering, so that the outline can be shifted first.
+    // NO_BITMAP declines embedded bitmap strikes: they cannot be subpixel
+    // positioned, and a face that silently switched between a strike and an
+    // outline at some size boundary would make the backend diff meaningless.
+    const flags: i32 = FT_LOAD_NO_BITMAP | switch (req.hinting) {
+        .none => FT_LOAD_NO_HINTING,
+        .light => FT_LOAD_TARGET_LIGHT,
+        .normal => 0,
+    };
+    if (c.FT_Load_Glyph(face, g, flags) != 0) return error.Unsupported;
 
     const slot = face.*.glyph;
+
+    // The outline moves, not the bitmap. Translating the result afterwards is
+    // exactly the pixel snapping that subpixel positioning exists to avoid.
+    // Font y is up and ours is down, hence the negation. The unit is 1/64 of a
+    // pixel, finer than any bucketing the atlas asks for.
+    if (req.offset_x != 0 or req.offset_y != 0) {
+        c.FT_Outline_Translate(
+            &slot.*.outline,
+            @intFromFloat(@round(req.offset_x * 64.0)),
+            @intFromFloat(@round(-req.offset_y * 64.0)),
+        );
+    }
+    if (c.FT_Render_Glyph(slot, c.FT_RENDER_MODE_NORMAL) != 0) return error.BackendFailed;
+
     const bmp = slot.*.bitmap;
     // A space has a real advance and no pixels; that is not an error.
     if (bmp.buffer == null) return .{};

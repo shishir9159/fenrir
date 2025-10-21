@@ -124,6 +124,37 @@ pub const Capabilities = packed struct {
     }
 };
 
+/// What to render, and how.
+///
+/// A `px_size` on its own is not enough, and the missing field is the one the
+/// glyph atlas is keyed on. Text placed at a fractional pen position looks
+/// wrong when every glyph is snapped to the pixel grid -- the spacing between
+/// letters wobbles by up to a pixel, which at eleven pixels is wider than a
+/// stem -- and it looks equally wrong when the run is snapped as a whole,
+/// because then the run drifts away from the layout the rest of the frame was
+/// solved for. The fix is to rasterise each glyph at the fraction it actually
+/// lands on, from a small set of buckets, and that has to be asked for here.
+///
+/// `offset_x` and `offset_y` are in pixels, normally in `[0, 1)`, and shift
+/// the outline before it meets the grid. They are not a translation of the
+/// resulting bitmap: moving it afterwards is exactly the snapping this exists
+/// to avoid.
+pub const Render = struct {
+    px_size: f32,
+    offset_x: f32 = 0,
+    offset_y: f32 = 0,
+    hinting: Hinting = .normal,
+};
+
+/// Grid fitting, where a backend can do it.
+///
+/// `normal` is the backend's own default; `light` is vertical-only fitting,
+/// which keeps the horizontal shapes the designer drew and is what almost
+/// every modern UI ships; `none` leaves the outline alone. A page render
+/// wants `none` -- a PDF is a fixed layout, and moving stems onto the pixel
+/// grid moves them off the positions the file specifies.
+pub const Hinting = enum { none, light, normal };
+
 /// An 8-bit coverage bitmap produced by a backend that rasterises.
 ///
 /// `pixels` is owned by the backend and valid only until the next call on the
@@ -135,8 +166,11 @@ pub const Bitmap = struct {
     height: u32 = 0,
     /// Bytes per row, which is not always `width`.
     stride: u32 = 0,
-    /// Top-left corner relative to the pen position, in pixels, y downwards.
+    /// Column of the leftmost pixel, relative to the pen.
     left: i32 = 0,
+    /// Rows from the baseline up to the top row, FreeType's `bitmap_top`
+    /// convention. Positive for anything above the baseline, which is almost
+    /// everything; a comma is negative.
     top: i32 = 0,
 };
 
@@ -156,7 +190,7 @@ pub const VTable = struct {
     outline: *const fn (ptr: *anyopaque, gpa: Allocator, g: GlyphIndex, out: *Outline) Error!void,
 
     /// Optional. Returns `error.Unsupported` unless `caps.rasterize`.
-    rasterize: *const fn (ptr: *anyopaque, g: GlyphIndex, px_size: f32) Error!Bitmap,
+    rasterize: *const fn (ptr: *anyopaque, g: GlyphIndex, req: Render) Error!Bitmap,
 
     deinit: *const fn (ptr: *anyopaque, gpa: Allocator) void,
 };
@@ -186,9 +220,9 @@ pub fn outline(f: Face, gpa: Allocator, g: GlyphIndex, out: *Outline) Error!void
 /// content, so that glyph edges and vector edges get identical coverage; this
 /// exists for small UI text, where a backend's hinting beats an unhinted fill
 /// by a visible margin at eleven pixels.
-pub fn rasterize(f: Face, g: GlyphIndex, px_size: f32) Error!Bitmap {
+pub fn rasterize(f: Face, g: GlyphIndex, req: Render) Error!Bitmap {
     if (!f.caps.rasterize) return error.Unsupported;
-    return f.vtable.rasterize(f.ptr, g, px_size);
+    return f.vtable.rasterize(f.ptr, g, req);
 }
 
 pub fn deinit(f: *Face, gpa: Allocator) void {
@@ -260,7 +294,7 @@ test "an unknown-capability face refuses without calling through" {
         fn out(_: *anyopaque, _: Allocator, _: GlyphIndex, _: *Outline) Error!void {
             unreachable;
         }
-        fn ras(_: *anyopaque, _: GlyphIndex, _: f32) Error!Bitmap {
+        fn ras(_: *anyopaque, _: GlyphIndex, _: Render) Error!Bitmap {
             unreachable;
         }
         fn free(_: *anyopaque, _: Allocator) void {}
@@ -285,7 +319,7 @@ test "an unknown-capability face refuses without calling through" {
 
     try testing.expectEqual(@as(?GlyphIndex, null), f.glyphForName("aacute"));
     try testing.expectEqual(@as(?GlyphIndex, null), f.glyphForCodepoint('A'));
-    try testing.expectError(error.Unsupported, f.rasterize(1, 12));
+    try testing.expectError(error.Unsupported, f.rasterize(1, .{ .px_size = 12 }));
 }
 
 test "unit scale follows the em square" {

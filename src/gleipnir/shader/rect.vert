@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 #include "rect.glsl"
 
 // No vertex buffer, no index buffer, no vertex attributes. The draw is

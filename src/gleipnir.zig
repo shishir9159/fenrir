@@ -33,11 +33,16 @@
 const std = @import("std");
 
 pub const DrawList = @import("gleipnir/DrawList.zig");
+pub const pathpipe = @import("gleipnir/pathpipe.zig");
 pub const pipeline = @import("gleipnir/pipeline.zig");
+pub const path = @import("gleipnir/path.zig");
 pub const png = @import("gleipnir/png.zig");
+pub const raster = @import("gleipnir/raster.zig");
+pub const replay = @import("gleipnir/replay.zig");
 pub const rect = @import("gleipnir/rect.zig");
 pub const sdf = @import("gleipnir/sdf.zig");
 pub const software = @import("gleipnir/software.zig");
+pub const stroke = @import("gleipnir/stroke.zig");
 
 pub const Batch = DrawList.Batch;
 pub const Framebuffer = software.Framebuffer;
@@ -49,9 +54,15 @@ pub const Xform = DrawList.Xform;
 
 test {
     _ = DrawList;
+    _ = pathpipe;
     _ = pipeline;
+    _ = path;
     _ = png;
+    _ = raster;
+    _ = replay;
+    _ = @import("gleipnir/zz_probe.zig");
     _ = rect;
     _ = sdf;
     _ = software;
+    _ = stroke;
 }

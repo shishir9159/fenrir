@@ -31,8 +31,9 @@ Týr still loses the hand. That part is not optional.
 | **Gjöll** | `src/gjoll/` | parser: objects, xref, filters, page tree | the boulder the fetter is anchored to | done |
 | **Gelgja** | `src/gelgja/` | the display list: parser output, renderer input | the cord threaded through the rock | interface done |
 | **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | rects done |
-| **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | interface done |
-| **Lyngvi** | `src/lyngvi/` | platform: window, input, surface | the island it happened on | — |
+| **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | atlas done |
+| **Þviti** | `src/thviti/` | the interface: box tree, layout solver, signals | the stone that pins the fetter down | core done |
+| **Lyngvi** | `src/lyngvi/` | platform: window, input, Vulkan device | the island it happened on | window and device done |
 | **Vánagandr** | `src/vanagandr/` | the command-line tool | "monster of the river Ván", his other name | done |
 
 Directory and identifier names are ASCII-folded — `gjoll`, `tyr`,
@@ -40,25 +41,58 @@ Directory and identifier names are ASCII-folded — `gjoll`, `tyr`,
 identifiers; build systems, shells, and filesystems across three platforms
 are less reliable about it, and this is not the hill.
 
-**Status: milestone 3, plus the Gelgja, Týr and Gleipnir-rect layers.** Gjöll is done:
-the container is fully readable and the page tree resolves into pages with
-their effective geometry. Gelgja's display list, builder, and trace backend
-are written and tested; nothing produces one yet, because the interpreter
-that will is milestone 4. Týr's two interfaces and its backend registry are
-written and tested, with one stand-in backend implementing them; the real
-glyph sources are behind build flags. Gleipnir's rect pipeline is written and
-tested against a CPU reference rasteriser, with the GLSL checked in but never
-yet handed to a device; its path pipeline and Lyngvi are not started.
+**Status: milestone 4, plus the Gelgja, Gleipnir-rect, Týr, Þviti and Lyngvi
+layers.** Gjöll is done: the container is fully readable, the page tree
+resolves into pages with their effective geometry, and the content-stream
+interpreter turns one into a display list -- all seventy-three operators,
+with colour spaces, functions, form XObjects, inline images, patterns and
+Type 3 glyphs. `fenrir trace` prints the result. Týr's two interfaces and its
+backend registry are written and tested, and so are the glyph atlas, its scan
+converter and its text layout; the real glyph sources are behind build flags
+and are still uncompiled. Gleipnir's rect pipeline is written and tested
+against a CPU reference rasteriser. Þviti's box tree, five-pass solver, style
+stacks and signals are written and tested, and `fenrir ui` runs the whole
+stack — layout, shaping, atlas, instances, pixels — into a PNG.
+
+Lyngvi opens a window on Win32 and creates a Vulkan instance, device,
+swapchain and pipeline through bindings written by hand and loaded at run
+time, so the default build still links no C and needs no SDK. `fenrir view`
+runs the same interface `fenrir ui` writes to a PNG, in a window, on the GPU.
+What is missing between here and a picture on a screen is one build
+dependency: the GLSL is compiled to SPIR-V by whatever shader compiler is on
+`PATH`, and on a machine with none the window still opens, the swapchain still
+presents, and nothing is drawn — which is the state this was developed in.
+Gleipnir's path pipeline is the other thing not started.
 
 ## Building
 
 ```
 zig build              # zig-out/bin/fenrir
-zig build test         # 196 tests
+zig build test         # 350 tests
 zig build run -- info file.pdf
 ```
 
-Requires Zig 0.16.0. The default build links no C at all.
+Requires Zig 0.16.0. The default build links no C at all — not even Vulkan,
+which is opened by name at run time rather than linked, so a machine with no
+driver gets a sentence instead of a link error. On Windows the build links
+`user32`, because Lyngvi's window is Win32 calls declared by hand.
+
+### Shaders
+
+The GLSL in `src/gleipnir/shader/` is compiled to SPIR-V by the build, using
+`glslc` or `glslangValidator`, whichever is on `PATH` first. Neither being
+present is not an error:
+
+```
+zig build              # looks for a shader compiler; carries on without one
+fenrir view --probe    # says which of the two it found, if either
+```
+
+A binary built without one opens its window, creates its device and swapchain,
+acquires and presents images, and draws nothing, with a message saying so. That
+is a deliberate half-measure rather than a failure: it keeps everything except
+the draw call testable on a machine with a driver and no SDK, which is the
+normal state of a machine that has never installed one.
 
 ### Font backends
 
@@ -67,6 +101,16 @@ zig build -Dfreetype               # link FreeType as a glyph backend
 zig build -Dstb-truetype           # compile stb_truetype (vendor the header first)
 zig build -Dharfbuzz               # link HarfBuzz as the UI text shaper
 zig build -Dfont-backend=freetype  # which glyph backend to try first
+```
+
+On a system where `linkSystemLibrary` cannot find a library on its own —
+which means anywhere without pkg-config, so most Windows machines — give the
+paths instead. The include directory is the one holding `ft2build.h`, which in
+a normal install is `<prefix>/include/freetype2` and not `<prefix>/include`:
+
+```
+zig build -Dfreetype -Dfreetype-include=<prefix>/include/freetype2 \
+                     -Dfreetype-lib=<prefix>/lib
 ```
 
 These flags decide what is *linked*. Which backend opens a given font stays a
@@ -87,15 +131,43 @@ fenrir pages <file> [--verbose]         every page and its effective geometry
 fenrir xref <file> [--verify]           where every object lives
 fenrir extract <file> <N> [--raw]       a stream's decoded bytes
 fenrir extract <file> --page <N>        a page's content stream
+fenrir trace <file> [--page N|--all]    a page interpreted into a display list
+             [--stats] [--paths]
+             [--glyphs] [--no-rotate]
 fenrir fonts                            what Týr can do in this build
 fenrir rects [--out F] [--size WxH]     a demo frame through the rect pipeline
+fenrir ui    [--out F] [--atlas F]      a frame of interface, text included
+             [--size WxH] [--mouse X,Y]
+fenrir view  [--frames N] [--size WxH]  the same interface, in a window, on
+             [--vsync on|off|adaptive]  the GPU
+             [--validate] [--gpu NAME]
+fenrir view --probe                     the devices, without opening anything
 ```
 
 `fenrir extract file.pdf --page 1` prints a decoded content stream — the
-actual graphics language a page is written in, and the input to milestone 4.
+actual graphics language a page is written in; `fenrir trace file.pdf --page 1`
+prints what the interpreter made of it.
 `fenrir xref --verify` checks that every offset in the table really points at
 its own `N G obj` header, which is the single most useful signal about
 whether a file is well-formed.
+
+`fenrir view --probe` opens the Vulkan loader, enumerates the devices, and
+prints what each one can do without creating a window, so it works over ssh
+and on a machine with no display. It is the first thing to run when something
+is wrong, and the last line of it is the one that matters:
+
+```
+device 0  NVIDIA GeForce GTX 1650 SUPER
+  kind          discrete, NVIDIA
+  api           1.4.351
+  memory        3930 MiB device-local
+  swapchain     yes
+  indexing      yes
+```
+
+`indexing` is descriptor indexing, and it decides whether a frame is one draw
+call or one per run of instances sharing a texture — 1 against 18 for the demo
+interface.
 
 ## Layout
 
@@ -122,11 +194,18 @@ src/
       predictor.zig         PNG and TIFF predictors
       ascii.zig             ASCIIHex, ASCII85, RunLength
       lzw.zig               LZWDecode
+    content.zig  content/   the content-stream interpreter
+      Scanner.zig           operators and operands, inline images included
+      Interpreter.zig       the operator table and the graphics state
+      matrix.zig            the interpreter's f64 matrix
+      color.zig             all eight colour space families, resolved to RGBA
+      function.zig          PDF function types 0, 2, 3 and 4
+      Font.zig              widths and code decoding out of a font dictionary
   gelgja.zig  gelgja/       Gelgja
     geom.zig                points, matrices, bounds, path verbs
     paint.zig               colour, stroke parameters, blend modes, layers
     DisplayList.zig         DrawCmd and the recorded list
-    Builder.zig             the recording API the interpreter will call
+    Builder.zig             the recording API the interpreter calls
     trace.zig               a display list as diffable text
   gleipnir.zig  gleipnir/   Gleipnir
     sdf.zig                 the distance field, in Zig; the shader mirrors it
@@ -144,16 +223,49 @@ src/
     Shaper.zig              string -> positioned glyphs; UI only, never a page
     format.zig              sniffing TrueType, CFF, Type 1 from the bytes
     registry.zig            the one place that knows which backends are built
+    raster.zig              outline -> coverage, by signed-area accumulation
+    Atlas.zig               glyphs packed by (face, glyph, size, subpixel x)
+    Fonts.zig               faces, the atlas, the shaper, and text layout
     backend/
       fallback.zig          always present; draws every glyph as a notdef box
       freetype.zig          -Dfreetype
       stb.zig               -Dstb-truetype
       harfbuzz.zig          -Dharfbuzz; a Shaper, not a Face
+  thviti.zig  thviti/       Þviti
+    key.zig                 a box's identity: a hash of a string and a parent
+    Box.zig                 the node: asked for, solved, and remembered
+    input.zig               what Lyngvi produces, one frame at a time
+    UI.zig                  the tree, the stacks, the five passes, the signals
+    text.zig                the one file that knows both Þviti and Týr
+    draw.zig                the tree, turned into Gleipnir instances
+    widgets.zig             enough controls to prove the core is usable
+  lyngvi.zig  lyngvi/       Lyngvi
+    vk.zig                  Vulkan, declared by hand; no headers, no SDK
+    loader.zig              the loader opened by name, and three dispatch tables
+    spirv.zig               enough of the format to check a module before use
+    shaders.zig             the compiled blobs, or the reason there are none
+    choose.zig              every decision, as a function of its inputs
+    Window.zig              fifteen functions; one implementation per platform
+    Events.zig              a message loop's output, as one frame of input
+    win32.zig               thirty externs and a window procedure
+    x11.zig                 stubbed, so the interface has two implementors
+    Device.zig              instance, surface, physical device, queues
+    Swapchain.zig           images, views, framebuffers, and the render pass
+    Renderer.zig            the rect pipeline, and one vkCmdDraw per frame
   vanagandr/                Vánagandr
     Context.zig             allocator, Io, and the two writers
     info.zig  dump.zig  pages.zig  xref.zig  extract.zig  fonts.zig
     rects.zig               draws a demo frame with no GPU in the process
+    ui.zig                  the whole stack, end to end, into a PNG
+    view.zig                the same stack, end to end, into a window
 ```
+
+Þviti is the only layer that imports across, and it does so in two named
+files: `text.zig` reaches Týr and `draw.zig` reaches Gleipnir. `UI.zig` itself
+imports neither — it asks how wide a string is through a vtable and produces
+nothing but a tree — so the layout solver, which is the part with all the
+arithmetic in it, is tested with no fonts, no atlas and no renderer anywhere
+in the test.
 
 Gelgja imports neither the PDF layer nor any graphics API, which is what lets
 its tests run with no document and no GPU. Týr imports Gelgja's geometry and
@@ -189,17 +301,44 @@ the ones with `#xx` or `\` escapes are copied into the arena.
   so a token can straddle two streams; joining without the separator corrupts
   one operator at every seam, silently.
 - Gelgja: the `DrawCmd` vocabulary, the recording builder, and the trace
-  backend. Nothing produces a display list yet -- the interpreter is next --
-  but the interface it must target is fixed and tested.
+  backend, now driven by the interpreter that was written against them.
+- The content-stream interpreter: all 73 operators of table A.1, the graphics
+  and text state with `q`/`Q`, deferred clipping, form XObjects with their
+  matrices, bounding boxes and transparency groups, inline images decoded into
+  the display list so it stays replayable without a document, all eight colour
+  space families, PDF function types 0, 2, 3 and 4 — including the PostScript
+  calculator, because spot colours are specified with one — shading and tiling
+  patterns in pattern space, embedded CMaps, and Type 3 glyph procedures run
+  as the content streams they are. `fenrir trace` prints the result; 236
+  million operators across the corpus produce no unimplemented operator.
 - Gleipnir's rect pipeline: the instance format, the draw layer with its clip
   and transform stacks, the distance field, and a CPU rasteriser that runs the
   same arithmetic a fragment shader would. `fenrir rects` writes a frame to a
-  PNG. The GLSL is written and has never been compiled -- there is no device
-  to hand it to until Lyngvi exists.
+  PNG, and `fenrir view` hands the same instances to a real device.
 - Týr: the `Face` and `Shaper` interfaces, format sniffing, the outline sink,
   and the backend registry with its selection rules. The default build has one
   backend, which draws `.notdef` boxes; FreeType, stb_truetype and HarfBuzz
   are written against the same interfaces but are not compiled here.
+- Týr's glyph pipeline: a signed-area scan converter, a skyline-packed atlas
+  keyed by `(face, glyph, size, subpixel x)`, and text layout with a shaped-run
+  cache. A backend that rasterises is asked to; one that only decomposes has
+  its outlines filled by Týr's own, which is why all of this runs on a machine
+  with no C dependencies at all.
+- Þviti: box identity, the tree, semantic sizing and its five-pass solver, the
+  parent and style stacks, mouse and keyboard signals, focus and tab order,
+  scrolling, and frame-rate-independent animation. `fenrir ui` builds a
+  reader's chrome, solves it, rasterises its text, turns it into rect
+  instances and writes the result as a PNG — every layer but the Vulkan
+  backend, on one path.
+- Lyngvi: a Win32 window with DPI awareness, mouse capture, wheel and
+  surrogate-paired text input; hand-written Vulkan bindings loaded at run
+  time; instance, surface, device and queue selection; a swapchain that
+  rebuilds on resize with a semaphore per image; and the rect pipeline with a
+  persistently mapped instance buffer and glyph uploads that ride along with
+  the frame. `fenrir view` runs it. On the machine this was written on it
+  opens a window on a GTX 1650 SUPER, picks `b8g8r8a8_srgb` and three images,
+  builds 742 instances a frame from the live UI, uploads the glyph atlas, and
+  presents — and draws nothing, because that machine has no shader compiler.
 
 ### Damage tolerance
 
@@ -240,8 +379,23 @@ in it — still reads completely.
   structurally but their strings and stream data read as ciphertext. Most
   encrypted files in practice have an empty user password, so this is the
   next thing worth adding.
-- Everything above the page: content-stream interpretation, fonts, colour,
-  rendering, UI.
+- **Three approximations in the interpreter**, each confined to one function
+  and named where it lives. A simple font with no `/Widths` is one of the
+  standard 14, whose metrics are AFM files rather than document content, so
+  every glyph advances half an em until Týr loads them. A `/Type0` font whose
+  `/Encoding` is a predefined CMap other than Identity decodes two bytes at a
+  time — right for all of them — with the wrong CID mapping for the CJK ones;
+  *embedded* CMap streams are parsed properly. And a clipping text render
+  mode (`Tr 4`–`Tr 7`) clips to a box per glyph rather than to the outline,
+  which shows a little too much rather than nothing.
+- Týr's encoding tables (`/Encoding`, `/Differences`, CMaps, `/CIDToGIDMap`),
+  the standard-14 metrics, and its own `glyf` and Type 2 charstring parsers.
+- Gleipnir's path pipeline: stencil-then-cover, for everything that is not a
+  rectangle.
+- A real widget set on top of Þviti — text fields with selection and an IME,
+  menus, tab bars, trees, splitters.
+- Lyngvi's xcb backend, and everything platform-shaped a reader eventually
+  needs: file dialogs, menus, the clipboard.
 
 ## Where this is going
 
@@ -297,14 +451,127 @@ was a renderer trustworthy enough to bisect against, and SVG stops being
 trustworthy exactly where PDF gets hard — blend modes, soft masks, shading
 types 4–7, text rendering modes, dash phase.
 
-### 5–6. Lyngvi and Gleipnir — window and pixels *(rect pipeline landed)*
+### 5. Lyngvi — window and device *(landed)*
 
-A platform layer of roughly fifteen functions: open a window, drain events
-into an arena, block until input, hand back a Vulkan surface. Win32 first,
-xcb second, and the xcb backend stubbed from day one so the abstraction stays
-honest rather than quietly Win32-shaped.
+The estimate was fifteen functions: open a window, drain events, block until
+input, hand back a Vulkan surface. The vtable has ten, and a test asserts it
+stays under fifteen — because everything else a window appears to do (hit
+testing, focus, hover, cursors over a control, drag and drop inside the
+program) belongs to Þviti and was already written, and a platform layer that
+grows is a portable program acquiring three subtly different behaviours.
 
-**The rect pipeline is written, minus the Vulkan calls.** One instance format
+Win32 first, xcb stubbed from day one. The stub is not a placeholder for
+politeness: an interface with one implementor is not an interface, and writing
+the second one's *signature* is what proved this one is not quietly
+Win32-shaped. Three things in the design come from it — `Window.Native` has an
+`xcb` arm, wheel movement is reported in pixels rather than notches because
+X11 delivers it as button presses with no magnitude at all, and
+`scroll_line_pixels` exists because in that arrangement nobody else has the
+number.
+
+**Vulkan is declared by hand and opened by name.** No `vulkan.h`, no
+`@cImport`, no `vulkan-1.lib`, no SDK: the ABI is frozen, the loader is
+reached through one symbol, and `std.DynLib` (plus three `kernel32`
+declarations on Windows, where that does not compile) finds it at run time.
+The cost is a day of transcription. The benefit is that a machine with no
+driver gets a sentence — and that the default build of a PDF reader still
+links no C at all.
+
+One rule keeps the transcription safe, and it is worth stating because it is
+what makes the shortcut legitimate: structures **passed to** the driver must be
+byte-exact, because it reads fields at fixed offsets, and structures **filled
+in by** it may be larger than the real thing, because it writes only what its
+own header says. So every `CreateInfo` is written out in full, and
+`VkPhysicalDeviceLimits` — a hundred members, of which four are read — is four
+named fields and a generously oversized tail. Getting that wrong in the safe
+direction wastes half a kilobyte of stack; getting a `CreateInfo` wrong is a
+black window.
+
+**Three dispatch tables, not one.** Device-level functions can be fetched from
+the instance, where the loader inserts a trampoline that reads the dispatch
+table out of the handle on every call, or from the device, where the pointer
+goes straight into the driver. For `vkCmdDraw` that is the difference between
+a call and a dependent load followed by a call, so the device table is filled
+with `vkGetDeviceProcAddr` and the tables are filled by `inline for` over
+their own fields rather than by a hundred hand-written assignments — which is
+the same code with one chance per line to paste the wrong name into the wrong
+field, a mistake that compiles and then calls a real Vulkan function with the
+wrong arguments.
+
+**The decisions are not in the Vulkan files.** Initialisation is mostly not API
+calls; it is a dozen small judgements surrounded by the calls that fetch the
+candidates. Which surface format, which present mode, how many images, which
+memory type, which queue family, which of two GPUs — all of it is in
+`choose.zig` as pure functions over the arrays Vulkan returns, and all of it is
+tested against the cases that never come up on the machine the code was
+written on: a driver offering no sRGB format, a compositor reporting
+`0xFFFFFFFF` for its extent, a surface with no maximum image count, a device
+whose only host-visible memory is also device-local, a queue family that can
+present but not draw.
+
+Three details in that file are load-bearing and each is a bug someone else
+would have found:
+
+- `max_image_count` of zero means *no maximum*, and clamping to it
+  unconditionally asks the presentation engine for zero images.
+- One more image than the minimum, because asking for exactly the minimum
+  makes every acquire block until the compositor releases the previous frame —
+  which turns a 2ms frame into a 16ms one and looks exactly like a slow
+  renderer.
+- The render-finished semaphore belongs to the swapchain *image*, not to the
+  frame in flight. With one per frame, two frames can present different images
+  while signalling the same semaphore, and the presentation engine may wait on
+  a signal already consumed. It works on the machine it was written on. The
+  official tutorial had this wrong for years.
+
+The instance buffer is mapped once and never unmapped — mapping per frame is a
+driver call and a page-table update to obtain a pointer that was already valid
+— and it asks for host-visible memory while *preferring* device-local, so on a
+machine with resizable BAR it lands in video memory without being asked to and
+on one without it lands in system memory and everything still works. Glyph
+uploads ride along in the frame's own command buffer ahead of the render pass,
+so a frame that adds characters to the atlas does not stall the queue.
+
+Text is the part of an input API that is easy to get wrong quietly. The mouse
+is state, so a platform that coalesces twenty motion events cannot
+desynchronise anything; the keyboard is an ordered list, because typing `a`,
+backspace, `a` leaves the same state as typing nothing and a text field has to
+see all three; the wheel accumulates and resets, because reporting each tick as
+an event makes a UI scroll in steps at whatever rate the mouse driver chose.
+`WM_CHAR` arrives as UTF-16, so anything outside the basic plane is two
+messages that are nothing at all until they are paired. And the text bytes are
+double-buffered, because Windows runs its own modal message loop while a window
+is being dragged and calls the window procedure from inside it — so input can
+arrive in the middle of a frame, and the buffer the frame is reading must not
+be the one being appended to. That one was found by a test, in the least
+ambiguous way available: every byte came back `0xaa`.
+
+```
+fenrir view --frames 120
+NVIDIA GeForce GTX 1650 SUPER (NVIDIA), Vulkan 1.4, fifo
+1100x760 in 3 swapchain images, b8g8r8a8_srgb
+120 frames drawn, 0 skipped, 0 swapchain rebuilds
+742 instances at the high-water mark
+atlas 1024x256, 8 glyphs, 872 bytes uploaded
+```
+
+What is still missing is the SPIR-V. The GLSL is compiled by the build when a
+shader compiler is on `PATH` and this machine has none, so that run acquired,
+cleared and presented 120 images and drew nothing. That is a real state and it
+is handled rather than papered over: `spirv.zig` parses whatever the build
+produced and checks it is SPIR-V at all, is not byte-swapped, and declares the
+stage and the capabilities the pipeline is about to ask the device for — the
+class of failure whose symptom is a pipeline that creates successfully, draws
+nothing, and reports nothing.
+
+Not here, and each of them a separate self-contained addition: file dialogs,
+menus, the clipboard, drag and drop from other applications, and any fallback
+to OpenGL or Direct3D. A machine without Vulkan gets a message saying so
+rather than a silently slower program.
+
+### 6. Gleipnir — pixels *(rect pipeline landed)*
+
+**The rect pipeline is written.** One instance format
 draws every rectangle the reader will ever put on the screen — panels,
 buttons, scrollbars, shadows, image tiles, and, with the source rect pointing
 into a glyph atlas, every character — as a rounded box evaluated from a signed
@@ -356,16 +623,24 @@ darks. The known cost is that antialiased text blended in linear light looks
 thin when it is light on dark, and the fix for that is stem darkening in the
 glyph atlas, not blending in the wrong space.
 
-**None of it has touched a GPU**, because Lyngvi does not exist yet and there
-is no device to hand it to. What can still be checked is: the distance field
-is implemented in Zig and tested against known distances, then transliterated
-into GLSL line for line; a CPU rasteriser drives that same arithmetic over a
-framebuffer the way a fragment shader would, one pixel centre at a time, in
-submission order, with the same blend equation; and `pipeline.zig` writes down
-the bindings, push constants, blend factors and device features the shader
-assumes, each of which produces a black window and no error message when it is
-wrong. The first bring-up is then a diff rather than an investigation — same
-scene, two rasterisers, subtract.
+**The instances now reach a real device** — Lyngvi's `Renderer` is the other
+half of `pipeline.zig`, and it is the only file in the project that both knows
+what a `DrawList` is and calls `vkCmdDraw`. **The shader still has not run**,
+because compiling it needs a shader compiler this machine does not have.
+
+What was checked without one: the distance field is implemented in Zig and
+tested against known distances, then transliterated into GLSL line for line; a
+CPU rasteriser drives that same arithmetic over a framebuffer the way a
+fragment shader would, one pixel centre at a time, in submission order, with
+the same blend equation; and `pipeline.zig` writes down the bindings, push
+constants, blend factors and device features the shader assumes, each of which
+produces a black window and no error message when it is wrong. A test in
+`Renderer.zig` compares the two halves of that contract, which is possible
+only there, because it is the only place both exist.
+
+So the first bring-up is a diff rather than an investigation: `fenrir ui` and
+`fenrir view` build the same scene from the same box tree, so the difference
+between the two images is the difference between the two rasterisers.
 
 ```
 fenrir rects --out frame.png
@@ -378,7 +653,7 @@ reach the buffer; the one draw call is what the fallback for a device without
 descriptor indexing *would* cost, which makes it a standing measure of how
 well the drawing was ordered.
 
-### 7. Týr — fonts *(interfaces landed)*
+### 7. Týr — fonts *(atlas landed)*
 
 **Two interfaces, not one.** "Font backend" is usually said as though
 FreeType, stb_truetype and HarfBuzz were three answers to one question. They
@@ -464,10 +739,50 @@ opening a font cannot fail for any reason except running out of memory.
 backend decomposes glyphs into the same `Outline` — Gelgja's verbs, in font
 units, quadratics elevated to cubics exactly. Two conversions live there
 rather than in each backend, because a bug in one copy would be invisible next
-to a correct one. Gleipnir will fill glyph outlines with its own scanline code
-so that glyph edges and vector edges get identical coverage; a backend's own
-rasteriser is used only for small UI text, where hinting beats an unhinted
-fill by a visible margin at eleven pixels.
+to a correct one. Gleipnir's path pipeline will fill page outlines with its
+own scanline code, so that a glyph drawn large and a vector edge beside it get
+identical coverage.
+
+Týr has the small-text half of that already, and it takes whichever door a
+backend offers: one that rasterises is asked to, because FreeType's hinting
+beats an unhinted fill by a visible margin at eleven pixels, and one that only
+decomposes has its outlines filled by Týr's own scan converter.
+
+**The atlas is keyed by the subpixel position, and that is the whole
+difference between text and letters.** A run advances by fractional amounts —
+an `r` is 5.34 pixels wide at eleven point — so the pen lands between pixels
+almost always. Rounding each glyph to a whole pixel makes the gaps between
+letters wobble by up to a pixel, which is wider than a stem, and the word
+stops looking like a word; rounding only the run's start means sampling a
+bitmap at a half-texel offset, which is a blur. The third option is to
+rasterise the glyph *at* the fraction it lands on, from three buckets per
+pixel, which is what FreeType and Skia both settle on. Baselines are snapped
+and there is no vertical bucket: a horizontal stem across two rows is the one
+artefact that reads as blur rather than as position.
+
+The atlas packs by skyline into a texture of fixed width and growing height.
+Fixed width because widening would re-stride every row and invalidate every
+cached rectangle; growing height appends rows and leaves every `(x, y)`
+exactly where it was. At the height cap it clears and starts again, at a frame
+boundary and never in the middle of one. There is no LRU, deliberately:
+eviction means touching a timestamp on every glyph of every frame to keep
+score of a resource that is not scarce, and what it buys is one frame of
+re-rasterisation in a session that filled four megabytes.
+
+**Týr rasterises outlines itself**, by signed-area accumulation — the method
+`font-rs` popularised: each segment's contribution is added to a float buffer
+and a running sum along the row turns it into coverage. No sorted edge list,
+no active edge table, no supersampling, and the antialiasing is analytic. It
+exists because a backend is not obliged to rasterise (Týr's own `glyf` and
+Type 2 parsers will produce outlines and nothing else), because it makes the
+whole glyph path testable on a machine with no C dependencies, and because it
+is the second opinion FreeType gets diffed against.
+
+Its flatness tolerance is a fiftieth of a pixel rather than the tenth that
+looks like enough, and a test is what moved it. Chords always cut *inside* a
+convex arc, so the error does not cancel: a tenth of a pixel costs a round
+glyph a quarter of a percent of its ink and shaves the outside of every bowl.
+The test measures a circle's coverage against πr².
 
 **What Týr's core keeps for itself: character codes.** `/Encoding`,
 `/Differences`, CMaps, `/CIDToGIDMap` — that machinery is the same whichever
@@ -481,26 +796,63 @@ Still to write: the encoding tables, the standard-14 metrics, Type 3 glyphs
 eventually Týr's own `glyf` and Type 2 charstring parsers — diffed glyph by
 glyph against FreeType, which is what the multi-backend design is for.
 
-### 8. The UI
+### 8. Þviti — the UI *(core landed)*
 
-**Decided: immediate-mode call sites over a retained box cache**, following
-the RAD Debugger's `ui` layer. Not either pure form.
+**Immediate-mode call sites over a retained box cache**, following the RAD
+Debugger's `ui` layer. Not either pure form.
 
 "Immediate versus retained" conflates two independent things: the shape of the
 call site, and whether per-widget state survives between frames. Dear ImGui
 picks immediate for both and pays in awkward animation, awkward focus order,
 and layout that lags a frame. Qt and GTK pick retained for both and pay in
 ownership, invalidation, and diffing. The hybrid takes immediate call sites
-and retained *state*: boxes live in a hash table across frames, keyed by a
-64-bit hash of a string plus a parent seed, carrying hover and active
-animation, focus, and scroll offsets. You write immediate-mode code and get
-persistent state for nothing.
+and retained *state*: boxes live in a hash table across frames and carry hover
+and press animation, keyboard focus, and scroll offsets. You write
+immediate-mode code and get persistent state for nothing.
 
-Sizing is semantic — pixels, text content, percent of parent, sum of children
-— each with a strictness, solved in passes: independent sizes, then
+The key is a 64-bit hash of the call site's string seeded with the parent's
+key, so `"Open"` means "the Open button *in this panel*" and two panels
+showing the same buttons do not share one animation. `"Save##toolbar"`
+displays `Save` and keys on the whole string; `"42 items###count"` displays
+`42 items` and keys on `count` alone, so a label that counts something does
+not become a different box each time the number moves. Boxes with no key at
+all come from the frame arena and vanish with it, which is most of a tree —
+rows, spacers, containers have nothing worth remembering.
+
+**Sizing is semantic.** A box does not have a width, it has an opinion about
+its width — so many pixels, as wide as its text, a share of its parent, or as
+wide as its children need — and a *strictness* saying how much of that
+opinion it will give up when the opinions do not fit. Solving is five walks
+over the finished tree, run once per axis: standalone sizes, then
 upward-dependent, then downward-dependent, then violations, then
 relative-to-absolute. Because layout is a separate pass over a tree that
-already exists, there is no one-frame lag.
+already exists, there is no one-frame lag in the geometry.
+
+The strictness is not a priority number bolted on. A shortfall is distributed
+in proportion to what each child is *willing* to lose, which is the only rule
+whose answer does not depend on the order the children happened to be built
+in — and build order is exactly what an immediate-mode call site makes
+invisible.
+
+Pass four has the one compromise in it: shrinking a box invalidates any
+percentage its descendants computed from it in pass two, and the honest fix is
+to re-run two and three for that subtree, which is quadratic. RAD does not,
+and neither does this; the escape is an overflow flag that excuses a box from
+being squeezed at all, which is what a scroll view uses anyway.
+
+**What does cost a frame is hit testing**, because a box's rectangle is not
+known while the tree is still being built. Hover is therefore resolved *after*
+layout, against this frame's geometry, for the next frame's signals — which
+makes a control interactive on the frame after it appears rather than two
+frames after, and makes "the box drawn on top" and "the box that gets the
+mouse" the same box without either of them sorting anything.
+
+**A style stack, not a dozen of them.** RAD keeps one stack per field because
+C macros make that ergonomic; Zig does not, so `pushStyle(.{ .fg = dim })`
+merges one field onto the top and leaves the rest alone. One-shot overrides
+are a separate mechanism that clears after the next box, because the classic
+immediate-mode bug is a colour set for one button that quietly applies to the
+next forty.
 
 **Vulkan does not push toward a retained widget tree**, and mildly pushes the
 other way. The per-frame vertex data is a few hundred kilobytes, which is
@@ -514,6 +866,26 @@ buffers in place — the latter has to track what is still in use.
 The one genuine argument for a classic retained tree is accessibility: screen
 reader APIs want a stable object tree to query out of band. The persistent box
 cache is one, so that stays available.
+
+```
+$ fenrir ui --out ui.png
+163 boxes solved, 158 drawn, 2142 glyph quads
+690 instances, 1599 culled, 18 draw calls without descriptor indexing
+atlas 1024x256, 8 glyphs, 0% full, 8 rasterised
+```
+
+The eighteen is the honest number and worth keeping in view: with descriptor
+indexing the frame is one call, and eighteen is what the fallback path would
+cost because text and panels are interleaved. Drawing all the text in a pass
+would make it two. The sixteen hundred culled are outline rows scrolled
+outside the sidebar's clip, dropped before they reach the buffer.
+
+Still missing, and deliberately: a real widget set. Text fields with selection
+and an IME, menus, tab bars, trees, splitters, drag-and-drop. That is a layer
+written *on* this one, and writing it before there was a window to put it in
+would have meant designing against an interface nobody had used. There is a
+window now, which is the argument for writing it next rather than the argument
+that it was wrong to wait.
 
 ## Reference
 

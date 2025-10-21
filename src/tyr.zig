@@ -28,10 +28,13 @@
 
 const std = @import("std");
 
+pub const Atlas = @import("tyr/Atlas.zig");
 pub const Face = @import("tyr/Face.zig");
+pub const Fonts = @import("tyr/Fonts.zig");
 pub const Outline = @import("tyr/Outline.zig");
 pub const Shaper = @import("tyr/Shaper.zig");
 pub const format = @import("tyr/format.zig");
+pub const raster = @import("tyr/raster.zig");
 pub const registry = @import("tyr/registry.zig");
 
 pub const Backend = Face.Backend;
@@ -51,10 +54,13 @@ pub const shaper = registry.shaper;
 pub const glyphs_are_real = registry.glyphs_are_real;
 
 test {
+    _ = Atlas;
     _ = Face;
+    _ = Fonts;
     _ = Outline;
     _ = Shaper;
     _ = format;
+    _ = raster;
     _ = registry;
     _ = @import("tyr/backend/fallback.zig");
 }

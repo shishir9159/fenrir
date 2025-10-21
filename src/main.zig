@@ -14,6 +14,10 @@ const fonts = @import("vanagandr/fonts.zig");
 const info = @import("vanagandr/info.zig");
 const pages = @import("vanagandr/pages.zig");
 const rects = @import("vanagandr/rects.zig");
+const raster = @import("vanagandr/raster.zig");
+const trace = @import("vanagandr/trace.zig");
+const ui = @import("vanagandr/ui.zig");
+const view = @import("vanagandr/view.zig");
 const xref = @import("vanagandr/xref.zig");
 
 const Command = struct {
@@ -29,8 +33,12 @@ const commands = [_]Command{
     .{ .name = "pages", .summary = "list pages and their geometry", .usage = pages.usage, .run = pages.run },
     .{ .name = "xref", .summary = "print the cross-reference table", .usage = xref.usage, .run = xref.run },
     .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run },
+    .{ .name = "raster", .summary = "rasterise a page to a PNG on the CPU", .usage = raster.usage, .run = raster.run },
+    .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
     .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run },
+    .{ .name = "ui", .summary = "render a frame of interface, layout and text included", .usage = ui.usage, .run = ui.run },
+    .{ .name = "view", .summary = "open a window and draw on the GPU", .usage = view.usage, .run = view.run },
 };
 
 pub fn main(init: std.process.Init) !void {

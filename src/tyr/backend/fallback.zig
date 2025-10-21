@@ -116,7 +116,7 @@ fn outline(_: *anyopaque, gpa: Allocator, _: GlyphIndex, out: *Outline) Face.Err
     try out.close(gpa);
 }
 
-fn rasterize(_: *anyopaque, _: GlyphIndex, _: f32) Face.Error!Bitmap {
+fn rasterize(_: *anyopaque, _: GlyphIndex, _: Face.Render) Face.Error!Bitmap {
     return error.Unsupported;
 }
 
@@ -176,6 +176,6 @@ test "declares no capabilities, so lookups short-circuit" {
 
     try testing.expectEqual(@as(?GlyphIndex, null), face.glyphForName("A"));
     try testing.expectEqual(@as(?GlyphIndex, null), face.glyphForCodepoint('A'));
-    try testing.expectError(error.Unsupported, face.rasterize(0, 12));
+    try testing.expectError(error.Unsupported, face.rasterize(0, .{ .px_size = 12 }));
     try testing.expectEqual(@as(?f32, 500), face.advance(0));
 }

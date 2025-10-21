@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive  : require
 #include "rect.glsl"
 
 // A transliteration of src/gleipnir/sdf.zig. Same functions, same names, same

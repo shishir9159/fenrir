@@ -166,19 +166,40 @@ fn outline(ptr: *anyopaque, gpa: Allocator, g: GlyphIndex, out: *Outline) Face.E
     try out.close(gpa);
 }
 
-fn rasterize(ptr: *anyopaque, g: GlyphIndex, px_size: f32) Face.Error!Face.Bitmap {
+fn rasterize(ptr: *anyopaque, g: GlyphIndex, req: Face.Render) Face.Error!Face.Bitmap {
     const state = stateOf(ptr);
     if (state.bitmap) |b| {
         c.stbtt_FreeBitmap(b, null);
         state.bitmap = null;
     }
 
-    const scale = c.stbtt_ScaleForPixelHeight(&state.info, px_size);
+    // `ScaleForMappingEmToPixels`, not `ScaleForPixelHeight`. The latter fits
+    // the ascender-to-descender span into `px_size`, which is a different and
+    // font-dependent number; FreeType, `Face.unitScale`, and the atlas all
+    // mean the em square. Using stb's other convention would make the same
+    // requested size come out visibly different between two backends, which
+    // is precisely the disagreement the backend diff is supposed to detect,
+    // and it would be ours rather than the font's.
+    const scale = c.stbtt_ScaleForMappingEmToPixels(&state.info, req.px_size);
     var w: c_int = 0;
     var h: c_int = 0;
     var xoff: c_int = 0;
     var yoff: c_int = 0;
-    const bits = c.stbtt_GetGlyphBitmap(&state.info, scale, scale, g, &w, &h, &xoff, &yoff);
+    // The subpixel form shifts the outline before scan conversion, which is
+    // the whole point; stb takes the shift in pixels and its y runs down, so
+    // both offsets pass through unchanged.
+    const bits = c.stbtt_GetGlyphBitmapSubpixel(
+        &state.info,
+        scale,
+        scale,
+        req.offset_x,
+        req.offset_y,
+        g,
+        &w,
+        &h,
+        &xoff,
+        &yoff,
+    );
     if (bits == null) return .{};
     state.bitmap = bits;
 

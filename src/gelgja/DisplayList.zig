@@ -55,6 +55,9 @@ scalars: []const f32 = &.{},
 fonts: []const FontInfo = &.{},
 /// Interned strings: marked-content tags and resource names.
 strings: []const u8 = &.{},
+/// Sample data for inline images. See `Image.data` for why this pool exists
+/// and why nothing else lives in it.
+bytes: []const u8 = &.{},
 
 /// The page box this list was recorded against, so a backend can build its
 /// device transform without consulting the document.
@@ -141,6 +144,31 @@ pub const Image = struct {
     fill: Paint = .{ .solid = .black },
     /// `/Interpolate`, a hint that the image should be smoothed when scaled up.
     interpolate: bool = false,
+
+    /// An inline image's samples, a span into `bytes`, already through its
+    /// filter chain.
+    ///
+    /// An `Image` normally carries only an `object` and lets the backend fetch
+    /// the pixels, which keeps a page of photographs from being copied into
+    /// the display list. An inline image (`BI ... ID ... EI`) has no object to
+    /// fetch: it exists only inside the content stream that has already been
+    /// consumed. So its samples are copied here, and the whole list stays
+    /// replayable with no document -- which is the property the rest of Gelgja
+    /// is built on. They are small by construction: §8.9.7 limits an inline
+    /// image to four kilobytes of data.
+    data: Range = .empty,
+    /// Only meaningful when `data` is non-empty.
+    bits_per_component: u8 = 8,
+    components: u8 = 1,
+    /// `/Decode [1 0]`: the samples run the other way. Common on stencil
+    /// masks, where it is the difference between a shape and its negative.
+    inverted: bool = false,
+
+    /// True for an image whose pixels are in the list rather than in the
+    /// document.
+    pub fn isInline(img: Image) bool {
+        return !img.data.isEmpty();
+    }
 };
 
 /// One drawing operation.
@@ -216,6 +244,10 @@ pub fn stringOf(l: DisplayList, r: Range) []const u8 {
     return r.slice(l.strings);
 }
 
+pub fn bytesOf(l: DisplayList, r: Range) []const u8 {
+    return r.slice(l.bytes);
+}
+
 /// Control-point bounds, which for a cubic is conservative: the curve lies
 /// inside its control hull but may not touch it. Exact bounds need the
 /// derivative roots, and no caller so far needs the tightness.
@@ -287,6 +319,7 @@ pub fn deinit(l: *DisplayList, gpa: Allocator) void {
     gpa.free(l.scalars);
     gpa.free(l.fonts);
     gpa.free(l.strings);
+    gpa.free(l.bytes);
     l.* = .{};
 }
 

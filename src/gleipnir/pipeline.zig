@@ -1,16 +1,17 @@
 //! Everything the Vulkan side of the rect pipeline has to agree with, written
 //! down where it can be read without a device.
 //!
-//! There is no Vulkan in this file, deliberately. Fenrir has no Vulkan
-//! bindings yet -- Lyngvi, which will own the instance, device and swapchain,
-//! is not started -- and hand-writing a few thousand lines of `vkCreate*`
-//! against no compiler and no validation layer is how a project acquires code
-//! nobody can change. What can be written now, and checked now, is the
-//! contract: which binding is what, how big a push constant is, which blend
-//! factors the shader's output assumes, and which device features the shader
-//! actually requires. Getting any of those wrong produces a black window and
-//! no error message, so they are worth stating once, here, rather than
-//! discovering them one at a time later.
+//! There is no Vulkan in this file, and there still is not now that Lyngvi
+//! exists. This half is the contract -- which binding is what, how big a push
+//! constant is, which blend factors the shader's output assumes, which device
+//! features it actually requires -- and `lyngvi/Renderer.zig` is the half that
+//! makes the calls. Getting any of these wrong produces a black window and no
+//! error message, which is why they are stated once, here, in a file that
+//! compiles on a machine with no driver, rather than discovered one at a time
+//! inside three hundred lines of `vkCreate*`.
+//!
+//! `Renderer.zig` has a test that compares the two, which is possible only
+//! there: it is the only place in the project where both halves exist.
 //!
 //! The shader sources are embedded rather than read from disk so that a
 //! binary is self-contained, and so that renaming a file breaks the build

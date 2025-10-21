@@ -47,6 +47,7 @@ glyphs: std.ArrayList(Glyph) = .empty,
 scalars: std.ArrayList(f32) = .empty,
 fonts: std.ArrayList(FontInfo) = .empty,
 strings: std.ArrayList(u8) = .empty,
+bytes: std.ArrayList(u8) = .empty,
 
 page: Bounds = .empty,
 
@@ -76,6 +77,7 @@ pub fn deinit(b: *Builder) void {
     b.scalars.deinit(b.gpa);
     b.fonts.deinit(b.gpa);
     b.strings.deinit(b.gpa);
+    b.bytes.deinit(b.gpa);
     b.* = undefined;
 }
 
@@ -128,7 +130,11 @@ pub fn hasPath(b: *const Builder) bool {
 
 /// Takes the path under construction without resetting it, so `B` can fill and
 /// then stroke the same geometry.
-fn currentPath(b: *const Builder) Path {
+///
+/// Public because the interpreter needs it for `W`: the clip is set from the
+/// path that the *following* painting operator has already consumed, so the
+/// range has to be taken before the paint and used after it.
+pub fn currentPath(b: *const Builder) Path {
     return .{
         .verbs = .{
             .start = b.path_verb_start,
@@ -206,9 +212,20 @@ pub fn fillThenStroke(
 /// the interpreter is responsible for the deferral.
 pub fn pushClip(b: *Builder, rule: FillRule) Error!void {
     const path = if (b.hasPath()) b.currentPath() else Path{};
+    try b.pushClipPath(path, rule);
+    b.endPath();
+}
+
+/// Clips with a path recorded earlier, leaving the path under construction
+/// alone.
+///
+/// `W f` means "fill this path, then clip to it", in that order: the fill must
+/// not be clipped by the region it is about to establish. So the interpreter
+/// takes the range with `currentPath`, paints -- which consumes the path --
+/// and then clips with the range it kept.
+pub fn pushClipPath(b: *Builder, path: Path, rule: FillRule) Error!void {
     try b.cmds.append(b.gpa, .{ .clip_push = .{ .path = path, .rule = rule } });
     b.clip_depth += 1;
-    b.endPath();
 }
 
 pub fn popClip(b: *Builder) Error!void {
@@ -313,6 +330,16 @@ pub fn intern(b: *Builder, s: []const u8) Error!Range {
     return .{ .start = start, .count = @intCast(s.len) };
 }
 
+/// Copies inline image samples into the list's byte pool. Kept separate from
+/// `strings` so that a `stringOf` on a bad range cannot hand a caller a
+/// megabyte of pixels where it expected a resource name.
+pub fn blob(b: *Builder, data: []const u8) Error!Range {
+    if (data.len == 0) return .empty;
+    const start: u32 = @intCast(b.bytes.items.len);
+    try b.bytes.appendSlice(b.gpa, data);
+    return .{ .start = start, .count = @intCast(data.len) };
+}
+
 /// Copies a dash pattern into the scalar pool. Zero-length and all-zero
 /// patterns mean "solid" (§8.4.3.6) and are dropped here so no backend has to
 /// special-case them.
@@ -350,6 +377,7 @@ pub fn finish(b: *Builder) Error!DisplayList {
         .scalars = try b.scalars.toOwnedSlice(b.gpa),
         .fonts = try b.fonts.toOwnedSlice(b.gpa),
         .strings = try b.strings.toOwnedSlice(b.gpa),
+        .bytes = try b.bytes.toOwnedSlice(b.gpa),
         .page = b.page,
         .unbalanced = unbalanced,
     };

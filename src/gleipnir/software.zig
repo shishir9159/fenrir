@@ -34,10 +34,22 @@ const Color = paint.Color;
 const Instance = rect.Instance;
 const Point = geom.Point;
 
-/// What a texture fetch returns, so a test can supply a pattern without an
-/// image decoder. Coordinates are normalised; wrapping and filtering are the
-/// sampler's business and this leaves both to the callback.
-pub const Sampler = *const fn (tex: rect.TextureId, u: f32, v: f32) Color;
+/// Where texture fetches come from, so a test can supply a pattern without an
+/// image decoder and a caller can supply a real glyph atlas.
+///
+/// Coordinates are normalised; wrapping and filtering are the samplers own
+/// business and this leaves both to it. A pointer and a function rather than a
+/// bare function, matching `Face`, `Shaper` and the UIs `Metrics`: without
+/// somewhere to hang state, the only way to reach an atlas from inside the
+/// callback is a global, and there is more than one atlas.
+pub const Sampler = struct {
+    ptr: *anyopaque,
+    sample: *const fn (ptr: *anyopaque, tex: rect.TextureId, u: f32, v: f32) Color,
+
+    pub fn at(s: Sampler, tex: rect.TextureId, u: f32, v: f32) Color {
+        return s.sample(s.ptr, tex, u, v);
+    }
+};
 
 /// Linear-light, premultiplied, four floats a pixel.
 ///
@@ -246,10 +258,10 @@ fn drawOne(fb: Framebuffer, i: Instance, sampler: ?Sampler) void {
             };
 
             if (i.flags.textured) {
-                if (sampler) |sample| {
+                if (sampler) |s| {
                     const u = i.src[0] + (i.src[2] - i.src[0]) * tx;
                     const v = i.src[1] + (i.src[3] - i.src[1]) * ty;
-                    const t = sample(i.texture, u, v);
+                    const t = s.at(i.texture, u, v);
                     if (i.flags.alpha_texture) {
                         src[3] *= t.r;
                     } else {
@@ -458,7 +470,10 @@ test "a gradient puts each colour at its own corner" {
     try testing.expect(bl.r > 0.9 and bl.g > 0.9 and bl.b > 0.9);
 }
 
-fn checker(tex: rect.TextureId, u: f32, v: f32) Color {
+const checker: Sampler = .{ .ptr = @constCast(@ptrCast(&checker_tag)), .sample = checkerSample };
+const checker_tag: u8 = 0;
+
+fn checkerSample(_: *anyopaque, tex: rect.TextureId, u: f32, v: f32) Color {
     _ = tex;
     const on = (@as(i32, @intFromFloat(@floor(u * 4))) + @as(i32, @intFromFloat(@floor(v * 4)))) & 1;
     return if (on == 0) Color.white else Color.black;
