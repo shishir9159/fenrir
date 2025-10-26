@@ -1,0 +1,312 @@
+//! `fenrir raster <file>` -- turn a page into a PNG.
+//!
+//! The first command in this project that produces a picture of a document.
+//! Everything it needs already existed except the last link: Gjöll reads the
+//! file, the interpreter turns a page into a display list, and
+//! `gleipnir.replay` walks that list through the path pipeline onto a
+//! framebuffer. This is the shell around those three calls.
+//!
+//! It renders on the CPU, deliberately. The GPU pipeline draws the same
+//! geometry through the same two passes, but it needs a device, a window, and
+//! a driver, and none of those belong between a person and a picture of page
+//! four. What this produces is also the reference the GPU is checked against:
+//! render both, subtract, and anything left is in the part the CPU cannot
+//! model.
+//!
+//! The report at the end says what was *not* drawn -- text, images, gradients
+//! -- rather than letting a page with a hole in it look finished. See
+//! `gleipnir/replay.zig` for why each of them is missing and what it is
+//! waiting for.
+
+const std = @import("std");
+const Io = std.Io;
+const fenrir = @import("fenrir");
+
+const Context = @import("Context.zig");
+
+const content = fenrir.content;
+const gleipnir = fenrir.gleipnir;
+const replay = gleipnir.replay;
+
+pub const usage =
+    \\fenrir raster <file> [--page N | --all] [options]
+    \\
+    \\    Interprets a page and rasterises it to a PNG, on the CPU, with no
+    \\    device or window involved.
+    \\
+    \\    --page N       Which page, numbered from 1. Defaults to 1.
+    \\    --all          Every page, numbered into separate files.
+    \\    -o, --out F    Where to write it. Defaults to page-N.png; with
+    \\                   --all, the number is always appended.
+    \\    --dpi N        Resolution. Defaults to 96, so a Letter page is
+    \\                   816x1056. PDF units are 1/72 inch.
+    \\    --scale N      Instead of --dpi: a direct multiplier on page units.
+    \\    --samples N    Multisampling: 1, 2, 4 or 8. Defaults to 4.
+    \\    --tolerance N  How far a flattened curve may stray, in pixels.
+    \\                   Defaults to 0.1.
+    \\    --text-boxes   Draw a rectangle where each glyph would be. A layout
+    \\                   aid: there is no glyph outline source in this build.
+    \\    --image-boxes  Outline each image's placement.
+    \\    --no-rotate    Ignore /Rotate.
+    \\    --no-type3     Do not run Type 3 glyph procedures.
+    \\    --stats        Report and write nothing.
+    \\
+    \\    Text is not drawn. Tyr has no outline extraction yet, so there is
+    \\    nothing to hand the path pipeline; --text-boxes shows the layout in
+    \\    the meantime. Images and gradients are not drawn either. All three
+    \\    are counted and reported rather than passed over in silence.
+;
+
+/// Above this, a page is almost certainly a mistake -- a --dpi typo, or a
+/// document whose media box is in the millions -- and allocating for it would
+/// take the machine down rather than report anything.
+const max_pixels: u64 = 64 << 20;
+
+pub fn run(ctx: *Context, argv: []const []const u8) !void {
+    var file_path: ?[]const u8 = null;
+    var dest: ?[]const u8 = null;
+    var page_number: u32 = 1;
+    var all = false;
+    var stats_only = false;
+    var dpi: f32 = 96;
+    var scale: ?f32 = null;
+    var samples: gleipnir.raster.Samples = .four;
+    var options: content.Options = .{};
+    var replay_options: replay.Options = .{};
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--page")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--page needs a page number", .{});
+            page_number = std.fmt.parseInt(u32, argv[i], 10) catch
+                return ctx.fail("not a page number: {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            all = true;
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--out")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--out needs a file name", .{});
+            dest = argv[i];
+        } else if (std.mem.eql(u8, arg, "--dpi")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--dpi needs a number", .{});
+            dpi = std.fmt.parseFloat(f32, argv[i]) catch
+                return ctx.fail("not a resolution: {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--scale")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--scale needs a number", .{});
+            scale = std.fmt.parseFloat(f32, argv[i]) catch
+                return ctx.fail("not a scale: {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--samples")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--samples needs 1, 2, 4 or 8", .{});
+            samples = switch (std.fmt.parseInt(u32, argv[i], 10) catch 0) {
+                1 => .one,
+                2 => .two,
+                4 => .four,
+                8 => .eight,
+                else => return ctx.fail("--samples takes 1, 2, 4 or 8, not {s}", .{argv[i]}),
+            };
+        } else if (std.mem.eql(u8, arg, "--tolerance")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--tolerance needs a number", .{});
+            replay_options.tolerance = std.fmt.parseFloat(f32, argv[i]) catch
+                return ctx.fail("not a tolerance: {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--text-boxes")) {
+            replay_options.text_boxes = true;
+        } else if (std.mem.eql(u8, arg, "--image-boxes")) {
+            replay_options.image_boxes = true;
+        } else if (std.mem.eql(u8, arg, "--no-rotate")) {
+            options.rotate = false;
+        } else if (std.mem.eql(u8, arg, "--no-type3")) {
+            options.type3 = false;
+        } else if (std.mem.eql(u8, arg, "--stats")) {
+            stats_only = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ctx.fail("unknown option {s}", .{arg});
+        } else if (file_path == null) {
+            file_path = arg;
+        } else {
+            return ctx.fail("raster takes one file", .{});
+        }
+    }
+
+    const name = file_path orelse return ctx.fail("raster needs a file", .{});
+    if (page_number == 0) return ctx.fail("pages are numbered from 1", .{});
+
+    // 72 PDF units to the inch (§8.3.2.3), so this is the only place dpi turns
+    // into a scale factor.
+    const factor = scale orelse (dpi / 72.0);
+    if (!(factor > 0) or !std.math.isFinite(factor)) {
+        return ctx.fail("a scale has to be positive and finite", .{});
+    }
+
+    const bytes = ctx.readFile(name) catch |err|
+        return ctx.fail("cannot read {s}: {t}", .{ name, err });
+
+    var doc = fenrir.open(ctx.gpa, bytes) catch |err|
+        return ctx.fail("cannot open {s}: {t}", .{ name, err });
+    defer doc.deinit();
+
+    const pages = fenrir.pages.all(&doc) catch |err|
+        return ctx.fail("cannot read the page tree: {t}", .{err});
+    if (pages.len == 0) return ctx.fail("this document has no pages", .{});
+
+    const job: Job = .{
+        .factor = factor,
+        .samples = samples,
+        .options = options,
+        .replay = replay_options,
+        .stats_only = stats_only,
+    };
+
+    if (all) {
+        var total: replay.Stats = .{};
+        for (pages, 0..) |p, index| {
+            const out = try numbered(ctx, dest, index + 1);
+            defer ctx.gpa.free(out);
+            const s = try one(ctx, &doc, p, out, job);
+            accumulate(&total, s);
+        }
+        ctx.note("{d} pages", .{pages.len});
+        report(ctx, total);
+        return;
+    }
+
+    if (page_number > pages.len) {
+        return ctx.fail("page {d}: this document has {d} pages", .{ page_number, pages.len });
+    }
+    const out = dest orelse try numbered(ctx, null, page_number);
+    defer if (dest == null) ctx.gpa.free(out);
+
+    const s = try one(ctx, &doc, pages[page_number - 1], out, job);
+    report(ctx, s);
+}
+
+const Job = struct {
+    factor: f32,
+    samples: gleipnir.raster.Samples,
+    options: content.Options,
+    replay: replay.Options,
+    stats_only: bool,
+};
+
+fn one(
+    ctx: *Context,
+    doc: *fenrir.Document,
+    p: fenrir.Page,
+    dest: []const u8,
+    job: Job,
+) !replay.Stats {
+    var result = content.page(ctx.gpa, doc, p, job.options) catch |err|
+        return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
+    defer result.deinit(ctx.gpa);
+
+    const size = replay.canvasSize(result.list.page, job.factor);
+    const pixels = @as(u64, size[0]) * size[1];
+    if (pixels > max_pixels) {
+        return ctx.fail(
+            "page {d} would be {d}x{d}: too big. Lower --dpi.",
+            .{ p.index + 1, size[0], size[1] },
+        );
+    }
+
+    var canvas = gleipnir.raster.Canvas.init(ctx.gpa, size[0], size[1], .{ .samples = job.samples }) catch |err|
+        return ctx.fail("cannot allocate a {d}x{d} canvas: {t}", .{ size[0], size[1], err });
+    defer canvas.deinit(ctx.gpa);
+
+    // Opaque white, because that is what paper is and what every other reader
+    // shows. A transparent page would composite correctly and look, in most
+    // viewers, like nothing at all.
+    canvas.fb.clear(.white);
+
+    const stats = replay.render(
+        ctx.gpa,
+        &canvas,
+        result.list,
+        replay.pageTransform(result.list.page, job.factor),
+        job.replay,
+    ) catch |err| return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
+
+    // The invariant from `raster.zig`, checked on real documents rather than
+    // only on the shapes a test could think of. A page that leaves the stencil
+    // dirty has drawn something wrong somewhere, and this is the cheapest
+    // place to notice.
+    if (!canvas.stencilIsClean()) {
+        ctx.note("page {d}: the stencil buffer was not clean afterwards", .{p.index + 1});
+    }
+
+    ctx.out.print("page {d}  {d}x{d}  {d} fills  {d} strokes  {d} clips  {d} segments\n", .{
+        p.index + 1,
+        size[0],
+        size[1],
+        stats.fills,
+        stats.strokes,
+        stats.clips,
+        stats.segments,
+    }) catch {};
+
+    if (!job.stats_only) {
+        try writePng(ctx, dest, canvas.fb);
+        ctx.out.print("wrote {s}\n", .{dest}) catch {};
+    }
+    return stats;
+}
+
+/// `page-4.png`, or `name-4.png` from a `--out name.png`.
+fn numbered(ctx: *Context, dest: ?[]const u8, n: usize) ![]u8 {
+    const base = dest orelse "page.png";
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
+    return std.fmt.allocPrint(ctx.gpa, "{s}-{d}{s}", .{ base[0..dot], n, base[dot..] }) catch
+        return ctx.fail("out of memory", .{});
+}
+
+fn writePng(ctx: *Context, dest: []const u8, fb: gleipnir.Framebuffer) !void {
+    var file = Io.Dir.cwd().createFile(ctx.io, dest, .{}) catch |err|
+        return ctx.fail("cannot create {s}: {t}", .{ dest, err });
+    defer file.close(ctx.io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var writer = file.writer(ctx.io, &buf);
+    fb.writePng(ctx.gpa, &writer.interface) catch |err|
+        return ctx.fail("cannot write {s}: {t}", .{ dest, err });
+    writer.interface.flush() catch |err|
+        return ctx.fail("cannot write {s}: {t}", .{ dest, err });
+}
+
+fn accumulate(total: *replay.Stats, s: replay.Stats) void {
+    total.fills += s.fills;
+    total.strokes += s.strokes;
+    total.clips += s.clips;
+    total.unsupported_paint += s.unsupported_paint;
+    total.text_runs += s.text_runs;
+    total.glyphs += s.glyphs;
+    total.images += s.images;
+    total.shadings += s.shadings;
+    total.layers += s.layers;
+    total.segments += s.segments;
+    total.clips_dropped += s.clips_dropped;
+    total.paths_dropped += s.paths_dropped;
+}
+
+/// What is missing from the picture, on stderr so the image path on stdout
+/// stays pipeable.
+///
+/// Only the non-zero lines, and nothing at all when the page came out whole --
+/// a report that always prints something teaches people to stop reading it.
+fn report(ctx: *Context, s: replay.Stats) void {
+    if (s.text_runs != 0) {
+        ctx.note("{d} text runs ({d} glyphs) not drawn: no glyph outlines in this build", .{
+            s.text_runs, s.glyphs,
+        });
+    }
+    if (s.images != 0) ctx.note("{d} images not drawn: no image decoder yet", .{s.images});
+    if (s.shadings != 0) ctx.note("{d} shadings not drawn", .{s.shadings});
+    if (s.unsupported_paint != 0) {
+        ctx.note("{d} paths with a gradient or pattern fill not drawn", .{s.unsupported_paint});
+    }
+    if (s.paths_dropped != 0) ctx.note("{d} paths over the point budget", .{s.paths_dropped});
+    if (s.clips_dropped != 0) ctx.note("{d} clips over the depth budget", .{s.clips_dropped});
+    if (s.complete()) ctx.note("every mark on the page was drawn", .{});
+}
