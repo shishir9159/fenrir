@@ -1,0 +1,1030 @@
+//! The rect pipeline, made real.
+//!
+//! `gleipnir/pipeline.zig` wrote down what the Vulkan side has to agree with
+//! before there was a Vulkan side: which binding is what, how big the push
+//! constant is, which blend factors the shader's output assumes. This is the
+//! other half of that contract, and it is deliberately the only file in the
+//! project that both knows about `DrawList` and calls `vkCmdDraw`.
+//!
+//! ## One draw call
+//!
+//! A frame is `vkCmdDraw(cb, 4, instance_count, 0, 0)`. No vertex buffer, no
+//! index buffer, no vertex input state at all: the quad's four corners come
+//! out of `gl_VertexIndex` and the instance comes out of a storage buffer
+//! indexed by `gl_InstanceIndex`. The clip is a field of the instance rather
+//! than a scissor, so instances with different clips sit next to each other
+//! with no state change between them, and the texture is an index into an
+//! unbounded array, so a glyph atlas and a page image can appear in the same
+//! call.
+//!
+//! That last part is why descriptor indexing is a hard requirement here and
+//! not a preference. `DrawList.textureRuns` exists as the fallback and needs a
+//! second SPIR-V module with a single `texture2D` in place of the array; until
+//! that module exists, a device without the feature is refused by name rather
+//! than drawn to incorrectly.
+//!
+//! ## What is per frame and what is per image
+//!
+//! Two frames in flight. Each has a command pool, a command buffer, a fence,
+//! an image-available semaphore, a persistently mapped instance buffer and a
+//! staging buffer. The render-finished semaphores are per swapchain *image*
+//! and live in `Swapchain`, for the reason set out there at length.
+//!
+//! The instance buffer is mapped once and never unmapped. Mapping per frame is
+//! a driver call and a page-table update to obtain a pointer that was already
+//! valid; the buffer is written with one `memcpy` from `DrawList.bytes` and
+//! read by the GPU where it lies. On a machine that exposes a device-local
+//! host-visible heap -- resizable BAR -- it lands in video memory without
+//! being asked to, because `choose.memoryType` prefers those bits.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const Device = @import("Device.zig");
+const Swapchain = @import("Swapchain.zig");
+const choose = @import("choose.zig");
+const shaders = @import("shaders.zig");
+const spirv = @import("spirv.zig");
+const vk = @import("vk.zig");
+
+const DrawList = @import("../gleipnir/DrawList.zig");
+const paint = @import("../gelgja/paint.zig");
+const pipeline_contract = @import("../gleipnir/pipeline.zig");
+const rect = @import("../gleipnir/rect.zig");
+
+const Color = paint.Color;
+const Renderer = @This();
+
+pub const Error = error{
+    NoDescriptorIndexing,
+    UnknownTexture,
+    TooManyTextures,
+} || Device.Error || shaders.Error;
+
+/// Two, not three. Three costs a frame of latency for a smoothness that only
+/// matters when the render time is close to the refresh interval, which for a
+/// UI drawing a few thousand instances it is not.
+pub const frames_in_flight = 2;
+
+/// The size of the descriptor array. Sixty-four is far more than a reader
+/// needs -- one glyph atlas, a handful of decoded page images -- and small
+/// enough that filling every slot with a placeholder at startup costs nothing.
+pub const max_textures = 64;
+
+pub const min_instance_bytes: u64 = 64 * 1024;
+pub const min_staging_bytes: u64 = 256 * 1024;
+
+pub const Status = enum {
+    /// Drawn and queued for presentation.
+    drawn,
+    /// The surface changed size or was invalidated. The caller recreates the
+    /// swapchain and draws again next frame.
+    needs_recreate,
+    /// The window has no area. Nothing was submitted.
+    skipped,
+};
+
+pub const TextureKind = enum {
+    /// One byte per pixel of coverage, which is what Týr's glyph atlas is. The
+    /// shader reads the red channel and modulates alpha only, so one atlas
+    /// serves every colour of text on the screen.
+    coverage,
+    /// Four bytes per pixel, sRGB-encoded. Decoded page images, eventually.
+    color,
+
+    fn format(k: TextureKind) vk.Format {
+        return switch (k) {
+            .coverage => .r8_unorm,
+            .color => .r8g8b8a8_srgb,
+        };
+    }
+
+    fn bytesPerPixel(k: TextureKind) u32 {
+        return switch (k) {
+            .coverage => 1,
+            .color => 4,
+        };
+    }
+};
+
+/// A rectangle of an image to send to the device this frame.
+///
+/// `pixels` is the *whole* image and `stride` its row length in bytes; the
+/// rectangle selects part of it. That is the shape Týr's atlas reports its
+/// dirty region in, and copying the sub-rectangle out into a packed buffer
+/// first would be a second copy of the same bytes.
+pub const Upload = struct {
+    texture: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    pixels: []const u8,
+    stride: u32,
+};
+
+pub const Texture = struct {
+    image: vk.Image = vk.null_handle,
+    memory: vk.DeviceMemory = vk.null_handle,
+    view: vk.ImageView = vk.null_handle,
+    width: u32 = 0,
+    height: u32 = 0,
+    kind: TextureKind = .coverage,
+};
+
+const Frame = struct {
+    pool: vk.CommandPool = vk.null_handle,
+    cb: vk.CommandBuffer = null,
+    fence: vk.Fence = vk.null_handle,
+    image_available: vk.Semaphore = vk.null_handle,
+    instances: Device.Buffer = .{},
+    staging: Device.Buffer = .{},
+    set: vk.DescriptorSet = vk.null_handle,
+};
+
+gpa: Allocator,
+device: *Device,
+swapchain: *Swapchain,
+
+sampler: vk.Sampler = vk.null_handle,
+set_layout: vk.DescriptorSetLayout = vk.null_handle,
+pool: vk.DescriptorPool = vk.null_handle,
+layout: vk.PipelineLayout = vk.null_handle,
+pipeline: vk.Pipeline = vk.null_handle,
+/// The swapchain's format generation the pipeline was built against. A format
+/// change means a new render pass, and a pipeline is tied to the render pass
+/// it was created with.
+pipeline_generation: u32 = 0,
+
+/// True when this binary was built without a shader compiler on the machine.
+///
+/// Not an error, and not a reason to refuse to run: everything except the draw
+/// call still works, so the window opens, the swapchain is created, images are
+/// acquired, cleared and presented, and the frame loop can be timed. What is
+/// missing is the drawing, and a window that clears to the right colour and
+/// presents at the refresh rate has already proved most of this file.
+shaders_missing: bool = false,
+
+setup_pool: vk.CommandPool = vk.null_handle,
+
+frames: [frames_in_flight]Frame = @splat(.{}),
+index: u32 = 0,
+
+textures: std.ArrayList(Texture) = .empty,
+
+// -- counters, because a renderer nobody can measure is a renderer nobody can
+// fix. Read by `fenrir view` on exit.
+frames_drawn: u64 = 0,
+frames_skipped: u64 = 0,
+recreates: u32 = 0,
+instance_high_water: u32 = 0,
+bytes_uploaded: u64 = 0,
+
+pub fn init(gpa: Allocator, device: *Device, swapchain: *Swapchain) Error!Renderer {
+    if (!device.descriptor_indexing) return error.NoDescriptorIndexing;
+
+    var r: Renderer = .{ .gpa = gpa, .device = device, .swapchain = swapchain };
+    errdefer r.deinit();
+
+    try r.createSampler();
+    try r.createDescriptorLayout();
+    try r.createPipelineLayout();
+    r.createPipeline() catch |err| switch (err) {
+        error.NoShaders => r.shaders_missing = true,
+        else => return err,
+    };
+    try r.createDescriptorPool();
+    try r.createSetupPool();
+    try r.createFrames();
+
+    // Slot zero of the array is never named by an instance -- ids from
+    // `DrawList.registerTexture` are one-based, and zero means "no texture" --
+    // but every slot has to hold a valid descriptor, because reading an
+    // unbound one is undefined behaviour rather than a black pixel. So slot
+    // zero holds a 1x1 white texture, every slot past the last real one holds
+    // the same, and the ids line up with `DrawList`'s for free.
+    const placeholder = try r.createTexture(1, 1, .color);
+    std.debug.assert(placeholder == 0);
+    const white: [4]u8 = .{ 255, 255, 255, 255 };
+    try r.uploadNow(placeholder, .{
+        .texture = placeholder,
+        .x = 0,
+        .y = 0,
+        .w = 1,
+        .h = 1,
+        .pixels = &white,
+        .stride = 4,
+    });
+    r.writeAllTextureSlots();
+
+    return r;
+}
+
+pub fn deinit(r: *Renderer) void {
+    const d = r.device;
+    const dt = &d.dt;
+    _ = dt.deviceWaitIdle(d.handle);
+
+    for (r.textures.items) |*t| r.destroyTexture(t);
+    r.textures.deinit(r.gpa);
+
+    for (&r.frames) |*f| {
+        if (f.pool != vk.null_handle) dt.destroyCommandPool(d.handle, f.pool, null);
+        if (f.fence != vk.null_handle) dt.destroyFence(d.handle, f.fence, null);
+        if (f.image_available != vk.null_handle) dt.destroySemaphore(d.handle, f.image_available, null);
+        d.destroyBuffer(&f.instances);
+        d.destroyBuffer(&f.staging);
+    }
+    if (r.setup_pool != vk.null_handle) dt.destroyCommandPool(d.handle, r.setup_pool, null);
+    if (r.pool != vk.null_handle) dt.destroyDescriptorPool(d.handle, r.pool, null);
+    if (r.pipeline != vk.null_handle) dt.destroyPipeline(d.handle, r.pipeline, null);
+    if (r.layout != vk.null_handle) dt.destroyPipelineLayout(d.handle, r.layout, null);
+    if (r.set_layout != vk.null_handle) dt.destroyDescriptorSetLayout(d.handle, r.set_layout, null);
+    if (r.sampler != vk.null_handle) dt.destroySampler(d.handle, r.sampler, null);
+    r.* = undefined;
+}
+
+// -- setup ------------------------------------------------------------------
+
+fn createSampler(r: *Renderer) Error!void {
+    const d = r.device;
+    // Linear, clamped, no mips. Clamping is what keeps a glyph from picking up
+    // its neighbour in the atlas when a source rectangle lands half a texel
+    // off, which is exactly what subpixel positioning arranges for.
+    const info: vk.SamplerCreateInfo = .{};
+    try vk.check(d.dt.createSampler(d.handle, &info, null, &r.sampler));
+}
+
+fn createDescriptorLayout(r: *Renderer) Error!void {
+    const d = r.device;
+    const b = pipeline_contract.binding;
+
+    const bindings = [_]vk.DescriptorSetLayoutBinding{
+        .{
+            .binding = b.instances,
+            .descriptor_type = .storage_buffer,
+            .descriptor_count = 1,
+            // Read by both stages: the vertex shader for the rectangle, the
+            // fragment shader for everything else. That is what keeps the
+            // varyings down to one flat integer.
+            .stage_flags = vk.ShaderStageFlags.vertex | vk.ShaderStageFlags.fragment,
+        },
+        .{
+            .binding = b.textures,
+            .descriptor_type = .sampled_image,
+            .descriptor_count = max_textures,
+            .stage_flags = vk.ShaderStageFlags.fragment,
+        },
+        .{
+            .binding = b.sampler,
+            .descriptor_type = .sampler,
+            .descriptor_count = 1,
+            .stage_flags = vk.ShaderStageFlags.fragment,
+        },
+    };
+
+    const info: vk.DescriptorSetLayoutCreateInfo = .{
+        .binding_count = bindings.len,
+        .p_bindings = &bindings,
+    };
+    try vk.check(d.dt.createDescriptorSetLayout(d.handle, &info, null, &r.set_layout));
+}
+
+fn createPipelineLayout(r: *Renderer) Error!void {
+    const d = r.device;
+    const range: vk.PushConstantRange = .{
+        .stage_flags = vk.ShaderStageFlags.vertex,
+        .offset = 0,
+        .size = @sizeOf(pipeline_contract.PushConstants),
+    };
+    const info: vk.PipelineLayoutCreateInfo = .{
+        .set_layout_count = 1,
+        .p_set_layouts = @ptrCast(&r.set_layout),
+        .push_constant_range_count = 1,
+        .p_push_constant_ranges = @ptrCast(&range),
+    };
+    try vk.check(d.dt.createPipelineLayout(d.handle, &info, null, &r.layout));
+}
+
+fn createPipeline(r: *Renderer) Error!void {
+    const d = r.device;
+
+    // Parsed rather than trusted: an empty `.spv` from a compiler that failed
+    // and exited zero, or the two modules wired to the wrong stages, both
+    // produce a pipeline that creates successfully and draws nothing.
+    const vertex = try shaders.vertexModule();
+    const fragment = try shaders.fragmentModule();
+
+    var vert_module: vk.ShaderModule = vk.null_handle;
+    var frag_module: vk.ShaderModule = vk.null_handle;
+    {
+        const info: vk.ShaderModuleCreateInfo = .{
+            .code_size = vertex.byteSize(),
+            .p_code = vertex.code().ptr,
+        };
+        try vk.check(d.dt.createShaderModule(d.handle, &info, null, &vert_module));
+    }
+    defer d.dt.destroyShaderModule(d.handle, vert_module, null);
+    {
+        const info: vk.ShaderModuleCreateInfo = .{
+            .code_size = fragment.byteSize(),
+            .p_code = fragment.code().ptr,
+        };
+        try vk.check(d.dt.createShaderModule(d.handle, &info, null, &frag_module));
+    }
+    defer d.dt.destroyShaderModule(d.handle, frag_module, null);
+
+    const stages = [_]vk.PipelineShaderStageCreateInfo{
+        .{ .stage = vk.ShaderStageFlags.vertex, .module = vert_module, .p_name = "main" },
+        .{ .stage = vk.ShaderStageFlags.fragment, .module = frag_module, .p_name = "main" },
+    };
+
+    // No vertex input state whatsoever; see the header.
+    const vertex_input: vk.PipelineVertexInputStateCreateInfo = .{};
+    const assembly: vk.PipelineInputAssemblyStateCreateInfo = .{ .topology = .triangle_strip };
+    const viewport: vk.PipelineViewportStateCreateInfo = .{};
+    const raster: vk.PipelineRasterizationStateCreateInfo = .{
+        // Culling off: nothing here is wound consistently and nothing needs to
+        // be. A fully clipped instance is a zero-area quad, which no winding
+        // rule can rescue and none has to.
+        .cull_mode = 0,
+    };
+    const multisample: vk.PipelineMultisampleStateCreateInfo = .{};
+
+    // The blend state the fragment shader's output assumes. `SRC_ALPHA` here
+    // instead of `ONE` would multiply every instance by its alpha twice, and
+    // everything translucent would go dark.
+    const blend_attachment: vk.PipelineColorBlendAttachmentState = .{
+        .blend_enable = 1,
+        .src_color_blend_factor = .one,
+        .dst_color_blend_factor = .one_minus_src_alpha,
+        .color_blend_op = .add,
+        .src_alpha_blend_factor = .one,
+        .dst_alpha_blend_factor = .one_minus_src_alpha,
+        .alpha_blend_op = .add,
+    };
+    const blend: vk.PipelineColorBlendStateCreateInfo = .{
+        .attachment_count = 1,
+        .p_attachments = @ptrCast(&blend_attachment),
+    };
+
+    // Viewport and scissor are dynamic so that a resize does not rebuild the
+    // pipeline -- which would mean a compile on the main thread in the middle
+    // of someone dragging a window edge.
+    const dynamic_states = [_]vk.DynamicState{ .viewport, .scissor };
+    const dynamic: vk.PipelineDynamicStateCreateInfo = .{
+        .dynamic_state_count = dynamic_states.len,
+        .p_dynamic_states = &dynamic_states,
+    };
+
+    const info: vk.GraphicsPipelineCreateInfo = .{
+        .stage_count = stages.len,
+        .p_stages = &stages,
+        .p_vertex_input_state = &vertex_input,
+        .p_input_assembly_state = &assembly,
+        .p_viewport_state = &viewport,
+        .p_rasterization_state = &raster,
+        .p_multisample_state = &multisample,
+        .p_color_blend_state = &blend,
+        .p_dynamic_state = &dynamic,
+        .layout = r.layout,
+        .render_pass = r.swapchain.render_pass,
+        .subpass = 0,
+    };
+
+    try vk.check(d.dt.createGraphicsPipelines(d.handle, vk.null_handle, 1, @ptrCast(&info), null, @ptrCast(&r.pipeline)));
+    r.pipeline_generation = r.swapchain.format_generation;
+}
+
+fn createDescriptorPool(r: *Renderer) Error!void {
+    const d = r.device;
+    const sizes = [_]vk.DescriptorPoolSize{
+        .{ .type = .storage_buffer, .descriptor_count = frames_in_flight },
+        .{ .type = .sampled_image, .descriptor_count = frames_in_flight * max_textures },
+        .{ .type = .sampler, .descriptor_count = frames_in_flight },
+    };
+    const info: vk.DescriptorPoolCreateInfo = .{
+        .max_sets = frames_in_flight,
+        .pool_size_count = sizes.len,
+        .p_pool_sizes = &sizes,
+    };
+    try vk.check(d.dt.createDescriptorPool(d.handle, &info, null, &r.pool));
+}
+
+fn createSetupPool(r: *Renderer) Error!void {
+    const d = r.device;
+    const info: vk.CommandPoolCreateInfo = .{
+        .flags = vk.CommandPoolCreateFlags.transient,
+        .queue_family_index = d.families.graphics,
+    };
+    try vk.check(d.dt.createCommandPool(d.handle, &info, null, &r.setup_pool));
+}
+
+fn createFrames(r: *Renderer) Error!void {
+    const d = r.device;
+
+    var layouts: [frames_in_flight]vk.DescriptorSetLayout = @splat(r.set_layout);
+    var sets: [frames_in_flight]vk.DescriptorSet = @splat(vk.null_handle);
+    const alloc: vk.DescriptorSetAllocateInfo = .{
+        .descriptor_pool = r.pool,
+        .descriptor_set_count = frames_in_flight,
+        .p_set_layouts = &layouts,
+    };
+    try vk.check(d.dt.allocateDescriptorSets(d.handle, &alloc, &sets));
+
+    for (&r.frames, 0..) |*f, i| {
+        f.set = sets[i];
+
+        const pool_info: vk.CommandPoolCreateInfo = .{
+            // Reset the whole pool each frame rather than the buffer: it lets
+            // the driver hand the memory back in one go instead of tracking
+            // one buffer's worth.
+            .flags = vk.CommandPoolCreateFlags.transient,
+            .queue_family_index = d.families.graphics,
+        };
+        try vk.check(d.dt.createCommandPool(d.handle, &pool_info, null, &f.pool));
+
+        const cb_info: vk.CommandBufferAllocateInfo = .{
+            .command_pool = f.pool,
+            .command_buffer_count = 1,
+        };
+        try vk.check(d.dt.allocateCommandBuffers(d.handle, &cb_info, @ptrCast(&f.cb)));
+
+        // Created signalled, so the first frame's wait returns immediately
+        // instead of deadlocking on a fence nothing will ever signal.
+        const fence_info: vk.FenceCreateInfo = .{ .flags = vk.FenceCreateFlags.signaled };
+        try vk.check(d.dt.createFence(d.handle, &fence_info, null, &f.fence));
+
+        const sem_info: vk.SemaphoreCreateInfo = .{};
+        try vk.check(d.dt.createSemaphore(d.handle, &sem_info, null, &f.image_available));
+
+        f.instances = try r.newInstanceBuffer(min_instance_bytes);
+        f.staging = try r.newStagingBuffer(min_staging_bytes);
+
+        r.writeBufferDescriptor(f.*);
+        r.writeSamplerDescriptor(f.*);
+    }
+}
+
+fn newInstanceBuffer(r: *Renderer, size: u64) Error!Device.Buffer {
+    const m = vk.MemoryPropertyFlags;
+    return r.device.createBuffer(
+        size,
+        vk.BufferUsageFlags.storage_buffer,
+        m.host_visible | m.host_coherent,
+        // Preferred, not required: on a machine with resizable BAR the buffer
+        // lands in video memory and the GPU reads it at full speed, and on one
+        // without it lands in system memory and everything still works.
+        m.device_local,
+    );
+}
+
+fn newStagingBuffer(r: *Renderer, size: u64) Error!Device.Buffer {
+    const m = vk.MemoryPropertyFlags;
+    return r.device.createBuffer(
+        size,
+        vk.BufferUsageFlags.transfer_src,
+        m.host_visible | m.host_coherent,
+        0,
+    );
+}
+
+fn writeBufferDescriptor(r: *Renderer, f: Frame) void {
+    const d = r.device;
+    const info: vk.DescriptorBufferInfo = .{ .buffer = f.instances.handle };
+    const write: vk.WriteDescriptorSet = .{
+        .dst_set = f.set,
+        .dst_binding = pipeline_contract.binding.instances,
+        .descriptor_count = 1,
+        .descriptor_type = .storage_buffer,
+        .p_buffer_info = @ptrCast(&info),
+    };
+    d.dt.updateDescriptorSets(d.handle, 1, @ptrCast(&write), 0, null);
+}
+
+fn writeSamplerDescriptor(r: *Renderer, f: Frame) void {
+    const d = r.device;
+    const info: vk.DescriptorImageInfo = .{ .sampler = r.sampler };
+    const write: vk.WriteDescriptorSet = .{
+        .dst_set = f.set,
+        .dst_binding = pipeline_contract.binding.sampler,
+        .descriptor_count = 1,
+        .descriptor_type = .sampler,
+        .p_image_info = @ptrCast(&info),
+    };
+    d.dt.updateDescriptorSets(d.handle, 1, @ptrCast(&write), 0, null);
+}
+
+/// Fills every slot of the texture array in every frame's set.
+///
+/// Slots past the last real texture get the placeholder, because a descriptor
+/// that is never written is undefined behaviour to read even if the shader
+/// never reaches it -- and "never reaches it" is a claim about a branch the
+/// driver is entitled to disbelieve.
+fn writeAllTextureSlots(r: *Renderer) void {
+    const d = r.device;
+    var infos: [max_textures]vk.DescriptorImageInfo = undefined;
+    const placeholder = r.textures.items[0].view;
+    for (&infos, 0..) |*info, i| {
+        const view = if (i < r.textures.items.len and r.textures.items[i].view != vk.null_handle)
+            r.textures.items[i].view
+        else
+            placeholder;
+        info.* = .{ .image_view = view, .image_layout = .shader_read_only_optimal };
+    }
+
+    for (r.frames) |f| {
+        const write: vk.WriteDescriptorSet = .{
+            .dst_set = f.set,
+            .dst_binding = pipeline_contract.binding.textures,
+            .dst_array_element = 0,
+            .descriptor_count = max_textures,
+            .descriptor_type = .sampled_image,
+            .p_image_info = &infos,
+        };
+        d.dt.updateDescriptorSets(d.handle, 1, @ptrCast(&write), 0, null);
+    }
+}
+
+/// Rebuilds the pipeline after the swapchain's format changed. Cheap and rare:
+/// it happens when a window moves to a monitor with a different colour depth,
+/// and not on an ordinary resize.
+pub fn refresh(r: *Renderer) Error!void {
+    if (r.shaders_missing) return;
+    if (r.pipeline_generation == r.swapchain.format_generation) return;
+    const d = r.device;
+    _ = d.dt.deviceWaitIdle(d.handle);
+    d.dt.destroyPipeline(d.handle, r.pipeline, null);
+    r.pipeline = vk.null_handle;
+    try r.createPipeline();
+}
+
+// -- textures ---------------------------------------------------------------
+
+/// Creates a texture and returns its id, which is also its index in the
+/// descriptor array.
+///
+/// The first call makes the placeholder in slot zero, so real textures are
+/// numbered from one -- exactly as `DrawList.registerTexture` numbers them.
+/// A caller that registers the same textures in the same order in both places
+/// therefore gets matching ids, which is a convention rather than an enforced
+/// link, and `fenrir view` asserts it.
+pub fn createTexture(r: *Renderer, width: u32, height: u32, kind: TextureKind) Error!u32 {
+    if (r.textures.items.len >= max_textures) return error.TooManyTextures;
+    const d = r.device;
+
+    var t: Texture = .{ .width = width, .height = height, .kind = kind };
+
+    const image_info: vk.ImageCreateInfo = .{
+        .format = kind.format(),
+        .extent = .{ .width = width, .height = height, .depth = 1 },
+        .usage = vk.ImageUsageFlags.sampled | vk.ImageUsageFlags.transfer_dst,
+    };
+    try vk.check(d.dt.createImage(d.handle, &image_info, null, &t.image));
+    errdefer d.dt.destroyImage(d.handle, t.image, null);
+
+    var req: vk.MemoryRequirements = undefined;
+    d.dt.getImageMemoryRequirements(d.handle, t.image, &req);
+    const type_index = choose.memoryType(
+        &d.memory,
+        req.memory_type_bits,
+        vk.MemoryPropertyFlags.device_local,
+        0,
+    ) orelse return error.FeatureNotPresent;
+
+    const alloc: vk.MemoryAllocateInfo = .{
+        .allocation_size = req.size,
+        .memory_type_index = type_index,
+    };
+    try vk.check(d.dt.allocateMemory(d.handle, &alloc, null, &t.memory));
+    errdefer d.dt.freeMemory(d.handle, t.memory, null);
+    try vk.check(d.dt.bindImageMemory(d.handle, t.image, t.memory, 0));
+
+    const view_info: vk.ImageViewCreateInfo = .{
+        .image = t.image,
+        .format = kind.format(),
+        .subresource_range = .{ .aspect_mask = vk.ImageAspectFlags.color },
+    };
+    try vk.check(d.dt.createImageView(d.handle, &view_info, null, &t.view));
+    errdefer d.dt.destroyImageView(d.handle, t.view, null);
+
+    // Moved into the layout the descriptor claims it is in, before anything
+    // can sample it. A texture created and never uploaded to would otherwise
+    // sit in UNDEFINED while the descriptor says SHADER_READ_ONLY, which is
+    // undefined behaviour rather than a black rectangle.
+    try r.transitionNow(t.image, .undefined, .shader_read_only_optimal);
+
+    try r.textures.append(r.gpa, t);
+
+    // The descriptor has to be written or the new texture is not reachable
+    // from the shader at all -- every instance naming it would sample the
+    // placeholder instead, which is a screen of solid white text rather than
+    // an error. The wait is safe because this happens at startup and when a
+    // page image is decoded, not per frame.
+    _ = d.dt.deviceWaitIdle(d.handle);
+    r.writeAllTextureSlots();
+
+    return @intCast(r.textures.items.len - 1);
+}
+
+/// Replaces a texture's image with one of a different size, keeping its id.
+///
+/// This is what an atlas growing looks like from here. It waits for the device
+/// to go idle, which is exactly as expensive as it sounds and happens a
+/// handful of times in the life of a document: Týr's atlas grows by doubling
+/// its height, so a session's worth of glyphs costs three or four of these.
+pub fn resizeTexture(r: *Renderer, id: u32, width: u32, height: u32) Error!void {
+    if (id == 0 or id >= r.textures.items.len) return error.UnknownTexture;
+    const d = r.device;
+    _ = d.dt.deviceWaitIdle(d.handle);
+
+    const kind = r.textures.items[id].kind;
+    r.destroyTexture(&r.textures.items[id]);
+
+    // `createTexture` appends, so the new one is moved into the existing slot
+    // and the append undone -- which keeps the id, and therefore every
+    // instance already referring to it, valid.
+    _ = try r.createTexture(width, height, kind);
+    r.textures.items[id] = r.textures.pop().?;
+
+    r.writeAllTextureSlots();
+}
+
+fn destroyTexture(r: *Renderer, t: *Texture) void {
+    const d = r.device;
+    if (t.view != vk.null_handle) d.dt.destroyImageView(d.handle, t.view, null);
+    if (t.image != vk.null_handle) d.dt.destroyImage(d.handle, t.image, null);
+    if (t.memory != vk.null_handle) d.dt.freeMemory(d.handle, t.memory, null);
+    t.* = .{};
+}
+
+pub fn textureCount(r: *const Renderer) u32 {
+    return @intCast(r.textures.items.len);
+}
+
+// -- one-shot command buffers -----------------------------------------------
+
+fn beginOneShot(r: *Renderer) Error!vk.CommandBuffer {
+    const d = r.device;
+    var cb: vk.CommandBuffer = null;
+    const info: vk.CommandBufferAllocateInfo = .{ .command_pool = r.setup_pool, .command_buffer_count = 1 };
+    try vk.check(d.dt.allocateCommandBuffers(d.handle, &info, @ptrCast(&cb)));
+    const begin: vk.CommandBufferBeginInfo = .{ .flags = vk.CommandBufferUsageFlags.one_time_submit };
+    try vk.check(d.dt.beginCommandBuffer(cb, &begin));
+    return cb;
+}
+
+fn endOneShot(r: *Renderer, cb: vk.CommandBuffer) Error!void {
+    const d = r.device;
+    try vk.check(d.dt.endCommandBuffer(cb));
+    var handle = cb;
+    const submit: vk.SubmitInfo = .{
+        .command_buffer_count = 1,
+        .p_command_buffers = @ptrCast(&handle),
+    };
+    try vk.check(d.dt.queueSubmit(d.graphics_queue, 1, @ptrCast(&submit), vk.null_handle));
+    // A full queue wait. Only ever reached at startup and when an atlas grows,
+    // where the alternative -- a fence and a deferred free -- is machinery for
+    // an event that happens four times.
+    _ = d.dt.queueWaitIdle(d.graphics_queue);
+    d.dt.freeCommandBuffers(d.handle, r.setup_pool, 1, @ptrCast(&handle));
+}
+
+fn transitionNow(r: *Renderer, image: vk.Image, from: vk.ImageLayout, to: vk.ImageLayout) Error!void {
+    const cb = try r.beginOneShot();
+    recordTransition(r.device, cb, image, from, to);
+    try r.endOneShot(cb);
+}
+
+fn recordTransition(
+    d: *Device,
+    cb: vk.CommandBuffer,
+    image: vk.Image,
+    from: vk.ImageLayout,
+    to: vk.ImageLayout,
+) void {
+    const a = vk.AccessFlags;
+    const p = vk.PipelineStageFlags;
+
+    var src_access: u32 = 0;
+    var dst_access: u32 = 0;
+    var src_stage: u32 = p.top_of_pipe;
+    var dst_stage: u32 = p.bottom_of_pipe;
+
+    if (to == .transfer_dst_optimal) {
+        dst_access = a.transfer_write;
+        dst_stage = p.transfer;
+        if (from == .shader_read_only_optimal) {
+            src_access = a.shader_read;
+            src_stage = p.fragment_shader;
+        }
+    } else if (to == .shader_read_only_optimal) {
+        dst_access = a.shader_read;
+        dst_stage = p.fragment_shader;
+        if (from == .transfer_dst_optimal) {
+            src_access = a.transfer_write;
+            src_stage = p.transfer;
+        }
+    }
+
+    const barrier: vk.ImageMemoryBarrier = .{
+        .src_access_mask = src_access,
+        .dst_access_mask = dst_access,
+        .old_layout = from,
+        .new_layout = to,
+        .image = image,
+        .subresource_range = .{ .aspect_mask = vk.ImageAspectFlags.color },
+    };
+    d.dt.cmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+}
+
+/// Uploads immediately, with its own command buffer and a queue wait. Used for
+/// the placeholder texture at startup; everything else rides along with the
+/// frame.
+fn uploadNow(r: *Renderer, id: u32, up: Upload) Error!void {
+    var staging = try r.newStagingBuffer(@max(min_staging_bytes, uploadBytes(r, up)));
+    defer r.device.destroyBuffer(&staging);
+
+    const written = r.packInto(staging.slice(), 0, up);
+    const cb = try r.beginOneShot();
+    const t = r.textures.items[id];
+    recordTransition(r.device, cb, t.image, .shader_read_only_optimal, .transfer_dst_optimal);
+    r.recordCopy(cb, t, staging.handle, 0, up);
+    recordTransition(r.device, cb, t.image, .transfer_dst_optimal, .shader_read_only_optimal);
+    try r.endOneShot(cb);
+    r.bytes_uploaded += written;
+}
+
+fn uploadBytes(r: *Renderer, up: Upload) u64 {
+    const bpp = r.textures.items[up.texture].kind.bytesPerPixel();
+    return @as(u64, up.w) * up.h * bpp;
+}
+
+/// Copies the sub-rectangle out of the source image into `dst`, packed.
+///
+/// Packed, because `bufferRowLength` could describe the source stride instead
+/// and then the whole atlas would have to be in the staging buffer to reach
+/// the last row of a dirty region near its bottom.
+fn packInto(r: *Renderer, dst: []u8, offset: u64, up: Upload) u64 {
+    const bpp = r.textures.items[up.texture].kind.bytesPerPixel();
+    const row_bytes = up.w * bpp;
+    var y: u32 = 0;
+    while (y < up.h) : (y += 1) {
+        const src_start = (up.y + y) * up.stride + up.x * bpp;
+        const dst_start = offset + y * row_bytes;
+        @memcpy(dst[dst_start..][0..row_bytes], up.pixels[src_start..][0..row_bytes]);
+    }
+    return @as(u64, up.h) * row_bytes;
+}
+
+fn recordCopy(r: *Renderer, cb: vk.CommandBuffer, t: Texture, buffer: vk.Buffer, offset: u64, up: Upload) void {
+    const region: vk.BufferImageCopy = .{
+        .buffer_offset = offset,
+        .image_subresource = .{ .aspect_mask = vk.ImageAspectFlags.color },
+        .image_offset = .{ .x = @intCast(up.x), .y = @intCast(up.y), .z = 0 },
+        .image_extent = .{ .width = up.w, .height = up.h, .depth = 1 },
+    };
+    r.device.dt.cmdCopyBufferToImage(cb, buffer, t.image, .transfer_dst_optimal, 1, @ptrCast(&region));
+}
+
+// -- the frame --------------------------------------------------------------
+
+/// Draws one frame: waits for its slot, acquires an image, uploads what
+/// changed, records the single draw call, submits and presents.
+///
+/// Returns `.needs_recreate` rather than recreating the swapchain itself. The
+/// caller has the window and therefore the new size, and doing it at the top
+/// of the next frame rather than in the middle of this one is what makes a
+/// resize cost one frame instead of two.
+pub fn frame(
+    r: *Renderer,
+    list: *const DrawList,
+    uploads: []const Upload,
+    clear: Color,
+) Error!Status {
+    const d = r.device;
+    const s = r.swapchain;
+    if (s.isMinimised()) {
+        r.frames_skipped += 1;
+        return .skipped;
+    }
+    try r.refresh();
+
+    const f = &r.frames[r.index];
+
+    // Waits for the frame two submissions ago, which is what makes writing to
+    // this frame's mapped buffer safe without any other synchronisation.
+    _ = d.dt.waitForFences(d.handle, 1, @ptrCast(&f.fence), 1, std.math.maxInt(u64));
+
+    const acquired = try s.acquire(f.image_available);
+    const image = switch (acquired) {
+        .image => |i| i,
+        .out_of_date => {
+            r.recreates += 1;
+            return .needs_recreate;
+        },
+        .minimised => {
+            r.frames_skipped += 1;
+            return .skipped;
+        },
+    };
+
+    // Reset only after the acquire succeeded: an early reset followed by a
+    // return leaves an unsignalled fence that the next frame waits on for
+    // ever.
+    _ = d.dt.resetFences(d.handle, 1, @ptrCast(&f.fence));
+
+    try r.writeInstances(f, list);
+    const staged = try r.stageUploads(f, uploads);
+
+    try vk.check(d.dt.resetCommandPool(d.handle, f.pool, 0));
+    const begin: vk.CommandBufferBeginInfo = .{ .flags = vk.CommandBufferUsageFlags.one_time_submit };
+    try vk.check(d.dt.beginCommandBuffer(f.cb, &begin));
+
+    // Uploads first, outside the render pass: a copy cannot be recorded inside
+    // one, and doing them here rather than in their own submission is what
+    // keeps a frame that adds glyphs to the atlas from stalling the queue.
+    var offset: u64 = 0;
+    for (uploads[0..staged]) |up| {
+        const t = r.textures.items[up.texture];
+        recordTransition(d, f.cb, t.image, .shader_read_only_optimal, .transfer_dst_optimal);
+        r.recordCopy(f.cb, t, f.staging.handle, offset, up);
+        recordTransition(d, f.cb, t.image, .transfer_dst_optimal, .shader_read_only_optimal);
+        offset += r.uploadBytes(up);
+    }
+
+    // The clear colour is written into an `_SRGB` attachment, which the
+    // hardware encodes on write -- so the value given here is linear, and
+    // handing it an sRGB-encoded number makes the background visibly paler
+    // than the same colour drawn as a rectangle.
+    const clear_value: vk.ClearValue = .{ .color = .{ .float32 = .{
+        rect.srgbToLinear(clear.r),
+        rect.srgbToLinear(clear.g),
+        rect.srgbToLinear(clear.b),
+        clear.a,
+    } } };
+
+    const pass_info: vk.RenderPassBeginInfo = .{
+        .render_pass = s.render_pass,
+        .framebuffer = s.framebuffers[image.index],
+        .render_area = s.renderArea(),
+        .clear_value_count = 1,
+        .p_clear_values = @ptrCast(&clear_value),
+    };
+    d.dt.cmdBeginRenderPass(f.cb, &pass_info, .@"inline");
+
+    const count = list.count();
+    // Recorded whether or not there is a pipeline to draw with, so that a
+    // build with no shaders still reports what a build with them would have
+    // drawn.
+    r.instance_high_water = @max(r.instance_high_water, count);
+
+    if (count > 0 and r.pipeline != vk.null_handle) {
+        d.dt.cmdBindPipeline(f.cb, .graphics, r.pipeline);
+
+        const viewport: vk.Viewport = .{
+            .width = @floatFromInt(s.extent.width),
+            .height = @floatFromInt(s.extent.height),
+        };
+        d.dt.cmdSetViewport(f.cb, 0, 1, @ptrCast(&viewport));
+        const scissor = s.renderArea();
+        d.dt.cmdSetScissor(f.cb, 0, 1, @ptrCast(&scissor));
+
+        d.dt.cmdBindDescriptorSets(f.cb, .graphics, r.layout, 0, 1, @ptrCast(&f.set), 0, null);
+
+        const push: pipeline_contract.PushConstants = .{ .viewport = .{
+            @floatFromInt(s.extent.width),
+            @floatFromInt(s.extent.height),
+        } };
+        d.dt.cmdPushConstants(
+            f.cb,
+            r.layout,
+            vk.ShaderStageFlags.vertex,
+            0,
+            @sizeOf(pipeline_contract.PushConstants),
+            &push,
+        );
+
+        // The whole frame. Four vertices, one instance per rectangle.
+        d.dt.cmdDraw(f.cb, pipeline_contract.state.vertices_per_instance, count, 0, 0);
+    }
+
+    d.dt.cmdEndRenderPass(f.cb);
+    try vk.check(d.dt.endCommandBuffer(f.cb));
+
+    var wait_semaphore = f.image_available;
+    var signal_semaphore = image.render_finished;
+    var cb = f.cb;
+    // The stage the wait applies to. COLOR_ATTACHMENT_OUTPUT rather than
+    // TOP_OF_PIPE, so the vertex work can start before the image is available
+    // and only the writing waits.
+    var wait_stage: u32 = vk.PipelineStageFlags.color_attachment_output;
+
+    const submit: vk.SubmitInfo = .{
+        .wait_semaphore_count = 1,
+        .p_wait_semaphores = @ptrCast(&wait_semaphore),
+        .p_wait_dst_stage_mask = @ptrCast(&wait_stage),
+        .command_buffer_count = 1,
+        .p_command_buffers = @ptrCast(&cb),
+        .signal_semaphore_count = 1,
+        .p_signal_semaphores = @ptrCast(&signal_semaphore),
+    };
+    try vk.check(d.dt.queueSubmit(d.graphics_queue, 1, @ptrCast(&submit), f.fence));
+    s.markInFlight(image.index, f.fence);
+
+    const presented = try s.present(image.index, image.render_finished);
+
+    r.index = (r.index + 1) % frames_in_flight;
+    r.frames_drawn += 1;
+    return if (presented) .drawn else .needs_recreate;
+}
+
+fn writeInstances(r: *Renderer, f: *Frame, list: *const DrawList) Error!void {
+    const bytes = list.bytes();
+    if (bytes.len == 0) return;
+
+    if (bytes.len > f.instances.size) {
+        // Safe here and nowhere else: the fence for this frame has been waited
+        // on, so nothing the GPU is reading lives in the old buffer.
+        const want = choose.bufferCapacity(f.instances.size, bytes.len, min_instance_bytes);
+        r.device.destroyBuffer(&f.instances);
+        f.instances = try r.newInstanceBuffer(want);
+        r.writeBufferDescriptor(f.*);
+    }
+
+    // The whole upload: one memcpy into memory the GPU reads where it lies.
+    @memcpy(f.instances.slice()[0..bytes.len], bytes);
+    r.device.flush(f.instances, 0, bytes.len);
+}
+
+/// Packs as many uploads as fit into this frame's staging buffer, growing it
+/// first when it is too small. Returns how many were staged; anything left
+/// over is simply not uploaded this frame, and the caller's dirty region will
+/// still be dirty next time.
+fn stageUploads(r: *Renderer, f: *Frame, uploads: []const Upload) Error!usize {
+    if (uploads.len == 0) return 0;
+
+    var needed: u64 = 0;
+    for (uploads) |up| needed += r.uploadBytes(up);
+
+    if (needed > f.staging.size) {
+        const want = choose.bufferCapacity(f.staging.size, needed, min_staging_bytes);
+        r.device.destroyBuffer(&f.staging);
+        f.staging = try r.newStagingBuffer(want);
+    }
+
+    const dst = f.staging.slice();
+    var offset: u64 = 0;
+    var staged: usize = 0;
+    for (uploads) |up| {
+        const size = r.uploadBytes(up);
+        if (offset + size > dst.len) break;
+        _ = r.packInto(dst, offset, up);
+        offset += size;
+        staged += 1;
+    }
+    r.device.flush(f.staging, 0, offset);
+    r.bytes_uploaded += offset;
+    return staged;
+}
+
+/// Waits for every frame in flight. Called before tearing anything down that a
+/// pending frame might still be reading.
+pub fn waitIdle(r: *Renderer) void {
+    _ = r.device.dt.deviceWaitIdle(r.device.handle);
+}
+
+// -- tests ------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "the renderer agrees with the contract it was written against" {
+    // `gleipnir/pipeline.zig` states the bindings, the push constant and the
+    // instance size with no Vulkan in sight. This is the only place both
+    // halves exist, so it is the only place the two can be compared.
+    try testing.expectEqual(@as(u32, 0), pipeline_contract.binding.instances);
+    try testing.expectEqual(@as(u32, 1), pipeline_contract.binding.textures);
+    try testing.expectEqual(@as(u32, 2), pipeline_contract.binding.sampler);
+    try testing.expectEqual(@as(usize, 8), @sizeOf(pipeline_contract.PushConstants));
+    try testing.expectEqual(@as(u32, 4), pipeline_contract.state.vertices_per_instance);
+    try testing.expectEqual(@as(u32, 96), pipeline_contract.state.instance_size);
+    try testing.expectEqual(@as(u32, 96), @sizeOf(rect.Instance));
+}
+
+test "a texture kind knows its format and its stride" {
+    try testing.expectEqual(vk.Format.r8_unorm, TextureKind.coverage.format());
+    try testing.expectEqual(@as(u32, 1), TextureKind.coverage.bytesPerPixel());
+    // sRGB for colour, so the hardware decodes on read and the shader's own
+    // conversion is applied to a value that is already linear.
+    try testing.expectEqual(vk.Format.r8g8b8a8_srgb, TextureKind.color.format());
+    try testing.expectEqual(@as(u32, 4), TextureKind.color.bytesPerPixel());
+}
+
+test "the descriptor pool is sized for what the sets actually hold" {
+    // Undersizing it produces `ERROR_OUT_OF_POOL_MEMORY` at startup, which is
+    // at least loud. Oversizing it wastes nothing worth measuring, and the
+    // arithmetic is easy to get wrong in the direction that fails on the
+    // second frame rather than the first.
+    try testing.expect(frames_in_flight * max_textures >= max_textures);
+    try testing.expectEqual(@as(u32, 2), frames_in_flight);
+}
