@@ -66,7 +66,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     defer d.deinit();
     try scene(&d);
 
-    var fb = try gleipnir.Framebuffer.init(ctx.gpa, width, height);
+    var fb = try gleipnir.Framebuffer.init(ctx.gpa, width, height, .linear);
     defer fb.deinit(ctx.gpa);
     fb.clear(.gray(0.09));
     gleipnir.software.render(fb, d.instances.items, null);

@@ -33,6 +33,9 @@ const options = @import("build_options");
 
 const Face = @import("Face.zig");
 const fallback = @import("backend/fallback.zig");
+const cff = @import("backend/cff.zig");
+const truetype = @import("backend/truetype.zig");
+const type1 = @import("backend/type1.zig");
 const format = @import("format.zig");
 const Shaper = @import("Shaper.zig");
 
@@ -49,6 +52,14 @@ pub const compiled: []const *const Backend = blk: {
     if (options.tyr_stb_truetype) {
         list = list ++ [_]*const Backend{&@import("backend/stb.zig").backend};
     }
+    // Týr's own parsers, always present because they need nothing linked.
+    // They come after the C libraries so that a build with `-Dfreetype` still
+    // prefers FreeType -- it hints, it handles Type 1, and it has thirty years
+    // of damaged-font repair in it -- but before the fallback, so that a
+    // default build renders letters rather than boxes.
+    list = list ++ [_]*const Backend{&truetype.backend};
+    list = list ++ [_]*const Backend{&cff.backend};
+    list = list ++ [_]*const Backend{&type1.backend};
     list = list ++ [_]*const Backend{&fallback.backend};
     break :blk list;
 };

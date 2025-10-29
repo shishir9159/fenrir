@@ -27,6 +27,8 @@ const Context = @import("Context.zig");
 const content = fenrir.content;
 const gleipnir = fenrir.gleipnir;
 const replay = gleipnir.replay;
+const glyphmod = @import("glyphs.zig");
+const Glyphs = glyphmod.Fonts;
 
 pub const usage =
     \\fenrir raster <file> [--page N | --all] [options]
@@ -41,20 +43,21 @@ pub const usage =
     \\    --dpi N        Resolution. Defaults to 96, so a Letter page is
     \\                   816x1056. PDF units are 1/72 inch.
     \\    --scale N      Instead of --dpi: a direct multiplier on page units.
-    \\    --samples N    Multisampling: 1, 2, 4 or 8. Defaults to 4.
+    \\    --samples N    Multisampling: 1, 2, 4 or 8. Defaults to 8.
     \\    --tolerance N  How far a flattened curve may stray, in pixels.
     \\                   Defaults to 0.1.
-    \\    --text-boxes   Draw a rectangle where each glyph would be. A layout
-    \\                   aid: there is no glyph outline source in this build.
+    \\    --text-boxes   Draw a rectangle where each glyph would be instead of
+    \\                   the glyph: a layout aid.
     \\    --image-boxes  Outline each image's placement.
     \\    --no-rotate    Ignore /Rotate.
     \\    --no-type3     Do not run Type 3 glyph procedures.
+    \\    --no-annots    Draw only the content stream, leaving out highlights,
+    \\                   stamps, form fields and every other annotation.
     \\    --stats        Report and write nothing.
     \\
-    \\    Text is not drawn. Tyr has no outline extraction yet, so there is
-    \\    nothing to hand the path pipeline; --text-boxes shows the layout in
-    \\    the meantime. Images and gradients are not drawn either. All three
-    \\    are counted and reported rather than passed over in silence.
+    \\    Text is drawn: Tyr reads TrueType, CFF and Type 1 outlines and the
+    \\    path pipeline fills them. Images, shadings and tiling patterns are
+    \\    not, and are counted and reported rather than passed over in silence.
 ;
 
 /// Above this, a page is almost certainly a mistake -- a --dpi typo, or a
@@ -70,9 +73,11 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var stats_only = false;
     var dpi: f32 = 96;
     var scale: ?f32 = null;
-    var samples: gleipnir.raster.Samples = .four;
+    var samples: gleipnir.raster.Samples = .eight;
     var options: content.Options = .{};
     var replay_options: replay.Options = .{};
+    var ascii: ?[4]u32 = null;
+    var list_fonts = false;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -121,8 +126,16 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             options.rotate = false;
         } else if (std.mem.eql(u8, arg, "--no-type3")) {
             options.type3 = false;
+        } else if (std.mem.eql(u8, arg, "--no-annots")) {
+            options.annotations = false;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             stats_only = true;
+        } else if (std.mem.eql(u8, arg, "--fonts")) {
+            list_fonts = true;
+        } else if (std.mem.eql(u8, arg, "--ascii")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--ascii needs x,y,w,h", .{});
+            ascii = parseWindow(ctx, argv[i]) catch return ctx.fail("--ascii wants x,y,w,h", .{});
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ctx.fail("unknown option {s}", .{arg});
         } else if (file_path == null) {
@@ -159,6 +172,8 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         .options = options,
         .replay = replay_options,
         .stats_only = stats_only,
+        .ascii = ascii,
+        .list_fonts = list_fonts,
     };
 
     if (all) {
@@ -190,6 +205,8 @@ const Job = struct {
     options: content.Options,
     replay: replay.Options,
     stats_only: bool,
+    ascii: ?[4]u32 = null,
+    list_fonts: bool = false,
 };
 
 fn one(
@@ -221,12 +238,18 @@ fn one(
     // viewers, like nothing at all.
     canvas.fb.clear(.white);
 
+    var glyphs: Glyphs = try .init(ctx.gpa, doc, result.list, ctx.io);
+    defer glyphs.deinit();
+
+    var options = job.replay;
+    options.glyphs = glyphs.source();
+
     const stats = replay.render(
         ctx.gpa,
         &canvas,
         result.list,
         replay.pageTransform(result.list.page, job.factor),
-        job.replay,
+        options,
     ) catch |err| return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
 
     // The invariant from `raster.zig`, checked on real documents rather than
@@ -246,6 +269,19 @@ fn one(
         stats.clips,
         stats.segments,
     }) catch {};
+
+    const d = result.diagnostics;
+    if (d.annotations_drawn != 0 or d.annotations_skipped != 0) {
+        ctx.out.print("         {d} annotation{s} drawn, {d} skipped\n", .{
+            d.annotations_drawn,
+            if (d.annotations_drawn == 1) "" else "s",
+            d.annotations_skipped,
+        }) catch {};
+    }
+
+    if (job.list_fonts) glyphmod.describe(&glyphs, result.list, ctx.out) catch {};
+
+    if (job.ascii) |w| dumpWindow(ctx, canvas.fb, w);
 
     if (!job.stats_only) {
         try writePng(ctx, dest, canvas.fb);
@@ -288,6 +324,11 @@ fn accumulate(total: *replay.Stats, s: replay.Stats) void {
     total.segments += s.segments;
     total.clips_dropped += s.clips_dropped;
     total.paths_dropped += s.paths_dropped;
+    total.glyphs_drawn += s.glyphs_drawn;
+    total.glyphs_missing += s.glyphs_missing;
+    total.glyphs_blank += s.glyphs_blank;
+    total.glyphs_invisible += s.glyphs_invisible;
+    total.text_not_drawn += s.text_not_drawn;
 }
 
 /// What is missing from the picture, on stderr so the image path on stdout
@@ -296,10 +337,17 @@ fn accumulate(total: *replay.Stats, s: replay.Stats) void {
 /// Only the non-zero lines, and nothing at all when the page came out whole --
 /// a report that always prints something teaches people to stop reading it.
 fn report(ctx: *Context, s: replay.Stats) void {
-    if (s.text_runs != 0) {
-        ctx.note("{d} text runs ({d} glyphs) not drawn: no glyph outlines in this build", .{
-            s.text_runs, s.glyphs,
+    if (s.text_not_drawn != 0) {
+        ctx.note("{d} text runs ({d} glyphs) not drawn: no glyph source", .{ s.text_not_drawn, s.glyphs });
+    } else if (s.glyphs_invisible == s.glyphs and s.glyphs != 0) {
+        ctx.note("{d} glyphs are an invisible OCR layer over a scan; nothing to draw", .{s.glyphs});
+    } else if (s.glyphs != 0) {
+        ctx.note("{d} of {d} glyphs drawn, {d} blank, {d} invisible", .{
+            s.glyphs_drawn, s.glyphs, s.glyphs_blank, s.glyphs_invisible,
         });
+    }
+    if (s.glyphs_missing != 0) {
+        ctx.note("{d} glyphs had no outline: unembedded font, or a code the encoding did not resolve", .{s.glyphs_missing});
     }
     if (s.images != 0) ctx.note("{d} images not drawn: no image decoder yet", .{s.images});
     if (s.shadings != 0) ctx.note("{d} shadings not drawn", .{s.shadings});
@@ -309,4 +357,52 @@ fn report(ctx: *Context, s: replay.Stats) void {
     if (s.paths_dropped != 0) ctx.note("{d} paths over the point budget", .{s.paths_dropped});
     if (s.clips_dropped != 0) ctx.note("{d} clips over the depth budget", .{s.clips_dropped});
     if (s.complete()) ctx.note("every mark on the page was drawn", .{});
+}
+
+/// `x,y,w,h`, in device pixels.
+fn parseWindow(ctx: *Context, s: []const u8) ![4]u32 {
+    var out: [4]u32 = .{ 0, 0, 0, 0 };
+    var it = std.mem.splitScalar(u8, s, ',');
+    for (&out) |*v| {
+        const part = it.next() orelse return ctx.fail("--ascii wants four numbers", .{});
+        v.* = std.fmt.parseInt(u32, part, 10) catch
+            return ctx.fail("not a number: {s}", .{part});
+    }
+    return out;
+}
+
+/// A window of the framebuffer as text, one character per pixel.
+///
+/// A rasteriser bug is a statement about individual pixels, and a PNG viewer
+/// is a poor instrument for reading one: a one-pixel seam is invisible at a
+/// glance and unmistakable in a grid of characters. This is `fenrir trace` for
+/// the other end of the pipeline.
+///
+/// Five levels of ink rather than two, because most rasteriser mistakes show
+/// up as *partial* coverage where there should be full -- a seam along a
+/// shared edge, a double-blended diagonal -- and a threshold would hide
+/// exactly the class of bug worth looking for.
+fn dumpWindow(ctx: *Context, fb: gleipnir.Framebuffer, w: [4]u32) void {
+    const x0 = @min(w[0], fb.width);
+    const y0 = @min(w[1], fb.height);
+    const x1 = @min(x0 +| w[2], fb.width);
+    const y1 = @min(y0 +| w[3], fb.height);
+
+    ctx.out.print("# ascii {d},{d} {d}x{d}  . <2% - <20% + <60% o <98% # solid\n", .{
+        x0, y0, x1 - x0, y1 - y0,
+    }) catch {};
+
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const c = fb.at(x, y);
+            // Ink against a white page: how far the pixel is from white, on
+            // the luminance the eye weights most.
+            const ink = 1.0 - (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) * c.a - (1.0 - c.a);
+            const ch: u8 = if (ink > 0.98) '#' else if (ink > 0.6) 'o' else if (ink > 0.2) '+' else if (ink > 0.02) '-' else '.';
+            ctx.out.writeByte(ch) catch {};
+        }
+        ctx.out.writeByte('\n') catch {};
+    }
 }

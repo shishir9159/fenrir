@@ -59,11 +59,55 @@ const Transform = geom.Transform;
 
 pub const Error = path.Error;
 
+/// What a `layer_push` saved, restored by its `layer_pop`.
+const SavedLayer = struct { alpha: f32, blend: paint.BlendMode };
+
+/// One glyph's outline, in the font program's own units.
+///
+/// Expressed in Gelgja's vocabulary -- the same verbs and points a display
+/// list path uses -- rather than in Týr's `Outline`, so that Gleipnir keeps
+/// importing nothing but Gelgja. A glyph is a path; the only thing that makes
+/// it special is that its coordinates are in em units and have to be divided
+/// by `units_per_em` before they mean anything.
+pub const GlyphOutline = struct {
+    verbs: []const geom.Verb,
+    points: []const Point,
+    /// 1000 for CFF and Type 1, usually 2048 for TrueType.
+    units_per_em: u16 = 1000,
+};
+
+/// Where glyph outlines come from.
+///
+/// An interface rather than a dependency, because resolving a character code
+/// to an outline needs a font program, and finding *that* needs the PDF
+/// document -- which is the one thing a display list exists to be independent
+/// of. The caller wires Gjöll and Týr together behind this and hands the
+/// result in; `src/vanagandr/glyphs.zig` is the implementation.
+///
+/// The returned slices are borrowed and valid only until the next call.
+pub const GlyphSource = struct {
+    ptr: *anyopaque,
+    lookup: *const fn (
+        ptr: *anyopaque,
+        font: DisplayList.FontId,
+        glyph: DisplayList.Glyph,
+    ) ?GlyphOutline,
+
+    pub fn get(s: GlyphSource, font: DisplayList.FontId, glyph: DisplayList.Glyph) ?GlyphOutline {
+        return s.lookup(s.ptr, font, glyph);
+    }
+};
+
 pub const Options = struct {
     /// How far a flattened segment may stray from its curve, in device pixels.
     tolerance: f32 = 0.1,
-    /// Draw a rectangle where each glyph would be. A layout aid, not a
-    /// rendering: see the header.
+    /// Where glyph outlines come from. Without one, text is counted and not
+    /// drawn.
+    glyphs: ?GlyphSource = null,
+    /// Draw a rectangle where each glyph would be, instead of the glyph. A
+    /// layout aid for when there is no glyph source, or when the question is
+    /// whether the interpreter put the text in the right place rather than
+    /// what it looks like.
     text_boxes: bool = false,
     /// Outline each image's placement.
     image_boxes: bool = false,
@@ -92,11 +136,28 @@ pub const Stats = struct {
     clips_dropped: u32 = 0,
     /// Paths abandoned because they exceeded the flattener's point budget.
     paths_dropped: u32 = 0,
+    /// Glyphs actually filled, and glyphs whose outline could not be found:
+    /// a code the encoding chain did not resolve, or a font program that would
+    /// not open.
+    glyphs_drawn: u32 = 0,
+    glyphs_missing: u32 = 0,
+    /// Glyphs that resolved to an outline with nothing in it. A space, and
+    /// most of the blank half of any page of text -- counted apart from the
+    /// drawn ones so that "drawn" is not quietly short of "total" by the
+    /// number of word gaps.
+    glyphs_blank: u32 = 0,
+    /// Glyphs in render mode 3, which paints nothing by design: the OCR layer
+    /// of a scanned page. Not a failure to draw them -- drawing them would put
+    /// a second copy of the text over the scan.
+    glyphs_invisible: u32 = 0,
+    /// Text runs skipped because there was no glyph source at all.
+    text_not_drawn: u32 = 0,
 
     /// True when everything on the page was drawn as it was recorded.
     pub fn complete(s: Stats) bool {
-        return s.unsupported_paint == 0 and s.text_runs == 0 and s.images == 0 and
-            s.shadings == 0 and s.clips_dropped == 0 and s.paths_dropped == 0;
+        return s.unsupported_paint == 0 and s.images == 0 and s.shadings == 0 and
+            s.clips_dropped == 0 and s.paths_dropped == 0 and
+            s.text_not_drawn == 0 and s.glyphs_missing == 0;
     }
 };
 
@@ -165,7 +226,10 @@ const Replayer = struct {
     clip_stack: std.ArrayList(bool) = .empty,
     /// Constant alpha, multiplied down by every open transparency group.
     alpha: f32 = 1,
-    alpha_stack: std.ArrayList(f32) = .empty,
+    /// What a `layer_push` saved, restored by its `layer_pop`. One stack
+    /// rather than two, so a failed append cannot leave them disagreeing
+    /// about how deep the nesting is.
+    alpha_stack: std.ArrayList(SavedLayer) = .empty,
 
     fn deinit(r: *Replayer) void {
         r.flat.deinit(r.gpa);
@@ -375,29 +439,60 @@ const Replayer = struct {
 
     fn pushLayer(r: *Replayer, l: paint.Layer) Error!void {
         r.stats.layers += 1;
-        try r.alpha_stack.append(r.gpa, r.alpha);
+        try r.alpha_stack.append(r.gpa, .{ .alpha = r.alpha, .blend = r.canvas.blend_mode });
         r.alpha *= std.math.clamp(l.alpha, 0, 1);
+        // The innermost mode that is not `normal` wins. A group composites
+        // into its parent with its own mode and its *contents* are drawn
+        // normally inside it -- so with the group folded into its contents
+        // the way this does, a nested plain group must not cancel the
+        // multiply an enclosing one asked for.
+        if (l.blend != .normal) r.canvas.blend_mode = l.blend;
     }
 
     fn popLayer(r: *Replayer) void {
-        r.alpha = r.alpha_stack.pop() orelse 1;
+        const saved: SavedLayer = r.alpha_stack.pop() orelse .{ .alpha = 1, .blend = .normal };
+        r.alpha = saved.alpha;
+        r.canvas.blend_mode = saved.blend;
     }
 
     // -- the not-yet-drawable ------------------------------------------------
 
+    /// A run of glyphs, drawn as the paths they are.
+    ///
+    /// There is nothing special here about text. A glyph is an outline in em
+    /// units; scale it by `size / units_per_em`, put it at the glyph's offset,
+    /// run it through the run's matrix and the page's, and fill it nonzero
+    /// like any other path. Everything that makes text hard -- encodings,
+    /// CMaps, font programs, subsetting -- happened before `GlyphSource`
+    /// answered, which is the point of that interface.
     fn text(r: *Replayer, tr: DisplayList.TextRun) Error!void {
         r.stats.text_runs += 1;
         const glyphs = r.list.glyphsOf(tr);
         r.stats.glyphs += @intCast(glyphs.len);
-        if (!r.options.text_boxes) return;
 
-        // Where each glyph would sit, as a box one em tall on the baseline.
-        // Only a layout aid: it says the interpreter put the text in the right
-        // place, and says nothing about what the letters look like.
+        // Mode 3 is how every scanned document carries its OCR layer: real
+        // text, positioned over the page image, painting nothing. Drawing it
+        // would put a second copy of the text on top of the scan.
+        if (tr.mode == .invisible) {
+            r.stats.glyphs_invisible += @intCast(glyphs.len);
+            return;
+        }
+
+        if (r.options.glyphs) |src| {
+            if (!r.options.text_boxes) {
+                try r.drawGlyphs(src, tr, glyphs);
+                return;
+            }
+        }
+        if (!r.options.text_boxes) {
+            r.stats.text_not_drawn += 1;
+            return;
+        }
+
+        // Where each glyph would sit, as a box on the baseline. Only a layout
+        // aid: it says the interpreter put the text in the right place, and
+        // says nothing about what the letters look like.
         for (glyphs) |g| {
-            // Half an em wide and seven tenths tall: an average letter, not
-            // any particular one. The real widths are in the font program that
-            // does not exist yet, which is the whole reason this is a box.
             const w = tr.size * 0.5;
             const h = tr.size * 0.7;
             const corners = [_]Point{
@@ -414,6 +509,83 @@ const Replayer = struct {
             r.flat.close(r.gpa) catch return;
             const flat = r.flat.finish(r.gpa) catch return;
             try r.paintFlattened(flat, .nonzero, .{ .r = 0.6, .g = 0.6, .b = 0.75, .a = 0.4 });
+        }
+    }
+
+    fn drawGlyphs(
+        r: *Replayer,
+        src: GlyphSource,
+        tr: DisplayList.TextRun,
+        glyphs: []const DisplayList.Glyph,
+    ) Error!void {
+        const color = solid(tr.fill) orelse {
+            r.stats.unsupported_paint += 1;
+            return;
+        };
+        // A stroked or clipping render mode is drawn as a plain fill. The
+        // outline is right and the paint is not; the alternative is nothing at
+        // all, and mode 1 and 2 are a fraction of a percent of text.
+        if (!tr.mode.fills() and tr.mode != .clip) {
+            if (!tr.mode.strokes()) return;
+        }
+
+        for (glyphs) |g| {
+            const out = src.get(tr.font, g) orelse {
+                r.stats.glyphs_missing += 1;
+                continue;
+            };
+            if (out.verbs.len == 0) {
+                r.stats.glyphs_blank += 1;
+                continue;
+            }
+
+            // Font units to text space: divide by the em, scale by `Tf`, and
+            // land at the glyph's own offset within the run. Then the run's
+            // matrix, then the page's.
+            const em = @as(f32, @floatFromInt(if (out.units_per_em == 0) 1000 else out.units_per_em));
+            const s = tr.size / em;
+            const place: Transform = .{ .a = s, .d = s, .e = g.offset.x, .f = g.offset.y };
+            const to_device = place.concat(tr.transform).concat(r.base);
+
+            const scale = to_device.expansion();
+            if (!(scale > 0) or !std.math.isFinite(scale)) continue;
+
+            r.flat.reset();
+            r.flat.options = .{ .tolerance = r.options.tolerance, .scale = scale };
+            var i: usize = 0;
+            var ok = true;
+            for (out.verbs) |verb| {
+                const n = verb.pointCount();
+                if (i + n > out.points.len) break;
+                (switch (verb) {
+                    .move => r.flat.moveTo(r.gpa, out.points[i]),
+                    .line => r.flat.lineTo(r.gpa, out.points[i]),
+                    .cubic => r.flat.cubicTo(r.gpa, out.points[i], out.points[i + 1], out.points[i + 2]),
+                    .close => r.flat.close(r.gpa),
+                }) catch {
+                    ok = false;
+                    break;
+                };
+                i += n;
+            }
+            if (!ok) {
+                r.stats.paths_dropped += 1;
+                continue;
+            }
+
+            const flat = r.flat.finish(r.gpa) catch continue;
+            if (flat.isEmpty()) continue;
+            r.stats.segments += flat.segmentCount();
+            r.stats.glyphs_drawn += 1;
+
+            var m = try path.mesh(r.gpa, flat);
+            defer m.deinit(r.gpa);
+            // Glyph outlines are always nonzero. TrueType and CFF both wind
+            // counters the opposite way from the outer contour, which is what
+            // makes the hole in an `o` a hole under this rule and under no
+            // other -- even-odd would agree here and disagree the moment two
+            // contours of a script face overlap.
+            r.canvas.fill(m, to_device, .nonzero, color, r.alpha);
         }
     }
 
@@ -641,10 +813,11 @@ test "a transparency group alpha reaches everything inside it" {
     try testing.expectEqual(@as(u32, 1), r.stats.layers);
     const inside = r.ink(15, 15);
     try testing.expectApproxEqAbs(@as(f32, 1), r.ink(45, 15), 0.01);
-    // Half alpha over white, blended in linear light, is about 0.26 ink -- not
-    // 0.5. A renderer that blends in sRGB gets 0.5 here, and text that is too
-    // dark everywhere.
-    try testing.expect(inside > 0.2 and inside < 0.35);
+    // Half alpha over white is half ink, because the canvas composites in the
+    // device's colour space the way PDF asks it to. Blended in linear light
+    // the same fill reads as about 0.26 -- see the pair of cases in
+    // `raster.zig` that pin both answers.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), inside, 0.02);
 }
 
 test "a shading fill is counted rather than half-drawn" {

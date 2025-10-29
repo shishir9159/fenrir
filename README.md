@@ -30,8 +30,8 @@ Týr still loses the hand. That part is not optional.
 | **Fenrir** | — | the format, and this project | the wolf | |
 | **Gjöll** | `src/gjoll/` | parser: objects, xref, filters, page tree | the boulder the fetter is anchored to | done |
 | **Gelgja** | `src/gelgja/` | the display list: parser output, renderer input | the cord threaded through the rock | interface done |
-| **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | rects done |
-| **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | atlas done |
+| **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | paths on the CPU, rects on the GPU |
+| **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | three parsers, encodings, atlas |
 | **Þviti** | `src/thviti/` | the interface: box tree, layout solver, signals | the stone that pins the fetter down | core done |
 | **Lyngvi** | `src/lyngvi/` | platform: window, input, Vulkan device | the island it happened on | window and device done |
 | **Vánagandr** | `src/vanagandr/` | the command-line tool | "monster of the river Ván", his other name | done |
@@ -41,34 +41,51 @@ Directory and identifier names are ASCII-folded — `gjoll`, `tyr`,
 identifiers; build systems, shells, and filesystems across three platforms
 are less reliable about it, and this is not the hill.
 
-**Status: milestone 4, plus the Gelgja, Gleipnir-rect, Týr, Þviti and Lyngvi
-layers.** Gjöll is done: the container is fully readable, the page tree
-resolves into pages with their effective geometry, and the content-stream
-interpreter turns one into a display list -- all seventy-three operators,
-with colour spaces, functions, form XObjects, inline images, patterns and
-Type 3 glyphs. `fenrir trace` prints the result. Týr's two interfaces and its
-backend registry are written and tested, and so are the glyph atlas, its scan
-converter and its text layout; the real glyph sources are behind build flags
-and are still uncompiled. Gleipnir's rect pipeline is written and tested
-against a CPU reference rasteriser. Þviti's box tree, five-pass solver, style
-stacks and signals are written and tested, and `fenrir ui` runs the whole
-stack — layout, shaping, atlas, instances, pixels — into a PNG.
+**Status: a PDF opens in a window and you can read it.** `fenrir read
+file.pdf` scrolls continuously through the document with the wheel, zooms,
+and shows highlights, stamps and everything else a person has added to it.
+`fenrir raster file.pdf --page 1` writes the same picture to a PNG. Across a
+400-document corpus every glyph on every first page is accounted for: drawn,
+blank, or an invisible OCR layer over a scan.
+
+Gjöll is done: the container is fully readable, the page tree resolves into
+pages with their effective geometry, and the content-stream interpreter turns
+one into a display list — all seventy-three operators, with colour spaces,
+functions, form XObjects, inline images, patterns and Type 3 glyphs. `fenrir
+trace` prints the result.
+
+Gleipnir has both pipelines. Rects are a signed distance field, one instance
+format, one draw call for a frame. Paths are stencil-then-cover: flattening,
+stroke-to-fill with caps, joins and dashes, both winding rules, and a CPU
+rasteriser that models the GPU's own stencil buffer down to its eight-bit
+wraparound, so bring-up is a diff rather than an investigation.
+
+Týr has three font parsers of its own, all compiled in by default and none
+needing anything linked: `glyf` for TrueType, a Type 2 charstring interpreter
+for CFF, and eexec plus Type 1 charstrings for PostScript fonts. FreeType and
+stb_truetype remain optional and preferred when present. The encoding chain —
+`/Differences`, the three standard encodings, glyph names to code points,
+CID-keyed lookups — resolves codes to glyphs.
 
 Lyngvi opens a window on Win32 and creates a Vulkan instance, device,
 swapchain and pipeline through bindings written by hand and loaded at run
-time, so the default build still links no C and needs no SDK. `fenrir view`
-runs the same interface `fenrir ui` writes to a PNG, in a window, on the GPU.
-What is missing between here and a picture on a screen is one build
-dependency: the GLSL is compiled to SPIR-V by whatever shader compiler is on
-`PATH`, and on a machine with none the window still opens, the swapchain still
-presents, and nothing is drawn — which is the state this was developed in.
-Gleipnir's path pipeline is the other thing not started.
+time, so the default build still links no C and needs no SDK. With a shader
+compiler on `PATH` the GLSL becomes SPIR-V at build time.
+
+The reader is honest about which rasteriser draws it. `fenrir read`
+rasterises each page on the CPU and uploads it as a texture, which the rect
+pipeline draws as one quad — so the window shows exactly the pixels
+`fenrir raster` writes, and the GPU is doing compositing rather than
+rasterising. The path pipeline’s Vulkan half is specified and its shaders
+compile, but `Renderer.zig` has not been taught to create it: no stencil
+attachment, no multisampled colour attachment, no vertex buffer. That, and an
+image decoder, are what stand between this and the real thing.
 
 ## Building
 
 ```
 zig build              # zig-out/bin/fenrir
-zig build test         # 350 tests
+zig build test         # 581 tests
 zig build run -- info file.pdf
 ```
 
@@ -80,13 +97,26 @@ driver gets a sentence instead of a link error. On Windows the build links
 ### Shaders
 
 The GLSL in `src/gleipnir/shader/` is compiled to SPIR-V by the build, using
-`glslc` or `glslangValidator`, whichever is on `PATH` first. Neither being
-present is not an error:
+`glslc`, `glslang` or `glslangValidator`, whichever is on `PATH` first. Neither
+being present is not an error:
 
 ```
 zig build              # looks for a shader compiler; carries on without one
-fenrir view --probe    # says which of the two it found, if either
+fenrir view --probe    # says whether this binary has SPIR-V in it
 ```
+
+**Getting a shader compiler.** Any one of these is enough; the build needs only
+the executable on `PATH`, never the SDK's headers or libraries.
+
+| | |
+|---|---|
+| Vulkan SDK | [vulkan.lunarg.com](https://vulkan.lunarg.com) — gives `glslc` *and* the validation layers, which are the best debugging tool for a Vulkan bring-up. `winget install LunarG.VulkanSDK` on Windows. |
+| glslang alone | [github.com/KhronosGroup/glslang/releases](https://github.com/KhronosGroup/glslang/releases) — one ~5 MB `glslang` binary, no installer, no admin. Unzip and put `bin/` on `PATH`. |
+| A package manager | `apt install glslang-tools`, `brew install glslang`, `pacman -S shaderc` |
+
+Every shader must ask for `GL_GOOGLE_include_directive` by name if it
+`#include`s anything. `glslc` enables it implicitly and `glslang` does not, so
+a shader without that line compiles with one and fails with the other.
 
 A binary built without one opens its window, creates its device and swapchain,
 acquires and presents images, and draws nothing, with a message saying so. That
@@ -134,6 +164,16 @@ fenrir extract <file> --page <N>        a page's content stream
 fenrir trace <file> [--page N|--all]    a page interpreted into a display list
              [--stats] [--paths]
              [--glyphs] [--no-rotate]
+fenrir raster <file> [--page N|--all]   a page rendered to a PNG, on the CPU
+             [-o F] [--dpi N|--scale N]
+             [--samples 1|2|4|8] [--fonts]
+             [--tolerance N] [--stats]
+             [--text-boxes] [--image-boxes]
+             [--no-annots] [--ascii x,y,w,h]
+fenrir read <file> [--page N]           the document in a window, scrollable
+             [--zoom N|--dpi N] [--size WxH]
+             [--samples N] [--frames N]
+             [--shot F] [--vsync ...]
 fenrir fonts                            what Týr can do in this build
 fenrir rects [--out F] [--size WxH]     a demo frame through the rect pipeline
 fenrir ui    [--out F] [--atlas F]      a frame of interface, text included
@@ -143,6 +183,36 @@ fenrir view  [--frames N] [--size WxH]  the same interface, in a window, on
              [--validate] [--gpu NAME]
 fenrir view --probe                     the devices, without opening anything
 ```
+
+`fenrir read file.pdf` is the one that opens a document to read. It scrolls
+continuously with the wheel, zooms with `+` and `-`, fits the width with `0`,
+and steps a page at a time with `n` and `p`. Pages are rasterised lazily, one
+per frame, and kept in a small cache, so scrolling stays answerable while a
+page that is not ready yet shows as blank paper for a frame rather than
+freezing the window. `--shot F` writes one composed frame to a PNG with no
+window and no device at all, which is how the layout is checked on a machine
+with no display.
+
+`fenrir raster file.pdf --page 1` writes the same picture to a file: parser,
+interpreter, path pipeline and font layer end to end, on the CPU, with no
+device or window involved. It reports what it could *not* draw rather than
+letting a page with a hole in it look finished.
+
+```
+$ fenrir raster paper.pdf --page 1 --dpi 110
+page 1  935x1210  25 fills  6 strokes  12 clips  131658 segments
+         4 annotations drawn, 57 skipped
+wrote page-1.png
+2102 of 2108 glyphs drawn, 6 blank, 0 invisible
+1 images not drawn: no image decoder yet
+```
+
+`--ascii x,y,w,h` prints a window of the result as text, one character per
+pixel at five levels of ink. A one-pixel seam along a shared edge is invisible
+in an image viewer and unmistakable in a grid of characters; it is `fenrir
+trace` for the other end of the pipeline. `--fonts` lists which backend opened
+each font, how many glyphs it has, and how its encoding was resolved, which is
+where the answer to "why is this page blank" almost always is.
 
 `fenrir extract file.pdf --page 1` prints a decoded content stream — the
 actual graphics language a page is written in; `fenrir trace file.pdf --page 1`
@@ -309,16 +379,27 @@ the ones with `#xx` or `\` escapes are copied into the arena.
   space families, PDF function types 0, 2, 3 and 4 — including the PostScript
   calculator, because spot colours are specified with one — shading and tiling
   patterns in pattern space, embedded CMaps, and Type 3 glyph procedures run
-  as the content streams they are. `fenrir trace` prints the result; 236
-  million operators across the corpus produce no unimplemented operator.
+  as the content streams they are, and annotation appearance streams fitted to
+  their rectangles by §12.5.5 — which is where a highlight, a stamp, a filled-in
+  form field and a signature live, and none of which are in the content
+  stream. `fenrir trace` prints the result; 236 million operators across the
+  corpus produce no unimplemented operator.
 - Gleipnir's rect pipeline: the instance format, the draw layer with its clip
   and transform stacks, the distance field, and a CPU rasteriser that runs the
   same arithmetic a fragment shader would. `fenrir rects` writes a frame to a
   PNG, and `fenrir view` hands the same instances to a real device.
+- Gleipnir’s path pipeline, on the CPU: flattening by Wang’s formula,
+  stencil-then-cover fills under both winding rules, stroke-to-fill with caps,
+  joins, miters and dashes, antialiased path clipping, transparency groups,
+  and all sixteen PDF blend modes — composited in the device’s own colour
+  space, which is what §11.3.8 asks for and what keeps a page from reading
+  like a photocopy of one.
 - Týr: the `Face` and `Shaper` interfaces, format sniffing, the outline sink,
-  and the backend registry with its selection rules. The default build has one
-  backend, which draws `.notdef` boxes; FreeType, stb_truetype and HarfBuzz
-  are written against the same interfaces but are not compiled here.
+  and the backend registry with its selection rules. Three native backends are
+  compiled in by default — `glyf` for TrueType, a Type 2 charstring
+  interpreter for CFF, and eexec plus Type 1 charstrings for PostScript fonts
+  — with FreeType, stb_truetype and HarfBuzz written against the same
+  interfaces and preferred when they are built in.
 - Týr's glyph pipeline: a signed-area scan converter, a skyline-packed atlas
   keyed by `(face, glyph, size, subpixel x)`, and text layout with a shaped-run
   cache. A backend that rasterises is asked to; one that only decomposes has
@@ -335,10 +416,10 @@ the ones with `#xx` or `\` escapes are copied into the arena.
   time; instance, surface, device and queue selection; a swapchain that
   rebuilds on resize with a semaphore per image; and the rect pipeline with a
   persistently mapped instance buffer and glyph uploads that ride along with
-  the frame. `fenrir view` runs it. On the machine this was written on it
-  opens a window on a GTX 1650 SUPER, picks `b8g8r8a8_srgb` and three images,
-  builds 742 instances a frame from the live UI, uploads the glyph atlas, and
-  presents — and draws nothing, because that machine has no shader compiler.
+  the frame. `fenrir view` runs it on the demo interface and `fenrir read`
+  runs it on a document: on the machine this was written on it opens a window
+  on a GTX 1650 SUPER, picks `b8g8r8a8_srgb` and three images, uploads a
+  rasterised page as a texture, and presents it at the refresh rate.
 
 ### Damage tolerance
 
@@ -379,19 +460,45 @@ in it — still reads completely.
   structurally but their strings and stream data read as ciphertext. Most
   encrypted files in practice have an empty user password, so this is the
   next thing worth adding.
-- **Three approximations in the interpreter**, each confined to one function
-  and named where it lives. A simple font with no `/Widths` is one of the
-  standard 14, whose metrics are AFM files rather than document content, so
-  every glyph advances half an em until Týr loads them. A `/Type0` font whose
-  `/Encoding` is a predefined CMap other than Identity decodes two bytes at a
-  time — right for all of them — with the wrong CID mapping for the CJK ones;
-  *embedded* CMap streams are parsed properly. And a clipping text render
-  mode (`Tr 4`–`Tr 7`) clips to a box per glyph rather than to the outline,
-  which shows a little too much rather than nothing.
-- Týr's encoding tables (`/Encoding`, `/Differences`, CMaps, `/CIDToGIDMap`),
-  the standard-14 metrics, and its own `glyf` and Type 2 charstring parsers.
-- Gleipnir's path pipeline: stencil-then-cover, for everything that is not a
-  rectangle.
+- **Two approximations in the interpreter**, each confined to one function and
+  named where it lives. A `/Type0` font whose `/Encoding` is a predefined CMap
+  other than Identity decodes two bytes at a time — right for all of them —
+  with the wrong CID mapping for the CJK ones; *embedded* CMap streams are
+  parsed properly. And a clipping text render mode (`Tr 4`–`Tr 7`) clips to a
+  box per glyph rather than to the outline, which shows a little too much
+  rather than nothing.
+- **A font the document does not embed is substituted, not matched.** A PDF
+  may name `/Helvetica` and ship no program; a face off this machine stands in
+  for it. The shapes are borrowed and only the shapes — positions still come
+  from the PDF's own `/Widths` — so the page is legible and not
+  typographically faithful.
+- **Images.** No decoder yet, so a scanned page renders as its invisible OCR
+  layer over nothing, and a figure that is a bitmap is absent. `fenrir raster
+  --image-boxes` outlines where they would go. This is now the largest gap
+  between a rendered page and the real one.
+- **Shadings and tiling patterns.** The interpreter resolves both into a
+  `Paint`; painting them needs a gradient rasteriser and a recursive replay.
+  Solid paint is exact and everything else is counted and skipped.
+- **Transparency groups are approximated.** `layer_push` multiplies its alpha
+  into everything inside and applies the group’s blend mode to each thing it
+  contains, which is exact for a non-isolated, non-knockout group whose
+  contents do not overlap — a highlight, a stamp, most of what a group is used
+  for — and wrong when they do. Doing it properly needs an offscreen canvas
+  per group.
+- **The GPU path pipeline is written but has never run.** The contract is in
+  `gleipnir/pathpipe.zig`, the shaders compile, and `raster.zig` executes the
+  same two passes on the CPU — but `lyngvi/Renderer.zig` still creates only
+  the rect pipeline: no stencil attachment, no multisampled colour
+  attachment, no vertex buffer. So `fenrir read` rasterises each page on the
+  CPU and hands the GPU a texture. The part with no answer yet is clipping:
+  the CPU keeps an antialiased byte-per-pixel clip mask, and the stencil
+  buffer will have to grow a second plane or a second attachment to match it.
+- **Annotations are drawn from their appearance streams only.** A `/Highlight`
+  or `/Square` that ships no `/AP` is skipped rather than synthesised from its
+  `/QuadPoints` and `/C`, and no annotation is interactive: a link is drawn if
+  it has an appearance and is never clickable.
+- **The standard-14 metrics.** A simple font with no `/Widths` still advances
+  half an em per glyph; the AFM files are not in the tree.
 - A real widget set on top of Þviti — text fields with selection and an IME,
   menus, tab bars, trees, splitters.
 - Lyngvi's xcb backend, and everything platform-shaped a reader eventually
@@ -569,7 +676,7 @@ menus, the clipboard, drag and drop from other applications, and any fallback
 to OpenGL or Direct3D. A machine without Vulkan gets a message saying so
 rather than a silently slower program.
 
-### 6. Gleipnir — pixels *(rect pipeline landed)*
+### 6. Gleipnir — pixels *(rect and path pipelines landed)*
 
 **The rect pipeline is written.** One instance format
 draws every rectangle the reader will ever put on the screen — panels,
@@ -653,7 +760,7 @@ reach the buffer; the one draw call is what the fallback for a device without
 descriptor indexing *would* cost, which makes it a standing measure of how
 well the drawing was ordered.
 
-### 7. Týr — fonts *(atlas landed)*
+### 7. Týr — fonts *(three native parsers landed)*
 
 **Two interfaces, not one.** "Font backend" is usually said as though
 FreeType, stb_truetype and HarfBuzz were three answers to one question. They
@@ -661,7 +768,7 @@ are answers to two.
 
 | | in | out | implementations |
 | --- | --- | --- | --- |
-| `Face` | glyph index | outline, advance | FreeType, stb_truetype, `fallback`, later a native parser |
+| `Face` | glyph index | outline, advance | `truetype`, `cff`, `type1` (native, always present), FreeType, stb_truetype, `fallback` |
 | `Shaper` | Unicode string | positioned glyphs | HarfBuzz, `simple` |
 
 FreeType cannot decide that `fi` should become one glyph. HarfBuzz cannot draw

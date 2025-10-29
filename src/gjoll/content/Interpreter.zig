@@ -87,6 +87,12 @@ pub const Options = struct {
     /// Run Type 3 glyph procedures. Off records nothing for them, which is
     /// what a text-extraction pass wants.
     type3: bool = true,
+    /// Draw the page's annotation appearance streams after its content
+    /// (§12.5.5). On, because a highlight, a stamp, a filled-in form field and
+    /// a signature all live there and in nothing else: a page drawn without
+    /// them looks finished rather than looking stripped. Off for a pass that
+    /// wants only what the content stream says.
+    annotations: bool = true,
 };
 
 /// What the interpreter noticed while it ran. None of it stops a page; all of
@@ -108,6 +114,12 @@ pub const Diagnostics = struct {
     /// Text shown with no `Tf` in effect. The glyphs are dropped, because
     /// there is no width with which to advance past them.
     text_without_font: u32 = 0,
+    /// Annotations whose appearance stream was drawn onto the page.
+    annotations_drawn: u32 = 0,
+    /// Annotations passed over: hidden, not for the screen, a popup, or with
+    /// no appearance stream to draw. A `/Link` with a border and no `/AP` is
+    /// the common one, and is correctly invisible.
+    annotations_skipped: u32 = 0,
     deepest_nesting: u8 = 0,
     /// True when `max_commands` cut the page short.
     truncated: bool = false,
@@ -275,7 +287,11 @@ pub fn page(gpa: Allocator, doc: *Document, p: Page, options: Options) Error!Res
         .fromRect(0, 0, @floatCast(w), @floatCast(h));
 
     const content = try p.contents(doc);
-    return run(gpa, doc, content, p.resources, box, shift.concat(turn), options);
+    const annots: []const Object = if (options.annotations)
+        p.annotations(doc) catch &.{}
+    else
+        &.{};
+    return run(gpa, doc, content, p.resources, box, shift.concat(turn), options, annots);
 }
 
 /// Interprets a bare content stream against a resource dictionary and a base
@@ -296,7 +312,7 @@ pub fn stream(
     base: Matrix,
     options: Options,
 ) Error!Result {
-    return run(gpa, doc, content, resources, box, base, options);
+    return run(gpa, doc, content, resources, box, base, options, &.{});
 }
 
 fn run(
@@ -307,6 +323,7 @@ fn run(
     box: Bounds,
     base: Matrix,
     options: Options,
+    annots: []const Object,
 ) Error!Result {
     var it: Interpreter = .{
         .gpa = gpa,
@@ -321,6 +338,7 @@ fn run(
 
     it.state.ctm = base;
     try it.execute(content, resources, 0);
+    if (annots.len != 0) try it.drawAnnotations(annots, resources, base);
 
     return .{
         .list = try it.builder.finish(),
@@ -1397,6 +1415,153 @@ fn drawForm(
     it.pending_clip = null;
 }
 
+// -- annotations ------------------------------------------------------------
+
+/// Reads a fixed-length array of numbers, resolving each entry. Null when the
+/// key is absent, is not an array, is too short, or holds something that is
+/// not a number -- all of which mean the same thing to every caller here:
+/// there is nothing to place, so do not place it wrongly.
+fn readNumbers(it: *Interpreter, dict: Dict, key: []const u8, comptime n: usize) Error!?[n]f64 {
+    const v = try it.doc.get(dict, key) orelse return null;
+    const a = v.asArray() orelse return null;
+    if (a.len < n) return null;
+    var out: [n]f64 = undefined;
+    for (&out, a[0..n]) |*slot, entry| {
+        slot.* = (try it.doc.resolve(entry)).asNumber() orelse return null;
+    }
+    return out;
+}
+
+/// Draws the page's annotations, in file order, after its content.
+///
+/// An annotation is not in the content stream. It is a dictionary beside the
+/// page holding a rectangle and a form XObject -- its *appearance stream* --
+/// to draw into that rectangle. A highlight, a stamp, a filled-in form field,
+/// an ink scribble and a signature are all annotations and nothing else, so a
+/// renderer that draws only the content stream produces a page with every
+/// mark a person added to it stripped off. That failure is invisible: the
+/// result is not a broken page, it is a clean one.
+///
+/// One bad annotation does not stop the rest. They are independent objects
+/// added at different times by different tools, and the odds that all of them
+/// parse are worse than the odds that any one does.
+fn drawAnnotations(it: *Interpreter, annots: []const Object, resources: Dict, base: Matrix) Error!void {
+    for (annots) |raw| {
+        const resolved = it.doc.resolve(raw) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                it.diag.annotations_skipped += 1;
+                continue;
+            },
+        };
+        const annot = resolved.asDict() orelse {
+            it.diag.annotations_skipped += 1;
+            continue;
+        };
+        const drawn = it.drawAnnotation(annot, resources, base) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => false,
+        };
+        if (drawn) it.diag.annotations_drawn += 1 else it.diag.annotations_skipped += 1;
+    }
+}
+
+/// One annotation. Returns whether anything was drawn.
+fn drawAnnotation(it: *Interpreter, annot: Dict, page_resources: Dict, base: Matrix) Error!bool {
+    // A popup is the note *window*, shown only while the note is open in a
+    // viewer that has one. It is never part of the page.
+    if (try it.doc.get(annot, "Subtype")) |v| {
+        if (v.isName("Popup")) return false;
+    }
+
+    // §12.5.3. Bit 2 hides it everywhere; bit 6 hides it on screen and prints
+    // it, which is how a "print only" watermark is written.
+    const flags = if (try it.doc.get(annot, "F")) |v| v.asInt() orelse 0 else 0;
+    if (flags & (1 << 1) != 0) return false;
+    if (flags & (1 << 5) != 0) return false;
+
+    const rect = (try it.readNumbers(annot, "Rect", 4)) orelse return false;
+    const rx0 = @min(rect[0], rect[2]);
+    const ry0 = @min(rect[1], rect[3]);
+    const rx1 = @max(rect[0], rect[2]);
+    const ry1 = @max(rect[1], rect[3]);
+
+    const ap = (try it.doc.get(annot, "AP")) orelse return false;
+    const ap_dict = ap.asDict() orelse return false;
+    var chosen = ap_dict.get("N") orelse return false;
+
+    // `/N` is either the appearance itself or a dictionary of them keyed by
+    // appearance state -- a checkbox carries `/Off` and `/Yes` -- and `/AS`
+    // says which is current. A sub-dictionary with exactly one entry and no
+    // `/AS` is unambiguous whatever the file forgot to say.
+    const normal = try it.doc.resolve(chosen);
+    if (normal.asStream() == null) {
+        const states = normal.asDict() orelse return false;
+        if (try it.doc.get(annot, "AS")) |as| {
+            chosen = states.get(as.asName() orelse return false) orelse return false;
+        } else if (states.count() == 1) {
+            chosen = states.values()[0];
+        } else return false;
+    }
+
+    const form_ref = if (chosen.asRef()) |r| r.num else 0;
+    const form = (try it.doc.resolve(chosen)).asStream() orelse return false;
+
+    const box = (try it.readNumbers(form.dict, "BBox", 4)) orelse return false;
+    const m: Matrix = if (try it.readNumbers(form.dict, "Matrix", 6)) |v|
+        .fromOperands(v)
+    else
+        .identity;
+
+    // §12.5.5, and the two steps are not interchangeable: map the four
+    // corners of `/BBox` through `/Matrix`, take the bounding box of *those*,
+    // and fit that to `/Rect`. Fitting the BBox itself would put the corners
+    // of a rotated appearance outside the rectangle the file promised it
+    // would stay inside.
+    const bx0 = @min(box[0], box[2]);
+    const by0 = @min(box[1], box[3]);
+    const bx1 = @max(box[0], box[2]);
+    const by1 = @max(box[1], box[3]);
+
+    var min_x = std.math.inf(f64);
+    var min_y = std.math.inf(f64);
+    var max_x = -std.math.inf(f64);
+    var max_y = -std.math.inf(f64);
+    for ([4][2]f64{ .{ bx0, by0 }, .{ bx1, by0 }, .{ bx1, by1 }, .{ bx0, by1 } }) |corner| {
+        const p = m.apply(corner[0], corner[1]);
+        min_x = @min(min_x, p[0]);
+        min_y = @min(min_y, p[1]);
+        max_x = @max(max_x, p[0]);
+        max_y = @max(max_y, p[1]);
+    }
+    if (!std.math.isFinite(min_x) or !std.math.isFinite(max_y)) return false;
+
+    // A degenerate box scales by one rather than by infinity. The spec says
+    // as much for a zero-area BBox, and it is also the only answer that does
+    // not put NaN into the display list.
+    const w = max_x - min_x;
+    const h = max_y - min_y;
+    const sx = if (w > 0) (rx1 - rx0) / w else 1;
+    const sy = if (h > 0) (ry1 - ry0) / h else 1;
+    const fit: Matrix = Matrix.scaling(sx, sy).concat(
+        .translation(rx0 - min_x * sx, ry0 - min_y * sy),
+    );
+
+    // A fresh state, not the one the content stream happened to end on: an
+    // annotation is the page's peer, and inherits its clip, colour and font
+    // from nothing.
+    const saved = it.state;
+    defer it.state = saved;
+    it.state = .{ .ctm = fit.concat(base) };
+
+    // `drawForm` applies `/Matrix` and clips to `/BBox` itself, which is
+    // exactly the rest of §12.5.5 -- so the appearance stream goes through
+    // the same path a form XObject does, and inherits its recursion guard,
+    // its transparency-group handling and its state restoration with it.
+    try it.drawForm(form, form_ref, page_resources, 0);
+    return true;
+}
+
 // -- inline images ----------------------------------------------------------
 
 /// Records a `BI ... ID ... EI`, samples and all.
@@ -2213,6 +2378,143 @@ test "no-rotate leaves the file's own numbers alone" {
     try testing.expectApproxEqAbs(@as(f32, 0), bounds.min_x, 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 20), bounds.max_y, 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 100), result.list.page.width(), 1e-4);
+}
+
+// -- annotations ------------------------------------------------------------
+
+/// The first `fill_path` in a list, so a test can assert on the artwork
+/// without counting the clip an appearance stream's `/BBox` pushes around it.
+fn onlyFill(list: DisplayList) DisplayList.DrawCmd {
+    for (list.cmds) |c| {
+        if (c == .fill_path) return c;
+    }
+    unreachable;
+}
+
+fn fillCount(list: DisplayList) usize {
+    var n: usize = 0;
+    for (list.cmds) |c| {
+        if (c == .fill_path) n += 1;
+    }
+    return n;
+}
+
+/// A page carrying one annotation, and the objects behind it.
+const square_annot =
+    \\30 0 obj << /Type /Annot /Subtype /Square /Rect [100 100 180 140]
+    \\  /AP << /N 31 0 R >> >> endobj
+    \\31 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 0 >> stream
+    \\0 0 10 10 re f
+    \\endstream endobj
+;
+
+test "an annotation's appearance is fitted to its rectangle" {
+    // The BBox is ten units square and the rectangle is 80 by 40, so the
+    // appearance is stretched by eight and by four -- unequally, which is
+    // allowed and is what a resized sticky note does. Getting this wrong
+    // draws the mark somewhere near the right place, which is the hardest
+    // kind of wrong to notice.
+    var result = try interpretFully("", "", square_annot, "/Annots [30 0 R]", .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u32, 1), result.diagnostics.annotations_drawn);
+    try testing.expectEqual(@as(usize, 1), fillCount(result.list));
+
+    const bounds = result.list.pathBounds(onlyFill(result.list).fill_path.path);
+    try testing.expectApproxEqAbs(@as(f32, 100), bounds.min_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 180), bounds.max_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 100), bounds.min_y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 140), bounds.max_y, 1e-3);
+}
+
+test "the appearance's own matrix is applied before the fit, not after" {
+    // Rotated a quarter turn, the ten-unit box still *bounds* ten by ten, so
+    // it still fills the rectangle -- but the artwork inside it has turned.
+    // A renderer that fits the BBox and then rotates puts the mark outside
+    // the rectangle entirely.
+    const rotated =
+        \\30 0 obj << /Type /Annot /Subtype /Square /Rect [0 0 40 40]
+        \\  /AP << /N 31 0 R >> >> endobj
+        \\31 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 10 10]
+        \\  /Matrix [0 1 -1 0 0 0] /Length 0 >> stream
+        \\0 0 10 5 re f
+        \\endstream endobj
+    ;
+    var result = try interpretFully("", "", rotated, "/Annots [30 0 R]", .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), fillCount(result.list));
+    const bounds = result.list.pathBounds(onlyFill(result.list).fill_path.path);
+    // The 10x5 strip lies along x before the turn and along y after it, so
+    // after the fit it is the right-hand half of the 40-unit square: full
+    // height, and starting halfway across.
+    try testing.expectApproxEqAbs(@as(f32, 20), bounds.min_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 40), bounds.max_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0), bounds.min_y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 40), bounds.max_y, 1e-3);
+}
+
+test "a hidden annotation is not drawn" {
+    // Bit 2 of /F. The other flags a reader has to honour are bit 6, which
+    // means print but do not display.
+    const hidden =
+        \\30 0 obj << /Type /Annot /Subtype /Square /Rect [100 100 180 140] /F 2
+        \\  /AP << /N 31 0 R >> >> endobj
+        \\31 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 0 >> stream
+        \\0 0 10 10 re f
+        \\endstream endobj
+    ;
+    var result = try interpretFully("", "", hidden, "/Annots [30 0 R]", .{});
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), fillCount(result.list));
+    try testing.expectEqual(@as(u32, 1), result.diagnostics.annotations_skipped);
+}
+
+test "the appearance state chooses between the appearances" {
+    // A checkbox: two appearances under /N, and /AS says which is current.
+    const checkbox =
+        \\30 0 obj << /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /AS /On
+        \\  /AP << /N << /Off 31 0 R /On 32 0 R >> >> >> endobj
+        \\31 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 0 >> stream
+        \\endstream endobj
+        \\32 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 0 >> stream
+        \\0 0 10 10 re f
+        \\endstream endobj
+    ;
+    var result = try interpretFully("", "", checkbox, "/Annots [30 0 R]", .{});
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), fillCount(result.list));
+
+    // With /AS pointing at the empty one, nothing is painted -- but the
+    // annotation still counts as drawn, because it was.
+    const off = try std.mem.replaceOwned(u8, testing.allocator, checkbox, "/AS /On", "/AS /Off");
+    defer testing.allocator.free(off);
+    var blank = try interpretFully("", "", off, "/Annots [30 0 R]", .{});
+    defer blank.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), fillCount(blank.list));
+    try testing.expectEqual(@as(u32, 1), blank.diagnostics.annotations_drawn);
+}
+
+test "annotations can be turned off" {
+    var result = try interpretFully("", "", square_annot, "/Annots [30 0 R]", .{ .annotations = false });
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), fillCount(result.list));
+    try testing.expectEqual(@as(u32, 0), result.diagnostics.annotations_drawn);
+}
+
+test "an annotation with no appearance stream is skipped rather than guessed at" {
+    // A /Link with a border and no /AP is the common case, and drawing a
+    // rectangle for it would put a box around every cross-reference in a
+    // paper that no other reader shows.
+    const link =
+        \\30 0 obj << /Type /Annot /Subtype /Link /Rect [0 0 10 10]
+        \\  /Border [0 0 1] >> endobj
+    ;
+    var result = try interpretFully("", "", link, "/Annots [30 0 R]", .{});
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), fillCount(result.list));
+    try testing.expectEqual(@as(u32, 1), result.diagnostics.annotations_skipped);
 }
 
 test "a bare stream can be interpreted against a base transform of its own" {

@@ -60,7 +60,6 @@ test {
     _ = png;
     _ = raster;
     _ = replay;
-    _ = @import("gleipnir/zz_probe.zig");
     _ = rect;
     _ = sdf;
     _ = software;

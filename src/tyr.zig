@@ -33,9 +33,13 @@ pub const Face = @import("tyr/Face.zig");
 pub const Fonts = @import("tyr/Fonts.zig");
 pub const Outline = @import("tyr/Outline.zig");
 pub const Shaper = @import("tyr/Shaper.zig");
+pub const encoding = @import("tyr/encoding.zig");
 pub const format = @import("tyr/format.zig");
 pub const raster = @import("tyr/raster.zig");
 pub const registry = @import("tyr/registry.zig");
+pub const cff = @import("tyr/backend/cff.zig");
+pub const truetype = @import("tyr/backend/truetype.zig");
+pub const type1 = @import("tyr/backend/type1.zig");
 
 pub const Backend = Face.Backend;
 pub const Bitmap = Face.Bitmap;
@@ -59,8 +63,12 @@ test {
     _ = Fonts;
     _ = Outline;
     _ = Shaper;
+    _ = encoding;
     _ = format;
     _ = raster;
     _ = registry;
+    _ = cff;
+    _ = truetype;
+    _ = type1;
     _ = @import("tyr/backend/fallback.zig");
 }

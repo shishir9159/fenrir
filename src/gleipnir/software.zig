@@ -51,13 +51,33 @@ pub const Sampler = struct {
     }
 };
 
-/// Linear-light, premultiplied, four floats a pixel.
+/// Which encoding the stored channels carry, and therefore which space
+/// compositing happens in.
 ///
-/// Linear because that is what the GPU blends in when the swapchain is an
-/// `_SRGB` format: the hardware decodes on read and encodes on write, and the
-/// blend in between happens in light. Premultiplied because it is the only
-/// representation in which compositing is associative, which is what lets a
-/// hundred overlapping instances land in any order without the result drifting.
+/// This is not a detail. Compositing is `dst*(1-a) + src*a`, and that
+/// expression means two different things depending on what the numbers are.
+/// Black text on white paper at half coverage lands on 188 if the halving is
+/// done in light and on 128 if it is done in sRGB -- the difference between a
+/// page and a faded photocopy of one, applied to every antialiased edge in the
+/// document at once.
+pub const Space = enum {
+    /// Linear light. What the GPU blends in when the colour attachment is an
+    /// `_SRGB` format: the hardware decodes on read and encodes on write, so
+    /// the blend in between happens in light. The rect pipeline's
+    /// framebuffer, because this file has to stay an oracle for that shader.
+    linear,
+    /// sRGB-encoded, blended exactly as stored. What PDF asks for -- §11.3.8
+    /// composites in the group's colour space, and a page with no transparency
+    /// group inherits the device's, which for a screen is sRGB -- and what
+    /// every other reader does. The page rasteriser's framebuffer.
+    srgb,
+};
+
+/// Premultiplied, four floats a pixel, in whichever `Space` it was created in.
+///
+/// Premultiplied because it is the only representation in which compositing is
+/// associative, which is what lets a hundred overlapping instances land in any
+/// order without the result drifting.
 ///
 /// Float rather than eight-bit because this is the reference. Eight bits per
 /// channel of *linear* light bands visibly in the darks, and an oracle that
@@ -66,15 +86,34 @@ pub const Framebuffer = struct {
     pixels: []f32,
     width: u32,
     height: u32,
+    space: Space,
 
-    pub fn init(gpa: Allocator, width: u32, height: u32) Allocator.Error!Framebuffer {
+    pub fn init(gpa: Allocator, width: u32, height: u32, space: Space) Allocator.Error!Framebuffer {
         const fb: Framebuffer = .{
             .pixels = try gpa.alloc(f32, @as(usize, width) * height * 4),
             .width = width,
             .height = height,
+            .space = space,
         };
         fb.clear(.transparent);
         return fb;
+    }
+
+    /// An sRGB-encoded channel as this framebuffer stores it.
+    pub fn encode(fb: Framebuffer, s: f32) f32 {
+        return switch (fb.space) {
+            .linear => rect.srgbToLinear(s),
+            .srgb => s,
+        };
+    }
+
+    /// The inverse: a stored channel as sRGB, which is what every caller
+    /// outside this file speaks.
+    pub fn decode(fb: Framebuffer, v: f32) f32 {
+        return switch (fb.space) {
+            .linear => rect.linearToSrgb(v),
+            .srgb => v,
+        };
     }
 
     pub fn deinit(fb: *Framebuffer, gpa: Allocator) void {
@@ -83,9 +122,10 @@ pub const Framebuffer = struct {
     }
 
     /// `c` is given the way every colour in this renderer is given: sRGB
-    /// encoded, straight alpha. It is decoded and premultiplied here.
+    /// encoded, straight alpha. It is encoded for this framebuffers space and
+    /// premultiplied here.
     pub fn clear(fb: Framebuffer, c: Color) void {
-        const p = premultiplied(c, 1.0);
+        const p = premultiplied(c, 1.0, fb.space);
         var i: usize = 0;
         while (i < fb.pixels.len) : (i += 4) {
             fb.pixels[i + 0] = p[0];
@@ -106,9 +146,9 @@ pub const Framebuffer = struct {
         const a = fb.pixels[i + 3];
         if (a <= 0) return .transparent;
         return .{
-            .r = rect.linearToSrgb(fb.pixels[i + 0] / a),
-            .g = rect.linearToSrgb(fb.pixels[i + 1] / a),
-            .b = rect.linearToSrgb(fb.pixels[i + 2] / a),
+            .r = fb.decode(fb.pixels[i + 0] / a),
+            .g = fb.decode(fb.pixels[i + 1] / a),
+            .b = fb.decode(fb.pixels[i + 2] / a),
             .a = a,
         };
     }
@@ -170,14 +210,19 @@ fn byteOf(v: f32) u8 {
     return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255.0));
 }
 
-/// Decodes an sRGB colour to linear light and premultiplies it by its own
-/// alpha and by `cov`.
-fn premultiplied(c: Color, cov: f32) [4]f32 {
+/// Encodes an sRGB colour for `space` and premultiplies it by its own alpha
+/// and by `cov`.
+fn premultiplied(c: Color, cov: f32, space: Space) [4]f32 {
     const a = std.math.clamp(c.a, 0, 1) * cov;
+    const e = struct {
+        fn f(s: f32, sp: Space) f32 {
+            return switch (sp) { .linear => rect.srgbToLinear(s), .srgb => s };
+        }
+    }.f;
     return .{
-        rect.srgbToLinear(std.math.clamp(c.r, 0, 1)) * a,
-        rect.srgbToLinear(std.math.clamp(c.g, 0, 1)) * a,
-        rect.srgbToLinear(std.math.clamp(c.b, 0, 1)) * a,
+        e(std.math.clamp(c.r, 0, 1), space) * a,
+        e(std.math.clamp(c.g, 0, 1), space) * a,
+        e(std.math.clamp(c.b, 0, 1), space) * a,
         a,
     };
 }
@@ -186,6 +231,10 @@ fn premultiplied(c: Color, cov: f32) [4]f32 {
 /// it is on the GPU: there is no z buffer, the pipeline is one draw call, and
 /// Vulkan guarantees instances rasterise in index order.
 pub fn render(fb: Framebuffer, instances: []const Instance, sampler: ?Sampler) void {
+    // This file models an `_SRGB` colour attachment, where the hardware
+    // decodes on read and encodes on write. Handed a framebuffer that stores
+    // sRGB directly it would still draw, and would no longer be an oracle.
+    std.debug.assert(fb.space == .linear);
     for (instances) |i| drawOne(fb, i, sampler);
 }
 
@@ -296,7 +345,7 @@ fn frame(gpa: Allocator, w: u32, h: u32, build: *const fn (*DrawList) anyerror!v
     defer d.deinit();
     try build(&d);
 
-    const fb = try Framebuffer.init(gpa, w, h);
+    const fb = try Framebuffer.init(gpa, w, h, .linear);
     render(fb, d.instances.items, null);
     return fb;
 }
@@ -487,7 +536,7 @@ test "an alpha texture modulates coverage and not colour" {
     const atlas = try d.registerTexture(32, 32);
     try d.glyph(.fromRect(0, 0, 32, 32), atlas, .fromRect(0, 0, 32, 32), .{ .r = 1, .g = 0, .b = 0 });
 
-    var fb = try Framebuffer.init(gpa, 32, 32);
+    var fb = try Framebuffer.init(gpa, 32, 32, .linear);
     defer fb.deinit(gpa);
     render(fb, d.instances.items, checker);
 
@@ -501,7 +550,7 @@ test "an alpha texture modulates coverage and not colour" {
 
 test "the PPM header and payload are the size they claim" {
     const gpa = testing.allocator;
-    var fb = try Framebuffer.init(gpa, 4, 3);
+    var fb = try Framebuffer.init(gpa, 4, 3, .linear);
     defer fb.deinit(gpa);
     fb.clear(.white);
 

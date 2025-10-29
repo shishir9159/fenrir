@@ -282,6 +282,18 @@ pub fn registerTexture(d: *DrawList, width: u32, height: u32) Error!TextureId {
     return @intCast(d.textures.items.len);
 }
 
+/// Records that a registered texture is now a different size, keeping its id.
+///
+/// The counterpart to `Renderer.resizeTexture`: the two hold the same fact in
+/// two places -- the device holds the image, this holds the size that turns a
+/// texel rectangle into a normalised one -- and a caller that changes one and
+/// not the other samples the right image through the wrong rectangle, which
+/// looks like a page drawn at the wrong zoom rather than like a bug.
+pub fn setTextureSize(d: *DrawList, id: TextureId, width: u32, height: u32) void {
+    if (id == rect.no_texture or id > d.textures.items.len) return;
+    d.textures.items[id - 1] = .{ .width = width, .height = height };
+}
+
 pub fn textureSize(d: *const DrawList, id: TextureId) ?Texture {
     if (id == rect.no_texture or id > d.textures.items.len) return null;
     return d.textures.items[id - 1];

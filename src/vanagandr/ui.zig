@@ -130,7 +130,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     d.reset(viewport);
     try renderer.render(&d, &ui, &fonts, atlas);
 
-    var fb = try gleipnir.Framebuffer.init(ctx.gpa, width, height);
+    var fb = try gleipnir.Framebuffer.init(ctx.gpa, width, height, .linear);
     defer fb.deinit(ctx.gpa);
     fb.clear(.gray(0.07));
 

@@ -15,6 +15,7 @@ const info = @import("vanagandr/info.zig");
 const pages = @import("vanagandr/pages.zig");
 const rects = @import("vanagandr/rects.zig");
 const raster = @import("vanagandr/raster.zig");
+const read = @import("vanagandr/read.zig");
 const trace = @import("vanagandr/trace.zig");
 const ui = @import("vanagandr/ui.zig");
 const view = @import("vanagandr/view.zig");
@@ -34,6 +35,7 @@ const commands = [_]Command{
     .{ .name = "xref", .summary = "print the cross-reference table", .usage = xref.usage, .run = xref.run },
     .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run },
     .{ .name = "raster", .summary = "rasterise a page to a PNG on the CPU", .usage = raster.usage, .run = raster.run },
+    .{ .name = "read", .summary = "open the document in a window and scroll through it", .usage = read.usage, .run = read.run },
     .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
     .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run },

@@ -89,13 +89,25 @@ pub const TextureKind = enum {
     /// shader reads the red channel and modulates alpha only, so one atlas
     /// serves every colour of text on the screen.
     coverage,
-    /// Four bytes per pixel, sRGB-encoded. Decoded page images, eventually.
+    /// Four bytes per pixel, sRGB-encoded: a rasterised page, a decoded image.
     color,
 
     fn format(k: TextureKind) vk.Format {
         return switch (k) {
             .coverage => .r8_unorm,
-            .color => .r8g8b8a8_srgb,
+            // UNORM, not `_SRGB`, even though the bytes *are* sRGB-encoded.
+            //
+            // An `_SRGB` sampled image is decoded by the hardware on read, so
+            // the shader would receive linear light -- and `rect.frag` then
+            // applies `srgbToLinear` to it, because that is what it does to
+            // every colour it is given. Converting twice is a page rendered
+            // far too dark, and it is invisible in the CPU model, whose
+            // sampler hands over the stored bytes.
+            //
+            // So the rule is one rule everywhere: every colour that reaches
+            // the shader is sRGB-encoded and the shader decodes it. The
+            // hardware is told to keep its hands off.
+            .color => .r8g8b8a8_unorm,
         };
     }
 
@@ -1011,13 +1023,23 @@ test "the renderer agrees with the contract it was written against" {
     try testing.expectEqual(@as(u32, 96), @sizeOf(rect.Instance));
 }
 
-test "a texture kind knows its format and its stride" {
+test "no sampled texture is an sRGB format, whatever its bytes mean" {
     try testing.expectEqual(vk.Format.r8_unorm, TextureKind.coverage.format());
     try testing.expectEqual(@as(u32, 1), TextureKind.coverage.bytesPerPixel());
-    // sRGB for colour, so the hardware decodes on read and the shader's own
-    // conversion is applied to a value that is already linear.
-    try testing.expectEqual(vk.Format.r8g8b8a8_srgb, TextureKind.color.format());
     try testing.expectEqual(@as(u32, 4), TextureKind.color.bytesPerPixel());
+
+    // The one that matters, and the one that is tempting to get wrong: a
+    // page image holds sRGB-encoded bytes, so `_SRGB` looks like the honest
+    // format for it. It is not. `rect.frag` converts every colour it is
+    // handed, so a format that also converts converts twice, and the page
+    // comes out at roughly the square of the brightness it should have.
+    //
+    // The CPU model cannot catch this -- its sampler hands over the stored
+    // bytes -- so it is pinned here instead.
+    inline for (comptime std.enums.values(TextureKind)) |kind| {
+        try testing.expect(!kind.format().isSrgb());
+    }
+    try testing.expectEqual(vk.Format.r8g8b8a8_unorm, TextureKind.color.format());
 }
 
 test "the descriptor pool is sized for what the sets actually hold" {

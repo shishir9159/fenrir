@@ -19,10 +19,14 @@
 //!   The rect pipeline gets its edges from `sdf.zig` and needs none of this;
 //!   the two pipelines antialias by different means and that is deliberate.
 //!
-//! It shares `software.Framebuffer` with the rect rasteriser -- same linear
-//! premultiplied float pixels, same blend, same PNG writer -- so a page's
+//! It shares `software.Framebuffer` with the rect rasteriser -- same
+//! premultiplied float pixels, same blend, same PNG writer -- so a page’s
 //! rects and paths land in one image and `fenrir raster` can put a real PDF
-//! page on disk with no GPU in the process.
+//! page on disk with no GPU in the process. The one thing it does not share
+//! is the compositing space: the rect pipeline models an `_SRGB` colour
+//! attachment and blends in light, and a page blends in the device’s own
+//! space, because that is what PDF asks for. `software.Space` is where that
+//! choice is written down.
 //!
 //! ## Speed
 //!
@@ -47,17 +51,16 @@ const Bounds = geom.Bounds;
 const Color = paint.Color;
 const FillRule = geom.FillRule;
 const Framebuffer = software.Framebuffer;
+const Space = software.Space;
 const Mesh = path.Mesh;
 const Transform = geom.Transform;
 const Vertex = path.Vertex;
 
 /// How many samples a pixel is split into.
 ///
-/// Four is the default for the same reason it is everywhere: it is the point
-/// where an edge stops looking like stairs, and eight costs twice the memory
-/// and twice the stencil traffic to remove an artefact most people cannot see.
-/// One exists so a test can assert on exact pixel coverage without reasoning
-/// about sample positions.
+/// Eight is the default, which is more than a UI would want and about right
+/// for text: see `Options.samples`. One exists so a test can assert on exact
+/// pixel coverage without reasoning about sample positions.
 pub const Samples = enum(u8) {
     one = 1,
     two = 2,
@@ -91,7 +94,22 @@ pub const Samples = enum(u8) {
 };
 
 pub const Options = struct {
-    samples: Samples = .four,
+    /// Eight, not four. Coverage from N samples has N+1 levels, so four gives
+    /// a glyph edge five shades to work with and eight gives it nine — and a
+    /// stem at a reading size is one or two pixels wide, so those levels are
+    /// most of what its weight is made of. The extra samples cost about a
+    /// quarter more time on a page and are the cheapest quality in the
+    /// renderer.
+    samples: Samples = .eight,
+    /// Which space partial coverage is composited in.
+    ///
+    /// sRGB by default, which is not the physically correct answer and is the
+    /// right one. PDF composites in the device colour space (§11.3.8), every
+    /// other reader does the same, and a page blended in linear light comes
+    /// out looking like a photocopy: a stem edge at half coverage lands on
+    /// 188 instead of 128, so every glyph in the document is a shade too
+    /// light and a fraction too thin.
+    space: Space = .srgb,
 };
 
 /// A framebuffer, a stencil buffer, and a clip.
@@ -131,10 +149,17 @@ pub const Canvas = struct {
     /// exactly one of the two triangles.
     cover: []u8,
     samples: Samples,
+    /// `/BM` for everything drawn until it is set again (§11.3.5).
+    ///
+    /// Device state, like the clip, rather than an argument to every call --
+    /// which is what it is in PDF too. It is here and not on the paint because
+    /// the blend function needs the backdrop, so it belongs to the surface
+    /// being drawn on rather than to the colour being drawn with.
+    blend_mode: paint.BlendMode = .normal,
 
     pub fn init(gpa: Allocator, w: u32, h: u32, options: Options) Allocator.Error!Canvas {
         const n = @as(usize, w) * h;
-        const fb = try Framebuffer.init(gpa, w, h);
+        const fb = try Framebuffer.init(gpa, w, h, options.space);
         errdefer {
             var f = fb;
             f.deinit(gpa);
@@ -397,22 +422,44 @@ pub const Canvas = struct {
         }
     }
 
-    /// The same blend the rect rasteriser and the GPU use: premultiplied
-    /// source over destination, in linear light.
+    /// Premultiplied source over destination, in the framebuffer's own space,
+    /// through the current blend mode.
+    ///
+    /// §11.3.6 in full is
+    ///
+    ///     Cr = (1 - as)*Cb + as*[ (1 - ab)*Cs + ab*B(Cb, Cs) ]
+    ///
+    /// which for the common case of an opaque backdrop collapses to
+    /// `(1 - as)*Cb + as*B(Cb, Cs)` -- and for `normal`, where `B` is just
+    /// `Cs`, to the plain source-over every other path here uses. Writing the
+    /// general form costs one unpremultiply and buys every blend mode,
+    /// including over the transparent regions a page can have.
     fn blend(c: *Canvas, pixel: usize, color: Color, cov: f32) void {
         const a = std.math.clamp(color.a, 0, 1) * std.math.clamp(cov, 0, 1);
         if (a <= 0) return;
-        const src = [3]f32{
-            rect.srgbToLinear(std.math.clamp(color.r, 0, 1)) * a,
-            rect.srgbToLinear(std.math.clamp(color.g, 0, 1)) * a,
-            rect.srgbToLinear(std.math.clamp(color.b, 0, 1)) * a,
-        };
         const o = pixel * 4;
+        const ab = c.fb.pixels[o + 3];
+
+        var cs = [3]f32{
+            c.fb.encode(std.math.clamp(color.r, 0, 1)),
+            c.fb.encode(std.math.clamp(color.g, 0, 1)),
+            c.fb.encode(std.math.clamp(color.b, 0, 1)),
+        };
+        if (c.blend_mode != .normal and ab > 0) {
+            const cb = [3]f32{
+                c.fb.pixels[o + 0] / ab,
+                c.fb.pixels[o + 1] / ab,
+                c.fb.pixels[o + 2] / ab,
+            };
+            const mixed = c.blend_mode.blend(cb, cs);
+            for (&cs, mixed) |*s, m| s.* = s.* * (1 - ab) + m * ab;
+        }
+
         const inv = 1.0 - a;
-        c.fb.pixels[o + 0] = c.fb.pixels[o + 0] * inv + src[0];
-        c.fb.pixels[o + 1] = c.fb.pixels[o + 1] * inv + src[1];
-        c.fb.pixels[o + 2] = c.fb.pixels[o + 2] * inv + src[2];
-        c.fb.pixels[o + 3] = c.fb.pixels[o + 3] * inv + a;
+        c.fb.pixels[o + 0] = c.fb.pixels[o + 0] * inv + cs[0] * a;
+        c.fb.pixels[o + 1] = c.fb.pixels[o + 1] * inv + cs[1] * a;
+        c.fb.pixels[o + 2] = c.fb.pixels[o + 2] * inv + cs[2] * a;
+        c.fb.pixels[o + 3] = ab * inv + a;
     }
 };
 
@@ -728,7 +775,10 @@ test "overlapping fills composite in submission order" {
     try testing.expectApproxEqAbs(@as(f32, 1), got.b, 0.01);
 }
 
-test "a half-transparent fill lets the background through" {
+test "a multiply fill lets the backdrop through, which is what a highlight is" {
+    // The whole reason blend modes are here. A highlight annotation is a
+    // yellow rectangle over the text with `/BM /Multiply`; drawn normally it
+    // is a yellow rectangle over the text and the text is gone.
     const gpa = testing.allocator;
     var c: Canvas = try .init(gpa, 16, 16, .{ .samples = .one });
     defer c.deinit(gpa);
@@ -736,16 +786,63 @@ test "a half-transparent fill lets the background through" {
 
     var f: Flattener = .init(.{});
     defer f.deinit(gpa);
-    const flat = try polygon(gpa, &f, &.{ .{ 2, 2 }, .{ 14, 2 }, .{ 14, 14 }, .{ 2, 14 } });
-    var m = try path.mesh(gpa, flat);
-    defer m.deinit(gpa);
-    c.fill(m, .identity, .nonzero, .black, 0.5);
 
-    // Halfway between black and white *in linear light*, which reads as about
-    // 0.74 once it is encoded back to sRGB -- not 0.5. Getting that wrong is
-    // how a renderer ends up with text that is too dark.
-    const got = c.fb.at(8, 8);
-    try testing.expectApproxEqAbs(@as(f32, 0.7354), got.r, 0.01);
+    // A black bar across the middle: the "text".
+    {
+        const flat = try polygon(gpa, &f, &.{ .{ 0, 6 }, .{ 16, 6 }, .{ 16, 10 }, .{ 0, 10 } });
+        var m = try path.mesh(gpa, flat);
+        defer m.deinit(gpa);
+        c.fill(m, .identity, .nonzero, .black, 1);
+    }
+
+    f.reset();
+    c.blend_mode = .multiply;
+    {
+        const flat = try polygon(gpa, &f, &.{ .{ 0, 0 }, .{ 16, 0 }, .{ 16, 16 }, .{ 0, 16 } });
+        var m = try path.mesh(gpa, flat);
+        defer m.deinit(gpa);
+        c.fill(m, .identity, .nonzero, .{ .r = 1, .g = 1, .b = 0 }, 1);
+    }
+    c.blend_mode = .normal;
+
+    // Off the bar: white times yellow is yellow.
+    const paper = c.fb.at(8, 2);
+    try testing.expectApproxEqAbs(@as(f32, 1), paper.r, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0), paper.b, 0.01);
+
+    // On it: black times anything is black, so the text survives.
+    const ink = c.fb.at(8, 8);
+    try testing.expectApproxEqAbs(@as(f32, 0), ink.r, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0), ink.g, 0.01);
+}
+
+test "the compositing space decides what half of black over white means" {
+    // The whole of the difference between a page and a photocopy of one, in
+    // one pixel. Half coverage of black over white is 0.5 if the halving is
+    // done in sRGB and 0.735 if it is done in light, and every antialiased
+    // glyph edge in a document is that pixel. Both answers are defensible in
+    // the abstract; PDF composites in the device's colour space (11.3.8) and
+    // so does every other reader, so `.srgb` is the default and this pins it
+    // rather than leaving it to whichever one a later edit happens to write.
+    const gpa = testing.allocator;
+
+    for ([_]struct { space: Space, want: f32 }{
+        .{ .space = .srgb, .want = 0.5 },
+        .{ .space = .linear, .want = 0.7354 },
+    }) |case| {
+        var c: Canvas = try .init(gpa, 16, 16, .{ .samples = .one, .space = case.space });
+        defer c.deinit(gpa);
+        c.fb.clear(.white);
+
+        var f: Flattener = .init(.{});
+        defer f.deinit(gpa);
+        const flat = try polygon(gpa, &f, &.{ .{ 2, 2 }, .{ 14, 2 }, .{ 14, 14 }, .{ 2, 14 } });
+        var m = try path.mesh(gpa, flat);
+        defer m.deinit(gpa);
+        c.fill(m, .identity, .nonzero, .black, 0.5);
+
+        try testing.expectApproxEqAbs(case.want, c.fb.at(8, 8).r, 0.01);
+    }
 }
 
 test "an empty mesh draws nothing and touches nothing" {
@@ -816,4 +913,48 @@ test "a stroked outline rasterises as a ring" {
     try testing.expectApproxEqAbs(@as(f32, 0), c.fb.alphaAt(32, 32), 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0), c.fb.alphaAt(32, 8), 0.001);
     try testing.expect(c.stencilIsClean());
+}
+
+test "the interior of a multisampled fill is solid, diagonal included" {
+    // The cover geometry is a quad, which is two triangles sharing the
+    // bounding box's diagonal. Blending once per triangle composites the same
+    // colour over that diagonal's pixels twice at partial coverage: 0.5 then
+    // 0.5 again is 0.75, not 1. The result is a lighter line corner to corner
+    // through every filled shape on the page -- invisible at one sample,
+    // because there only one triangle can claim the single sample, and plainly
+    // visible at four.
+    //
+    // Deliberately at fractional coordinates: on integer bounds the diagonal
+    // passes through pixel corners and the artefact hides.
+    const gpa = testing.allocator;
+    var c: Canvas = try .init(gpa, 48, 48, .{ .samples = .four });
+    defer c.deinit(gpa);
+    c.fb.clear(.white);
+
+    var f: Flattener = .init(.{});
+    defer f.deinit(gpa);
+    const flat = try polygon(gpa, &f, &.{
+        .{ 6.37, 8.21 }, .{ 41.63, 8.21 }, .{ 41.63, 39.79 }, .{ 6.37, 39.79 },
+    });
+    try fillPath(gpa, &c, flat, .identity, .nonzero, .black);
+
+    // Every pixel strictly inside must be fully covered. Before the fix the
+    // ones on the diagonal came out at 0.75.
+    var worst: f32 = 1;
+    var at: [2]u32 = .{ 0, 0 };
+    var y: u32 = 9;
+    while (y < 39) : (y += 1) {
+        var x: u32 = 7;
+        while (x < 41) : (x += 1) {
+            const a = c.fb.alphaAt(x, y);
+            if (a < worst) {
+                worst = a;
+                at = .{ x, y };
+            }
+        }
+    }
+    testing.expectApproxEqAbs(@as(f32, 1), worst, 0.001) catch |e| {
+        std.debug.print("pixel {d},{d} is only {d:.3} covered\n", .{ at[0], at[1], worst });
+        return e;
+    };
 }
