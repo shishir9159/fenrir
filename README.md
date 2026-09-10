@@ -116,7 +116,7 @@ the executable on `PATH`, never the SDK's headers or libraries.
 
 Every shader must ask for `GL_GOOGLE_include_directive` by name if it
 `#include`s anything. `glslc` enables it implicitly and `glslang` does not, so
-a shader without that line compiles with one and fails with the other.
+a shader without that line compiles with one and fails with the other. Tried aganst glslang-16.5.0-x86_64-release.
 
 A binary built without one opens its window, creates its device and swapchain,
 acquires and presents images, and draws nothing, with a message saying so. That
