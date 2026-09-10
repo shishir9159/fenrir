@@ -763,7 +763,7 @@ well the drawing was ordered.
 ### 7. Týr — fonts *(three native parsers landed)*
 
 **Two interfaces, not one.** "Font backend" is usually said as though
-FreeType, stb_truetype and HarfBuzz were three answers to one question. They
+FreeType, stb_truetype(https://codeberg.org/andrewrk/TrueType) and HarfBuzz were three answers to one question. They
 are answers to two.
 
 | | in | out | implementations |
@@ -1009,3 +1009,6 @@ Edda. Gleipnir's six ingredients were the sound of a cat's footfall, the
 beard of a woman, the roots of a mountain, the sinews of a bear, the breath
 of a fish, and the spittle of a bird. They no longer exist, having been used
 up in the making.
+
+# final goal: remove glslc dependency
+consume: https://codeberg.org/andrewrk/async-io-examples/src/branch/main/example8.zig
