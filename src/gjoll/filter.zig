@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const ascii = @import("filter/ascii.zig");
 const lzw = @import("filter/lzw.zig");
 
+pub const jpeg = @import("filter/jpeg.zig");
 pub const predictor = @import("filter/predictor.zig");
 pub const Predictor = predictor.Params;
 
@@ -291,4 +292,9 @@ test "the chain stops at an image codec" {
     defer result.deinit(testing.allocator);
     try testing.expectEqual(@as(?Kind, .dct), result.stopped_at);
     try testing.expectEqualStrings("\xff\xd8\xff", result.data);
+}
+
+test {
+    _ = jpeg;
+    _ = predictor;
 }
