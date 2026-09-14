@@ -25,9 +25,11 @@ const fenrir = @import("fenrir");
 const Context = @import("Context.zig");
 
 const content = fenrir.content;
+const gelgja = fenrir.gelgja;
 const gleipnir = fenrir.gleipnir;
 const replay = gleipnir.replay;
 const glyphmod = @import("glyphs.zig");
+const Images = @import("images.zig").Images;
 const Glyphs = glyphmod.Fonts;
 
 pub const usage =
@@ -54,10 +56,17 @@ pub const usage =
     \\    --no-annots    Draw only the content stream, leaving out highlights,
     \\                   stamps, form fields and every other annotation.
     \\    --stats        Report and write nothing.
+    \\    --path P       Which rasteriser fills an outline: stencil (the
+    \\                   default), slug, or both -- which renders the page
+    \\                   twice and reports how far the two disagree.
+    \\    --rays N       Sub-rows per pixel for the analytic rasteriser.
+    \\                   Defaults to 4.
     \\
-    \\    Text is drawn: Tyr reads TrueType, CFF and Type 1 outlines and the
-    \\    path pipeline fills them. Images, shadings and tiling patterns are
-    \\    not, and are counted and reported rather than passed over in silence.
+    \\    Text and images are drawn: Tyr reads TrueType, CFF and Type 1
+    \\    outlines, and Gjoll decodes Flate and baseline JPEG images through
+    \\    the document's colour space. JPEG 2000, CCITT and JBIG2 images,
+    \\    shadings and tiling patterns are not, and are counted and reported
+    \\    rather than passed over in silence.
 ;
 
 /// Above this, a page is almost certainly a mistake -- a --dpi typo, or a
@@ -74,6 +83,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var dpi: f32 = 96;
     var scale: ?f32 = null;
     var samples: gleipnir.raster.Samples = .eight;
+    var path_choice: PathChoice = .stencil;
     var options: content.Options = .{};
     var replay_options: replay.Options = .{};
     var ascii: ?[4]u32 = null;
@@ -132,6 +142,23 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             stats_only = true;
         } else if (std.mem.eql(u8, arg, "--fonts")) {
             list_fonts = true;
+        } else if (std.mem.eql(u8, arg, "--path")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--path needs stencil, slug or both", .{});
+            path_choice = if (std.mem.eql(u8, argv[i], "stencil"))
+                .stencil
+            else if (std.mem.eql(u8, argv[i], "slug"))
+                .slug
+            else if (std.mem.eql(u8, argv[i], "both"))
+                .both
+            else
+                return ctx.fail("--path wants stencil, slug or both, not {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--rays")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--rays needs a count", .{});
+            replay_options.rays = std.fmt.parseInt(u32, argv[i], 10) catch
+                return ctx.fail("--rays wants a number, not {s}", .{argv[i]});
+            if (replay_options.rays == 0) return ctx.fail("--rays must be at least 1", .{});
         } else if (std.mem.eql(u8, arg, "--ascii")) {
             i += 1;
             if (i == argv.len) return ctx.fail("--ascii needs x,y,w,h", .{});
@@ -169,6 +196,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const job: Job = .{
         .factor = factor,
         .samples = samples,
+        .path = path_choice,
         .options = options,
         .replay = replay_options,
         .stats_only = stats_only,
@@ -207,7 +235,13 @@ const Job = struct {
     stats_only: bool,
     ascii: ?[4]u32 = null,
     list_fonts: bool = false,
+    path: PathChoice = .stencil,
 };
+
+/// Which rasteriser fills the page's outlines. `both` renders it twice and
+/// says how far apart the two came out, which is how the analytic one is
+/// checked against the one that is known to be right.
+const PathChoice = enum { stencil, slug, both };
 
 fn one(
     ctx: *Context,
@@ -241,8 +275,20 @@ fn one(
     var glyphs: Glyphs = try .init(ctx.gpa, doc, result.list, ctx.io);
     defer glyphs.deinit();
 
+    // A real allocator and not `ctx.gpa`, which is the CLI's arena. A decoded
+    // page image is tens of megabytes, `--all` decodes them a page at a time,
+    // and on an arena `deinit` is a no-op -- so a scanned book would climb
+    // into the gigabytes before it finished. Everything else this command
+    // allocates is arena-shaped and bounded by the document; this is not.
+    var heap: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = heap.deinit();
+    var images: Images = .init(heap.allocator(), doc, p.resources);
+    defer images.deinit();
+
     var options = job.replay;
     options.glyphs = glyphs.source();
+    options.images = images.source();
+    options.path_backend = if (job.path == .slug) .slug else .stencil;
 
     const stats = replay.render(
         ctx.gpa,
@@ -279,6 +325,8 @@ fn one(
         }) catch {};
     }
 
+    images.report(ctx.out);
+
     if (job.list_fonts) glyphmod.describe(&glyphs, result.list, ctx.out) catch {};
 
     if (job.ascii) |w| dumpWindow(ctx, canvas.fb, w);
@@ -287,7 +335,103 @@ fn one(
         try writePng(ctx, dest, canvas.fb);
         ctx.out.print("wrote {s}\n", .{dest}) catch {};
     }
+
+    if (job.path == .both) try second(ctx, doc, result.list, &glyphs, canvas.fb, dest, job, size);
     return stats;
+}
+
+/// Renders the same page again through the analytic rasteriser and reports
+/// how far the two disagree.
+///
+/// This is the only evidence the slug pipeline is correct that can be
+/// collected without a device, and it is collected on real documents rather
+/// than on shapes a test invented. Two independent rasterisers agreeing to
+/// within a percent of a level, across a page of several thousand glyphs, is
+/// a much stronger statement than either one passing its own unit tests.
+fn second(
+    ctx: *Context,
+    doc: *fenrir.Document,
+    list: gelgja.DisplayList,
+    glyphs: *Glyphs,
+    reference: gleipnir.Framebuffer,
+    dest: []const u8,
+    job: Job,
+    size: [2]u32,
+) !void {
+    _ = doc;
+    var canvas = gleipnir.raster.Canvas.init(ctx.gpa, size[0], size[1], .{ .samples = job.samples }) catch
+        return;
+    defer canvas.deinit(ctx.gpa);
+    canvas.fb.clear(.white);
+
+    var options = job.replay;
+    options.glyphs = glyphs.source();
+    options.path_backend = .slug;
+
+    _ = replay.render(
+        ctx.gpa,
+        &canvas,
+        list,
+        replay.pageTransform(list.page, job.factor),
+        options,
+    ) catch |err| {
+        ctx.note("the analytic pass failed: {t}", .{err});
+        return;
+    };
+
+    compare(ctx, reference, canvas.fb);
+
+    if (!job.stats_only) {
+        const other = suffixed(ctx, dest, "-slug") catch return;
+        defer ctx.gpa.free(other);
+        try writePng(ctx, other, canvas.fb);
+        ctx.out.print("wrote {s}\n", .{other}) catch {};
+    }
+}
+
+fn suffixed(ctx: *Context, name: []const u8, tail: []const u8) ![]u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse name.len;
+    return std.fmt.allocPrint(ctx.gpa, "{s}{s}{s}", .{ name[0..dot], tail, name[dot..] }) catch
+        return ctx.fail("out of memory", .{});
+}
+
+/// Per-pixel difference between two renders of the same page.
+///
+/// Reported in levels out of 255, because that is the unit a difference has
+/// to be judged in: a mean under a level is invisible, a maximum of a few
+/// levels is an antialiased edge landing differently, and anything with a
+/// large *count* of big differences is a shape in the wrong place.
+fn compare(ctx: *Context, a: gleipnir.Framebuffer, b: gleipnir.Framebuffer) void {
+    if (a.width != b.width or a.height != b.height) return;
+    const n = @as(usize, a.width) * a.height;
+
+    var total: f64 = 0;
+    var worst: f32 = 0;
+    var over_1: u64 = 0;
+    var over_8: u64 = 0;
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var d: f32 = 0;
+        for (0..3) |c| {
+            d = @max(d, @abs(a.pixels[i * 4 + c] - b.pixels[i * 4 + c]));
+        }
+        const levels = d * 255.0;
+        total += levels;
+        worst = @max(worst, levels);
+        if (levels > 1) over_1 += 1;
+        if (levels > 8) over_8 += 1;
+    }
+
+    ctx.out.print(
+        "         stencil vs slug: mean {d:.3}, worst {d:.1}, {d:.3}% over 1 level, {d:.3}% over 8\n",
+        .{
+            total / @as(f64, @floatFromInt(n)),
+            worst,
+            @as(f64, @floatFromInt(over_1)) * 100.0 / @as(f64, @floatFromInt(n)),
+            @as(f64, @floatFromInt(over_8)) * 100.0 / @as(f64, @floatFromInt(n)),
+        },
+    ) catch {};
 }
 
 /// `page-4.png`, or `name-4.png` from a `--out name.png`.
@@ -349,7 +493,12 @@ fn report(ctx: *Context, s: replay.Stats) void {
     if (s.glyphs_missing != 0) {
         ctx.note("{d} glyphs had no outline: unembedded font, or a code the encoding did not resolve", .{s.glyphs_missing});
     }
-    if (s.images != 0) ctx.note("{d} images not drawn: no image decoder yet", .{s.images});
+    if (s.images_not_drawn != 0) {
+        ctx.note("{d} of {d} images not drawn: see the codec note above", .{
+            s.images_not_drawn,
+            s.images,
+        });
+    }
     if (s.shadings != 0) ctx.note("{d} shadings not drawn", .{s.shadings});
     if (s.unsupported_paint != 0) {
         ctx.note("{d} paths with a gradient or pattern fill not drawn", .{s.unsupported_paint});

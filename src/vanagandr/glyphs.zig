@@ -77,6 +77,9 @@ const Binding = struct {
     }
 };
 
+/// A font program and who is responsible for it. See `Fonts.programs`.
+const Program = struct { bytes: []u8, owned: bool };
+
 /// Resolves and caches every font a display list mentions.
 pub const Fonts = struct {
     gpa: Allocator,
@@ -86,7 +89,18 @@ pub const Fonts = struct {
     io: ?std.Io = null,
     bindings: []Binding,
     /// Font programs, kept alive because a `Face` borrows its bytes.
-    programs: std.ArrayList([]u8) = .empty,
+    ///
+    /// Two owners, and the difference matters. A program read out of the
+    /// document comes from `Document.streamData`, which decodes into the
+    /// document's *arena* -- so it lives as long as the document and must not
+    /// be freed here. A substitute read off the machine was allocated with
+    /// `gpa` and must be.
+    ///
+    /// Freeing both was harmless for as long as every command ran on one
+    /// process-wide arena, where `free` does nothing. `fenrir read` has a real
+    /// allocator now, and the same line is an invalid free on the first page
+    /// with an embedded font in it.
+    programs: std.ArrayList(Program) = .empty,
     /// The outline handed back by the last `lookup`. One buffer, reused: the
     /// interface promises the slices only until the next call, which is
     /// exactly what a page-at-a-time replay needs.
@@ -118,7 +132,9 @@ pub const Fonts = struct {
     pub fn deinit(f: *Fonts) void {
         for (f.bindings) |*b| b.deinit(f.gpa);
         f.gpa.free(f.bindings);
-        for (f.programs.items) |p| f.gpa.free(p);
+        for (f.programs.items) |p| {
+            if (p.owned) f.gpa.free(p.bytes);
+        }
         f.programs.deinit(f.gpa);
         f.scratch.deinit(f.gpa);
     }
@@ -282,9 +298,10 @@ pub const Fonts = struct {
         // The document's own program first. Only when there is none -- which
         // is legal, and is what `/BaseFont /Helvetica` with no descriptor
         // means -- does a face off this machine stand in.
-        const program = blk: {
+        const entry: Program = blk: {
             if (descriptor) |fd| {
-                if (try f.readProgram(fd)) |p| break :blk p;
+                // The document's arena owns this one.
+                if (try f.readProgram(fd)) |p| break :blk .{ .bytes = p, .owned = false };
             }
             const sub = readSubstitute(f, f.base_font, flags) orelse return;
             b.substituted = true;
@@ -293,9 +310,10 @@ pub const Fonts = struct {
             // so its own cmap must not be consulted with raw codes: the name
             // chain is the only thing that means anything now.
             b.symbolic = false;
-            break :blk sub;
+            break :blk .{ .bytes = sub, .owned = true };
         };
-        try f.programs.append(f.gpa, program);
+        try f.programs.append(f.gpa, entry);
+        const program = entry.bytes;
 
         b.face = tyr.open(f.gpa, program, .{}) catch null;
         // The fallback backend opens anything and draws boxes. A box is worse
@@ -310,17 +328,16 @@ pub const Fonts = struct {
         }
     }
 
-    /// `/FontFile`, `/FontFile2` or `/FontFile3`, decoded. The caller owns it.
+    /// `/FontFile`, `/FontFile2` or `/FontFile3`, decoded into the document.s
+    /// arena, which owns it and outlives this.
     fn readProgram(f: *Fonts, fd: Dict) !?[]u8 {
         for ([_][]const u8{ "FontFile2", "FontFile3", "FontFile" }) |key| {
             const v = try f.doc.get(fd, key) orelse continue;
             const r = try f.doc.resolve(v);
             const stream = r.asStream() orelse continue;
             const data = f.doc.streamData(stream) catch continue;
-            if (data.data.len == 0) {
-                f.gpa.free(data.data);
-                continue;
-            }
+            // Not freed: the document.s arena will, when the document goes.
+            if (data.data.len == 0) continue;
             return data.data;
         }
         return null;

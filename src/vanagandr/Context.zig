@@ -19,10 +19,21 @@ err: *Io.Writer,
 /// the cross-reference table is at the end and points backwards -- so there is
 /// no streaming path worth having here.
 pub fn readFile(ctx: *Context, path: []const u8) ![]u8 {
+    return ctx.readFileWith(ctx.gpa, path);
+}
+
+/// Reads a file with an allocator that is not the command's.
+///
+/// `Document` frees the bytes it was opened with, using the allocator it was
+/// opened with, so a command that gives `fenrir.open` its own heap -- as
+/// `read` does, because the CLI's arena never frees and a reader runs until
+/// you close it -- has to read the file with that same heap or the free at
+/// the end is an invalid one.
+pub fn readFileWith(ctx: *Context, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     // One gibibyte is far past any real document and keeps a corrupt length
     // from turning into an allocation failure at an awkward moment.
     const max_size: Io.Limit = .limited(1 << 30);
-    return Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.gpa, max_size);
+    return Io.Dir.cwd().readFileAlloc(ctx.io, path, gpa, max_size);
 }
 
 pub fn fail(ctx: *Context, comptime fmt: []const u8, args: anytype) error{CommandFailed} {

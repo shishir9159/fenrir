@@ -29,20 +29,46 @@
 //! frame loop -- all of which the GPU pipeline will need working underneath
 //! it.
 //!
-//! ## Cost
+//! ## Cost, and why there is a second thread
 //!
-//! A page costs one interpretation and one rasterisation, tens of
-//! milliseconds in a release build and several times that in a debug one. So
-//! pages are rendered lazily, at most one per frame, and kept in a small
-//! cache; scrolling past an unrendered page shows blank paper for a frame or
-//! two rather than stalling the loop until it is ready.
+//! A page costs one interpretation and one rasterisation. For a page of prose
+//! that is a couple of hundred milliseconds in a release build; for a page
+//! whose figure is a scatter plot of several thousand separately clipped
+//! markers it is a second, because the CPU rasteriser's work is proportional
+//! to the summed area of its stencil fans and that page has three million
+//! device pixels of them.
+//!
+//! Either number is far longer than a frame. Rasterising on the frame thread
+//! therefore does not make the reader slow, it makes it *stop* -- smooth
+//! scrolling until a heavy page comes into view, then a freeze, then smooth
+//! scrolling again. So rasterisation happens on a thread of its own and the
+//! loop never blocks on it: it collects whatever finished, uploads it, and
+//! draws. A page not ready yet is blank paper for a few frames.
+//!
+//! The document is the reason it is one thread and not a pool. `Document.get`
+//! fills an object cache, so it is not safe to call from two threads at once.
+//! The worker owns it; the frame loop touches only `pages[i]`, which is a
+//! value copy of geometry resolved when the file was opened.
+//!
+//! ## Memory
+//!
+//! The reader allocates from its own heap rather than from the CLI's arena.
+//! Every other command is a short-lived process for which never freeing is
+//! the right trade; a reader is not. A page's framebuffer is four floats per
+//! pixel and its texture four bytes, so an arena would grow by tens of
+//! megabytes per page scrolled past, and the allocator's own cost would grow
+//! with it -- which is felt as a scroll that gets stickier the longer you
+//! read.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const fenrir = @import("fenrir");
 
 const Context = @import("Context.zig");
 const glyphmod = @import("glyphs.zig");
+const Images = @import("images.zig").Images;
 
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
@@ -54,6 +80,24 @@ const Bounds = gelgja.Bounds;
 const Color = gelgja.Color;
 const DrawList = gleipnir.DrawList;
 const Glyphs = glyphmod.Fonts;
+const Scene = gleipnir.scene.Scene;
+
+/// Which path rasteriser this binary has, from `-Dpath`.
+const have_cpu = fenrir.build_options.path_cpu;
+const have_gpu = fenrir.build_options.path_gpu;
+
+/// Where a page's marks are turned into pixels.
+///
+///   **cpu** -- rasterised into an image and uploaded as a texture. Every
+///   feature the renderer has: all sixteen blend modes, antialiased clips,
+///   transparency groups. Costs a page of work per zoom change and hundreds
+///   of milliseconds for a heavy page.
+///
+///   **gpu** -- the outlines go to the device and the fragment shader works
+///   out coverage from the curves. Resolution independent, so a zoom is a
+///   matrix and not a re-render, and a page is one draw call. Does not yet
+///   composite blend modes.
+const Backend = enum { cpu, gpu };
 
 pub const usage =
     \\fenrir read <file> [--page N] [--zoom N | --dpi N] [--size WxH]
@@ -63,8 +107,10 @@ pub const usage =
     \\    Opens the document in a window and scrolls through it.
     \\
     \\    --page N     Start at this page, numbered from 1.
-    \\    --zoom N     Device pixels per PDF point. 1.0 is 72 dpi.
-    \\    --dpi N      The same thing in the other unit. Defaults to 110.
+    \\    --zoom N     Device pixels per PDF point. 1.0 is 72 dpi. Without
+    \\                 it the page is fitted to the width of the window,
+    \\                 which is what a reader opened on a document wants.
+    \\    --dpi N      The same thing in the other unit.
     \\    --size WxH   The window's initial size.
     \\    --samples N  Multisampling for the page raster: 1, 2, 4 or 8.
     \\                 Defaults to 8.
@@ -72,6 +118,10 @@ pub const usage =
     \\    --shot F     Write one composed frame to F as a PNG and exit, with
     \\                 no window and no device. What the reader would look
     \\                 like, on a machine with no display and in a test.
+    \\    --path P     Which path rasteriser draws the page: cpu or gpu.
+    \\                 Only what this build has; see -Dpath. With cpu the
+    \\                 page is rasterised into a texture, with gpu its
+    \\                 outlines are drawn by the analytic pipeline.
     \\    --vsync      on (default), off, or adaptive.
     \\    --validate   Turn on the Khronos validation layers, if installed.
     \\    --gpu NAME   Prefer a device whose name contains NAME.
@@ -86,10 +136,11 @@ pub const usage =
     \\    1                    one hundred per cent
     \\    escape, q            close
     \\
-    \\    Pages are rasterised on the CPU and uploaded as textures -- the same
-    \\    pixels `fenrir raster` writes to a PNG. The GPU path pipeline is
-    \\    specified and its shaders compile, but the renderer does not create
-    \\    it yet, so it is not what draws this.
+    \\    The percentage in the title bar is relative to the page's true
+    \\    physical size on this display: 100% means a 72-point inch is an
+    \\    inch, display scaling included. It is not the `--zoom` number,
+    \\    which counts device pixels per point and is a different thing on
+    \\    every screen.
 ;
 
 /// How many rendered pages to keep. Six covers a screen and a half at any
@@ -113,7 +164,9 @@ const max_page_pixels: u64 = 64 << 20;
 pub fn run(ctx: *Context, args: []const []const u8) !void {
     var name: ?[]const u8 = null;
     var start_page: u32 = 1;
-    var zoom: f32 = 110.0 / 72.0;
+    // Null means "fit the width", which needs a window size to mean anything
+    // and so cannot be resolved until there is one.
+    var zoom: ?f32 = null;
     var width: u32 = 1000;
     var height: u32 = 900;
     var frames: ?u32 = null;
@@ -122,6 +175,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     var prefer: ?[]const u8 = null;
     var samples: gleipnir.raster.Samples = .eight;
     var shot: ?[]const u8 = null;
+    var backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -164,6 +218,18 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return ctx.fail("--shot needs a file", .{});
             shot = args[i];
+        } else if (std.mem.eql(u8, arg, "--path")) {
+            i += 1;
+            if (i >= args.len) return ctx.fail("--path needs cpu or gpu", .{});
+            if (std.mem.eql(u8, args[i], "cpu")) {
+                if (!have_cpu) return ctx.fail("this build has no CPU path rasteriser", .{});
+                backend = .cpu;
+            } else if (std.mem.eql(u8, args[i], "gpu")) {
+                if (!have_gpu) return ctx.fail("this build has no GPU path pipeline", .{});
+                backend = .gpu;
+            } else {
+                return ctx.fail("--path wants cpu or gpu, not '{s}'", .{args[i]});
+            }
         } else if (std.mem.eql(u8, arg, "--gpu")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--gpu needs a name", .{});
@@ -199,8 +265,10 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     }
 
     const file = name orelse return ctx.fail("read needs a file", .{});
-    if (!(zoom > 0) or !std.math.isFinite(zoom)) {
-        return ctx.fail("a zoom has to be positive and finite", .{});
+    if (zoom) |z| {
+        if (!(z > 0) or !std.math.isFinite(z)) {
+            return ctx.fail("a zoom has to be positive and finite", .{});
+        }
     }
 
     if (shot == null and !lyngvi.has_window) {
@@ -210,10 +278,25 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
         );
     }
 
-    const bytes = ctx.readFile(file) catch |err|
+    // The reader's own heap. See the note on memory at the top of the file:
+    // the CLI's arena is right for a command that runs and exits and wrong
+    // for one that runs until you close it. It also has to be safe to call
+    // from the rasterising thread, which an arena is not.
+    var heap: std.heap.DebugAllocator(.{}) = .init;
+    defer if (builtin.mode == .Debug) {
+        if (heap.deinit() == .leak) ctx.note("the reader leaked memory", .{});
+    };
+    const gpa: Allocator = if (builtin.mode == .Debug)
+        heap.allocator()
+    else
+        std.heap.smp_allocator;
+
+    // With `gpa` and not `ctx.gpa`: `Document` owns these bytes and frees
+    // them with the allocator it was opened with.
+    const bytes = ctx.readFileWith(gpa, file) catch |err|
         return ctx.fail("cannot read {s}: {t}", .{ file, err });
 
-    var doc = fenrir.open(ctx.gpa, bytes) catch |err|
+    var doc = fenrir.open(gpa, bytes) catch |err|
         return ctx.fail("cannot open {s}: {t}", .{ file, err });
     defer doc.deinit();
 
@@ -226,11 +309,16 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
 
     var reader: Reader = .{
         .ctx = ctx,
+        .gpa = gpa,
         .doc = &doc,
         .pages = pages,
         .file = file,
-        .zoom = std.math.clamp(zoom, min_zoom, max_zoom),
+        // A placeholder until there is a window to fit to, or to scale the
+        // requested zoom against. Never used to render at.
+        .zoom = std.math.clamp(zoom orelse 1.0, min_zoom, max_zoom),
+        .fit_on_open = zoom == null,
         .samples = samples,
+        .backend = backend,
     };
     defer reader.deinit();
 
@@ -315,13 +403,260 @@ const CpuTextures = struct {
     }
 };
 
+/// The pages recorded for the GPU pipeline.
+///
+/// One `Scene` holds the outlines of every cached page, so they go to the
+/// device as one set of buffers; `ranges` says which instances belong to
+/// which page. Recording is in *page space*, with no zoom and no scroll baked
+/// in, which is what makes a scroll cost a matrix per instance rather than a
+/// re-record.
+///
+/// The store is rebuilt from scratch whenever the set of cached pages
+/// changes, because a `slug.Store` is append-only and evicting a page from
+/// the middle of it would mean renumbering every header after it. Pages come
+/// into view rarely -- once per page scrolled past -- so a rebuild there is
+/// cheaper than the bookkeeping to avoid it.
+const Recorded = struct {
+    /// Every cached page's outlines, merged into one store so they reach the
+    /// device as one set of buffers.
+    scene: Scene = .{},
+    /// This frame's placement: one instance per drawn path, rebuilt whenever
+    /// the scroll or the zoom moves.
+    frame: gleipnir.scene.Frame = .{},
+    pages: [cache_slots]Entry = @splat(.{}),
+    stamp: u64 = 0,
+
+    const Entry = struct {
+        page: u32 = Slot.no_page,
+        used: u64 = 0,
+        /// The page as it was recorded, kept so the shared store can be
+        /// rebuilt when the cache changes. A `slug.Store` is append-only --
+        /// evicting from the middle of it would renumber every header after
+        /// the hole -- so the answer is to merge the survivors again.
+        source: ?Scene = null,
+        /// Where this page landed in `scene` after the last rebuild.
+        range: Scene.Range = .{},
+    };
+
+    fn deinit(rc: *Recorded, gpa: Allocator) void {
+        for (&rc.pages) |*e| {
+            if (e.source) |*s| s.deinit(gpa);
+        }
+        rc.scene.deinit(gpa);
+        rc.frame.deinit(gpa);
+    }
+
+    fn has(rc: *const Recorded, page: u32) bool {
+        for (rc.pages) |e| {
+            if (e.page == page and e.source != null) return true;
+        }
+        return false;
+    }
+
+    /// Takes ownership of a recording and puts it in a slot, evicting the
+    /// least recently drawn page if there is no free one.
+    fn insert(rc: *Recorded, gpa: Allocator, page: u32, source: Scene) Allocator.Error!void {
+        var chosen: usize = 0;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (&rc.pages, 0..) |*e, i| {
+            if (e.source == null) {
+                chosen = i;
+                break;
+            }
+            if (e.used < oldest) {
+                oldest = e.used;
+                chosen = i;
+            }
+        }
+
+        const slot = &rc.pages[chosen];
+        if (slot.source) |*old| old.deinit(gpa);
+        slot.* = .{ .page = page, .used = rc.stamp, .source = source };
+        try rc.rebuild(gpa);
+    }
+
+    /// Merges every kept recording into the shared scene again.
+    ///
+    /// Runs once per page that comes into view, not once per frame: it is a
+    /// few tens of megabytes of copying, which is a few milliseconds, and the
+    /// alternative is a free-list inside a store whose indices are absolute.
+    fn rebuild(rc: *Recorded, gpa: Allocator) Allocator.Error!void {
+        rc.scene.reset(.{ 1, 1 });
+        for (&rc.pages) |*e| {
+            if (e.source) |src| e.range = try rc.scene.merge(gpa, src);
+        }
+    }
+
+    fn touch(rc: *Recorded, page: u32) void {
+        for (&rc.pages) |*e| {
+            if (e.page == page) e.used = rc.stamp;
+        }
+    }
+};
+
+/// One page, at one zoom: everything that decides what a rasterisation will
+/// produce, and so everything needed to say whether one is still wanted.
+const Job = struct {
+    page: u32,
+    zoom: f32,
+
+    fn eql(a: Job, b: Job) bool {
+        return a.page == b.page and a.zoom == b.zoom;
+    }
+};
+
+/// The rasterising thread.
+///
+/// One thread, not a pool, because it owns the `Document` -- see the note at
+/// the top of the file. One job in flight and one waiting, with the waiting
+/// one replaced rather than queued: if the loop has asked for three pages
+/// while this thread rendered one, the third is the one on screen now and the
+/// other two are behind the scroll.
+///
+/// Everything under `mutex` is small and every critical section is a handful
+/// of assignments; the rasterising itself happens with the lock released, or
+/// the thread would be an elaborate way to do the work in the same place.
+const Rasteriser = struct {
+    reader: *Reader,
+    /// A copy of the process's `Io`, which is what the lock and the condition
+    /// are implemented in terms of. Both sides only ever use the uncancelable
+    /// operations: this thread is joined explicitly and has nothing to unwind.
+    io: Io,
+    thread: ?std.Thread = null,
+
+    mutex: Io.Mutex = .init,
+    /// Signalled by both sides: by the loop when there is a new job or the
+    /// finished one has been collected, by the worker when a job is done.
+    change: Io.Condition = .init,
+
+    /// What the loop wants next, if anything.
+    want: ?Job = null,
+    /// What the worker is rasterising right now.
+    busy: ?Job = null,
+    /// What the worker finished and the loop has not collected. A null image
+    /// means the page would not rasterise.
+    done: ?Finished = null,
+    quit: bool = false,
+
+    /// What one job produced. A CPU page is pixels; a GPU page is an outline
+    /// recorded in page space, which the frame loop merges into the shared
+    /// store and then places with a matrix.
+    const Finished = struct {
+        job: Job,
+        result: ?Result,
+
+        const Result = union(Backend) {
+            cpu: Reader.Image,
+            gpu: Scene,
+        };
+    };
+
+    fn start(rz: *Rasteriser) !void {
+        rz.thread = try std.Thread.spawn(.{}, work, .{rz});
+    }
+
+    /// Asks the worker to stop and waits for it. The worker may be halfway
+    /// through a page; it finishes that page rather than being interrupted,
+    /// because there is no safe point inside a rasterisation to stop at and
+    /// a page is a bounded amount of work.
+    fn stop(rz: *Rasteriser) void {
+        const thread = rz.thread orelse return;
+        {
+            rz.mutex.lockUncancelable(rz.io);
+            defer rz.mutex.unlock(rz.io);
+            rz.quit = true;
+            rz.change.broadcast(rz.io);
+        }
+        thread.join();
+        rz.thread = null;
+
+        // Whatever it managed to finish on the way out is still ours to free.
+        if (rz.done) |*f| {
+            rz.reader.discard(f);
+            rz.done = null;
+        }
+    }
+
+    /// Queues a job, unless it is already queued or in flight.
+    fn post(rz: *Rasteriser, job: Job) void {
+        rz.mutex.lockUncancelable(rz.io);
+        defer rz.mutex.unlock(rz.io);
+        if (rz.want) |w| {
+            if (w.eql(job)) return;
+        }
+        if (rz.busy) |b| {
+            if (b.eql(job)) return;
+        }
+        rz.want = job;
+        rz.change.signal(rz.io);
+    }
+
+    /// Takes the finished page, if there is one. Never waits: a frame that
+    /// has nothing new to show still has to be drawn, because the scroll has
+    /// moved.
+    fn collect(rz: *Rasteriser) ?Finished {
+        rz.mutex.lockUncancelable(rz.io);
+        defer rz.mutex.unlock(rz.io);
+        const f = rz.done orelse return null;
+        rz.done = null;
+        // The worker holds off on the next page until this one is taken, so
+        // that a result is never dropped on the floor. Tell it there is room.
+        rz.change.signal(rz.io);
+        return f;
+    }
+
+    fn work(rz: *Rasteriser) void {
+        while (true) {
+            rz.mutex.lockUncancelable(rz.io);
+            // Wait for work, and for somewhere to put the last answer.
+            while (!rz.quit and (rz.want == null or rz.done != null)) {
+                rz.change.waitUncancelable(rz.io, &rz.mutex);
+            }
+            if (rz.quit) {
+                rz.mutex.unlock(rz.io);
+                return;
+            }
+            const job = rz.want.?;
+            rz.want = null;
+            rz.busy = job;
+            rz.mutex.unlock(rz.io);
+
+            const result: ?Finished.Result = rz.reader.produce(job) catch null;
+
+            rz.mutex.lockUncancelable(rz.io);
+            rz.busy = null;
+            rz.done = .{ .job = job, .result = result };
+            rz.change.signal(rz.io);
+            rz.mutex.unlock(rz.io);
+        }
+    }
+};
+
 const Reader = struct {
     ctx: *Context,
+    /// The reader's heap, not the CLI's arena, and safe to call from the
+    /// rasterising thread.
+    gpa: Allocator,
     doc: *fenrir.Document,
     pages: []const fenrir.Page,
     file: []const u8,
     zoom: f32,
     samples: gleipnir.raster.Samples,
+
+    /// Which rasteriser draws the page.
+    backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu,
+    /// What the last `placeVisible` was built for, so it is not rebuilt for
+    /// a frame in which nothing moved.
+    placed: ?Placement = null,
+    /// The pages recorded for the GPU pipeline. Unused under `.cpu`.
+    recorded: Recorded = .{},
+
+    /// Device pixels per logical pixel, from the platform. 1.0 on an
+    /// unscaled display, 1.5 at 150%, and so on.
+    dpi_scale: f32 = 1,
+    /// Fit the page width to the window as soon as there is a window to fit
+    /// to. Set when neither `--zoom` nor `--dpi` was given.
+    fit_on_open: bool = false,
 
     /// The top of the viewport, in document pixels at the current zoom.
     scroll: f32 = 0,
@@ -340,8 +675,70 @@ const Reader = struct {
 
     pages_rendered: u64 = 0,
 
+    /// Pages that would not rasterise, so `firstMissing` stops asking for
+    /// them every frame. Small and forgetful on purpose: a page that failed
+    /// because memory was tight should get another chance eventually, and a
+    /// ring of sixteen gives it one.
+    failures: [16]Job = @splat(.{ .page = Slot.no_page, .zoom = 0 }),
+    failure_next: usize = 0,
+
     fn deinit(r: *Reader) void {
-        _ = r;
+        r.recorded.deinit(r.gpa);
+    }
+
+    /// One job's worth of work, on the rasterising thread, in whichever form
+    /// this backend wants it.
+    fn produce(r: *Reader, job: Job) !Rasteriser.Finished.Result {
+        return switch (r.backend) {
+            .cpu => .{ .cpu = try r.rasterise(job) },
+            // No zoom in it: the outline is recorded in page space and the
+            // frame loop places it. That is the whole reason a zoom on the
+            // GPU path is instant and on the CPU path is a re-render.
+            .gpu => .{ .gpu = try r.recordPage(job.page) },
+        };
+    }
+
+    /// Frees a finished job the frame loop is not going to use.
+    fn discard(r: *Reader, f: *Rasteriser.Finished) void {
+        const result = &(f.result orelse return);
+        switch (result.*) {
+            .cpu => |image| r.gpa.free(image.pixels),
+            .gpu => |*s| s.deinit(r.gpa),
+        }
+        f.result = null;
+    }
+
+    fn failed(r: *const Reader, page: u32, zoom: f32) bool {
+        for (r.failures) |f| {
+            if (f.page == page and f.zoom == zoom) return true;
+        }
+        return false;
+    }
+
+    fn noteFailure(r: *Reader, job: Job) void {
+        r.failures[r.failure_next] = job;
+        r.failure_next = (r.failure_next + 1) % r.failures.len;
+    }
+
+    // -- zoom, as a number a person recognises -------------------------------
+
+    /// The `zoom` at which the page is its true physical size.
+    ///
+    /// A PDF point is 1/72 inch and an unscaled display is 96 dpi by
+    /// convention, so 100% is 96/72 device pixels per point -- times the
+    /// display's own scaling, which is the part that makes the number mean
+    /// the same thing on a laptop panel and an external monitor.
+    ///
+    /// Reporting `zoom` itself as a percentage is what made the title bar say
+    /// 153%: the old default was `--dpi 110`, 110/72 = 1.528, and that is a
+    /// perfectly good number to render at and a meaningless one to show
+    /// someone.
+    fn hundredPercent(r: *const Reader) f32 {
+        return r.dpi_scale * (96.0 / 72.0);
+    }
+
+    fn percent(r: *const Reader) f32 {
+        return r.zoom / r.hundredPercent() * 100.0;
     }
 
     // -- layout -------------------------------------------------------------
@@ -438,9 +835,14 @@ const Reader = struct {
     /// window uploads.
     fn shoot(r: *Reader, dest: []const u8, width: u32, height: u32, start_page: u32) !void {
         const ctx = r.ctx;
-        const gpa = ctx.gpa;
+        const gpa = r.gpa;
+
+        // There is no device here, so there is no path pipeline either: a
+        // shot is always the CPU rasteriser, whatever the window would use.
+        r.backend = .cpu;
 
         r.viewport = .{ @floatFromInt(width), @floatFromInt(height) };
+        if (r.fit_on_open) r.fitWidth();
         r.scrollToPage(start_page);
 
         var list: DrawList = .init(gpa, .fromRect(0, 0, r.viewport[0], r.viewport[1]));
@@ -450,11 +852,11 @@ const Reader = struct {
         defer images.deinit(gpa);
 
         // Every visible page, rendered up front: there is no next frame to
-        // finish in.
+        // finish in, and no thread to finish it on.
         var slot: usize = 0;
         while (r.firstMissing()) |page| {
             if (slot >= cache_slots) break;
-            const image = r.rasterise(page) catch break;
+            const image = r.rasterise(.{ .page = page, .zoom = r.zoom }) catch break;
             const id = try list.registerTexture(image.width, image.height);
             images.entries[id - 1] = image;
             r.slots[slot] = .{
@@ -468,7 +870,9 @@ const Reader = struct {
             slot += 1;
         }
 
-        try r.compose(&list);
+        // `--shot` models the rect pipeline only, so the two layers go into
+        // one list: there is no path pass between them to separate.
+        try r.compose(&list, &list);
 
         var fb = try gleipnir.Framebuffer.init(gpa, width, height, .linear);
         defer fb.deinit(gpa);
@@ -492,7 +896,7 @@ const Reader = struct {
             dest,
             slot,
             if (slot == 1) "" else "s",
-            r.zoom * 100,
+            r.percent(),
         }) catch {};
     }
 
@@ -500,7 +904,7 @@ const Reader = struct {
 
     fn open(r: *Reader, settings: Settings) !void {
         const ctx = r.ctx;
-        const gpa = ctx.gpa;
+        const gpa = r.gpa;
 
         var window = lyngvi.open(gpa, .{
             .title = "fenrir",
@@ -556,14 +960,52 @@ const Reader = struct {
             return;
         }
 
+        // The analytic path pipeline, if this build has it and the reader is
+        // using it. Created lazily: a `--path cpu` session should not pay for
+        // six storage buffers and a pipeline compile it will never bind.
+        var paths_renderer: ?lyngvi.PathRenderer = if (have_gpu and r.backend == .gpu)
+            lyngvi.PathRenderer.init(gpa, &device, &swapchain) catch |err| blk: {
+                ctx.note("no GPU path pipeline ({s}); falling back to the CPU rasteriser", .{
+                    @errorName(err),
+                });
+                r.backend = .cpu;
+                break :blk null;
+            }
+        else
+            null;
+        defer if (paths_renderer) |*p| p.deinit();
+
+        if (paths_renderer) |p| {
+            if (p.shaders_missing) {
+                ctx.note("no SPIR-V for the path pipeline; falling back to the CPU rasteriser", .{});
+                r.backend = .cpu;
+            }
+        }
+        ctx.note("paths: {s}", .{@tagName(r.backend)});
+
         var list: DrawList = .init(gpa, .fromRect(0, 0, 1, 1));
         defer list.deinit();
+        // The layer above the document: the scrollbar, and anything else that
+        // must not be covered by the page it sits on.
+        var over: DrawList = .init(gpa, .fromRect(0, 0, 1, 1));
+        defer over.deinit();
 
         r.viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height) };
+        // Now there is a display to be a percentage of, and a window to fit
+        // to. Both have to happen before the first `scrollToPage`, because
+        // the zoom decides where every page starts.
+        r.dpi_scale = window.scale();
+        if (r.fit_on_open) r.fitWidth();
         r.scrollToPage(settings.start_page);
 
         var uploads: std.ArrayList(lyngvi.Renderer.Upload) = .empty;
         defer uploads.deinit(gpa);
+
+        var worker: Rasteriser = .{ .reader = r, .io = ctx.io };
+        worker.start() catch |err| {
+            return ctx.fail("could not start the rasterising thread: {s}", .{@errorName(err)});
+        };
+        defer worker.stop();
 
         var clock: lyngvi.Clock = .start(ctx.io);
         var drawn: u32 = 0;
@@ -596,21 +1038,49 @@ const Reader = struct {
             if (r.handle(input)) break;
             r.clampScroll();
 
-            // One page per frame, so a scroll that crosses three unrendered
-            // pages stays responsive and fills in over the next three frames
-            // instead of freezing for the sum of them.
+            // Collect whatever the rasterising thread finished, and ask it
+            // for the next page. Neither waits: the frame is drawn from what
+            // is in the cache now, and a page still being worked on is blank
+            // paper until it arrives.
+            //
+            // `pixels` stays alive until the frame is submitted, because
+            // `Upload.pixels` is read during `frame`.
             var pixels: ?[]u8 = null;
             defer if (pixels) |p| gpa.free(p);
-            pixels = r.renderOne(&renderer, &list, &uploads) catch |err| switch (err) {
+            pixels = r.collectPage(&worker, &renderer, &list, &uploads) catch |err| switch (err) {
                 error.OutOfMemory => return ctx.fail("out of memory rendering a page", .{}),
                 else => null,
             };
+            if (r.firstMissing()) |page| worker.post(.{ .page = page, .zoom = r.zoom });
 
             list.reset(.fromRect(0, 0, r.viewport[0], r.viewport[1]));
-            try r.compose(&list);
+            over.reset(.fromRect(0, 0, r.viewport[0], r.viewport[1]));
+            try r.compose(&list, &over);
             r.updateTitle(window);
 
-            switch (try renderer.frame(&list, uploads.items, page_backdrop)) {
+            // The path pass, between the two rect lists. Placing is a matrix
+            // per instance and nothing else, so this runs every frame even
+            // while scrolling at the refresh rate.
+            var paths: ?lyngvi.Renderer.Paths = null;
+            if (r.backend == .gpu) {
+                if (paths_renderer) |*pr| {
+                    // Only when the view has actually moved. A reader sitting
+                    // still then uploads nothing at all: the outlines are on
+                    // the device and so is the placement.
+                    const key = r.placementKey();
+                    if (r.placed == null or !std.meta.eql(r.placed.?, key)) {
+                        try r.placeVisible();
+                        r.placed = key;
+                    }
+                    paths = .{
+                        .renderer = pr,
+                        .scene = &r.recorded.scene,
+                        .frame = &r.recorded.frame,
+                    };
+                }
+            }
+
+            switch (try renderer.frameWith(&list, uploads.items, page_backdrop, paths, &over)) {
                 .drawn => drawn += 1,
                 .needs_recreate => {
                     try swapchain.recreate(.{ .width = client.width, .height = client.height });
@@ -622,11 +1092,34 @@ const Reader = struct {
         }
 
         renderer.waitIdle();
-        ctx.note("{d} frames drawn, {d} pages rasterised, {d} MiB uploaded", .{
+        ctx.note("{d} frames drawn, {d} pages prepared, {d} MiB uploaded", .{
             renderer.frames_drawn,
             r.pages_rendered,
             renderer.bytes_uploaded / (1024 * 1024),
         });
+        if (paths_renderer) |p| {
+            ctx.note(
+                "paths: {d} drawn, {d} instances at most, {d} curves, {d} MiB uploaded",
+                .{
+                    p.paths_drawn,
+                    p.instance_high_water,
+                    p.curve_high_water,
+                    p.bytes_uploaded / (1024 * 1024),
+                },
+            );
+            const s = r.recorded.scene.stats;
+            if (s.blended != 0 or s.clips_too_deep != 0) {
+                ctx.note(
+                    "         {d} path{s} with a blend mode this pipeline cannot honour, {d} clip{s} too deep",
+                    .{
+                        s.blended,
+                        if (s.blended == 1) "" else "s",
+                        s.clips_too_deep,
+                        if (s.clips_too_deep == 1) "" else "s",
+                    },
+                );
+            }
+        }
     }
 
     fn updateTitle(r: *Reader, window: lyngvi.Window) void {
@@ -642,7 +1135,7 @@ const Reader = struct {
             base[0..@min(base.len, 200)],
             page + 1,
             r.pages.len,
-            r.zoom * 100,
+            r.percent(),
         }) catch return;
         window.setTitle(title);
     }
@@ -680,7 +1173,7 @@ const Reader = struct {
             '+', '=' => r.setZoom(r.zoom * 1.25),
             '-', '_' => r.setZoom(r.zoom / 1.25),
             '0' => r.fitWidth(),
-            '1' => r.setZoom(1),
+            '1' => r.setZoom(r.hundredPercent()),
             else => {},
         };
         return false;
@@ -688,30 +1181,56 @@ const Reader = struct {
 
     // -- the cache ----------------------------------------------------------
 
-    /// Renders at most one page that is on screen and not yet in the cache,
-    /// and returns the pixel buffer the caller must keep alive until the frame
+    /// Takes whatever the rasterising thread finished and puts it in a slot,
+    /// returning the pixel buffer the caller must keep alive until the frame
     /// has been submitted -- `Upload.pixels` is read during `frame`.
-    fn renderOne(
+    ///
+    /// Nothing here waits. If the worker is still on the page, this frame
+    /// draws without it.
+    fn collectPage(
         r: *Reader,
+        worker: *Rasteriser,
         renderer: *lyngvi.Renderer,
         list: *DrawList,
         uploads: *std.ArrayList(lyngvi.Renderer.Upload),
     ) !?[]u8 {
-        const want = r.firstMissing() orelse return null;
-        const gpa = r.ctx.gpa;
+        const gpa = r.gpa;
+        const finished = worker.collect() orelse return null;
 
-        const image = r.rasterise(want) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+        const result = finished.result orelse {
             // A page that will not interpret is a blank page, not a dead
-            // reader. It stays uncached and is retried, which is cheap
-            // because it failed early.
-            else => return null,
+            // reader. Remembering that it failed is what stops the loop
+            // asking for it again on every frame for the rest of the session.
+            r.noteFailure(finished.job);
+            return null;
         };
+
+        if (result == .gpu) {
+            // The recording is in page space, so a zoom change does not make
+            // it stale the way it makes a rasterised page stale. It goes in
+            // whatever the zoom is now.
+            var source = result.gpu;
+            errdefer source.deinit(gpa);
+            try r.recorded.insert(gpa, finished.job.page, source);
+            r.pages_rendered += 1;
+            return null;
+        }
+
+        const image = result.cpu;
         errdefer gpa.free(image.pixels);
 
+        // The zoom may have changed while this was rendering, which makes the
+        // image the right picture at the wrong size. Caching it would put a
+        // stale page on screen that never refreshes, because `matches` would
+        // find it at a zoom nobody is looking at.
+        if (finished.job.zoom != r.zoom) {
+            gpa.free(image.pixels);
+            return null;
+        }
+
         const slot = try r.claim(renderer, list, image.width, image.height);
-        slot.page = want;
-        slot.zoom = r.zoom;
+        slot.page = finished.job.page;
+        slot.zoom = finished.job.zoom;
         slot.width = image.width;
         slot.height = image.height;
         slot.used = r.stamp;
@@ -742,9 +1261,23 @@ const Reader = struct {
             // bottom. Rendering either is a page of work for nothing.
             if (bottom <= 0) continue;
             if (top >= r.viewport[1]) break;
-            if (r.find(@intCast(i)) == null) return @intCast(i);
+            if (r.failed(@intCast(i), r.zoom)) continue;
+            if (!r.cached(@intCast(i))) return @intCast(i);
         }
         return null;
+    }
+
+    /// Whether page `index` is ready to draw at the current zoom.
+    ///
+    /// The two backends disagree about what "at the current zoom" means, and
+    /// that difference is the whole point of the GPU one: a rasterised page
+    /// is pixels at one scale and a recorded one is curves at every scale, so
+    /// a zoom throws away the CPU cache and leaves the GPU cache untouched.
+    fn cached(r: *const Reader, page: u32) bool {
+        return switch (r.backend) {
+            .cpu => r.find(page) != null,
+            .gpu => r.recorded.has(page),
+        };
     }
 
     fn find(r: *const Reader, page: u32) ?*const Slot {
@@ -800,13 +1333,19 @@ const Reader = struct {
 
     /// One page, interpreted and rasterised. The same three calls
     /// `fenrir raster` makes, which is why the two produce identical images.
-    fn rasterise(r: *Reader, index: u32) !Image {
-        const gpa = r.ctx.gpa;
+    ///
+    /// **Runs on the rasterising thread.** It touches `r.doc`, which nothing
+    /// else may while it does, and `r.pages` and `r.samples`, which are fixed
+    /// for the life of the reader. The zoom comes from the job rather than
+    /// from `r.zoom`, because `r.zoom` belongs to the frame loop and can
+    /// change underneath this at any moment.
+    fn rasterise(r: *Reader, job: Job) !Image {
+        const gpa = r.gpa;
 
-        var result = try content.page(gpa, r.doc, r.pages[index], .{});
+        var result = try content.page(gpa, r.doc, r.pages[job.page], .{});
         defer result.deinit(gpa);
 
-        var zoom = r.zoom;
+        var zoom = job.zoom;
         var size = replay.canvasSize(result.list.page, zoom);
         while (@as(u64, size[0]) * size[1] > max_page_pixels and zoom > min_zoom) {
             zoom *= 0.5;
@@ -820,12 +1359,15 @@ const Reader = struct {
         var glyphs: Glyphs = try .init(gpa, r.doc, result.list, r.ctx.io);
         defer glyphs.deinit();
 
+        var images: Images = .init(gpa, r.doc, r.pages[job.page].resources);
+        defer images.deinit();
+
         _ = replay.render(
             gpa,
             &canvas,
             result.list,
             replay.pageTransform(result.list.page, zoom),
-            .{ .glyphs = glyphs.source() },
+            .{ .glyphs = glyphs.source(), .images = images.source() },
         ) catch |err| return err;
 
         return .{
@@ -833,6 +1375,106 @@ const Reader = struct {
             .width = size[0],
             .height = size[1],
         };
+    }
+
+    /// One page, interpreted and recorded as outlines for the GPU pipeline.
+    ///
+    /// **Runs on the rasterising thread**, like `rasterise`, and under the
+    /// same rules about what it may touch.
+    ///
+    /// Recorded in *page space*: the transform is the page's own flip, with
+    /// no zoom and no scroll in it, because those are what the frame loop
+    /// applies per instance. The curves that come out of this are good at
+    /// every zoom, which is what the pipeline is for.
+    fn recordPage(r: *Reader, index: u32) !Scene {
+        const gpa = r.gpa;
+
+        var result = try content.page(gpa, r.doc, r.pages[index], .{});
+        defer result.deinit(gpa);
+
+        var s: Scene = .{};
+        errdefer s.deinit(gpa);
+        const size = replay.canvasSize(result.list.page, 1.0);
+        s.reset(.{ @floatFromInt(size[0]), @floatFromInt(size[1]) });
+
+        var glyphs: Glyphs = try .init(gpa, r.doc, result.list, r.ctx.io);
+        defer glyphs.deinit();
+
+        _ = try replay.record(
+            gpa,
+            &s,
+            result.list,
+            replay.pageTransform(result.list.page, 1.0),
+            .{ .glyphs = glyphs.source() },
+        );
+        return s;
+    }
+
+    /// Where page `index` sits on screen, as a matrix from its own page-pixel
+    /// space to the framebuffer.
+    ///
+    /// The recording was made at zoom 1, so this is the zoom and the scroll
+    /// together -- and it is all that changes when either of them does.
+    fn placement(r: *const Reader, index: usize) gelgja.Transform {
+        const size = r.pageSize(index);
+        const x = @round((r.viewport[0] - size[0]) * 0.5 + r.pan);
+        const y = @round(r.pageTop(index) - r.scroll);
+        return gelgja.Transform.scaling(r.zoom, r.zoom).concat(.translation(x, y));
+    }
+
+    /// Everything the placement depends on.
+    ///
+    /// Compared rather than invalidated by hand: a `dirty` flag has to be set
+    /// in every place that moves the view, and the one place it is forgotten
+    /// is a page that stops following the scroll.
+    const Placement = struct {
+        scroll: f32,
+        pan: f32,
+        zoom: f32,
+        viewport: [2]f32,
+        cache: u64,
+    };
+
+    fn placementKey(r: *const Reader) Placement {
+        var cache: u64 = 0;
+        for (r.recorded.pages) |e| cache = cache *% 31 +% e.page;
+        return .{
+            .scroll = r.scroll,
+            .pan = r.pan,
+            .zoom = r.zoom,
+            .viewport = r.viewport,
+            .cache = cache,
+        };
+    }
+
+    /// Builds this frame's instance list: every visible page, placed.
+    ///
+    /// Cheap on purpose. It touches no curve and no band -- only one matrix
+    /// concatenation and one scissor per instance -- so scrolling a document
+    /// costs a few hundred kilobytes of writes rather than a re-render.
+    fn placeVisible(r: *Reader) !void {
+        r.recorded.frame.reset();
+        const box: [4]f32 = .{ 0, 0, r.viewport[0], r.viewport[1] };
+
+        var i: usize = 0;
+        while (i < r.pages.len) : (i += 1) {
+            const size = r.pageSize(i);
+            const top = r.pageTop(i) - r.scroll;
+            if (top + size[1] <= 0) continue;
+            if (top >= r.viewport[1]) break;
+
+            for (r.recorded.pages) |entry| {
+                if (entry.page != i) continue;
+                try r.recorded.frame.place(
+                    r.gpa,
+                    r.recorded.scene,
+                    entry.range,
+                    r.placement(i),
+                    box,
+                );
+                break;
+            }
+        }
     }
 
     // -- the frame ----------------------------------------------------------
@@ -845,8 +1487,15 @@ const Reader = struct {
     const shadow: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0.45 };
     const white: Color = .white;
 
-    fn compose(r: *Reader, list: *DrawList) !void {
+    /// The rectangles under the page: the shadow, and the paper.
+    ///
+    /// Under `.cpu` the paper *is* the page -- the rasterised image is drawn
+    /// as one textured quad on top of it. Under `.gpu` the paper stays blank
+    /// here and the marks are drawn over it by the path pipeline, which is
+    /// why the two layers are separate draw lists rather than one.
+    fn compose(r: *Reader, list: *DrawList, over: *DrawList) !void {
         r.stamp += 1;
+        r.recorded.stamp = r.stamp;
 
         var i: usize = 0;
         while (i < r.pages.len) : (i += 1) {
@@ -867,6 +1516,14 @@ const Reader = struct {
                 shadow,
             );
 
+            if (r.backend == .gpu) {
+                // Blank paper. The path pipeline draws on it, in its own pass
+                // between this list and `over`.
+                r.recorded.touch(@intCast(i));
+                try list.fill(rect, paper);
+                continue;
+            }
+
             if (r.slotFor(@intCast(i))) |s| {
                 s.used = r.stamp;
                 try list.image(
@@ -882,7 +1539,9 @@ const Reader = struct {
             }
         }
 
-        try r.scrollbar(list);
+        // On top of the document, so it is not covered by the page it
+        // measures.
+        try r.scrollbar(over);
     }
 
     fn slotFor(r: *Reader, page: u32) ?*Slot {
@@ -935,6 +1594,7 @@ fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
 fn layoutOf(pages: []fenrir.Page, zoom: f32, viewport: [2]f32) Reader {
     return .{
         .ctx = undefined,
+        .gpa = testing.allocator,
         .doc = undefined,
         .pages = pages,
         .file = "test.pdf",
@@ -1064,4 +1724,62 @@ test "only the pages on screen are asked for" {
     // A slot rendered at a different zoom is not a hit.
     r.slots[0].zoom = r.zoom * 2;
     try testing.expectEqual(@as(u32, 20), r.firstMissing().?);
+}
+
+test "the percentage is the page's physical size, not the raster scale" {
+    // The bug this pins: the title bar said 153% on a fresh window and never
+    // anything else, because it was showing `zoom` -- device pixels per point
+    // -- as though it were a percentage. The default was `--dpi 110`, so it
+    // said 110/72 = 153% forever.
+    var buf: [1]fenrir.Page = undefined;
+    var r = layoutOf(fakePages(&buf, 1), 1, .{ 700, 500 });
+
+    // An unscaled display: 100% is 96 dpi over 72, and a zoom of 1.0 -- one
+    // device pixel per point -- is a page shown at three quarters of its real
+    // size, which is what it is.
+    r.dpi_scale = 1;
+    r.zoom = 1;
+    try testing.expectApproxEqAbs(@as(f32, 75), r.percent(), 0.01);
+    r.zoom = r.hundredPercent();
+    try testing.expectApproxEqAbs(@as(f32, 100), r.percent(), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 4.0 / 3.0), r.zoom, 0.001);
+
+    // The same document at 100% on a 150% display needs half again as many
+    // device pixels per point, and still reads as 100%: the page is the same
+    // size in millimetres, which is the thing the number is about.
+    r.dpi_scale = 1.5;
+    r.zoom = r.hundredPercent();
+    try testing.expectApproxEqAbs(@as(f32, 100), r.percent(), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), r.zoom, 0.001);
+
+    // And the old default, which is where 153% came from.
+    r.dpi_scale = 1;
+    r.zoom = 110.0 / 72.0;
+    try testing.expectApproxEqAbs(@as(f32, 114.58), r.percent(), 0.01);
+}
+
+test "a page that will not rasterise is asked for once, not every frame" {
+    // Without this the frame loop posts the same doomed page to the worker
+    // forever: it never lands in a slot, so `firstMissing` keeps returning it
+    // and the reader burns a core rendering nothing.
+    var buf: [8]fenrir.Page = undefined;
+    var r = layoutOf(fakePages(&buf, 4), 0.5, .{ 700, 500 });
+
+    try testing.expectEqual(@as(u32, 0), r.firstMissing().?);
+    r.noteFailure(.{ .page = 0, .zoom = r.zoom });
+    try testing.expectEqual(@as(u32, 1), r.firstMissing().?);
+
+    // The failure is remembered per zoom, because a page that ran out of
+    // memory at one scale may well fit at another.
+    r.zoom = 0.25;
+    try testing.expectEqual(@as(u32, 0), r.firstMissing().?);
+}
+
+test "a job only equals a job for the same page at the same zoom" {
+    // What keeps a page rendered before a zoom change from being uploaded
+    // into a slot that claims to hold the page at the new one.
+    const a: Job = .{ .page = 3, .zoom = 1.5 };
+    try testing.expect(a.eql(.{ .page = 3, .zoom = 1.5 }));
+    try testing.expect(!a.eql(.{ .page = 4, .zoom = 1.5 }));
+    try testing.expect(!a.eql(.{ .page = 3, .zoom = 1.25 }));
 }
