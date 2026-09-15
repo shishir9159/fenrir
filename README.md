@@ -28,9 +28,9 @@ Týr still loses the hand. That part is not optional.
 | Name | Directory | Role | In the myth | |
 | --- | --- | --- | --- | --- |
 | **Fenrir** | — | the format, and this project | the wolf | |
-| **Gjöll** | `src/gjoll/` | parser: objects, xref, filters, page tree | the boulder the fetter is anchored to | done |
+| **Gjöll** | `src/gjoll/` | parser: objects, xref, filters, page tree, images | the boulder the fetter is anchored to | done |
 | **Gelgja** | `src/gelgja/` | the display list: parser output, renderer input | the cord threaded through the rock | interface done |
-| **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | paths on the CPU, rects on the GPU |
+| **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | both pipelines, on the CPU and the GPU |
 | **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | three parsers, encodings, atlas |
 | **Þviti** | `src/thviti/` | the interface: box tree, layout solver, signals | the stone that pins the fetter down | core done |
 | **Lyngvi** | `src/lyngvi/` | platform: window, input, Vulkan device | the island it happened on | window and device done |
@@ -55,10 +55,12 @@ functions, form XObjects, inline images, patterns and Type 3 glyphs. `fenrir
 trace` prints the result.
 
 Gleipnir has both pipelines. Rects are a signed distance field, one instance
-format, one draw call for a frame. Paths are stencil-then-cover: flattening,
-stroke-to-fill with caps, joins and dashes, both winding rules, and a CPU
-rasteriser that models the GPU's own stencil buffer down to its eight-bit
-wraparound, so bring-up is a diff rather than an investigation.
+format, one draw call for a frame. Paths come with flattening, stroke-to-fill
+with caps, joins and dashes, both winding rules, antialiased clipping and all
+sixteen blend modes — and *two* rasterisers for them: stencil-then-cover on
+the CPU, modelling a GPU stencil buffer down to its eight-bit wraparound, and
+an analytic one that computes coverage from the curves themselves and runs on
+either.
 
 Týr has three font parsers of its own, all compiled in by default and none
 needing anything linked: `glyf` for TrueType, a Type 2 charstring interpreter
@@ -72,22 +74,51 @@ swapchain and pipeline through bindings written by hand and loaded at run
 time, so the default build still links no C and needs no SDK. With a shader
 compiler on `PATH` the GLSL becomes SPIR-V at build time.
 
-The reader is honest about which rasteriser draws it. `fenrir read`
-rasterises each page on the CPU and uploads it as a texture, which the rect
-pipeline draws as one quad — so the window shows exactly the pixels
-`fenrir raster` writes, and the GPU is doing compositing rather than
-rasterising. The path pipeline’s Vulkan half is specified and its shaders
-compile, but `Renderer.zig` has not been taught to create it: no stencil
-attachment, no multisampled colour attachment, no vertex buffer. That, and an
-image decoder, are what stand between this and the real thing.
+There are two path rasterisers and the reader will use either. `--path cpu`
+rasterises each page into an image and uploads it as a texture, which is
+exactly the picture `fenrir raster` writes. `--path gpu` sends the *outlines*
+to the device and works out coverage in the fragment shader, analytically,
+from the curves — so a page is one draw call, a zoom is a matrix rather than
+a re-render, and a clip is multiplied in instead of needing a stencil buffer.
+`-Dpath=cpu|gpu|both` decides which the window may use; the default is both,
+so the two can be compared, and `fenrir raster --path both` is that
+comparison. The GPU path draws every mark on a page but cannot yet sample an
+image or composite a blend mode, so `--path cpu` is still the one that draws
+a document in full.
+
+Images decode. Flate and the other byte filters give samples directly, and
+`/DCTDecode` goes through a baseline JPEG decoder written for this, so the
+figures and photographs on a page are on the page. JPEG 2000, CCITT and
+JBIG2 are counted and skipped.
 
 ## Building
 
 ```
 zig build              # zig-out/bin/fenrir
-zig build test         # 581 tests
+zig build test         # 626 tests
 zig build run -- info file.pdf
 ```
+
+### Which path rasteriser
+
+```
+zig build              # both, selectable at run time -- the default
+zig build -Dpath=cpu   # the window only ever uses the CPU rasteriser
+zig build -Dpath=gpu   # the window only ever uses the analytic pipeline
+```
+
+A build with both lets `fenrir read --path cpu|gpu` choose, and
+`fenrir raster --path both` render a page each way and subtract. A build with
+one refuses the other by name rather than silently falling back.
+
+The flag decides what the *window* draws with, not what the binary contains:
+`fenrir raster` and `fenrir read --shot` render with no device in the process
+at all, so the CPU rasteriser is compiled either way.
+
+`both` is the default in every optimisation mode, and stays so until the GPU
+path can sample an image and composite a blend mode -- a release build with
+only that one would show a document with its figures missing and its
+highlights opaque.
 
 Requires Zig 0.16.0. The default build links no C at all — not even Vulkan,
 which is opened by name at run time rather than linked, so a machine with no
@@ -168,12 +199,13 @@ fenrir raster <file> [--page N|--all]   a page rendered to a PNG, on the CPU
              [-o F] [--dpi N|--scale N]
              [--samples 1|2|4|8] [--fonts]
              [--tolerance N] [--stats]
+             [--path stencil|slug|both] [--rays N]
              [--text-boxes] [--image-boxes]
              [--no-annots] [--ascii x,y,w,h]
 fenrir read <file> [--page N]           the document in a window, scrollable
              [--zoom N|--dpi N] [--size WxH]
-             [--samples N] [--frames N]
-             [--shot F] [--vsync ...]
+             [--path cpu|gpu] [--samples N]
+             [--frames N] [--shot F] [--vsync ...]
 fenrir fonts                            what Týr can do in this build
 fenrir rects [--out F] [--size WxH]     a demo frame through the rect pipeline
 fenrir ui    [--out F] [--atlas F]      a frame of interface, text included
@@ -184,14 +216,22 @@ fenrir view  [--frames N] [--size WxH]  the same interface, in a window, on
 fenrir view --probe                     the devices, without opening anything
 ```
 
-`fenrir read file.pdf` is the one that opens a document to read. It scrolls
-continuously with the wheel, zooms with `+` and `-`, fits the width with `0`,
-and steps a page at a time with `n` and `p`. Pages are rasterised lazily, one
-per frame, and kept in a small cache, so scrolling stays answerable while a
-page that is not ready yet shows as blank paper for a frame rather than
-freezing the window. `--shot F` writes one composed frame to a PNG with no
-window and no device at all, which is how the layout is checked on a machine
-with no display.
+`fenrir read file.pdf` is the one that opens a document to read. It opens
+fitted to the width of the window, scrolls continuously with the wheel, zooms
+with `+` and `-`, refits with `0`, and steps a page at a time with `n` and
+`p`. The percentage in the title bar is the page's true physical size on the
+display, display scaling included — not the raster scale, which is a
+different number on every screen.
+
+Pages are prepared on a thread of their own and the frame loop never waits
+for one: a page that is not ready yet is blank paper for a few frames rather
+than a frozen window. That matters more than it sounds. A page whose figure
+is a scatter plot of a few thousand separately clipped markers takes about a
+second to rasterise, and doing that on the frame thread does not make the
+reader slow, it makes it stop.
+
+`--shot F` writes one composed frame to a PNG with no window and no device at
+all, which is how the layout is checked on a machine with no display.
 
 `fenrir raster file.pdf --page 1` writes the same picture to a file: parser,
 interpreter, path pipeline and font layer end to end, on the CPU, with no
@@ -199,12 +239,26 @@ device or window involved. It reports what it could *not* draw rather than
 letting a page with a hole in it look finished.
 
 ```
-$ fenrir raster paper.pdf --page 1 --dpi 110
-page 1  935x1210  25 fills  6 strokes  12 clips  131658 segments
-         4 annotations drawn, 57 skipped
-wrote page-1.png
-2102 of 2108 glyphs drawn, 6 blank, 0 invisible
-1 images not drawn: no image decoder yet
+$ fenrir raster paper.pdf --page 8 --dpi 110
+page 8  935x1210  0 fills  1 strokes  0 clips  103515 segments
+         0 annotations drawn, 8 skipped
+         6 images decoded
+wrote page-8.png
+2833 of 2833 glyphs drawn, 0 blank, 0 invisible
+every mark on the page was drawn
+```
+
+`--path both` renders the page through both rasterisers and reports how far
+apart they came out, in levels of 255. The mean halves every time the
+stencil rasteriser's sample count doubles, which is what it looks like when
+two implementations agree and one of them is the limit the other converges
+to:
+
+```
+$ fenrir raster paper.pdf --page 1 --path both --samples 1 --stats
+         stencil vs slug: mean 8.067, worst 224.8, 13.292% over 1 level
+$ fenrir raster paper.pdf --page 1 --path both --samples 8 --stats
+         stencil vs slug: mean 1.527, worst 83.9, 12.202% over 1 level
 ```
 
 `--ascii x,y,w,h` prints a window of the result as text, one character per
@@ -394,6 +448,27 @@ the ones with `#xx` or `\` escapes are copied into the arena.
   and all sixteen PDF blend modes — composited in the device’s own colour
   space, which is what §11.3.8 asks for and what keeps a page from reading
   like a photocopy of one.
+- Gleipnir's **analytic** path rasteriser, in `slug.zig`, on both the CPU and
+  the GPU. Coverage comes out of the outline in closed form rather than out of
+  samples: a horizontal ray across a pixel gives the exact covered length of
+  that row, and only the integral down the pixel's height is sampled. A
+  vertical edge — most of what a page of text is made of — lands on its true
+  coverage from a single ray, where eight multisamples would give it nine
+  possible values. The curves go to the device as curves, so a zoom is a
+  matrix rather than a re-tessellation, and a clip is another outline whose
+  coverage is multiplied in. `fenrir raster --path both` renders a page each
+  way and reports the difference; on a page of text the two converge as the
+  stencil rasteriser's sample count rises, which is the evidence that they
+  agree and that the analytic one is the limit.
+- Image decoding: the packing (1, 2, 4, 8 and 16 bits a component, rows byte
+  aligned), every colour space `color.zig` knows including `/Indexed`
+  palettes and `/Separation` tint transforms, `/Decode` arrays, `/ImageMask`
+  stencils painted with the current fill, `/SMask` alpha at any resolution,
+  and a baseline JPEG decoder — Huffman, dequantisation, a separable inverse
+  DCT, chroma upsampling, restart markers and the Adobe transform flag.
+  Images are sampled onto the page through the inverse of their placement
+  matrix, so a rotated or sheared one is right, and averaged when minified so
+  a page-sized photograph does not shimmer.
 - Týr: the `Face` and `Shaper` interfaces, format sniffing, the outline sink,
   and the backend registry with its selection rules. Three native backends are
   compiled in by default — `glyf` for TrueType, a Type 2 charstring
@@ -472,10 +547,15 @@ in it — still reads completely.
   for it. The shapes are borrowed and only the shapes — positions still come
   from the PDF's own `/Widths` — so the page is legible and not
   typographically faithful.
-- **Images.** No decoder yet, so a scanned page renders as its invisible OCR
-  layer over nothing, and a figure that is a bitmap is absent. `fenrir raster
-  --image-boxes` outlines where they would go. This is now the largest gap
-  between a rendered page and the real one.
+- **Three image codecs.** Flate, LZW and the ASCII filters give samples
+  directly, and `/DCTDecode` goes through a baseline JPEG decoder written for
+  this — with the packing, the colour space, `/Decode` and `/SMask` all
+  applied. **`/JPXDecode`, `/CCITTFaxDecode` and `/JBIG2Decode` are not
+  decoded**, so a fax-coded or JBIG2 scan still renders as its invisible OCR
+  layer over nothing. Progressive JPEG is refused rather than decoded as
+  baseline. Each is counted and named in the report. Inline images
+  (`BI ... ID ... EI`) carry their samples in the display list and are not
+  reached yet either.
 - **Shadings and tiling patterns.** The interpreter resolves both into a
   `Paint`; painting them needs a gradient rasteriser and a recursive replay.
   Solid paint is exact and everything else is counted and skipped.
@@ -485,14 +565,20 @@ in it — still reads completely.
   contents do not overlap — a highlight, a stamp, most of what a group is used
   for — and wrong when they do. Doing it properly needs an offscreen canvas
   per group.
-- **The GPU path pipeline is written but has never run.** The contract is in
-  `gleipnir/pathpipe.zig`, the shaders compile, and `raster.zig` executes the
-  same two passes on the CPU — but `lyngvi/Renderer.zig` still creates only
-  the rect pipeline: no stencil attachment, no multisampled colour
-  attachment, no vertex buffer. So `fenrir read` rasterises each page on the
-  CPU and hands the GPU a texture. The part with no answer yet is clipping:
-  the CPU keeps an antialiased byte-per-pixel clip mask, and the stencil
-  buffer will have to grow a second plane or a second attachment to match it.
+- **The GPU path pipeline does not composite blend modes, and cannot sample
+  an image.** It draws every fill, stroke and glyph on a page in one call and
+  clips them analytically, but a `/Multiply` highlight comes out as plain
+  source-over, and an image has to be drawn by the rect pipeline as a
+  textured quad — which `--path gpu` does not yet arrange, so under it a page
+  draws its marks and not its figures. Both are counted. `--path cpu` has all
+  of it and is the default in a build with both.
+- **Stencil-and-cover was specified and then not used.** `gleipnir/pathpipe.zig`
+  is a complete contract for the classical GPU path fill and `raster.zig` is a
+  faithful CPU model of it, down to the eight-bit stencil wraparound. The
+  analytic pipeline won on three counts — one pass instead of two, no
+  multisampled attachment, and an antialiased clip that a stencil bit cannot
+  express — so `pathpipe.zig` stays as the argument and as the other half of
+  a comparison rather than as something that runs.
 - **Annotations are drawn from their appearance streams only.** A `/Highlight`
   or `/Square` that ships no `/AP` is skipped rather than synthesised from its
   `/QuadPoints` and `/C`, and no annotation is interactive: a link is drawn if
@@ -1010,5 +1096,6 @@ beard of a woman, the roots of a mountain, the sinews of a bear, the breath
 of a fish, and the spittle of a bird. They no longer exist, having been used
 up in the making.
 
-# final goal: remove glslc dependency
+# final goal: remove glslc dependency https://github.com/khronosGroup/glslang#ast---spir-v-back-end
 consume: https://codeberg.org/andrewrk/async-io-examples/src/branch/main/example8.zig
+inline iamge

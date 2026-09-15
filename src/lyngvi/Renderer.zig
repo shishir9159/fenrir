@@ -51,6 +51,8 @@ const DrawList = @import("../gleipnir/DrawList.zig");
 const paint = @import("../gelgja/paint.zig");
 const pipeline_contract = @import("../gleipnir/pipeline.zig");
 const rect = @import("../gleipnir/rect.zig");
+const scene_mod = @import("../gleipnir/scene.zig");
+const PathRenderer = @import("PathRenderer.zig");
 
 const Color = paint.Color;
 const Renderer = @This();
@@ -808,11 +810,42 @@ fn recordCopy(r: *Renderer, cb: vk.CommandBuffer, t: Texture, buffer: vk.Buffer,
 /// caller has the window and therefore the new size, and doing it at the top
 /// of the next frame rather than in the middle of this one is what makes a
 /// resize cost one frame instead of two.
+/// The path pipeline's contribution to a frame, if there is one.
+///
+/// Recorded inside the same render pass, after the rects: a reader draws the
+/// page's backdrop, shadow and paper as rectangles, the page's marks as
+/// paths, and nothing needs to go between. UI chrome that must sit *on top*
+/// of the page -- a scrollbar, a selection -- is drawn in `over`.
+pub const Paths = struct {
+    renderer: *PathRenderer,
+    /// The outlines, shared across frames and uploaded only when they change.
+    scene: *const scene_mod.Scene,
+    /// This frame is placement: one matrix per instance.
+    frame: *const scene_mod.Frame,
+};
+
 pub fn frame(
     r: *Renderer,
     list: *const DrawList,
     uploads: []const Upload,
     clear: Color,
+) Error!Status {
+    return r.frameWith(list, uploads, clear, null, null);
+}
+
+/// `frame`, with paths drawn between two rect lists.
+///
+/// Order in one render pass is draw order, and a page is three layers: the
+/// paper under it, the marks on it, and the interface over it. One draw list
+/// cannot express that, because the paths have to land in the middle of it,
+/// so there are two.
+pub fn frameWith(
+    r: *Renderer,
+    list: *const DrawList,
+    uploads: []const Upload,
+    clear: Color,
+    paths: ?Paths,
+    over: ?*const DrawList,
 ) Error!Status {
     const d = r.device;
     const s = r.swapchain;
@@ -846,8 +879,11 @@ pub fn frame(
     // ever.
     _ = d.dt.resetFences(d.handle, 1, @ptrCast(&f.fence));
 
-    try r.writeInstances(f, list);
+    const split = try r.writeInstances(f, list, over);
     const staged = try r.stageUploads(f, uploads);
+    // After the fence and before the recording: the only window in which this
+    // frame's buffers are not being read by the device.
+    if (paths) |p| try p.renderer.upload(r.index, p.scene, p.frame);
 
     try vk.check(d.dt.resetCommandPool(d.handle, f.pool, 0));
     const begin: vk.CommandBufferBeginInfo = .{ .flags = vk.CommandBufferUsageFlags.one_time_submit };
@@ -885,41 +921,28 @@ pub fn frame(
     };
     d.dt.cmdBeginRenderPass(f.cb, &pass_info, .@"inline");
 
-    const count = list.count();
+    const count = split.under + split.over;
     // Recorded whether or not there is a pipeline to draw with, so that a
     // build with no shaders still reports what a build with them would have
     // drawn.
     r.instance_high_water = @max(r.instance_high_water, count);
 
-    if (count > 0 and r.pipeline != vk.null_handle) {
-        d.dt.cmdBindPipeline(f.cb, .graphics, r.pipeline);
+    // Viewport and scissor are pipeline-independent dynamic state, so they
+    // are set once and both pipelines inherit them.
+    const viewport: vk.Viewport = .{
+        .width = @floatFromInt(s.extent.width),
+        .height = @floatFromInt(s.extent.height),
+    };
+    d.dt.cmdSetViewport(f.cb, 0, 1, @ptrCast(&viewport));
+    const scissor = s.renderArea();
+    d.dt.cmdSetScissor(f.cb, 0, 1, @ptrCast(&scissor));
 
-        const viewport: vk.Viewport = .{
-            .width = @floatFromInt(s.extent.width),
-            .height = @floatFromInt(s.extent.height),
-        };
-        d.dt.cmdSetViewport(f.cb, 0, 1, @ptrCast(&viewport));
-        const scissor = s.renderArea();
-        d.dt.cmdSetScissor(f.cb, 0, 1, @ptrCast(&scissor));
-
-        d.dt.cmdBindDescriptorSets(f.cb, .graphics, r.layout, 0, 1, @ptrCast(&f.set), 0, null);
-
-        const push: pipeline_contract.PushConstants = .{ .viewport = .{
-            @floatFromInt(s.extent.width),
-            @floatFromInt(s.extent.height),
-        } };
-        d.dt.cmdPushConstants(
-            f.cb,
-            r.layout,
-            vk.ShaderStageFlags.vertex,
-            0,
-            @sizeOf(pipeline_contract.PushConstants),
-            &push,
-        );
-
-        // The whole frame. Four vertices, one instance per rectangle.
-        d.dt.cmdDraw(f.cb, pipeline_contract.state.vertices_per_instance, count, 0, 0);
-    }
+    // Three layers in one pass: rects under, paths, rects over. Each is at
+    // most one draw call, so a page of ten thousand marks under a scrollbar
+    // is three.
+    r.recordRects(f, split.under, 0);
+    if (paths) |p| p.renderer.record(f.cb, r.index, p.frame);
+    r.recordRects(f, split.over, split.under);
 
     d.dt.cmdEndRenderPass(f.cb);
     try vk.check(d.dt.endCommandBuffer(f.cb));
@@ -951,22 +974,65 @@ pub fn frame(
     return if (presented) .drawn else .needs_recreate;
 }
 
-fn writeInstances(r: *Renderer, f: *Frame, list: *const DrawList) Error!void {
-    const bytes = list.bytes();
-    if (bytes.len == 0) return;
+/// How many instances came from each list, so the two draws know their ranges.
+const Split = struct { under: u32 = 0, over: u32 = 0 };
 
-    if (bytes.len > f.instances.size) {
+/// Packs one or two draw lists into this frame's instance buffer, back to
+/// back.
+///
+/// One buffer and not two: `vkCmdDraw`'s `firstInstance` is added to
+/// `gl_InstanceIndex`, so a second range in the same buffer is a second draw
+/// with an offset rather than a second binding and a second descriptor write.
+fn writeInstances(r: *Renderer, f: *Frame, list: *const DrawList, over: ?*const DrawList) Error!Split {
+    const a = list.bytes();
+    const b = if (over) |o| o.bytes() else &.{};
+    const total = a.len + b.len;
+    if (total == 0) return .{};
+
+    if (total > f.instances.size) {
         // Safe here and nowhere else: the fence for this frame has been waited
         // on, so nothing the GPU is reading lives in the old buffer.
-        const want = choose.bufferCapacity(f.instances.size, bytes.len, min_instance_bytes);
+        const want = choose.bufferCapacity(f.instances.size, total, min_instance_bytes);
         r.device.destroyBuffer(&f.instances);
         f.instances = try r.newInstanceBuffer(want);
         r.writeBufferDescriptor(f.*);
     }
 
-    // The whole upload: one memcpy into memory the GPU reads where it lies.
-    @memcpy(f.instances.slice()[0..bytes.len], bytes);
-    r.device.flush(f.instances, 0, bytes.len);
+    // The whole upload: memcpy into memory the GPU reads where it lies.
+    const dst = f.instances.slice();
+    @memcpy(dst[0..a.len], a);
+    if (b.len != 0) @memcpy(dst[a.len..][0..b.len], b);
+    r.device.flush(f.instances, 0, total);
+
+    return .{
+        .under = list.count(),
+        .over = if (over) |o| o.count() else 0,
+    };
+}
+
+/// One draw for a contiguous range of the instance buffer.
+fn recordRects(r: *Renderer, f: *Frame, count: u32, first: u32) void {
+    if (count == 0 or r.pipeline == vk.null_handle) return;
+    const d = r.device;
+    const s = r.swapchain;
+
+    d.dt.cmdBindPipeline(f.cb, .graphics, r.pipeline);
+    d.dt.cmdBindDescriptorSets(f.cb, .graphics, r.layout, 0, 1, @ptrCast(&f.set), 0, null);
+
+    const push: pipeline_contract.PushConstants = .{ .viewport = .{
+        @floatFromInt(s.extent.width),
+        @floatFromInt(s.extent.height),
+    } };
+    d.dt.cmdPushConstants(
+        f.cb,
+        r.layout,
+        vk.ShaderStageFlags.vertex,
+        0,
+        @sizeOf(pipeline_contract.PushConstants),
+        &push,
+    );
+
+    d.dt.cmdDraw(f.cb, pipeline_contract.state.vertices_per_instance, count, 0, first);
 }
 
 /// Packs as many uploads as fit into this frame's staging buffer, growing it

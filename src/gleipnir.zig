@@ -39,8 +39,11 @@ pub const path = @import("gleipnir/path.zig");
 pub const png = @import("gleipnir/png.zig");
 pub const raster = @import("gleipnir/raster.zig");
 pub const replay = @import("gleipnir/replay.zig");
+pub const scene = @import("gleipnir/scene.zig");
 pub const rect = @import("gleipnir/rect.zig");
 pub const sdf = @import("gleipnir/sdf.zig");
+pub const slug = @import("gleipnir/slug.zig");
+pub const slugpipe = @import("gleipnir/slugpipe.zig");
 pub const software = @import("gleipnir/software.zig");
 pub const stroke = @import("gleipnir/stroke.zig");
 
@@ -60,8 +63,11 @@ test {
     _ = png;
     _ = raster;
     _ = replay;
+    _ = scene;
     _ = rect;
     _ = sdf;
+    _ = slug;
+    _ = slugpipe;
     _ = software;
     _ = stroke;
 }

@@ -49,7 +49,42 @@ pub fn build(b: *std.Build) void {
     // naming the command that would fix it.
     const shaders = compileShaders(b);
 
+    // Which path rasteriser the *window* uses, and which `--path` will
+    // accept.
+    //
+    // `both` is the point of it: the
+    // CPU rasteriser is the reference, the GPU one is the model of the
+    // shader, and a build with both can draw the same page each way and
+    // subtract. `fenrir raster --path both` is that comparison.
+    //
+    // A release build may pick one, and `-Dpath=gpu` builds a reader that
+    // never rasterises a page on the CPU while `-Dpath=cpu` builds one that
+    // never creates the analytic pipeline -- for a machine whose driver
+    // cannot be trusted with it.
+    //
+    // The default stays `both` in every mode, and deliberately. The GPU path
+    // draws every mark on a page and cannot yet sample an image or composite
+    // a blend mode, so a release build that had only it would show a document
+    // with its figures missing and its highlights opaque. `both` is the
+    // default until that is no longer true.
+    //
+    // What this does *not* do is remove the CPU rasteriser from the binary.
+    // `fenrir raster` and `fenrir read --shot` both render with no device in
+    // the process and would have nothing to render with; the flag decides
+    // what the window does, not what the program contains.
+    //
+    // This is one option and not two booleans because there is no fourth
+    // state: a build with neither draws nothing.
+    const path_backend = b.option(
+        PathBackend,
+        "path",
+        "Which path rasteriser the window uses: cpu, gpu, or both (default: both)",
+    ) orelse PathBackend.both;
+
     const opts = b.addOptions();
+    opts.addOption(bool, "path_cpu", path_backend != .gpu);
+    opts.addOption(bool, "path_gpu", path_backend != .cpu);
+    opts.addOption([]const u8, "path_backend", @tagName(path_backend));
     opts.addOption(bool, "tyr_freetype", want_freetype);
     opts.addOption(bool, "tyr_stb_truetype", want_stb);
     opts.addOption(bool, "tyr_harfbuzz", want_harfbuzz);
@@ -121,6 +156,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&exe_tests.step);
 }
 
+/// The two rasterisers, and the build that keeps both.
+///
+///   **cpu** -- `gleipnir/raster.zig`, stencil-then-cover with multisampling,
+///   into a framebuffer that is then uploaded as a texture. Needs no device
+///   and is the reference every other answer is checked against.
+///
+///   **gpu** -- `gleipnir/slugpipe.zig`, analytic coverage from the outline
+///   in the fragment shader. Resolution independent, one draw call a page, no
+///   stencil attachment and no multisampling.
+const PathBackend = enum { cpu, gpu, both };
+
 const shader_dir = "src/gleipnir/shader";
 
 /// Every stage the build compiles, in the order `shaders.spv` returns them.
@@ -132,13 +178,15 @@ const shader_stages = [_][]const u8{
     "rect.frag",
     "path.vert",
     "path.frag",
+    "slug.vert",
+    "slug.frag",
 };
 
 /// The headers a stage may `#include`. Listed as build inputs for every stage
 /// rather than per stage: over-invalidating recompiles four small shaders,
 /// under-invalidating ships a pipeline whose two halves disagree about a
 /// struct layout, and only one of those is recoverable by looking at it.
-const shader_headers = [_][]const u8{ "rect.glsl", "path.glsl" };
+const shader_headers = [_][]const u8{ "rect.glsl", "path.glsl", "slug.glsl" };
 
 /// `rect.vert` -> `rect_vert_spv`. Comptime, because `addAnonymousImport`
 /// takes a name that has to match the `@embedFile` on the Zig side, and a

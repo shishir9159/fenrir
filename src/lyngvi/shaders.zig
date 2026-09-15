@@ -37,11 +37,15 @@ const rect_vert_raw = @embedFile("rect_vert_spv");
 const rect_frag_raw = @embedFile("rect_frag_spv");
 const path_vert_raw = @embedFile("path_vert_spv");
 const path_frag_raw = @embedFile("path_frag_spv");
+const slug_vert_raw = @embedFile("slug_vert_spv");
+const slug_frag_raw = @embedFile("slug_frag_spv");
 
 pub const vert: [rect_vert_raw.len]u8 align(4) = rect_vert_raw.*;
 pub const frag: [rect_frag_raw.len]u8 align(4) = rect_frag_raw.*;
 pub const path_vert: [path_vert_raw.len]u8 align(4) = path_vert_raw.*;
 pub const path_frag: [path_frag_raw.len]u8 align(4) = path_frag_raw.*;
+pub const slug_vert: [slug_vert_raw.len]u8 align(4) = slug_vert_raw.*;
+pub const slug_frag: [slug_frag_raw.len]u8 align(4) = slug_frag_raw.*;
 
 pub const Error = error{ NoShaders, WrongStage } || spirv.Error;
 
@@ -75,6 +79,20 @@ pub fn pathFragmentModule() Error!spirv.Module {
     return module(&path_frag, .fragment);
 }
 
+/// The analytic path pipeline's stages: one draw, one pass, two modules.
+///
+/// Unlike the stencil pipeline's, these *do* read storage buffers -- six of
+/// them -- and index them with the instance index, which is uniform across a
+/// draw. So they need descriptor indexing no more than the rect pipeline's
+/// vertex shader does, and `slugFragmentModule` is checked for that below.
+pub fn slugVertexModule() Error!spirv.Module {
+    return module(&slug_vert, .vertex);
+}
+
+pub fn slugFragmentModule() Error!spirv.Module {
+    return module(&slug_frag, .fragment);
+}
+
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
@@ -101,6 +119,19 @@ test "a build with no shader compiler says so rather than crashing" {
         // rect pipeline does. A path pipeline that asked for it would make the
         // descriptor-indexing fallback pointless.
         try testing.expect(!try pf.needsNonUniformIndexing());
+
+        // The analytic pipeline reads six storage buffers and indexes every
+        // one of them with a value derived from the instance index, which is
+        // uniform across the draw. So it must not ask for non-uniform
+        // indexing either: a page's worth of paths goes through one draw call
+        // on a device that has none of the descriptor-indexing features.
+        const sv = try slugVertexModule();
+        const sf = try slugFragmentModule();
+        try testing.expect(sv.byteSize() > 0);
+        try testing.expect(sf.byteSize() > 0);
+        try testing.expect(sv.isStage(.vertex));
+        try testing.expect(sf.isStage(.fragment));
+        try testing.expect(!try sf.needsNonUniformIndexing());
         // The check that catches a build wiring the modules to the wrong
         // stages, which creates a pipeline that draws nothing and reports
         // nothing.

@@ -24,6 +24,7 @@ pub const Page = @import("gjoll/Page.zig");
 pub const Parser = @import("gjoll/Parser.zig");
 pub const content = @import("gjoll/content.zig");
 pub const filter = @import("gjoll/filter.zig");
+pub const image = @import("gjoll/image.zig");
 pub const pages = @import("gjoll/pages.zig");
 pub const print = @import("gjoll/print.zig");
 pub const xref = @import("gjoll/xref.zig");
@@ -50,6 +51,11 @@ pub const thviti = @import("thviti.zig");
 /// Týr: the font layer. Two runtime interfaces, `Face` for glyph outlines
 /// and `Shaper` for UI text, with the choice of backend made in one place.
 pub const tyr = @import("tyr.zig");
+
+/// What this binary was built with: which glyph backends are linked, whether
+/// there is SPIR-V in it, and which path rasterisers are compiled in. Exposed
+/// so a command can say so rather than guess.
+pub const build_options = @import("build_options");
 
 pub const Rect = Page.Rect;
 pub const Rotation = Page.Rotation;
@@ -85,6 +91,7 @@ test {
     _ = Parser;
     _ = content;
     _ = filter;
+    _ = image;
     _ = pages;
     _ = print;
     _ = xref;

@@ -41,6 +41,7 @@ const builtin = @import("builtin");
 
 pub const Device = @import("lyngvi/Device.zig");
 pub const Events = @import("lyngvi/Events.zig");
+pub const PathRenderer = @import("lyngvi/PathRenderer.zig");
 pub const Renderer = @import("lyngvi/Renderer.zig");
 pub const Swapchain = @import("lyngvi/Swapchain.zig");
 pub const Window = @import("lyngvi/Window.zig");
@@ -110,6 +111,7 @@ pub const Clock = struct {
 test {
     _ = Device;
     _ = Events;
+    _ = PathRenderer;
     _ = Renderer;
     _ = Swapchain;
     _ = Window;
