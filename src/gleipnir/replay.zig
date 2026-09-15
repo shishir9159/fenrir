@@ -48,6 +48,8 @@ const geom = @import("../gelgja/geom.zig");
 const paint = @import("../gelgja/paint.zig");
 const path = @import("path.zig");
 const raster = @import("raster.zig");
+const scene_mod = @import("scene.zig");
+const slug = @import("slug.zig");
 const stroke = @import("stroke.zig");
 
 const Bounds = geom.Bounds;
@@ -55,6 +57,7 @@ const Canvas = raster.Canvas;
 const Color = paint.Color;
 const FillRule = geom.FillRule;
 const Point = geom.Point;
+const Scene = scene_mod.Scene;
 const Transform = geom.Transform;
 
 pub const Error = path.Error;
@@ -98,12 +101,44 @@ pub const GlyphSource = struct {
     }
 };
 
+/// Where decoded images come from.
+///
+/// The same arrangement as `GlyphSource`, and for the same reason: a display
+/// list records which object an image is and stops there, because decoding it
+/// needs the document and a display list exists to be independent of one. The
+/// caller wires Gjöll's `image.zig` behind this;
+/// `src/vanagandr/images.zig` is the implementation.
+///
+/// The returned pixels are borrowed and must stay valid for the whole replay,
+/// which is what makes a page that draws the same logo forty times decode it
+/// once.
+pub const ImageSource = struct {
+    ptr: *anyopaque,
+    lookup: *const fn (ptr: *anyopaque, object: u32, name: []const u8) ?Bitmap,
+
+    /// Straight RGBA, eight bits a channel.
+    pub const Bitmap = struct {
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        /// The alpha is a stencil and the colour comes from the current fill.
+        is_mask: bool = false,
+    };
+
+    pub fn get(s: ImageSource, object: u32, name: []const u8) ?Bitmap {
+        return s.lookup(s.ptr, object, name);
+    }
+};
+
 pub const Options = struct {
     /// How far a flattened segment may stray from its curve, in device pixels.
     tolerance: f32 = 0.1,
     /// Where glyph outlines come from. Without one, text is counted and not
     /// drawn.
     glyphs: ?GlyphSource = null,
+    /// Where decoded image pixels come from. Without one, images are counted
+    /// and not drawn.
+    images: ?ImageSource = null,
     /// Draw a rectangle where each glyph would be, instead of the glyph. A
     /// layout aid for when there is no glyph source, or when the question is
     /// whether the interpreter put the text in the right place rather than
@@ -114,7 +149,43 @@ pub const Options = struct {
     /// A ceiling on the clip stack, so a damaged list that pushes without
     /// popping cannot exhaust memory a framebuffer at a time.
     max_clip_depth: u32 = 64,
+    /// Which rasteriser fills an outline.
+    path_backend: PathBackend = .stencil,
+    /// Sub-rows per pixel, for `.slug`. Ignored by `.stencil`, which has
+    /// `Canvas.samples` instead.
+    rays: u32 = slug.default_rays,
+    /// How far a quadratic may stray from the cubic it stands in for, in the
+    /// path's own units rather than in pixels.
+    ///
+    /// Not `tolerance`, and not derived from it, because it is answering a
+    /// different question. `tolerance` is how coarsely a curve may be
+    /// flattened *for this zoom*; this is how coarsely a cubic may be
+    /// rewritten as quadratics *once, for every zoom*, since the curves go to
+    /// the device and stay there. A fiftieth of a point is a fiftieth of a
+    /// pixel at 100% and still under a fifth at eight times that.
+    curve_tolerance: f32 = slug.default_tolerance,
 };
+
+/// The two ways to turn an outline into coverage.
+///
+/// They are not a fast one and a slow one. They answer different questions
+/// and have different failure modes, and both are kept because each is the
+/// other's check:
+///
+///   **stencil** counts winding per sample and resolves, which is what a
+///   Vulkan stencil attachment does. Exact in the limit, quantised to
+///   `samples + 1` coverage levels, and the cost is the summed area of the
+///   fan triangles.
+///
+///   **slug** asks the outline how much of each pixel is inside, from the
+///   curves. Continuous coverage across an edge, resolution independent, and
+///   the cost is the curves in one band per fragment. This is the model of
+///   the GPU pipeline; `raster.Canvas.fillSlug` is the fragment shader.
+///
+/// `fenrir raster --path both` renders a page each way and reports the
+/// difference, which is the whole reason there is a runtime switch here and
+/// not a compile-time one.
+pub const PathBackend = enum { stencil, slug };
 
 /// What the page contained and what was actually drawn.
 pub const Stats = struct {
@@ -127,6 +198,10 @@ pub const Stats = struct {
     text_runs: u32 = 0,
     glyphs: u32 = 0,
     images: u32 = 0,
+    /// Images actually sampled onto the page, and images whose pixels could
+    /// not be had -- an undecodable codec, or a backend with no sampler.
+    images_drawn: u32 = 0,
+    images_not_drawn: u32 = 0,
     shadings: u32 = 0,
     layers: u32 = 0,
     /// Segments produced by flattening, summed. The number that explains why a
@@ -155,7 +230,7 @@ pub const Stats = struct {
 
     /// True when everything on the page was drawn as it was recorded.
     pub fn complete(s: Stats) bool {
-        return s.unsupported_paint == 0 and s.images == 0 and s.shadings == 0 and
+        return s.unsupported_paint == 0 and s.images_not_drawn == 0 and s.shadings == 0 and
             s.clips_dropped == 0 and s.paths_dropped == 0 and
             s.text_not_drawn == 0 and s.glyphs_missing == 0;
     }
@@ -189,9 +264,48 @@ pub fn render(
     xform: Transform,
     options: Options,
 ) Error!Stats {
+    return walk(gpa, .{ .canvas = canvas }, list, xform, options);
+}
+
+/// The same walk, ending in instances for the GPU instead of pixels.
+///
+/// Everything about how a page is interpreted -- clip nesting, stroke
+/// outlines, glyph placement, the transform stack -- happens here exactly as
+/// it does for `render`, because it *is* `render`, with the last call in each
+/// branch pointed somewhere else. A page recorded this way and a page
+/// rasterised on the CPU cannot disagree about anything but the rasteriser.
+pub fn record(
+    gpa: Allocator,
+    target: *Scene,
+    list: DisplayList,
+    xform: Transform,
+    options: Options,
+) Error!Stats {
+    var opts = options;
+    // Recording has only one rasteriser to record for.
+    opts.path_backend = .slug;
+    target.rays = opts.rays;
+    return walk(gpa, .{ .scene = target }, list, xform, opts);
+}
+
+/// Where a replay's output goes. Exactly one of the two, chosen by the entry
+/// point rather than by a flag, so there is no state in which both or neither
+/// is set.
+const Sink = union(enum) {
+    canvas: *Canvas,
+    scene: *Scene,
+};
+
+fn walk(
+    gpa: Allocator,
+    sink: Sink,
+    list: DisplayList,
+    xform: Transform,
+    options: Options,
+) Error!Stats {
     var r: Replayer = .{
         .gpa = gpa,
-        .canvas = canvas,
+        .sink = sink,
         .list = list,
         .base = xform,
         .options = options,
@@ -208,7 +322,7 @@ pub fn render(
 
 const Replayer = struct {
     gpa: Allocator,
-    canvas: *Canvas,
+    sink: Sink,
     list: DisplayList,
     base: Transform,
     options: Options,
@@ -221,9 +335,18 @@ const Replayer = struct {
     /// destroy the flattened input it is being built from.
     outline: path.Flattener,
 
+    /// Scratch for `.slug`: one path's curves, and the store that holds the
+    /// bands built over them. Both are reset rather than reallocated per
+    /// path, which is what keeps a page of thousands of glyphs to a handful
+    /// of allocations.
+    curves: std.ArrayList(slug.Curve) = .empty,
+    store: slug.Store = .{},
+
     /// One entry per open clip, so `clip_pop` knows whether its `clip_push`
     /// actually took effect.
     clip_stack: std.ArrayList(bool) = .empty,
+    /// The blend mode in force. See `setBlend`.
+    blend: paint.BlendMode = .normal,
     /// Constant alpha, multiplied down by every open transparency group.
     alpha: f32 = 1,
     /// What a `layer_push` saved, restored by its `layer_pop`. One stack
@@ -234,6 +357,8 @@ const Replayer = struct {
     fn deinit(r: *Replayer) void {
         r.flat.deinit(r.gpa);
         r.outline.deinit(r.gpa);
+        r.curves.deinit(r.gpa);
+        r.store.deinit(r.gpa);
         r.clip_stack.deinit(r.gpa);
         r.alpha_stack.deinit(r.gpa);
     }
@@ -269,8 +394,60 @@ const Replayer = struct {
             return;
         };
 
+        // The analytic rasteriser takes the path's own curves, unflattened.
+        // That is the whole point of it: a cubic stays a cubic pair all the
+        // way to the fragment, so the same buffers draw the page at any zoom
+        // and a curve never shows the flat spots of its approximation.
+        //
+        // Strokes and glyphs cannot do this -- the stroker and the font layer
+        // both hand over outlines that are already flattened -- so they go
+        // through `paintThrough` with segments. Fills are the case where it
+        // is free, and fills are most of the vector art on a page.
+        if (r.options.path_backend == .slug) {
+            r.curves.clearRetainingCapacity();
+            slug.fromPath(
+                r.gpa,
+                &r.curves,
+                r.list,
+                p,
+                .identity,
+                r.options.curve_tolerance,
+            ) catch {
+                r.stats.paths_dropped += 1;
+                return;
+            };
+            try r.paintCurves(rule, color, r.base);
+            return;
+        }
+
         const flat = r.flatten(p) orelse return;
         try r.paintFlattened(flat, rule, color);
+    }
+
+    /// Fills whatever is in `r.curves`: the one place the two sinks part.
+    fn paintCurves(r: *Replayer, rule: FillRule, color: Color, xform: Transform) Error!void {
+        if (r.curves.items.len == 0) return;
+        switch (r.sink) {
+            .canvas => |c| {
+                r.store.reset();
+                const id = try r.store.add(r.gpa, r.curves.items, rule);
+                c.fillSlug(.{
+                    .store = &r.store,
+                    .header = id,
+                    .xform = xform,
+                    .rays = r.options.rays,
+                }, color, r.alpha);
+            },
+            .scene => |s| try s.draw(
+                r.gpa,
+                r.curves.items,
+                rule,
+                xform,
+                color,
+                r.alpha,
+                r.blend,
+            ),
+        }
     }
 
     /// Flattens a path, or counts it as dropped and returns null.
@@ -294,10 +471,42 @@ const Replayer = struct {
     }
 
     fn paintFlattened(r: *Replayer, flat: path.Flattened, rule: FillRule, color: Color) Error!void {
+        try r.paintThrough(flat, r.base, rule, color);
+    }
+
+    /// Every filled outline on the page goes through here, whichever
+    /// rasteriser is in force: a path fill, a stroke's generated outline, a
+    /// glyph. One place, so the two backends cannot drift apart in *what*
+    /// they are asked to draw -- only in how they draw it, which is the whole
+    /// point of being able to compare them.
+    fn paintThrough(
+        r: *Replayer,
+        flat: path.Flattened,
+        xform: Transform,
+        rule: FillRule,
+        color: Color,
+    ) Error!void {
         if (flat.isEmpty()) return;
-        var m = try path.mesh(r.gpa, flat);
-        defer m.deinit(r.gpa);
-        r.canvas.fill(m, r.base, rule, color, r.alpha);
+        switch (r.options.path_backend) {
+            .stencil => {
+                // Only a canvas has a stencil buffer; `record` forces `.slug`
+                // before the walk starts, so this arm is unreachable with a
+                // scene and the switch says so rather than silently drawing
+                // nothing.
+                const c = switch (r.sink) {
+                    .canvas => |c| c,
+                    .scene => unreachable,
+                };
+                var m = try path.mesh(r.gpa, flat);
+                defer m.deinit(r.gpa);
+                c.fill(m, xform, rule, color, r.alpha);
+            },
+            .slug => {
+                r.curves.clearRetainingCapacity();
+                try slug.fromFlattened(r.gpa, &r.curves, flat);
+                try r.paintCurves(rule, color, xform);
+            },
+        }
     }
 
     // -- strokes ------------------------------------------------------------
@@ -361,11 +570,9 @@ const Replayer = struct {
         const outlined = r.outline.finish(r.gpa) catch return;
         if (outlined.isEmpty()) return;
 
-        var m = try path.mesh(r.gpa, outlined);
-        defer m.deinit(r.gpa);
-        // A stroke's outline is always nonzero: the rule is how the stamped
+        // A stroke.s outline is always nonzero: the rule is how the stamped
         // pieces are unioned, not a property of the path. See `stroke.zig`.
-        r.canvas.fill(m, to_device, .nonzero, color, r.alpha);
+        try r.paintThrough(outlined, to_device, .nonzero, color);
     }
 
     /// Like `flatten`, but maps every point through `pre` first.
@@ -424,35 +631,65 @@ const Replayer = struct {
             return;
         }
 
-        var m = try path.mesh(r.gpa, flat);
-        defer m.deinit(r.gpa);
-        try r.canvas.pushClip(r.gpa, m, r.base, rule);
+        switch (r.sink) {
+            .canvas => |c| {
+                var m = try path.mesh(r.gpa, flat);
+                defer m.deinit(r.gpa);
+                try c.pushClip(r.gpa, m, r.base, rule);
+            },
+            .scene => |s| {
+                // The clip goes to the device as an outline like any other,
+                // and the fragment shader intersects it by multiplying
+                // coverages. No mask, no second attachment, and an
+                // antialiased clip edge for free.
+                r.curves.clearRetainingCapacity();
+                try slug.fromFlattened(r.gpa, &r.curves, flat);
+                try s.pushClip(r.gpa, r.curves.items, rule, r.base);
+            },
+        }
         try r.clip_stack.append(r.gpa, true);
     }
 
     fn popClip(r: *Replayer) void {
         const pushed = r.clip_stack.pop() orelse return;
-        if (pushed) r.canvas.popClip(r.gpa);
+        if (!pushed) return;
+        switch (r.sink) {
+            .canvas => |c| c.popClip(r.gpa),
+            .scene => |s| s.popClip(),
+        }
     }
 
     // -- groups -------------------------------------------------------------
 
     fn pushLayer(r: *Replayer, l: paint.Layer) Error!void {
         r.stats.layers += 1;
-        try r.alpha_stack.append(r.gpa, .{ .alpha = r.alpha, .blend = r.canvas.blend_mode });
+        try r.alpha_stack.append(r.gpa, .{ .alpha = r.alpha, .blend = r.blend });
         r.alpha *= std.math.clamp(l.alpha, 0, 1);
         // The innermost mode that is not `normal` wins. A group composites
         // into its parent with its own mode and its *contents* are drawn
         // normally inside it -- so with the group folded into its contents
         // the way this does, a nested plain group must not cancel the
         // multiply an enclosing one asked for.
-        if (l.blend != .normal) r.canvas.blend_mode = l.blend;
+        if (l.blend != .normal) r.setBlend(l.blend);
     }
 
     fn popLayer(r: *Replayer) void {
         const saved: SavedLayer = r.alpha_stack.pop() orelse .{ .alpha = 1, .blend = .normal };
         r.alpha = saved.alpha;
-        r.canvas.blend_mode = saved.blend;
+        r.setBlend(saved.blend);
+    }
+
+    /// The replayer owns the current blend mode and the canvas mirrors it.
+    ///
+    /// It used to live only on the canvas, which was fine while a canvas was
+    /// the only thing a replay could end in. A recorded scene has nowhere to
+    /// put device state, so the mode is kept here and pushed down.
+    fn setBlend(r: *Replayer, mode: paint.BlendMode) void {
+        r.blend = mode;
+        switch (r.sink) {
+            .canvas => |c| c.blend_mode = mode,
+            .scene => {},
+        }
     }
 
     // -- the not-yet-drawable ------------------------------------------------
@@ -578,19 +815,46 @@ const Replayer = struct {
             r.stats.segments += flat.segmentCount();
             r.stats.glyphs_drawn += 1;
 
-            var m = try path.mesh(r.gpa, flat);
-            defer m.deinit(r.gpa);
             // Glyph outlines are always nonzero. TrueType and CFF both wind
             // counters the opposite way from the outer contour, which is what
             // makes the hole in an `o` a hole under this rule and under no
             // other -- even-odd would agree here and disagree the moment two
             // contours of a script face overlap.
-            r.canvas.fill(m, to_device, .nonzero, color, r.alpha);
+            try r.paintThrough(flat, to_device, .nonzero, color);
         }
     }
 
     fn image(r: *Replayer, img: DisplayList.Image) Error!void {
         r.stats.images += 1;
+
+        if (r.options.images) |source| {
+            if (source.get(img.object, r.list.stringOf(img.name))) |bitmap| {
+                switch (r.sink) {
+                    .canvas => |c| {
+                        c.drawImage(.{
+                            .pixels = bitmap.pixels,
+                            .width = bitmap.width,
+                            .height = bitmap.height,
+                            .xform = img.transform.concat(r.base),
+                            .is_mask = bitmap.is_mask,
+                            .mask_color = solid(img.fill) orelse .black,
+                        }, r.alpha);
+                        r.stats.images_drawn += 1;
+                        return;
+                    },
+                    // The analytic pipeline has no sampler. An image recorded
+                    // for it would have to become a textured quad in the rect
+                    // pipeline, which is a different draw call and a real
+                    // feature; counting it is the honest placeholder.
+                    .scene => {},
+                }
+            }
+        }
+
+        // Not drawn: no source, an undecodable codec, or a backend that
+        // cannot sample. The outline below is a debugging aid and is not the
+        // image, so it does not make the page complete.
+        r.stats.images_not_drawn += 1;
         if (!r.options.image_boxes) return;
 
         // The unit square through the image's own matrix, which is how PDF

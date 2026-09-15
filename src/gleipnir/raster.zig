@@ -45,6 +45,7 @@ const geom = @import("../gelgja/geom.zig");
 const paint = @import("../gelgja/paint.zig");
 const path = @import("path.zig");
 const rect = @import("rect.zig");
+const slug = @import("slug.zig");
 const software = @import("software.zig");
 
 const Bounds = geom.Bounds;
@@ -112,13 +113,140 @@ pub const Options = struct {
     space: Space = .srgb,
 };
 
+/// A half-open rectangle of device pixels: `x0 <= x < x1`, `y0 <= y < y1`.
+///
+/// Integer, not `Bounds`, because it is a range of array indices and every
+/// use of it is a loop bound. `Bounds` is the float geometry it comes from.
+pub const Box = struct {
+    x0: u32 = 0,
+    y0: u32 = 0,
+    x1: u32 = 0,
+    y1: u32 = 0,
+
+    pub fn widthOf(b: Box) u32 {
+        return b.x1 -| b.x0;
+    }
+
+    pub fn heightOf(b: Box) u32 {
+        return b.y1 -| b.y0;
+    }
+
+    pub fn area(b: Box) usize {
+        return @as(usize, b.widthOf()) * b.heightOf();
+    }
+
+    pub fn isEmpty(b: Box) bool {
+        return b.x1 <= b.x0 or b.y1 <= b.y0;
+    }
+
+    pub fn intersect(a: Box, b: Box) Box {
+        return .{
+            .x0 = @max(a.x0, b.x0),
+            .y0 = @max(a.y0, b.y0),
+            .x1 = @min(a.x1, b.x1),
+            .y1 = @min(a.y1, b.y1),
+        };
+    }
+
+    pub fn contains(b: Box, x: u32, y: u32) bool {
+        return x >= b.x0 and x < b.x1 and y >= b.y0 and y < b.y1;
+    }
+
+    /// Every pixel a `Bounds` touches, clamped to `limit`.
+    ///
+    /// The `+ 1` on the maxima is the same one the two rasterising loops use:
+    /// a shape ending at x = 10.0 still deposits samples in pixel 10, because
+    /// the sample positions inside a pixel are offsets from its corner.
+    pub fn fromBounds(b: Bounds, limit: Box) Box {
+        if (b.isEmpty()) return .{};
+        const x0: u32 = @intFromFloat(@max(0.0, @floor(b.min_x)));
+        const y0: u32 = @intFromFloat(@max(0.0, @floor(b.min_y)));
+        const x1: u32 = @as(u32, @intFromFloat(@max(0.0, @ceil(b.max_x)))) +| 1;
+        const y1: u32 = @as(u32, @intFromFloat(@max(0.0, @ceil(b.max_y)))) +| 1;
+        return (Box{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 }).intersect(limit);
+    }
+};
+
+/// Somewhere to rasterise coverage that is not the framebuffer: a clip path,
+/// or a soft mask. One byte per pixel of `box`, and nothing outside it.
+pub const Mask = struct {
+    data: []u8,
+    box: Box,
+
+    pub fn at(m: Mask, x: u32, y: u32) u8 {
+        if (!m.box.contains(x, y)) return 0;
+        return m.data[@as(usize, y - m.box.y0) * m.box.widthOf() + (x - m.box.x0)];
+    }
+};
+
+/// One entry of the clip stack: the mask a `pushClip` displaced, and where it
+/// lived. Restoring a clip is two assignments, whatever its size.
+const SavedClip = struct { mask: []u8, box: Box };
+
+/// One analytic fill: which path in the store, and where to put it.
+///
+/// The curves stay in their own space and the transform is carried separately
+/// -- the same arrangement the GPU pipeline uses, and for the same reason.
+/// One uploaded outline can be drawn at any scale, so a zoom changes a matrix
+/// rather than every buffer on the device.
+pub const SlugFill = struct {
+    store: *const slug.Store,
+    header: u32,
+    /// Path space to device space.
+    xform: Transform,
+    /// Sub-rows per pixel for the `∫ F(y) dy` midpoint rule.
+    rays: u32 = slug.default_rays,
+};
+
+/// One drawn image: decoded pixels, and the matrix that puts the unit square
+/// where they go.
+pub const ImageFill = struct {
+    /// Straight (not premultiplied) RGBA, eight bits a channel.
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    /// The unit square to device pixels.
+    xform: Transform,
+    /// `/ImageMask`: the alpha is a stencil and the colour comes from the
+    /// fill in force, not from the image.
+    is_mask: bool = false,
+    mask_color: Color = .black,
+};
+
+/// How many samples to take across one device pixel, from how many source
+/// pixels it covers.
+///
+/// One when magnifying -- there is nothing to average, and averaging would
+/// only blur. Up to four when minifying, which is sixteen samples a pixel at
+/// the limit and enough to stop a page-sized photograph from shimmering.
+fn sampleSteps(footprint: f32) u32 {
+    if (!(footprint > 1.5)) return 1;
+    return @min(4, @as(u32, @intFromFloat(@ceil(footprint))));
+}
+
+/// A `Bounds` through a transform: the box of the four mapped corners, which
+/// is what a rotated path needs and what an axis-aligned one costs nothing.
+fn mapBounds(b: Bounds, t: Transform) Bounds {
+    if (b.isEmpty()) return .empty;
+    var out: Bounds = .empty;
+    for ([4][2]f32{
+        .{ b.min_x, b.min_y }, .{ b.max_x, b.min_y },
+        .{ b.max_x, b.max_y }, .{ b.min_x, b.max_y },
+    }) |corner| {
+        out = out.add(t.apply(.{ .x = corner[0], .y = corner[1] }));
+    }
+    return out;
+}
+
 /// A framebuffer, a stencil buffer, and a clip.
 pub const Canvas = struct {
     fb: Framebuffer,
     /// One byte per sample, `width * height * samples`. Zero everywhere
     /// between paths, which is an invariant a test checks rather than a hope.
     stencil: []u8,
-    /// Per-pixel clip coverage, 255 everywhere by default.
+    /// Clip coverage inside `clip_box`, one byte per pixel. Outside the box
+    /// the clip is zero *by definition* -- there is no storage for it and
+    /// nothing is drawn there.
     ///
     /// A rectangular clip could be a loop bound, but PDF clips with paths --
     /// `W n` is on nearly every page that has a figure on it -- and an
@@ -127,9 +255,21 @@ pub const Canvas = struct {
     /// stencil; a byte per pixel is the CPU's version of that and it
     /// antialiases the clip edge for free, which the stencil-bit version
     /// cannot.
+    ///
+    /// The box is not an optimisation of the common case, it is the
+    /// difference between a usable reader and an unusable one. A scatter plot
+    /// draws each marker inside its own two-point clip: page 4 of a paper in
+    /// the corpus has 1,635 of them. Storing each as a full-page mask means
+    /// duplicating, zeroing and multiplying a megabyte three times per marker
+    /// -- five gigabytes of memory traffic for a page whose clipped area adds
+    /// up to a few thousand pixels, and three and a half seconds of it. With
+    /// the box, each of those clips costs the nine bytes it covers.
     clip: []u8,
+    /// Where `clip` lives. Starts as the whole canvas and only ever shrinks
+    /// until a `popClip` restores a wider one.
+    clip_box: Box = .{},
     /// Saved clips, for `pushClip` / `popClip`.
-    clip_stack: std.ArrayList([]u8) = .empty,
+    clip_stack: std.ArrayList(SavedClip) = .empty,
     /// How many samples of each pixel the cover pass has claimed so far, for
     /// the path being drawn. Zero everywhere between paths.
     ///
@@ -176,6 +316,7 @@ pub const Canvas = struct {
             .fb = fb,
             .stencil = stencil,
             .clip = clip,
+            .clip_box = .{ .x0 = 0, .y0 = 0, .x1 = w, .y1 = h },
             .cover = cover,
             .samples = options.samples,
         };
@@ -184,9 +325,11 @@ pub const Canvas = struct {
     pub fn deinit(c: *Canvas, gpa: Allocator) void {
         c.fb.deinit(gpa);
         gpa.free(c.stencil);
-        gpa.free(c.clip);
+        if (c.clip.len != 0) gpa.free(c.clip);
         gpa.free(c.cover);
-        for (c.clip_stack.items) |m| gpa.free(m);
+        for (c.clip_stack.items) |s| {
+            if (s.mask.len != 0) gpa.free(s.mask);
+        }
         c.clip_stack.deinit(gpa);
         c.* = undefined;
     }
@@ -212,44 +355,226 @@ pub const Canvas = struct {
         return true;
     }
 
+    /// The clip's coverage at one pixel, which is zero outside the box.
+    pub inline fn clipAt(c: *const Canvas, x: u32, y: u32) u8 {
+        const b = c.clip_box;
+        if (!b.contains(x, y)) return 0;
+        return c.clip[@as(usize, y - b.y0) * b.widthOf() + (x - b.x0)];
+    }
+
     /// Intersects the clip with a path. The mesh is rendered to coverage the
     /// same way a fill is, and multiplied into the existing mask.
+    ///
+    /// The new mask covers the intersection of the old box with the path's
+    /// own bounds, because that is the only place the result can be non-zero:
+    /// outside the path there is no coverage, and outside the old box there
+    /// was no clip. So a clip costs its own area and not the page's.
     pub fn pushClip(c: *Canvas, gpa: Allocator, m: Mesh, xform: Transform, rule: FillRule) Allocator.Error!void {
-        const saved = try gpa.dupe(u8, c.clip);
-        errdefer gpa.free(saved);
-        try c.clip_stack.append(gpa, saved);
+        const want = Box.fromBounds(meshBounds(m, xform), c.clip_box);
+
+        try c.clip_stack.append(gpa, .{ .mask = c.clip, .box = c.clip_box });
+        errdefer _ = c.clip_stack.pop();
+
+        // A clip that meets the page nowhere is not the same as no clip: it
+        // hides everything until its `Q`, which is what `W n` with a
+        // degenerate or off-page path is asking for.
+        if (want.isEmpty()) {
+            c.clip = &.{};
+            c.clip_box = .{};
+            return;
+        }
+
+        const mask = try gpa.alloc(u8, want.area());
+        @memset(mask, 0);
 
         // Coverage of the clip path, then `clip *= coverage`. Multiplying
         // rather than replacing is what makes nested clips intersect, which is
         // the only thing PDF's clip stack ever does (§8.5.4): a clip can be
         // narrowed by `W` and widened only by `Q`.
-        const mask = try gpa.alloc(u8, c.clip.len);
-        defer gpa.free(mask);
-        @memset(mask, 0);
-        c.coverage(m, xform, rule, mask);
+        //
+        // `coverage` still reads the *old* clip through `clipAt`, which is
+        // both correct -- coverage outside the enclosing clip cannot matter --
+        // and what keeps the stencil buffer clean, since the two passes skip
+        // exactly the same pixels.
+        c.coverage(m, xform, rule, .{ .data = mask, .box = want });
 
-        for (c.clip, mask) |*dst, src| {
-            dst.* = @intCast((@as(u32, dst.*) * src + 127) / 255);
+        const stride = want.widthOf();
+        var y: u32 = want.y0;
+        while (y < want.y1) : (y += 1) {
+            const row = @as(usize, y - want.y0) * stride;
+            var x: u32 = want.x0;
+            while (x < want.x1) : (x += 1) {
+                const i = row + (x - want.x0);
+                mask[i] = @intCast((@as(u32, mask[i]) * c.clipAt(x, y) + 127) / 255);
+            }
         }
+
+        c.clip = mask;
+        c.clip_box = want;
     }
 
     pub fn popClip(c: *Canvas, gpa: Allocator) void {
         const saved = c.clip_stack.pop() orelse return;
-        gpa.free(c.clip);
-        c.clip = saved;
+        if (c.clip.len != 0) gpa.free(c.clip);
+        c.clip = saved.mask;
+        c.clip_box = saved.box;
     }
 
     /// Fills a mesh. The two passes, in order.
     pub fn fill(c: *Canvas, m: Mesh, xform: Transform, rule: FillRule, color: Color, alpha: f32) void {
         if (m.isEmpty()) return;
+        // Nothing survives an empty clip, and a path outside the clip box
+        // touches no pixel the resolve would keep. Both are worth an early
+        // exit: on a clipped page most fills are one or the other.
+        if (c.clip_box.isEmpty()) return;
+        if (Box.fromBounds(meshBounds(m, xform), c.clip_box).isEmpty()) return;
         c.stencilPass(m, xform);
         c.coverPass(m, xform, rule, color, alpha, null);
     }
 
-    /// Rasterises the mesh to an eight-bit coverage buffer instead of blending
+    /// Fills a path from its curves instead of from a mesh: the CPU model of
+    /// the slug pipeline's fragment shader, pixel for pixel.
+    ///
+    /// There is no stencil pass, no cover pass and no mesh. Each pixel asks
+    /// the outline directly how much of itself is inside, which is why this
+    /// can be checked against `fill` on a real page -- two independent
+    /// rasterisers, one display list, one difference to look at. That
+    /// comparison is `fenrir raster --path both`, and it is the only evidence
+    /// that the shader is right that does not require a GPU to collect.
+    pub fn fillSlug(c: *Canvas, f: SlugFill, color: Color, alpha: f32) void {
+        const store = f.store;
+        if (f.header >= store.headers.items.len) return;
+        const h = store.headers.items[f.header];
+        if (h.curve_count == 0) return;
+
+        const inverse = f.xform.invert() orelse return;
+        const area = Box.fromBounds(mapBounds(h.bounds(), f.xform), c.clip_box);
+        if (area.isEmpty()) return;
+
+        const scale: slug.Scale = .of(f.xform);
+        const rays = @max(1, f.rays);
+
+        var y: u32 = area.y0;
+        while (y < area.y1) : (y += 1) {
+            var x: u32 = area.x0;
+            while (x < area.x1) : (x += 1) {
+                const clip = c.clipAt(x, y);
+                if (clip == 0) continue;
+                // The pixel's centre, back in the space the curves are in.
+                const p = inverse.apply(.{
+                    .x = @as(f32, @floatFromInt(x)) + 0.5,
+                    .y = @as(f32, @floatFromInt(y)) + 0.5,
+                });
+                const cov = slug.coverageAt(store.*, f.header, p.x, p.y, scale, rays);
+                if (cov <= 0) continue;
+                c.blend(
+                    @as(usize, y) * c.width() + x,
+                    color,
+                    cov * (@as(f32, @floatFromInt(clip)) / 255.0) * alpha,
+                );
+            }
+        }
+    }
+
+    /// Draws a decoded image through its placement matrix.
+    ///
+    /// PDF maps every image into the unit square and leaves the CTM to place
+    /// it (§8.9.5), so the geometry is one matrix and the work is entirely in
+    /// the sampling: each device pixel in the image's device-space box is
+    /// mapped *back* through the inverse to find where it lands in the image.
+    /// That is what makes a rotated or sheared image come out right, and it
+    /// is why there is no separate path for the axis-aligned case.
+    ///
+    /// The unit square's `v` runs up and the image's rows run down, so row
+    /// zero is at `v = 1`. Getting that backwards flips every figure on every
+    /// page vertically, which is obvious once seen and easy to write.
+    pub fn drawImage(c: *Canvas, img: ImageFill, alpha: f32) void {
+        if (img.width == 0 or img.height == 0 or img.pixels.len == 0) return;
+        const inverse = img.xform.invert() orelse return;
+        const area = Box.fromBounds(mapBounds(.fromRect(0, 0, 1, 1), img.xform), c.clip_box);
+        if (area.isEmpty()) return;
+
+        // How many source pixels one device pixel covers, which decides
+        // whether this is magnifying (sample once) or minifying (average, or
+        // the page moirés). A figure scaled from 1600 pixels down to 160 has
+        // a footprint of ten, and taking one sample in ten throws away the
+        // other nine and shimmers when it moves.
+        const fx = @abs(inverse.a) + @abs(inverse.c);
+        const fy = @abs(inverse.b) + @abs(inverse.d);
+        const steps_x = sampleSteps(fx * @as(f32, @floatFromInt(img.width)));
+        const steps_y = sampleSteps(fy * @as(f32, @floatFromInt(img.height)));
+        const n = @as(f32, @floatFromInt(steps_x * steps_y));
+
+        var y: u32 = area.y0;
+        while (y < area.y1) : (y += 1) {
+            var x: u32 = area.x0;
+            while (x < area.x1) : (x += 1) {
+                const clip = c.clipAt(x, y);
+                if (clip == 0) continue;
+
+                var acc: [4]f32 = @splat(0);
+                var taken: u32 = 0;
+                var sy: u32 = 0;
+                while (sy < steps_y) : (sy += 1) {
+                    var sx: u32 = 0;
+                    while (sx < steps_x) : (sx += 1) {
+                        const px = @as(f32, @floatFromInt(x)) +
+                            (@as(f32, @floatFromInt(sx)) + 0.5) / @as(f32, @floatFromInt(steps_x));
+                        const py = @as(f32, @floatFromInt(y)) +
+                            (@as(f32, @floatFromInt(sy)) + 0.5) / @as(f32, @floatFromInt(steps_y));
+                        const uv = inverse.apply(.{ .x = px, .y = py });
+                        if (uv.x < 0 or uv.x >= 1 or uv.y < 0 or uv.y >= 1) continue;
+
+                        const ix: u32 = @min(img.width - 1, @as(u32, @intFromFloat(uv.x *
+                            @as(f32, @floatFromInt(img.width)))));
+                        const iy: u32 = @min(img.height - 1, @as(u32, @intFromFloat((1 - uv.y) *
+                            @as(f32, @floatFromInt(img.height)))));
+                        const at = (@as(usize, iy) * img.width + ix) * 4;
+                        if (at + 4 > img.pixels.len) continue;
+
+                        // Averaged premultiplied, so a transparent texel does
+                        // not drag its colour into the average.
+                        const a = @as(f32, @floatFromInt(img.pixels[at + 3])) / 255.0;
+                        acc[0] += @as(f32, @floatFromInt(img.pixels[at + 0])) / 255.0 * a;
+                        acc[1] += @as(f32, @floatFromInt(img.pixels[at + 1])) / 255.0 * a;
+                        acc[2] += @as(f32, @floatFromInt(img.pixels[at + 2])) / 255.0 * a;
+                        acc[3] += a;
+                        taken += 1;
+                    }
+                }
+                if (taken == 0) continue;
+
+                // Divided by the full sample count and not by how many landed
+                // inside: a device pixel half off the edge of the image is
+                // half covered, and that is its antialiased edge.
+                const cover = acc[3] / n;
+                if (cover <= 0) continue;
+
+                const color: Color = if (img.is_mask) .{
+                    .r = img.mask_color.r,
+                    .g = img.mask_color.g,
+                    .b = img.mask_color.b,
+                    .a = img.mask_color.a,
+                } else .{
+                    .r = acc[0] / acc[3],
+                    .g = acc[1] / acc[3],
+                    .b = acc[2] / acc[3],
+                    .a = 1,
+                };
+
+                c.blend(
+                    @as(usize, y) * c.width() + x,
+                    color,
+                    cover * (@as(f32, @floatFromInt(clip)) / 255.0) * alpha,
+                );
+            }
+        }
+    }
+
+    /// Rasterises the mesh to an eight-bit coverage mask instead of blending
     /// it, for a clip path or a soft mask. Runs the same two passes, so a clip
     /// and a fill of the same path cover exactly the same samples.
-    pub fn coverage(c: *Canvas, m: Mesh, xform: Transform, rule: FillRule, out: []u8) void {
+    pub fn coverage(c: *Canvas, m: Mesh, xform: Transform, rule: FillRule, out: Mask) void {
         if (m.isEmpty()) return;
         c.stencilPass(m, xform);
         c.coverPass(m, xform, rule, null, 1.0, out);
@@ -276,17 +601,13 @@ pub const Canvas = struct {
         rule: FillRule,
         color: ?Color,
         alpha: f32,
-        out: ?[]u8,
+        out: ?Mask,
     ) void {
         // The quad's device-space bounds, which is the region the resolve
         // below has to sweep and the only region `cover` can have been
-        // written in.
-        var box: Bounds = .empty;
-        var k: u32 = 0;
-        while (k < Mesh.cover_count) : (k += 1) {
-            box = box.add(apply(xform, m.vertices[m.indices[m.cover_first + k]]).point());
-        }
-        const area = box.intersect(c.bounds());
+        // written in. Narrowed by the clip, because `rasterTriangle` deposits
+        // nothing outside it.
+        const area = Box.fromBounds(meshBounds(m, xform), c.clip_box);
         if (area.isEmpty()) return;
 
         var cov: CoverState = .{ .rule = rule };
@@ -303,29 +624,27 @@ pub const Canvas = struct {
 
     /// Turns the accumulated sample counts into colour, once per pixel, and
     /// clears them for the next path.
-    fn resolve(c: *Canvas, area: Bounds, color: ?Color, alpha: f32, out: ?[]u8) void {
+    fn resolve(c: *Canvas, area: Box, color: ?Color, alpha: f32, out: ?Mask) void {
         const inv_n = 1.0 / @as(f32, @floatFromInt(c.samples.count()));
 
-        const x0: u32 = @intFromFloat(@max(0.0, @floor(area.min_x)));
-        const y0: u32 = @intFromFloat(@max(0.0, @floor(area.min_y)));
-        const x1: u32 = @min(c.width(), @as(u32, @intFromFloat(@max(0.0, @ceil(area.max_x)))) + 1);
-        const y1: u32 = @min(c.height(), @as(u32, @intFromFloat(@max(0.0, @ceil(area.max_y)))) + 1);
-
-        var y: u32 = y0;
-        while (y < y1) : (y += 1) {
-            var x: u32 = x0;
-            while (x < x1) : (x += 1) {
+        var y: u32 = area.y0;
+        while (y < area.y1) : (y += 1) {
+            var x: u32 = area.x0;
+            while (x < area.x1) : (x += 1) {
                 const pixel = @as(usize, y) * c.width() + x;
                 const n = c.cover[pixel];
                 if (n == 0) continue;
                 c.cover[pixel] = 0;
 
                 const frac = @as(f32, @floatFromInt(n)) * inv_n *
-                    (@as(f32, @floatFromInt(c.clip[pixel])) / 255.0);
+                    (@as(f32, @floatFromInt(c.clipAt(x, y))) / 255.0);
 
                 if (out) |mask| {
+                    if (!mask.box.contains(x, y)) continue;
+                    const i = @as(usize, y - mask.box.y0) * mask.box.widthOf() +
+                        (x - mask.box.x0);
                     const v: u8 = @intFromFloat(@round(std.math.clamp(frac, 0, 1) * 255.0));
-                    mask[pixel] = @max(mask[pixel], v);
+                    mask.data[i] = @max(mask.data[i], v);
                 } else {
                     c.blend(pixel, color.?, frac * alpha);
                 }
@@ -360,28 +679,23 @@ pub const Canvas = struct {
 
         var box: Bounds = .empty;
         for ([_]Vertex{ a, b, t }) |v| box = box.add(v.point());
-        const area_px = box.intersect(c.bounds());
+        // Clipped-away pixels produce no fragments at all, which is both
+        // faster and the reason a clip never leaves stencil bits behind: the
+        // cover pass skips exactly the pixels the stencil pass skipped. Most
+        // of that skipping is free, as a loop bound rather than a test.
+        const area_px = Box.fromBounds(box, c.clip_box);
         if (area_px.isEmpty()) return;
-
-        const x0: u32 = @intFromFloat(@max(0.0, @floor(area_px.min_x)));
-        const y0: u32 = @intFromFloat(@max(0.0, @floor(area_px.min_y)));
-        const x1: u32 = @min(c.width(), @as(u32, @intFromFloat(@max(0.0, @ceil(area_px.max_x)))) + 1);
-        const y1: u32 = @min(c.height(), @as(u32, @intFromFloat(@max(0.0, @ceil(area_px.max_y)))) + 1);
 
         const positions = c.samples.positions();
         const n = c.samples.count();
 
-        var y: u32 = y0;
-        while (y < y1) : (y += 1) {
-            var x: u32 = x0;
-            while (x < x1) : (x += 1) {
+        var y: u32 = area_px.y0;
+        while (y < area_px.y1) : (y += 1) {
+            var x: u32 = area_px.x0;
+            while (x < area_px.x1) : (x += 1) {
                 const pixel = @as(usize, y) * c.width() + x;
 
-                // Clipped-away pixels produce no fragments at all, which is
-                // both faster and the reason a clip never leaves stencil bits
-                // behind: the cover pass skips exactly the pixels the stencil
-                // pass skipped.
-                if (c.clip[pixel] == 0) continue;
+                if (c.clipAt(x, y) == 0) continue;
 
                 var covered: u32 = 0;
                 for (positions, 0..) |off, si| {
@@ -462,6 +776,21 @@ pub const Canvas = struct {
         c.fb.pixels[o + 3] = ab * inv + a;
     }
 };
+
+/// The device-space bounds of a mesh, taken from its cover quad.
+///
+/// The quad is the path's own bounding box carried through the mesh, so this
+/// is four transformed points rather than a sweep of every vertex -- which
+/// matters, because it is called once per fill and per clip on a page that
+/// may have thousands of both.
+fn meshBounds(m: Mesh, xform: Transform) Bounds {
+    var box: Bounds = .empty;
+    var k: u32 = 0;
+    while (k < Mesh.cover_count) : (k += 1) {
+        box = box.add(apply(xform, m.vertices[m.indices[m.cover_first + k]]).point());
+    }
+    return box;
+}
 
 fn apply(t: Transform, v: Vertex) Vertex {
     return .{
@@ -957,4 +1286,209 @@ test "the interior of a multisampled fill is solid, diagonal included" {
         std.debug.print("pixel {d},{d} is only {d:.3} covered\n", .{ at[0], at[1], worst });
         return e;
     };
+}
+
+test "a clip costs its own area, not the page's" {
+    // The property that makes a page of small clipped marks affordable. A
+    // scatter plot pushes one clip per marker; if each of those held a mask
+    // the size of the page, the page would take seconds rather than
+    // milliseconds, which is exactly what it used to do.
+    const gpa = testing.allocator;
+    var c = try Canvas.init(gpa, 512, 512, .{ .samples = .four });
+    defer c.deinit(gpa);
+
+    // No clip: the box is the whole canvas, and the mask is a byte a pixel.
+    try testing.expectEqual(@as(usize, 512 * 512), c.clip.len);
+    try testing.expectEqual(Box{ .x0 = 0, .y0 = 0, .x1 = 512, .y1 = 512 }, c.clip_box);
+
+    var flat: Flattener = .{};
+    defer flat.deinit(gpa);
+    const small = try polygon(gpa, &flat, &.{
+        .{ 100, 100 }, .{ 104, 100 }, .{ 104, 104 }, .{ 100, 104 },
+    });
+    var mesh = try path.mesh(gpa, small);
+    defer mesh.deinit(gpa);
+
+    try c.pushClip(gpa, mesh, .identity, .nonzero);
+    // Six pixels a side at most: the four the square covers, plus the one the
+    // sample positions can reach past each edge.
+    try testing.expect(c.clip_box.widthOf() <= 6);
+    try testing.expect(c.clip_box.heightOf() <= 6);
+    try testing.expect(c.clip.len <= 36);
+    try testing.expectEqual(c.clip_box.area(), c.clip.len);
+
+    // Inside the square the clip is open, outside it is shut -- and "outside"
+    // includes everywhere there is no longer any storage.
+    try testing.expectEqual(@as(u8, 255), c.clipAt(102, 102));
+    try testing.expectEqual(@as(u8, 0), c.clipAt(400, 400));
+    try testing.expectEqual(@as(u8, 0), c.clipAt(0, 0));
+
+    c.popClip(gpa);
+    try testing.expectEqual(@as(u8, 255), c.clipAt(400, 400));
+    try testing.expectEqual(Box{ .x0 = 0, .y0 = 0, .x1 = 512, .y1 = 512 }, c.clip_box);
+    try testing.expect(c.stencilIsClean());
+}
+
+test "a clip that misses the page shuts everything out until it is popped" {
+    const gpa = testing.allocator;
+    var c = try Canvas.init(gpa, 64, 64, .{ .samples = .four });
+    defer c.deinit(gpa);
+    c.fb.clear(.white);
+
+    var flat: Flattener = .{};
+    defer flat.deinit(gpa);
+    const away = try polygon(gpa, &flat, &.{
+        .{ 500, 500 }, .{ 520, 500 }, .{ 520, 520 }, .{ 500, 520 },
+    });
+    var mesh = try path.mesh(gpa, away);
+    defer mesh.deinit(gpa);
+
+    try c.pushClip(gpa, mesh, .identity, .nonzero);
+    try testing.expect(c.clip_box.isEmpty());
+    try testing.expectEqual(@as(usize, 0), c.clip.len);
+
+    // A fill that would have covered the canvas paints nothing, because an
+    // off-page clip is still a clip. Not the same as no clip at all.
+    var solid: Flattener = .{};
+    defer solid.deinit(gpa);
+    const all = try polygon(gpa, &solid, &.{
+        .{ 0, 0 }, .{ 64, 0 }, .{ 64, 64 }, .{ 0, 64 },
+    });
+    var all_mesh = try path.mesh(gpa, all);
+    defer all_mesh.deinit(gpa);
+    c.fill(all_mesh, .identity, .nonzero, .black, 1.0);
+    try testing.expectEqual(@as(f32, 1.0), c.fb.at(32, 32).r);
+
+    c.popClip(gpa);
+    c.fill(all_mesh, .identity, .nonzero, .black, 1.0);
+    try testing.expectEqual(@as(f32, 0.0), c.fb.at(32, 32).r);
+    try testing.expect(c.stencilIsClean());
+}
+
+test "an image lands the right way up and inside its rectangle" {
+    // The orientation trap: PDF maps an image into the unit square with v
+    // running *up* while its rows run *down*, so row zero is at v = 1. Get it
+    // backwards and every figure on every page is mirrored vertically, which
+    // on a photograph is obvious and on a plot with a symmetric axis is not.
+    const gpa = testing.allocator;
+    var c = try Canvas.init(gpa, 40, 40, .{ .samples = .one });
+    defer c.deinit(gpa);
+    c.fb.clear(.white);
+
+    // Two rows: red on top (row 0), blue underneath.
+    const pixels = [_]u8{
+        255, 0, 0, 255, 255, 0, 0, 255,
+        0,   0, 255, 255, 0, 0, 255, 255,
+    };
+
+    // The unit square into a 20x20 box at (10, 10), *with the page's y flip
+    // in it* -- which is what `pageTransform` always contributes, and which
+    // is why v = 1 is the top of the drawn rectangle and not the bottom.
+    c.drawImage(.{
+        .pixels = &pixels,
+        .width = 2,
+        .height = 2,
+        .xform = Transform.scaling(20, -20).concat(.translation(10, 30)),
+    }, 1.0);
+
+    // Row 0 of the image is at v = 1, which the flip puts at the top.
+    const top = c.fb.at(15, 14);
+    try testing.expect(top.r > 0.9 and top.b < 0.1);
+    const bottom = c.fb.at(15, 26);
+    try testing.expect(bottom.b > 0.9 and bottom.r < 0.1);
+
+    // And nothing outside the rectangle was touched.
+    try testing.expectEqual(@as(f32, 1.0), c.fb.at(2, 2).r);
+    try testing.expectEqual(@as(f32, 1.0), c.fb.at(35, 35).b);
+}
+
+test "an image mask paints the fill colour where its alpha is set" {
+    const gpa = testing.allocator;
+    var c = try Canvas.init(gpa, 20, 20, .{ .samples = .one });
+    defer c.deinit(gpa);
+    c.fb.clear(.white);
+
+    // Left half opaque, right half transparent. The colours in an image mask
+    // mean nothing; only the alpha does.
+    const pixels = [_]u8{
+        0, 255, 0, 255,
+        0, 255, 0, 0,
+    };
+
+    c.drawImage(.{
+        .pixels = &pixels,
+        .width = 2,
+        .height = 1,
+        .xform = Transform.scaling(20, 20),
+        .is_mask = true,
+        .mask_color = .{ .r = 1, .g = 0, .b = 0, .a = 1 },
+    }, 1.0);
+
+    // Red where the mask is set -- not the green in the pixels.
+    const left = c.fb.at(5, 10);
+    try testing.expect(left.r > 0.9 and left.g < 0.1);
+    // Untouched where it is not.
+    const right = c.fb.at(15, 10);
+    try testing.expectEqual(@as(f32, 1.0), right.g);
+}
+
+test "an image obeys the clip like everything else" {
+    const gpa = testing.allocator;
+    var c = try Canvas.init(gpa, 40, 40, .{ .samples = .one });
+    defer c.deinit(gpa);
+    c.fb.clear(.white);
+
+    var flat: Flattener = .{};
+    defer flat.deinit(gpa);
+    const half = try polygon(gpa, &flat, &.{
+        .{ 0, 0 }, .{ 20, 0 }, .{ 20, 40 }, .{ 0, 40 },
+    });
+    var mesh = try path.mesh(gpa, half);
+    defer mesh.deinit(gpa);
+    try c.pushClip(gpa, mesh, .identity, .nonzero);
+
+    const pixels = [_]u8{ 0, 0, 0, 255 };
+    c.drawImage(.{
+        .pixels = &pixels,
+        .width = 1,
+        .height = 1,
+        .xform = Transform.scaling(40, 40),
+    }, 1.0);
+
+    try testing.expectEqual(@as(f32, 0.0), c.fb.at(10, 20).r);
+    try testing.expectEqual(@as(f32, 1.0), c.fb.at(30, 20).r);
+    c.popClip(gpa);
+}
+
+test "minifying averages rather than picking one texel in ten" {
+    // A checkerboard scaled far down is mid grey if it is filtered and either
+    // black or white if it is not. Nearest-neighbour on a page-sized
+    // photograph is what makes a scanned document shimmer when it scrolls.
+    const gpa = testing.allocator;
+    var c = try Canvas.init(gpa, 8, 8, .{ .samples = .one });
+    defer c.deinit(gpa);
+    c.fb.clear(.white);
+
+    var pixels: [16 * 16 * 4]u8 = undefined;
+    for (0..16) |y| {
+        for (0..16) |x| {
+            const v: u8 = if ((x + y) % 2 == 0) 0 else 255;
+            const o = (y * 16 + x) * 4;
+            pixels[o + 0] = v;
+            pixels[o + 1] = v;
+            pixels[o + 2] = v;
+            pixels[o + 3] = 255;
+        }
+    }
+
+    // Sixteen source pixels into four device pixels: a footprint of four.
+    c.drawImage(.{
+        .pixels = &pixels,
+        .width = 16,
+        .height = 16,
+        .xform = Transform.scaling(4, 4).concat(.translation(2, 2)),
+    }, 1.0);
+
+    const mid = c.fb.at(3, 3).r;
+    try testing.expect(mid > 0.2 and mid < 0.8);
 }
