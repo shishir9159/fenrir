@@ -75,6 +75,17 @@ pub const Capability = enum(u32) {
 const op_capability: u16 = 17;
 const op_entry_point: u16 = 15;
 const op_function: u16 = 54;
+const op_type_runtime_array: u16 = 29;
+const op_type_struct: u16 = 30;
+const op_type_pointer: u16 = 32;
+const op_variable: u16 = 59;
+const op_decorate: u16 = 71;
+const op_member_decorate: u16 = 72;
+
+const decoration_array_stride: u32 = 6;
+const decoration_binding: u32 = 33;
+const decoration_descriptor_set: u32 = 34;
+const decoration_offset: u32 = 35;
 
 /// A parsed module. Borrows the words; nothing is copied.
 pub const Module = struct {
@@ -189,6 +200,115 @@ pub const Module = struct {
         return try m.declares(.sampled_image_array_non_uniform_indexing) or
             try m.declares(.shader_non_uniform) or
             try m.declares(.runtime_descriptor_array);
+    }
+
+    /// How a storage buffer of the form `buffer B { T items[]; }` is laid out
+    /// in memory, as the compiler decided it: the stride of `T` and the byte
+    /// offset of each of its members.
+    pub const ArrayLayout = struct {
+        stride: u32 = 0,
+        /// Member offsets of `T` in declaration order, or empty when `T` is a
+        /// scalar.
+        offsets: [max_members]u32 = @splat(0),
+        members: u32 = 0,
+
+        pub const max_members = 16;
+
+        pub fn memberOffsets(l: *const ArrayLayout) []const u32 {
+            return l.offsets[0..l.members];
+        }
+    };
+
+    /// Reads the layout of the runtime array in the buffer at `set` and
+    /// `binding` out of the module's decorations, or null if the module has
+    /// no such buffer.
+    ///
+    /// Names are not used: an optimising compiler strips them, and the
+    /// binding number is what the Zig side agrees on anyway. The chain is
+    /// variable -> pointer -> block struct -> member 0 -> runtime array
+    /// (which carries `ArrayStride`) -> element struct (whose members carry
+    /// `Offset`).
+    pub fn arrayLayout(m: Module, set: u32, binding: u32) Error!?ArrayLayout {
+        const Pending = struct { id: u32 = 0, set: ?u32 = null, binding: ?u32 = null };
+        var candidates: [64]Pending = @splat(.{});
+        var candidate_count: usize = 0;
+
+        // Pass one: the variable with this set and binding.
+        var it = m.instructions();
+        while (try it.next()) |ins| {
+            if (ins.opcode != op_decorate or ins.operands.len < 3) continue;
+            const decoration = ins.operands[1];
+            if (decoration != decoration_binding and decoration != decoration_descriptor_set) continue;
+            const target = ins.operands[0];
+            var slot: ?*Pending = null;
+            for (candidates[0..candidate_count]) |*c| {
+                if (c.id == target) slot = c;
+            }
+            if (slot == null) {
+                if (candidate_count == candidates.len) continue;
+                candidates[candidate_count] = .{ .id = target };
+                slot = &candidates[candidate_count];
+                candidate_count += 1;
+            }
+            if (decoration == decoration_binding) slot.?.binding = ins.operands[2];
+            if (decoration == decoration_descriptor_set) slot.?.set = ins.operands[2];
+        }
+        var variable: ?u32 = null;
+        for (candidates[0..candidate_count]) |c| {
+            if (c.binding == binding and (c.set orelse 0) == set) variable = c.id;
+        }
+        const var_id = variable orelse return null;
+
+        // Pass two: follow the types down, and pick up the decorations.
+        const pointer = try m.resultTypeOf(var_id, op_variable) orelse return null;
+        const block = try m.operandOf(pointer, op_type_pointer, 1) orelse return null;
+        const array = try m.operandOf(block, op_type_struct, 0) orelse return null;
+        const element = try m.operandOf(array, op_type_runtime_array, 0) orelse return null;
+
+        var out: ArrayLayout = .{};
+        it = m.instructions();
+        while (try it.next()) |ins| {
+            switch (ins.opcode) {
+                op_decorate => if (ins.operands.len >= 3 and ins.operands[0] == array and
+                    ins.operands[1] == decoration_array_stride)
+                {
+                    out.stride = ins.operands[2];
+                },
+                op_member_decorate => if (ins.operands.len >= 4 and ins.operands[0] == element and
+                    ins.operands[2] == decoration_offset)
+                {
+                    const member = ins.operands[1];
+                    if (member < ArrayLayout.max_members) {
+                        out.offsets[member] = ins.operands[3];
+                        out.members = @max(out.members, member + 1);
+                    }
+                },
+                else => {},
+            }
+        }
+        return out;
+    }
+
+    /// The type an `OpVariable` with this result id was declared with.
+    fn resultTypeOf(m: Module, id: u32, opcode: u16) Error!?u32 {
+        var it = m.instructions();
+        while (try it.next()) |ins| {
+            if (ins.opcode == opcode and ins.operands.len >= 2 and ins.operands[1] == id) {
+                return ins.operands[0];
+            }
+        }
+        return null;
+    }
+
+    /// Operand `index` after the result id of the type declaration `id`.
+    fn operandOf(m: Module, id: u32, opcode: u16, index: usize) Error!?u32 {
+        var it = m.instructions();
+        while (try it.next()) |ins| {
+            if (ins.opcode == opcode and ins.operands.len > index + 1 and ins.operands[0] == id) {
+                return ins.operands[index + 1];
+            }
+        }
+        return null;
     }
 
     /// The check worth making at pipeline creation: this module really is for

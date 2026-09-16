@@ -1,19 +1,22 @@
 //! The compiled shaders, and what to say when there are none.
 //!
-//! The GLSL in `gleipnir/shader/` is the source of truth and is compiled to
-//! SPIR-V by the build, not by this program: a renderer that carries a shader
-//! compiler pays for it in binary size and startup time on every machine in
-//! order to produce the same two blobs every time. `build.zig` looks for
-//! `glslc` or `glslangValidator`, runs it if it finds one, and hands the
-//! results here as anonymous imports.
+//! SPIR-V comes in by the build, not by this program: a renderer that carries
+//! a shader compiler pays for it in binary size and startup time on every
+//! machine in order to produce the same blobs every time. `-Dshaders` picks
+//! where it comes from -- the GLSL in `gleipnir/shader/` through glslc or
+//! glslang, the Slang in `gleipnir/shader/slang/` through slangc, or the
+//! modules committed in `gleipnir/shader/spirv/` with no compiler at all --
+//! and the result arrives here as anonymous imports. `compiler` says which.
 //!
-//! When it finds neither, the imports are empty and `available` is false. That
-//! is a real situation and not an error: a machine with a Vulkan driver and no
-//! shader compiler is the normal state of a machine that has never had the SDK
-//! installed. Everything else in Lyngvi still works there -- the window opens,
-//! the device is created, `fenrir view --probe` prints what the hardware can
-//! do -- and only the pipeline refuses, with a message naming the command that
-//! would fix it.
+//! The tests below hold every source to the same contract, which is what
+//! lets one replace another: each module is the stage it claims to be, asks
+//! for descriptor indexing exactly where the pipeline expects it, and lays
+//! out every storage buffer the way the Zig side writes it.
+//!
+//! With `-Dshaders=auto` and nothing to compile or embed, the imports are
+//! empty and `available` is false. Everything else in Lyngvi still works
+//! there -- the window opens, the device is created -- and only the pipeline
+//! refuses, with a message naming the command that would fix it.
 //!
 //! The blobs are declared `align(4)` because `vkCreateShaderModule` takes a
 //! `const uint32_t*` and `@embedFile` promises nothing about alignment.
@@ -29,9 +32,11 @@ pub const available = build_options.lyngvi_spirv;
 /// The command that produces the modules, quoted in the error message when
 /// there are none. Kept next to the thing it produces so it cannot drift.
 pub const compile_hint =
-    "install the Vulkan SDK (or shaderc) and rebuild: the build runs\n" ++
-    "    glslc -I src/gleipnir/shader --target-env=vulkan1.2 src/gleipnir/shader/rect.vert -o rect.vert.spv\n" ++
-    "automatically once glslc or glslangValidator is on PATH";
+    "rebuild with -Dshaders=spirv to embed the committed modules in src/gleipnir/shader/spirv,\n" ++
+    "or put glslc, glslang or slangc on PATH and pick -Dshaders=glsl or -Dshaders=slang";
+
+/// Which compiler, or `spirv` for the committed modules, made what is embedded.
+pub const compiler = build_options.lyngvi_shader_compiler;
 
 const rect_vert_raw = @embedFile("rect_vert_spv");
 const rect_frag_raw = @embedFile("rect_frag_spv");
@@ -81,7 +86,7 @@ pub fn pathFragmentModule() Error!spirv.Module {
 
 /// The analytic path pipeline's stages: one draw, one pass, two modules.
 ///
-/// Unlike the stencil pipeline's, these *do* read storage buffers -- six of
+/// Unlike the stencil pipeline's, these *do* read storage buffers -- eight of
 /// them -- and index them with the instance index, which is uniform across a
 /// draw. So they need descriptor indexing no more than the rect pipeline's
 /// vertex shader does, and `slugFragmentModule` is checked for that below.
@@ -120,7 +125,7 @@ test "a build with no shader compiler says so rather than crashing" {
         // descriptor-indexing fallback pointless.
         try testing.expect(!try pf.needsNonUniformIndexing());
 
-        // The analytic pipeline reads six storage buffers and indexes every
+        // The analytic pipeline reads eight storage buffers and indexes every
         // one of them with a value derived from the instance index, which is
         // uniform across the draw. So it must not ask for non-uniform
         // indexing either: a page's worth of paths goes through one draw call
@@ -150,7 +155,75 @@ test "a build with no shader compiler says so rather than crashing" {
     }
 }
 
+test "the compiled shader lays out every buffer the way the Zig side writes it" {
+    // The failure this exists for shipped: `PathHeader` held its box in a
+    // `vec4`, which aligns a std430 struct to sixteen bytes and made it 48
+    // where `slug.Header` is 40. Every comptime assertion on the Zig side
+    // passed, the shader compiled, the pipeline validated, and every header
+    // after the first was read from the wrong place -- a page of text drawn
+    // as its own glyphs, huge and scattered. Nothing but the compiled module
+    // knows the layout the shader will actually use, so it is read from there.
+    if (!available) return error.SkipZigTest;
+    const slugpipe = @import("../gleipnir/slugpipe.zig");
+    const slug = @import("../gleipnir/slug.zig");
+    const b = slugpipe.binding;
+
+    const checks = [_]Check{
+        .{ .binding = b.curves, .T = slug.Curve },
+        .{ .binding = b.bands, .T = slug.Band },
+        .{ .binding = b.indices, .T = u32 },
+        .{ .binding = b.headers, .T = slug.Header },
+        .{ .binding = b.instances, .T = slugpipe.Instance },
+        .{ .binding = b.clips, .T = slugpipe.ClipNode },
+        .{ .binding = b.images, .T = slugpipe.ImageInfo },
+        .{ .binding = b.texels, .T = u32 },
+    };
+
+    const rect = @import("../gleipnir/rect.zig");
+    try expectLayouts(try slugFragmentModule(), &checks);
+    try expectLayouts(try slugVertexModule(), &[_]Check{
+        .{ .binding = b.headers, .T = slug.Header },
+        .{ .binding = b.instances, .T = slugpipe.Instance },
+    });
+    // The rect pipeline's one buffer, from both stages.
+    try expectLayouts(try vertexModule(), &[_]Check{.{ .binding = 0, .T = rect.Instance }});
+    try expectLayouts(try fragmentModule(), &[_]Check{.{ .binding = 0, .T = rect.Instance }});
+}
+
+const Check = struct {
+    binding: u32,
+    T: type,
+};
+
+fn expectLayouts(module_: spirv.Module, comptime checks: []const Check) !void {
+    inline for (checks) |c| {
+        const layout = (try module_.arrayLayout(0, c.binding)) orelse {
+            std.debug.print("binding {d} is not in the module\n", .{c.binding});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqual(@as(u32, @sizeOf(c.T)), layout.stride);
+
+        if (@typeInfo(c.T) == .@"struct") {
+            // The GLSL structs may group two Zig fields into one vector --
+            // `vec2 p0` for `x0, y0` -- so every GLSL member offset has to be
+            // the offset of *some* Zig field.
+            for (layout.memberOffsets()) |offset| {
+                var found = false;
+                inline for (@typeInfo(c.T).@"struct".fields) |f| {
+                    if (@offsetOf(c.T, f.name) == offset) found = true;
+                }
+                if (!found) {
+                    std.debug.print("binding {d}: a member at offset {d} lines up with no field of {s}\n", .{
+                        c.binding, offset, @typeName(c.T),
+                    });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
 test "the hint names the command that fixes it" {
+    try testing.expect(std.mem.indexOf(u8, compile_hint, "-Dshaders=spirv") != null);
     try testing.expect(std.mem.indexOf(u8, compile_hint, "glslc") != null);
-    try testing.expect(std.mem.indexOf(u8, compile_hint, "vulkan1.2") != null);
 }
