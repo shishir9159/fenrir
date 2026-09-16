@@ -1,71 +1,75 @@
-//! Analytic path coverage, in the shape Slug put it in: the outline itself
-//! goes to the GPU and the fragment shader works out how much of each pixel
-//! the path covers, from the curves, exactly.
+//! Analytic path coverage, the way Slug computes it: the outline itself goes
+//! to the GPU and the fragment shader works out how much of each pixel the
+//! path covers, from the curves.
 //!
-//! This is the other way of filling a path, and it is not a faster
-//! stencil-and-cover. It is a different answer to a different question.
+//! This follows Eric Lengyel's reference shaders
+//! (https://github.com/EricLengyel/Slug, MIT) in everything that decides
+//! the picture -- two rays per pixel and how they are combined, bands in
+//! both directions sorted for an early exit, lines left out of the bands
+//! they run parallel to, and the pixel footprint taken from the transform.
+//! It departs from them in two places, both said where they happen: the root
+//! solve is the numerically stable one rather than an epsilon test, and the
+//! curves and bands live in storage buffers rather than textures.
 //!
 //! ## What it computes
 //!
-//! Take one horizontal line across a pixel, at height `y`. Every place the
-//! outline crosses that line, it either enters the shape or leaves it. Sort
-//! the crossings and you know exactly which parts of that line are inside:
+//! Cast a ray from the pixel's centre towards +x. Every place the outline
+//! crosses it, the outline either enters the shape or leaves it, and
 //!
-//!     F(y) = Σ  ±clamp((x_cross − x_pixel)·scale + ½, 0, 1)
+//!     xcov = Σ ±clamp((x_cross − x_pixel)·ppu + ½, 0, 1)
 //!
-//! Each term is the fraction of the pixel's width lying to one side of a
-//! crossing, and with the signs (up adds, down subtracts) the sum is the
-//! **exact covered length of that line**, for any outline, at any resolution.
-//! No sampling, no quantisation, no square root.
+//! is the winding number with each crossing ramped across the pixel's width:
+//! a crossing well to the right counts fully, one well to the left not at
+//! all, and one inside the pixel by how much of the pixel lies to its left.
+//! Along that row it is the exact covered length, in closed form. Cast a
+//! second ray towards +y and the same sum gives `ycov`.
 //!
-//! The pixel's coverage is that length integrated down the pixel's height:
+//! One ray is exact for an edge perpendicular to it and blind to an edge
+//! parallel to it -- a horizontal ray across a horizontal edge is either
+//! wholly inside or wholly outside. So each ray also reports a **weight**:
+//! how close its nearest crossing is to the pixel's centre,
+//! `clamp(1 − 2|r|, 0, 1)`, which is one for a crossing through the centre
+//! and zero for one half a pixel away or more. The two are then blended by
+//! their weights:
 //!
-//!     coverage = ∫ F(y) dy
+//!     cov = max(|xcov·xw + ycov·yw| / max(xw + yw, ε), min(|xcov|, |ycov|))
 //!
-//! and *that* is the only part that is approximated. `rays` sub-rows evaluate
-//! the integral by the midpoint rule.
-//!
-//! ## Why that is the right place for the error
-//!
-//! Multisampling quantises both axes: eight samples give a pixel nine
-//! possible coverages, whichever way the edge runs. This quantises only the
-//! vertical one. A vertical edge -- a stem, the side of a rule, the straight
-//! part of almost every letter at a reading size -- lands on its exact
-//! coverage with `rays = 1`, because it is the x integral that is closed
-//! form. A horizontal edge is the bad case and gets `rays + 1` levels.
-//!
-//! Text is mostly vertical edges, so four rays here beat eight samples there,
-//! on the axis that matters, for half the work. And the whole thing is
-//! resolution independent: the same buffers draw the page at any zoom, which
-//! is the property a reader actually wants.
+//! A vertical edge has a crossing near the pixel on the x ray and none on the
+//! y ray, so it takes the x ray's answer, which is exact. A horizontal edge
+//! the other way round. Where neither ray has a nearby crossing the pixel is
+//! inside or outside and `min(|xcov|, |ycov|)` says which. Only where an edge
+//! runs diagonally, or a corner sits inside the pixel, is this an
+//! approximation -- and it is a smooth one, with no quantisation anywhere.
 //!
 //! ## What it costs, and bands
 //!
-//! Every curve crossing the pixel's row has to be tested, and testing every
-//! curve in the path per fragment is quadratic nonsense on anything bigger
-//! than a glyph. So the path's bounding box is cut into horizontal **bands**,
-//! each holding the curves that reach into it, and a fragment tests one
-//! band's worth. `Store` builds them; `bandCount` picks how many.
+//! Every curve crossing a ray has to be tested, and testing every curve of a
+//! path per fragment is quadratic nonsense on anything bigger than a glyph.
+//! So the path's box is cut into **horizontal bands** for the x ray and
+//! **vertical bands** for the y ray, and a fragment tests the curves of one
+//! of each. Within a band the curves are sorted by how far they reach in the
+//! ray's direction, descending, so the loop stops at the first curve that
+//! ends more than half a pixel behind the sample: every curve after it does
+//! too. A curve that is a straight line along a band's direction is left out
+//! of that band altogether, because a ray parallel to it cannot cross it.
 //!
 //! ## The two rules
 //!
-//! `F` is a winding number weighted by coverage, so the fill rule is applied
-//! to it at the end: nonzero clamps the magnitude to one, even-odd folds it
-//! into a triangle wave. Both are exact wherever a pixel is not straddling
-//! the point at which two contours cross each other -- where the ramp method
-//! double-counts by up to the area of the overlap inside that one pixel. It
-//! is the same approximation Slug makes, it is bounded by a pixel, and it is
-//! invisible on glyphs, which do not self-intersect at all.
+//! `cov` is a coverage-weighted winding number, so the fill rule is applied
+//! to it last: nonzero clamps it to one, even-odd folds it into a triangle
+//! wave. Both are exact except where a pixel straddles the point at which two
+//! contours cross -- the same approximation Slug makes, bounded by a pixel,
+//! and invisible on glyphs, which do not self-intersect.
 //!
 //! ## Where the copies of this live
 //!
-//! Three, and they are meant to be read against each other:
+//! Three, meant to be read against each other:
 //!
-//! * `coverageAt` here is the readable one, and the one the tests check.
-//! * `windingTable` here is the branchless one, written the way a shader has
-//!   to be written. A test asserts the two agree on random curves, which is
-//!   what makes it safe to trust the third.
-//! * `shader/slug.glsl` is `windingTable` transcribed into GLSL.
+//! * `crossings` here is the readable one: it solves for the roots, checks
+//!   they are in range and looks at the tangent.
+//! * `crossingsTable` here is the branchless one, written the way a shader
+//!   has to be. A test asserts the two agree bit for bit.
+//! * `shader/slug.glsl` is `crossingsTable` and `coverageAt` transcribed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -104,7 +108,7 @@ pub const Curve = extern struct {
     pub fn bounds(c: Curve) Bounds {
         // The control point is outside the curve but the hull contains it, and
         // a hull box costs three comparisons instead of a derivative solve.
-        // Bands only need a conservative box.
+        // Bands and early exits only need a conservative box.
         return .{
             .min_x = @min(c.x0, @min(c.x1, c.x2)),
             .min_y = @min(c.y0, @min(c.y1, c.y2)),
@@ -112,9 +116,16 @@ pub const Curve = extern struct {
             .max_y = @max(c.y0, @max(c.y1, c.y2)),
         };
     }
+
+    /// The same curve with x and y exchanged, which is what turns the
+    /// horizontal ray test into the vertical one.
+    pub fn swapped(c: Curve) Curve {
+        return .{ .x0 = c.y0, .y0 = c.x0, .x1 = c.y1, .y1 = c.x1, .x2 = c.y2, .y2 = c.x2 };
+    }
 };
 
-/// A slice of `Store.indices`: the curves that reach into one band.
+/// A slice of `Store.indices`: the curves that reach into one band, sorted
+/// so the shader can stop early. See `Store.buildBands`.
 pub const Band = extern struct {
     first: u32 = 0,
     count: u32 = 0,
@@ -123,6 +134,14 @@ pub const Band = extern struct {
 /// Everything the shader needs to know about one path, and nothing about
 /// where it is drawn -- that is the instance's business, which is what lets
 /// one uploaded path be drawn at several transforms.
+///
+/// Forty bytes, and every member a scalar. A `vec4` for the box would read
+/// better in GLSL and would make the struct 48 bytes there -- std430 aligns a
+/// struct to its most-aligned member, and a `vec4` aligns to sixteen -- while
+/// this side wrote forty. That mismatch shipped once: every header after the
+/// first was read eight bytes further along per index than it was written,
+/// and a page came out as its own glyphs, huge and scattered. The SPIR-V
+/// layout test in `lyngvi/shaders.zig` is what stops it shipping again.
 pub const Header = extern struct {
     min_x: f32 = 0,
     min_y: f32 = 0,
@@ -130,13 +149,15 @@ pub const Header = extern struct {
     max_y: f32 = 0,
     curve_first: u32 = 0,
     curve_count: u32 = 0,
-    /// Bands across y, for the horizontal rays.
-    row_first: u32 = 0,
-    row_count: u32 = 0,
+    /// The horizontal bands, then the vertical ones, back to back.
+    band_first: u32 = 0,
+    /// Bands across y, cut horizontally, for the ray towards +x.
+    h_bands: u32 = 0,
+    /// Bands across x, cut vertically, for the ray towards +y.
+    v_bands: u32 = 0,
     /// `0` nonzero, `1` even-odd. A `u32` because GLSL has no enums and the
     /// std430 layout has to be written out in full anyway.
     rule: u32 = 0,
-    _pad: u32 = 0,
 
     pub fn bounds(h: Header) Bounds {
         return .{ .min_x = h.min_x, .min_y = h.min_y, .max_x = h.max_x, .max_y = h.max_y };
@@ -153,16 +174,9 @@ comptime {
 ///
 /// Small, and it can afford to be: splitting a cubic in half cuts the error
 /// by eight, so the segment count grows as the cube root of the precision
-/// asked for. A tenth of a point is a hundredth of a pixel at a reading zoom
-/// and costs perhaps two segments where one would have done.
+/// asked for. A fiftieth of a point is a hundredth of a pixel at a reading
+/// zoom and costs perhaps two segments where one would have done.
 pub const default_tolerance: f32 = 0.02;
-
-/// Sub-rows per pixel: how finely `∫ F(y) dy` is sampled.
-///
-/// Four is the default. It is the only quantisation in the method and it
-/// applies to horizontal edges alone, so it buys more than the same number of
-/// multisamples would.
-pub const default_rays: u32 = 4;
 
 /// The buffers the shader reads, built on the CPU.
 ///
@@ -187,6 +201,31 @@ pub const Store = struct {
         s.bands.clearRetainingCapacity();
         s.indices.clearRetainingCapacity();
         s.headers.clearRetainingCapacity();
+    }
+
+    /// Where the store currently ends, for `rewind`.
+    pub const Mark = struct { curves: usize, bands: usize, indices: usize, headers: usize };
+
+    pub fn mark(s: Store) Mark {
+        return .{
+            .curves = s.curves.items.len,
+            .bands = s.bands.items.len,
+            .indices = s.indices.items.len,
+            .headers = s.headers.items.len,
+        };
+    }
+
+    /// Drops everything added since `m`, keeping the capacity.
+    ///
+    /// What a CPU replay does with a path it has finished with: the outline
+    /// was needed for one fill and the store would otherwise grow by every
+    /// path on the page. Glyphs are the exception -- they are kept and reused,
+    /// which is why this takes a mark rather than resetting.
+    pub fn rewind(s: *Store, m: Mark) void {
+        s.curves.shrinkRetainingCapacity(m.curves);
+        s.bands.shrinkRetainingCapacity(m.bands);
+        s.indices.shrinkRetainingCapacity(m.indices);
+        s.headers.shrinkRetainingCapacity(m.headers);
     }
 
     /// Bytes to upload, in the order the descriptor set binds them.
@@ -214,7 +253,7 @@ pub const Store = struct {
     /// re-extracting a single curve.
     ///
     /// Three levels of renumbering, and missing any of them draws a page made
-    /// of the wrong shapes: a header's `curve_first` and `row_first` move by
+    /// of the wrong shapes: a header's `curve_first` and `band_first` move by
     /// this store's curve and band counts, and a band's `first` moves by its
     /// index count.
     pub fn merge(s: *Store, gpa: Allocator, src: Store) Allocator.Error!u32 {
@@ -237,7 +276,7 @@ pub const Store = struct {
         for (src.headers.items) |h| {
             var out = h;
             out.curve_first += curve_base;
-            out.row_first += band_base;
+            out.band_first += band_base;
             s.headers.appendAssumeCapacity(out);
         }
         return header_base;
@@ -245,10 +284,6 @@ pub const Store = struct {
 
     /// Adds a path's curves and builds its bands. Returns its header index,
     /// which is what an instance refers to it by.
-    ///
-    /// `curves` is consumed rather than copied where it can be: they are
-    /// appended to the store's own array, which is where the shader reads
-    /// them from.
     pub fn add(
         s: *Store,
         gpa: Allocator,
@@ -275,10 +310,12 @@ pub const Store = struct {
         };
 
         if (curves.len != 0 and !box.isEmpty()) {
-            const rows = bandCount(curves.len);
-            header.row_first = @intCast(s.bands.items.len);
-            header.row_count = rows;
-            try s.buildBands(gpa, curves, first, box, rows);
+            const n = bandCount(curves.len);
+            header.band_first = @intCast(s.bands.items.len);
+            header.h_bands = n;
+            header.v_bands = n;
+            try s.buildBands(gpa, curves, first, box, .horizontal, n);
+            try s.buildBands(gpa, curves, first, box, .vertical, n);
         }
 
         const id: u32 = @intCast(s.headers.items.len);
@@ -286,7 +323,13 @@ pub const Store = struct {
         return id;
     }
 
-    /// Sorts the curves into rows, as a counted-then-filled index array.
+    /// Sorts the curves into bands along one axis, as a counted-then-filled
+    /// index array, and orders each band for the early exit.
+    ///
+    /// `.horizontal` bands are cut across y and serve the ray towards +x:
+    /// they leave out curves that are straight horizontal lines, and sort by
+    /// the largest x, descending. `.vertical` is the same with the axes
+    /// exchanged.
     ///
     /// Two passes rather than a list per band: the answer is one allocation
     /// of exactly the right size, which matters because this runs once per
@@ -297,71 +340,135 @@ pub const Store = struct {
         curves: []const Curve,
         curve_first: u32,
         box: Bounds,
-        rows: u32,
+        axis: Axis,
+        count: u32,
     ) Allocator.Error!void {
         const band_first = s.bands.items.len;
-        try s.bands.appendNTimes(gpa, .{}, rows);
-        const height = @max(box.max_y - box.min_y, std.math.floatEps(f32));
-        const per = @as(f32, @floatFromInt(rows)) / height;
+        try s.bands.appendNTimes(gpa, .{}, count);
+        const lo, const hi = axis.across(box);
+        const extent = @max(hi - lo, std.math.floatEps(f32));
+        const per = @as(f32, @floatFromInt(count)) / extent;
+        // Bands overlap by a sliver, so a sample landing on a boundary finds
+        // every curve that touches it whichever side rounding puts it on.
+        const eps = extent / @as(f32, @floatFromInt(count)) / 64.0;
 
-        // Pass one: how many curves reach into each row.
+        // Pass one: how many curves reach into each band.
         for (curves) |c| {
-            const cb = c.bounds();
-            const lo, const hi = rowSpan(cb.min_y, cb.max_y, box.min_y, per, rows);
-            var r = lo;
-            while (r <= hi) : (r += 1) s.bands.items[band_first + r].count += 1;
+            if (axis.parallel(c)) continue;
+            const a, const b = axis.across(c.bounds());
+            const first, const last = bandSpan(a - eps, b + eps, lo, per, count);
+            var i = first;
+            while (i <= last) : (i += 1) s.bands.items[band_first + i].count += 1;
         }
 
-        // Running offsets, so each row knows where its indices start.
+        // Running offsets, so each band knows where its indices start.
         var total: u32 = @intCast(s.indices.items.len);
-        for (s.bands.items[band_first..]) |*b| {
-            b.first = total;
-            total += b.count;
-            // Reused below as a write cursor, and restored after.
-            b.count = 0;
+        for (s.bands.items[band_first..]) |*band| {
+            band.first = total;
+            total += band.count;
+            // Reused below as a write cursor, and restored by the fill.
+            band.count = 0;
         }
         try s.indices.resize(gpa, total);
 
         // Pass two: fill them in.
-        for (curves, 0..) |c, i| {
-            const cb = c.bounds();
-            const lo, const hi = rowSpan(cb.min_y, cb.max_y, box.min_y, per, rows);
-            var r = lo;
-            while (r <= hi) : (r += 1) {
-                const b = &s.bands.items[band_first + r];
-                s.indices.items[b.first + b.count] = curve_first + @as(u32, @intCast(i));
-                b.count += 1;
+        for (curves, 0..) |c, ci| {
+            if (axis.parallel(c)) continue;
+            const a, const b = axis.across(c.bounds());
+            const first, const last = bandSpan(a - eps, b + eps, lo, per, count);
+            var i = first;
+            while (i <= last) : (i += 1) {
+                const band = &s.bands.items[band_first + i];
+                s.indices.items[band.first + band.count] = curve_first + @as(u32, @intCast(ci));
+                band.count += 1;
             }
+        }
+
+        // Descending by how far each curve reaches along the ray, so the
+        // shader's loop can stop at the first curve that ends behind the
+        // pixel. The sort is what makes the break correct; without it the
+        // break skips curves that do cross.
+        for (s.bands.items[band_first..]) |band| {
+            const slice = s.indices.items[band.first..][0..band.count];
+            std.sort.pdq(u32, slice, SortContext{ .curves = s.curves.items, .axis = axis }, SortContext.lessThan);
         }
     }
 };
 
-/// The rows a curve's y-range touches, clamped into range.
-fn rowSpan(min_y: f32, max_y: f32, origin: f32, per: f32, rows: u32) struct { u32, u32 } {
-    const last = rows - 1;
-    const a = (min_y - origin) * per;
-    const b = (max_y - origin) * per;
-    const lo: u32 = if (a <= 0) 0 else @min(last, @as(u32, @intFromFloat(a)));
-    const hi: u32 = if (b <= 0) 0 else @min(last, @as(u32, @intFromFloat(b)));
+const Axis = enum {
+    horizontal,
+    vertical,
+
+    /// The range a box covers across the bands, which is y for horizontal
+    /// bands and x for vertical ones.
+    fn across(axis: Axis, b: Bounds) struct { f32, f32 } {
+        return switch (axis) {
+            .horizontal => .{ b.min_y, b.max_y },
+            .vertical => .{ b.min_x, b.max_x },
+        };
+    }
+
+    /// How far a curve reaches in the ray's direction.
+    fn reach(axis: Axis, c: Curve) f32 {
+        return switch (axis) {
+            .horizontal => @max(c.x0, @max(c.x1, c.x2)),
+            .vertical => @max(c.y0, @max(c.y1, c.y2)),
+        };
+    }
+
+    /// A straight line running along the ray, which the ray cannot cross.
+    fn parallel(axis: Axis, c: Curve) bool {
+        return switch (axis) {
+            .horizontal => c.y0 == c.y1 and c.y1 == c.y2,
+            .vertical => c.x0 == c.x1 and c.x1 == c.x2,
+        };
+    }
+};
+
+const SortContext = struct {
+    curves: []const Curve,
+    axis: Axis,
+
+    fn lessThan(ctx: SortContext, a: u32, b: u32) bool {
+        return ctx.axis.reach(ctx.curves[a]) > ctx.axis.reach(ctx.curves[b]);
+    }
+};
+
+/// The bands a range touches, clamped into range.
+fn bandSpan(min: f32, max: f32, origin: f32, per: f32, count: u32) struct { u32, u32 } {
+    const last = count - 1;
+    const a = (min - origin) * per;
+    const b = (max - origin) * per;
+    const lo: u32 = if (!(a > 0)) 0 else @min(last, @as(u32, @intFromFloat(a)));
+    const hi: u32 = if (!(b > 0)) 0 else @min(last, @as(u32, @intFromFloat(b)));
     return .{ lo, @max(lo, hi) };
 }
 
-/// How many bands a path with this many curves gets.
+/// Which band a coordinate lands in. The shader's `bandOf`.
+fn bandOf(lo: f32, hi: f32, v: f32, count: u32) u32 {
+    const extent = hi - lo;
+    if (!(extent > 0) or count == 0) return 0;
+    const t = (v - lo) / extent * @as(f32, @floatFromInt(count));
+    if (!(t > 0)) return 0;
+    return @min(@as(u32, @intFromFloat(t)), count - 1);
+}
+
+/// How many bands a path with this many curves gets, in each direction.
 ///
-/// The cost per fragment is the curves in one band, roughly `n/bands`, and
-/// the memory is roughly `n` indices plus the bands themselves. Balancing the
-/// two puts the band count near the square root, which for a glyph of forty
-/// curves is nine bands of four or five -- and for a path of one curve is one
-/// band, with no arithmetic wasted on it.
+/// The cost per fragment is the curves in one band of each kind, roughly
+/// `2n/bands` before the early exit, and the memory is roughly `2n` indices
+/// plus the bands themselves. Balancing the two puts the count near the
+/// square root, which for a glyph of forty curves is nine bands of four or
+/// five -- and for a path of one or two curves is one band.
 pub fn bandCount(curves: usize) u32 {
     if (curves <= 2) return 1;
     const n: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(curves)) * 2.0)));
     return std.math.clamp(n, 1, max_bands);
 }
 
-/// A ceiling on bands per path. A path with more curves than this squared
-/// just gets fuller bands; the alternative is a store whose band array is
-/// larger than its curve array.
+/// A ceiling on bands per direction. A path with more curves than this
+/// squared just gets fuller bands; the alternative is a store whose band
+/// array is larger than its curve array.
 pub const max_bands: u32 = 64;
 
 // -- turning a path into curves ----------------------------------------------
@@ -420,9 +527,76 @@ pub fn fromPath(
     if (open) try lineOf(gpa, out, cur, start);
 }
 
+/// Collects the quadratics of a glyph outline, scaled by `scale`.
+///
+/// The same walk as `fromPath` over the verbs and points a `GlyphSource`
+/// hands back, with the em normalisation folded in so the curves come out in
+/// em units: one unit is one em, whatever the font program counts in. That is
+/// what lets one recorded outline serve every size the glyph is drawn at --
+/// the size is the instance's matrix.
+pub fn fromOutline(
+    gpa: Allocator,
+    out: *std.ArrayList(Curve),
+    verbs: []const Verb,
+    points: []const Point,
+    scale: f32,
+    tolerance: f32,
+) Allocator.Error!void {
+    var start: Point = .origin;
+    var cur: Point = .origin;
+    var open = false;
+    var i: usize = 0;
+
+    for (verbs) |verb| {
+        const n = verb.pointCount();
+        if (i + n > points.len) break;
+        switch (verb) {
+            .move => {
+                if (open) try lineOf(gpa, out, cur, start);
+                start = scaled(points[i], scale);
+                cur = start;
+                open = true;
+            },
+            .line => {
+                const to = scaled(points[i], scale);
+                try lineOf(gpa, out, cur, to);
+                cur = to;
+            },
+            .cubic => {
+                const c1 = scaled(points[i], scale);
+                const c2 = scaled(points[i + 1], scale);
+                const to = scaled(points[i + 2], scale);
+                try addCubic(gpa, out, cur, c1, c2, to, tolerance, 16);
+                cur = to;
+            },
+            .close => {
+                try lineOf(gpa, out, cur, start);
+                cur = start;
+                open = false;
+            },
+        }
+        i += n;
+    }
+    if (open) try lineOf(gpa, out, cur, start);
+}
+
+fn scaled(p: Point, by: f32) Point {
+    return .{ .x = p.x * by, .y = p.y * by };
+}
+
+/// How far a quadratic may stray from the cubic it stands in for, in em
+/// units, for an outline recorded once and drawn at every size.
+///
+/// A two-thousandth of an em is a twentieth of a pixel on a hundred-pixel
+/// glyph, which is larger than anything on a page of text and half the size
+/// of the largest display type. It cannot be derived from the size the way
+/// `default_tolerance` is, because the whole point of recording in em space
+/// is that the size is not known yet.
+pub const glyph_tolerance: f32 = 1.0 / 2048.0;
+
 /// Collects the quadratics of an already-flattened path.
 ///
-/// Every segment becomes a degenerate quadratic. That throws away the
+/// Every segment becomes a straight quadratic. That throws away the
 /// resolution independence for anything that arrives this way -- a stroke's
 /// generated outline, and a glyph, both of which are flattened by the layer
 /// that produces them -- but it is what makes the analytic fill usable for
@@ -447,10 +621,14 @@ pub fn fromFlattened(
     }
 }
 
-/// A line as a quadratic, with the control point in the middle. Degenerate on
-/// purpose: one curve type through the shader means one code path, and the
-/// root solve handles `a == 0` anyway because a great many real curves are
-/// straight in y.
+/// A line as a quadratic, with the control point in the middle.
+///
+/// Lengyel's reference duplicates the second endpoint instead, `{p1, p2,
+/// p2}`, because its solver switches to the linear formula below an epsilon
+/// and a midpoint control makes `a` land near that epsilon. The stable solve
+/// here has no epsilon, so the midpoint is fine -- and it is the one that
+/// keeps a horizontal line's control point on the line, which is what lets
+/// `Axis.parallel` recognise it exactly.
 fn lineOf(gpa: Allocator, out: *std.ArrayList(Curve), from: Point, to: Point) Allocator.Error!void {
     if (from.x == to.x and from.y == to.y) return;
     try out.append(gpa, .{
@@ -511,99 +689,113 @@ pub fn addCubic(
 
 // -- the coverage itself -----------------------------------------------------
 
-/// How the sample point relates to the pixel grid: one pixel is `1/scale`
-/// path units across, in each direction separately.
+/// Device pixels per path unit, in each axis, as the rays see them.
 ///
-/// Two numbers and not a matrix because the ray is cast in path space, where
-/// the bands are. For a page transform -- a scale, possibly with a quarter
-/// turn -- these are exact. Under a rotation or a skew they are the lengths
-/// of the transform's columns, which is the right answer to first order and
-/// wrong only in how wide the antialiased band along an edge is.
+/// Slug takes this from `fwidth` of the interpolated em-space coordinate:
+/// the path-space distance one pixel step covers in x, plus the one in y.
+/// For an affine transform that is a property of the inverse matrix and not
+/// of the fragment, so it is computed from the matrix -- which is also what
+/// lets the CPU model and the shader agree exactly. Under a page transform,
+/// a scale with a flip, it is the scale; under a rotation it widens the ramp
+/// the way `fwidth` does, rather than taking the column lengths and leaving
+/// a rotated edge too sharp.
 pub const Scale = struct {
     x: f32,
     y: f32,
 
-    /// The device pixels one path unit spans, in each axis.
     pub fn of(xform: Transform) Scale {
+        const det = @abs(xform.a * xform.d - xform.b * xform.c);
+        const across_x = @abs(xform.c) + @abs(xform.d);
+        const across_y = @abs(xform.a) + @abs(xform.b);
         return .{
-            .x = @sqrt(xform.a * xform.a + xform.b * xform.b),
-            .y = @sqrt(xform.c * xform.c + xform.d * xform.d),
+            .x = if (across_x > 0) det / across_x else 0,
+            .y = if (across_y > 0) det / across_y else 0,
         };
     }
 };
 
-/// The fraction of the pixel at `(x, y)` that the path covers.
+/// One ray's crossings with one curve: the coverage-weighted winding it adds
+/// and the weight of its nearest crossing.
+pub const Ray = struct {
+    cov: f32 = 0,
+    wgt: f32 = 0,
+};
+
+/// The fraction of the pixel centred on `(x, y)` that the path covers.
 ///
-/// This is the model of the fragment shader, and the only part of it that is
-/// approximate is `rays`: the pixel's height is split into that many rows,
-/// each row's covered length is computed exactly, and the results averaged.
-pub fn coverageAt(
-    s: Store,
-    header: u32,
-    x: f32,
-    y: f32,
-    scale: Scale,
-    rays: u32,
-) f32 {
+/// This is the model of the fragment shader, line for line: the x ray over
+/// one horizontal band, the y ray over one vertical band, each stopping at
+/// the first curve behind the pixel, and Lengyel's combination of the two.
+pub fn coverageAt(s: Store, header: u32, x: f32, y: f32, ppu: Scale) f32 {
     if (header >= s.headers.items.len) return 0;
     const h = s.headers.items[header];
-    if (h.curve_count == 0 or h.row_count == 0) return 0;
+    if (h.curve_count == 0 or h.h_bands == 0 or !(ppu.x > 0) or !(ppu.y > 0)) return 0;
 
-    // A pixel's worth of path space, and the half of it above and below the
-    // sample point.
-    const pixel_h = if (scale.y > 0) 1.0 / scale.y else 0;
-    const n = @max(1, rays);
-    const step = pixel_h / @as(f32, @floatFromInt(n));
-    const top = y - pixel_h * 0.5 + step * 0.5;
+    // Further outside the box than half a pixel is outside the path.
+    const half_x = 0.5 / ppu.x;
+    const half_y = 0.5 / ppu.y;
+    if (x + half_x < h.min_x or x - half_x > h.max_x) return 0;
+    if (y + half_y < h.min_y or y - half_y > h.max_y) return 0;
 
-    // Outside the path's box by more than the pixel is outside the path.
-    if (x + 0.5 / @max(scale.x, std.math.floatEps(f32)) < h.min_x) return 0;
-    if (y + pixel_h * 0.5 < h.min_y or y - pixel_h * 0.5 > h.max_y) return 0;
-
-    var total: f32 = 0;
-    var j: u32 = 0;
-    while (j < n) : (j += 1) {
-        const ray_y = top + step * @as(f32, @floatFromInt(j));
-        total += applyRule(windingAlongRow(s, h, x, ray_y, scale.x), h.rule);
-    }
-    return std.math.clamp(total / @as(f32, @floatFromInt(n)), 0, 1);
+    const xr = rayAlongX(s, h, x, y, ppu.x);
+    const yr = rayAlongY(s, h, x, y, ppu.y);
+    return combine(xr, yr, h.rule);
 }
 
-/// `F(y)`: the covered length of one row of the pixel, in pixel widths.
-///
-/// Only the curves in the band containing `y` are tested, which is the whole
-/// reason the bands exist.
-pub fn windingAlongRow(s: Store, h: Header, x: f32, y: f32, scale_x: f32) f32 {
-    const row = rowOf(h, y);
-    if (row >= h.row_count) return 0;
-    const band = s.bands.items[h.row_first + row];
-
-    var sum: f32 = 0;
+/// The ray towards +x, over the horizontal band containing `y`.
+pub fn rayAlongX(s: Store, h: Header, x: f32, y: f32, ppu_x: f32) Ray {
+    const band = s.bands.items[h.band_first + bandOf(h.min_y, h.max_y, y, h.h_bands)];
+    var out: Ray = .{};
     var k: u32 = 0;
     while (k < band.count) : (k += 1) {
-        const curve = s.curves.items[s.indices.items[band.first + k]];
-        sum += crossings(curve, x, y, scale_x);
+        const c = s.curves.items[s.indices.items[band.first + k]];
+        // Sorted by reach: once one curve ends behind the pixel, all the rest
+        // do, and none of them can contribute.
+        if ((@max(c.x0, @max(c.x1, c.x2)) - x) * ppu_x < -0.5) break;
+        const r = crossingsTable(c, x, y, ppu_x);
+        out.cov += r.cov;
+        out.wgt = @max(out.wgt, r.wgt);
     }
-    return sum;
+    return out;
 }
 
-/// Which band a y lands in.
-fn rowOf(h: Header, y: f32) u32 {
-    const height = h.max_y - h.min_y;
-    if (!(height > 0) or h.row_count == 0) return 0;
-    const t = (y - h.min_y) / height * @as(f32, @floatFromInt(h.row_count));
-    if (t <= 0) return 0;
-    const i: u32 = @intFromFloat(t);
-    return @min(i, h.row_count - 1);
-}
-
-/// One curve's contribution to `F(y)`: the readable version.
+/// The ray towards +y, over the vertical band containing `x`.
 ///
-/// Finds where the curve crosses the ray, and for each crossing adds the
-/// fraction of the pixel's width lying to the left of it -- positive where
-/// the outline is going up, negative where it is going down, because that is
-/// what makes the sum a winding number rather than a count.
-pub fn crossings(c: Curve, x: f32, y: f32, scale_x: f32) f32 {
+/// `crossingsTable` on the curve with its axes exchanged. Exchanging the axes
+/// is a reflection, which reverses every contour's orientation, so the sum
+/// comes back negated -- and is negated again here, so the two rays agree in
+/// sign about which side of an outline is inside. Their weighted sum is
+/// meaningless otherwise.
+pub fn rayAlongY(s: Store, h: Header, x: f32, y: f32, ppu_y: f32) Ray {
+    const band = s.bands.items[h.band_first + h.h_bands + bandOf(h.min_x, h.max_x, x, h.v_bands)];
+    var out: Ray = .{};
+    var k: u32 = 0;
+    while (k < band.count) : (k += 1) {
+        const c = s.curves.items[s.indices.items[band.first + k]];
+        if ((@max(c.y0, @max(c.y1, c.y2)) - y) * ppu_y < -0.5) break;
+        const r = crossingsTable(c.swapped(), y, x, ppu_y);
+        out.cov -= r.cov;
+        out.wgt = @max(out.wgt, r.wgt);
+    }
+    return out;
+}
+
+/// Lengyel's combination of the two rays, and then the fill rule. See the
+/// module comment for why each term is there.
+pub fn combine(xr: Ray, yr: Ray, rule: u32) f32 {
+    const weighted = @abs(xr.cov * xr.wgt + yr.cov * yr.wgt) / @max(xr.wgt + yr.wgt, 1.0 / 65536.0);
+    const cov = @max(weighted, @min(@abs(xr.cov), @abs(yr.cov)));
+    return applyRule(cov, rule);
+}
+
+/// One curve's crossings with the ray from `(x, y)` towards +x: the readable
+/// version.
+///
+/// Finds where the curve crosses the ray's line, and for each crossing adds
+/// the fraction of the pixel's width lying to the left of it -- positive
+/// where the outline is going up, negative where it is going down, because
+/// that is what makes the sum a winding number rather than a count.
+pub fn crossings(c: Curve, x: f32, y: f32, ppu_x: f32) Ray {
     // Relative to the sample: the ray is then the positive x axis.
     const y0 = c.y0 - y;
     const y1 = c.y1 - y;
@@ -613,24 +805,25 @@ pub fn crossings(c: Curve, x: f32, y: f32, scale_x: f32) f32 {
     const a = y0 - 2 * y1 + y2;
     const b = y0 - y1;
     const disc = b * b - a * y0;
-    if (disc < 0) return 0;
+    if (disc < 0) return .{};
 
     const lo, const hi = roots(a, b, y0, disc);
 
-    var sum: f32 = 0;
+    var out: Ray = .{};
     for ([2]f32{ lo, hi }) |tt| {
         // Half-open, so a crossing shared by two curves at their joint is
         // counted once rather than twice or not at all.
         if (!(tt >= 0) or tt >= 1) continue;
         // dy/dt at the crossing decides the direction. Up adds, down
-        // subtracts: see the derivation in the module comment.
+        // subtracts.
         const dy = 2 * ((y1 - y0) + tt * (y0 - 2 * y1 + y2));
         if (dy == 0) continue;
-        const cx = xAt(c, tt) - x;
-        const ramp = std.math.clamp(cx * scale_x + 0.5, 0, 1);
-        sum += if (dy > 0) ramp else -ramp;
+        const r = (xAt(c, tt) - x) * ppu_x;
+        const ramp = std.math.clamp(r + 0.5, 0, 1);
+        out.cov += if (dy > 0) ramp else -ramp;
+        out.wgt = @max(out.wgt, std.math.clamp(1 - @abs(r) * 2, 0, 1));
     }
-    return sum;
+    return out;
 }
 
 fn xAt(c: Curve, t: f32) f32 {
@@ -641,21 +834,15 @@ fn xAt(c: Curve, t: f32) f32 {
 /// Both roots of `a·t² − 2b·t + c = 0`, as `(b − √d)/a` and `(b + √d)/a`,
 /// computed so that neither is destroyed by cancellation.
 ///
-/// The textbook formula has two failure modes and a path fill walks into
-/// both. When `a` is near zero -- which is every straight segment, and every
-/// curve whose ends and control point happen to line up in y, so most of a
-/// page -- dividing by it turns a root that should be at infinity into a
-/// large finite number and, worse, turns the other one into `0/0`. A line
-/// that never meets the ray then reports a crossing at `t = 0` and half the
-/// page fills in.
-///
-/// Testing `|a| < ε` instead only moves the problem: the right ε depends on
-/// the size of the numbers, and a page in points and a glyph in em units are
-/// three orders of magnitude apart. The stable form has no ε at all. Take
-/// `s = b ± √d` with the sign that makes the two terms add rather than
-/// cancel; then `s/a` is the root of larger magnitude and `c/s` is the other,
-/// by Vieta. As `a → 0`, `s → 2b` and `c/s → c/2b`, which is exactly the root
-/// of the linear equation that is left -- no special case, no branch.
+/// Lengyel's `SolveHorizPoly` switches to the linear formula when
+/// `|a| < 1/65536`. That threshold is in em units, where a glyph is one unit
+/// tall; here a path is in page points and a curve's `a` is three orders of
+/// magnitude larger or smaller depending on what drew it, so no fixed
+/// epsilon is right. The stable form needs none. Take `s = b ± √d` with the
+/// sign that makes the two terms add rather than cancel; then `s/a` is the
+/// root of larger magnitude and `c/s` is the other, by Vieta. As `a → 0`,
+/// `s → 2b` and `c/s → c/2b`, which is exactly the root of the linear
+/// equation that is left -- no special case, no branch.
 fn roots(a: f32, b: f32, c: f32, disc: f32) struct { f32, f32 } {
     const root = @sqrt(disc);
     // `s` takes the sign of `b` so that `b` and `±√d` reinforce.
@@ -676,13 +863,14 @@ fn roots(a: f32, b: f32, c: f32, disc: f32) struct { f32, f32 } {
 ///
 /// No loop, no root-range test, no derivative: which of the two roots to use
 /// and with what sign falls out of the signs of the three y values, through
-/// `root_table`. That is worth having because a fragment shader runs this
-/// tens of times per pixel and every branch in it is a branch the whole warp
-/// takes.
+/// `root_table`. That is Slug's root eligibility test, and it is what makes
+/// the method robust -- a crossing exactly at a joint between two curves is
+/// counted by exactly one of them, decided by signs rather than by comparing
+/// a computed `t` against 0 and 1.
 ///
 /// `crossings` is the specification; this is the implementation; the test
 /// "the branchless crossing test agrees with the readable one" is the bridge.
-pub fn crossingsTable(c: Curve, x: f32, y: f32, scale_x: f32) f32 {
+pub fn crossingsTable(c: Curve, x: f32, y: f32, ppu_x: f32) Ray {
     const y0 = c.y0 - y;
     const y1 = c.y1 - y;
     const y2 = c.y2 - y;
@@ -691,7 +879,7 @@ pub fn crossingsTable(c: Curve, x: f32, y: f32, scale_x: f32) f32 {
         (@as(u32, @intFromBool(y1 > 0)) << 2) |
         (@as(u32, @intFromBool(y2 > 0)) << 3));
     const code = (root_table >> shift) & 3;
-    if (code == 0) return 0;
+    if (code == 0) return .{};
 
     const a = y0 - 2 * y1 + y2;
     const b = y0 - y1;
@@ -701,22 +889,26 @@ pub fn crossingsTable(c: Curve, x: f32, y: f32, scale_x: f32) f32 {
     // both ends", and a quadratic does not pass through its control point --
     // it may bend towards the ray and turn back without ever reaching it. The
     // discriminant is what knows the difference, so it is tested and not
-    // merely clamped. Clamping a negative one to zero invents a pair of
-    // crossings at the parabola's vertex, and a page drawn that way grows a
-    // faint wrong-coloured smear wherever a curve comes close to a scanline.
+    // merely clamped. Lengyel's reference clamps it, treating the near miss
+    // as a double root at the vertex whose two crossings cancel in `cov`; the
+    // weight they leave behind is what the test here avoids.
     const disc = b * b - a * y0;
-    if (disc < 0) return 0;
+    if (disc < 0) return .{};
 
     const t0, const t1 = roots(a, b, y0, disc);
 
-    // No range test on `t`: the table is what decides which root is in
-    // `[0, 1)`, which is the whole point of it. The sign is the other half --
-    // the lower root of a crossing pair leaves the shape and the upper one
-    // enters it, in the orientation `crossings` derives from the tangent.
-    var sum: f32 = 0;
-    if (code & 1 != 0) sum -= std.math.clamp((xAt(c, t0) - x) * scale_x + 0.5, 0, 1);
-    if (code & 2 != 0) sum += std.math.clamp((xAt(c, t1) - x) * scale_x + 0.5, 0, 1);
-    return sum;
+    var out: Ray = .{};
+    if (code & 1 != 0) {
+        const r = (xAt(c, t0) - x) * ppu_x;
+        out.cov -= std.math.clamp(r + 0.5, 0, 1);
+        out.wgt = @max(out.wgt, std.math.clamp(1 - @abs(r) * 2, 0, 1));
+    }
+    if (code & 2 != 0) {
+        const r = (xAt(c, t1) - x) * ppu_x;
+        out.cov += std.math.clamp(r + 0.5, 0, 1);
+        out.wgt = @max(out.wgt, std.math.clamp(1 - @abs(r) * 2, 0, 1));
+    }
+    return out;
 }
 
 /// Which roots of `B(t) = 0` lie in `[0, 1)`, and with which sign, for each
@@ -724,8 +916,9 @@ pub fn crossingsTable(c: Curve, x: f32, y: f32, scale_x: f32) f32 {
 ///
 /// Two bits per pattern, indexed by `2·[y₀>0] + 4·[y₁>0] + 8·[y₂>0]`: bit 0
 /// means the lower root crosses downward, bit 1 means the upper root crosses
-/// upward. The shift is by twos so the index can be built with shifts instead
-/// of a multiply.
+/// upward. The constant is Slug's; the indexing is by positive signs where
+/// the reference extracts negative ones, which reads the same table from the
+/// other end.
 ///
 /// Reading it out: `0` for all-below and all-above, because a curve entirely
 /// on one side of the ray never meets it; `3` where the middle point is on
@@ -734,10 +927,10 @@ pub const root_table: u16 = 0x2E74;
 
 /// Turns a coverage-weighted winding number into a coverage.
 ///
-/// Nonzero keeps the magnitude and stops at one, which is also what makes an
-/// overlapping stroke outline -- where the winding is two or three deep --
-/// come out solid instead of over-bright. Even-odd folds it into a triangle
-/// wave, so winding two is empty again.
+/// Nonzero stops at one, which is also what makes an overlapping stroke
+/// outline -- where the winding is two or three deep -- come out solid
+/// instead of over-bright. Even-odd folds it into a triangle wave, so
+/// winding two is empty again; this is Lengyel's `1 − |1 − 2·fract(w/2)|`.
 pub fn applyRule(winding: f32, rule: u32) f32 {
     const w = @abs(winding);
     if (rule == 0) return @min(w, 1);
@@ -757,6 +950,8 @@ fn square(gpa: Allocator, out: *std.ArrayList(Curve), x0: f32, y0: f32, x1: f32,
     try lineOf(gpa, out, .{ .x = x0, .y = y1 }, .{ .x = x0, .y = y0 });
 }
 
+const unit: Scale = .{ .x = 1, .y = 1 };
+
 test "a pixel well inside a shape is fully covered and one outside is not" {
     const gpa = testing.allocator;
     var curves: std.ArrayList(Curve) = .empty;
@@ -767,17 +962,44 @@ test "a pixel well inside a shape is fully covered and one outside is not" {
     defer store.deinit(gpa);
     const id = try store.add(gpa, curves.items, .nonzero);
 
-    const scale: Scale = .{ .x = 1, .y = 1 };
-    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 20, 20, scale, 4), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 5, 20, scale, 4), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 35, 20, scale, 4), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 20, 40, scale, 4), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 20, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 5, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 35, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 20, 40, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 20, 5, unit), 0.001);
+}
+
+test "the two rays agree about which side of an outline is inside" {
+    // The weighted sum adds the two rays' windings, so they have to have the
+    // same sign for the same shape. If the y ray's reflection were not undone
+    // every edge would cancel against itself.
+    const gpa = testing.allocator;
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 10, 10, 30, 30);
+
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    const id = try store.add(gpa, curves.items, .nonzero);
+    const h = store.headers.items[id];
+
+    const xr = rayAlongX(store, h, 20, 20, 1);
+    const yr = rayAlongY(store, h, 20, 20, 1);
+    try testing.expectApproxEqAbs(@as(f32, 1), @abs(xr.cov), 0.001);
+    try testing.expectEqual(std.math.sign(xr.cov), std.math.sign(yr.cov));
+
+    // And a clockwise square flips both together.
+    curves.clearRetainingCapacity();
+    try square(gpa, &curves, 30, 10, 10, 30);
+    const cw = try store.add(gpa, curves.items, .nonzero);
+    const hc = store.headers.items[cw];
+    const xc = rayAlongX(store, hc, 20, 20, 1);
+    const yc = rayAlongY(store, hc, 20, 20, 1);
+    try testing.expectEqual(std.math.sign(xc.cov), std.math.sign(yc.cov));
+    try testing.expect(std.math.sign(xc.cov) != std.math.sign(xr.cov));
 }
 
 test "a vertical edge is exact at every sub-pixel offset" {
-    // The property the whole method is for. Multisampling gives an edge as
-    // many coverage levels as it has samples; this gives it the real number,
-    // because the x integral is closed form and only the y one is sampled.
     const gpa = testing.allocator;
     var curves: std.ArrayList(Curve) = .empty;
     defer curves.deinit(gpa);
@@ -786,24 +1008,20 @@ test "a vertical edge is exact at every sub-pixel offset" {
     var store: Store = .{};
     defer store.deinit(gpa);
     const id = try store.add(gpa, curves.items, .nonzero);
-    const scale: Scale = .{ .x = 1, .y = 1 };
 
     // The shape's left edge is at x = 10 and it extends to the right, so a
-    // pixel centred at 10 + f has `0.5 + f` of its width inside -- and gets
-    // exactly that, from a single ray, at every offset.
+    // pixel centred at 10 + f has `0.5 + f` of its width inside.
     var f: f32 = -0.45;
     while (f <= 0.45) : (f += 0.05) {
         const want = std.math.clamp(0.5 + f, 0, 1);
-        const got = coverageAt(store, id, 10 + f, 50, scale, 1);
-        try testing.expectApproxEqAbs(want, got, 0.001);
+        try testing.expectApproxEqAbs(want, coverageAt(store, id, 10 + f, 50, unit), 0.001);
     }
 }
 
-test "a horizontal edge is quantised, and by exactly the ray count" {
-    // The other half of the trade, stated rather than hidden: the y integral
-    // is a midpoint rule, so a horizontal edge gets `rays + 1` levels. With
-    // one ray it is a hard edge; with four it is five steps; with sixteen it
-    // is close enough to the truth to measure.
+test "a horizontal edge is exact too, which one ray could not make it" {
+    // What the second ray is for. The x ray through a pixel on a horizontal
+    // edge is entirely inside or entirely outside; the y ray crosses the edge
+    // inside the pixel, carries all the weight, and gets the true answer.
     const gpa = testing.allocator;
     var curves: std.ArrayList(Curve) = .empty;
     defer curves.deinit(gpa);
@@ -812,31 +1030,47 @@ test "a horizontal edge is quantised, and by exactly the ray count" {
     var store: Store = .{};
     defer store.deinit(gpa);
     const id = try store.add(gpa, curves.items, .nonzero);
-    const scale: Scale = .{ .x = 1, .y = 1 };
 
-    // Dead on the edge: half the pixel is inside, whatever the ray count.
-    try testing.expectApproxEqAbs(@as(f32, 0.5), coverageAt(store, id, 50, 10, scale, 4), 0.001);
-
-    // A quarter of a pixel above it, four rays can only say "three quarters".
-    try testing.expectApproxEqAbs(@as(f32, 0.75), coverageAt(store, id, 50, 10.25, scale, 4), 0.001);
-
-    // And sixteen rays land within a sixteenth of the truth.
-    var off: f32 = -0.4;
-    while (off <= 0.4) : (off += 0.1) {
+    var off: f32 = -0.45;
+    while (off <= 0.45) : (off += 0.05) {
         const want = std.math.clamp(0.5 + off, 0, 1);
-        const got = coverageAt(store, id, 50, 10 + off, scale, 16);
-        try testing.expectApproxEqAbs(want, got, 1.0 / 16.0);
+        try testing.expectApproxEqAbs(want, coverageAt(store, id, 50, 10 + off, unit), 0.001);
     }
+}
+
+test "a diagonal edge is close to its true coverage" {
+    // The case the combination approximates. A 45° edge through a pixel's
+    // centre covers exactly half of it; both rays cross at the centre with
+    // full weight and the blend gives the half.
+    const gpa = testing.allocator;
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+    try lineOf(gpa, &curves, .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 });
+    try lineOf(gpa, &curves, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 });
+    try lineOf(gpa, &curves, .{ .x = 100, .y = 100 }, .{ .x = 0, .y = 0 });
+
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    const id = try store.add(gpa, curves.items, .nonzero);
+
+    try testing.expectApproxEqAbs(@as(f32, 0.5), coverageAt(store, id, 50.5, 50.5, unit), 0.001);
+    // A quarter pixel into the shape along the normal is past three
+    // quarters in truth; the blend is monotone and lands between.
+    const inside = coverageAt(store, id, 50.75, 50.25, unit);
+    try testing.expect(inside > 0.5 and inside <= 1.0);
+    const outside = coverageAt(store, id, 50.25, 50.75, unit);
+    try testing.expect(outside < 0.5 and outside >= 0.0);
 }
 
 test "the branchless crossing test agrees with the readable one" {
     // What makes the GLSL safe to trust: the table in the shader is this
-    // table, and this table gives the same answers as the version that
-    // actually solves for the roots and looks at the tangent.
+    // table, and this table gives the same answers -- coverage and weight --
+    // as the version that solves for the roots and looks at the tangent.
     var rng: std.Random.DefaultPrng = .init(0x51a6);
     const rand = rng.random();
 
-    var worst: f32 = 0;
+    var worst_cov: f32 = 0;
+    var worst_wgt: f32 = 0;
     for (0..20000) |_| {
         const c: Curve = .{
             .x0 = rand.float(f32) * 20 - 10,
@@ -850,13 +1084,92 @@ test "the branchless crossing test agrees with the readable one" {
         const y = rand.float(f32) * 20 - 10;
         const a = crossings(c, x, y, 1.0);
         const b = crossingsTable(c, x, y, 1.0);
-        worst = @max(worst, @abs(a - b));
+        worst_cov = @max(worst_cov, @abs(a.cov - b.cov));
+        worst_wgt = @max(worst_wgt, @abs(a.wgt - b.wgt));
     }
-    // Bit-exact over twenty thousand random curves, which is more than the
-    // bridge needs to carry but is what it happens to hold: the two compute
-    // the same roots by the same stable formula and differ only in how they
-    // decide which of them is in range.
-    try testing.expectEqual(@as(f32, 0), worst);
+    try testing.expectEqual(@as(f32, 0), worst_cov);
+    try testing.expectEqual(@as(f32, 0), worst_wgt);
+}
+
+test "the early exit never skips a curve that would have contributed" {
+    // The sort and the break are a pair: this renders random shapes with the
+    // break and compares against summing every curve in the path.
+    const gpa = testing.allocator;
+    var rng: std.Random.DefaultPrng = .init(0xba2d);
+    const rand = rng.random();
+
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+
+    for (0..40) |_| {
+        curves.clearRetainingCapacity();
+        // A closed polygon of random quadratics.
+        var pts: [12]Point = undefined;
+        for (&pts) |*p| p.* = .{ .x = rand.float(f32) * 40, .y = rand.float(f32) * 40 };
+        for (pts, 0..) |p, i| {
+            const q = pts[(i + 1) % pts.len];
+            try curves.append(gpa, .{
+                .x0 = p.x,
+                .y0 = p.y,
+                .x1 = rand.float(f32) * 40,
+                .y1 = rand.float(f32) * 40,
+                .x2 = q.x,
+                .y2 = q.y,
+            });
+        }
+        const id = try store.add(gpa, curves.items, .nonzero);
+        const h = store.headers.items[id];
+
+        for (0..50) |_| {
+            const x = rand.float(f32) * 40;
+            const y = rand.float(f32) * 40;
+            var all_x: Ray = .{};
+            var all_y: Ray = .{};
+            for (curves.items) |c| {
+                const r = crossingsTable(c, x, y, 1);
+                all_x.cov += r.cov;
+                all_x.wgt = @max(all_x.wgt, r.wgt);
+                const v = crossingsTable(c.swapped(), y, x, 1);
+                all_y.cov -= v.cov;
+                all_y.wgt = @max(all_y.wgt, v.wgt);
+            }
+            const xr = rayAlongX(store, h, x, y, 1);
+            const yr = rayAlongY(store, h, x, y, 1);
+            try testing.expectApproxEqAbs(all_x.cov, xr.cov, 0.0001);
+            try testing.expectApproxEqAbs(all_x.wgt, xr.wgt, 0.0001);
+            try testing.expectApproxEqAbs(all_y.cov, yr.cov, 0.0001);
+            try testing.expectApproxEqAbs(all_y.wgt, yr.wgt, 0.0001);
+        }
+    }
+}
+
+test "a straight line is left out of the bands it runs along" {
+    const gpa = testing.allocator;
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 10, 10);
+
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    const id = try store.add(gpa, curves.items, .nonzero);
+    const h = store.headers.items[id];
+
+    // Every horizontal band holds the two vertical sides and nothing else,
+    // and every vertical band the two horizontal ones.
+    for (store.bands.items[h.band_first..][0..h.h_bands]) |hb| {
+        try testing.expectEqual(@as(u32, 2), hb.count);
+        for (store.indices.items[hb.first..][0..hb.count]) |i| {
+            try testing.expect(store.curves.items[i].x0 == store.curves.items[i].x2);
+        }
+    }
+    for (store.bands.items[h.band_first + h.h_bands ..][0..h.v_bands]) |vb| {
+        try testing.expectEqual(@as(u32, 2), vb.count);
+        for (store.indices.items[vb.first..][0..vb.count]) |i| {
+            try testing.expect(store.curves.items[i].y0 == store.curves.items[i].y2);
+        }
+    }
 }
 
 test "the even-odd rule empties what the nonzero rule fills" {
@@ -871,40 +1184,40 @@ test "the even-odd rule empties what the nonzero rule fills" {
     defer store.deinit(gpa);
     const nz = try store.add(gpa, curves.items, .nonzero);
     const eo = try store.add(gpa, curves.items, .even_odd);
-    const scale: Scale = .{ .x = 1, .y = 1 };
 
     // In the overlap the winding is two.
-    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, nz, 20, 20, scale, 4), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, eo, 20, 20, scale, 4), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, nz, 20, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, eo, 20, 20, unit), 0.001);
     // In the ring between them it is one, and both rules fill it.
-    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, nz, 5, 20, scale, 4), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, eo, 5, 20, scale, 4), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, nz, 5, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, eo, 5, 20, unit), 0.001);
 }
 
 test "bands hold every curve that reaches into them and no pixel misses one" {
     const gpa = testing.allocator;
     var curves: std.ArrayList(Curve) = .empty;
     defer curves.deinit(gpa);
-    // A tall thin shape, so the bands actually divide it.
-    try square(gpa, &curves, 0, 0, 4, 400);
+    // A tall thin shape made of many short segments, so the bands actually
+    // divide it in both directions.
+    var y: f32 = 0;
+    while (y < 400) : (y += 10) {
+        try lineOf(gpa, &curves, .{ .x = 4, .y = y }, .{ .x = 4, .y = y + 10 });
+    }
+    try lineOf(gpa, &curves, .{ .x = 4, .y = 400 }, .{ .x = 0, .y = 400 });
+    while (y > 0) : (y -= 10) {
+        try lineOf(gpa, &curves, .{ .x = 0, .y = y }, .{ .x = 0, .y = y - 10 });
+    }
+    try lineOf(gpa, &curves, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 0 });
 
     var store: Store = .{};
     defer store.deinit(gpa);
     const id = try store.add(gpa, curves.items, .nonzero);
     const h = store.headers.items[id];
-    try testing.expect(h.row_count > 1);
+    try testing.expect(h.h_bands > 1);
 
-    // The two long sides span every band; the two short ends span one each.
-    var seen: u32 = 0;
-    for (store.bands.items[h.row_first..][0..h.row_count]) |b| seen += b.count;
-    try testing.expect(seen >= h.row_count * 2);
-
-    // And the shape is filled all the way down, which is the thing the bands
-    // could silently break.
-    const scale: Scale = .{ .x = 1, .y = 1 };
-    var y: f32 = 2;
-    while (y < 398) : (y += 7) {
-        try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 2, y, scale, 4), 0.001);
+    var probe: f32 = 2;
+    while (probe < 398) : (probe += 3.7) {
+        try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 2, probe, unit), 0.001);
     }
 }
 
@@ -961,10 +1274,6 @@ fn cubicAt(p0: Point, c1: Point, c2: Point, p3: Point, t: f32) Point {
 }
 
 test "a coarser zoom widens the antialiased band rather than moving the edge" {
-    // Resolution independence, which is the reason the curves and not the
-    // pixels go to the device: the same store, drawn at two scales, puts the
-    // edge in the same place and only changes how many pixels the transition
-    // takes.
     const gpa = testing.allocator;
     var curves: std.ArrayList(Curve) = .empty;
     defer curves.deinit(gpa);
@@ -975,13 +1284,26 @@ test "a coarser zoom widens the antialiased band rather than moving the edge" {
     const id = try store.add(gpa, curves.items, .nonzero);
 
     // At four device pixels per path unit a pixel is a quarter of a unit, so
-    // a quarter unit past the edge is a whole pixel in and fully covered.
+    // a quarter unit past the edge is half a pixel in and fully covered.
     const fine: Scale = .{ .x = 4, .y = 4 };
-    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 10.25, 50, fine, 4), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 10.125, 50, fine), 0.001);
     // At one pixel per unit the same place is still on the edge.
-    const coarse: Scale = .{ .x = 1, .y = 1 };
-    try testing.expectApproxEqAbs(@as(f32, 0.75), coverageAt(store, id, 10.25, 50, coarse, 4), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.625), coverageAt(store, id, 10.125, 50, unit), 0.001);
     // And the midpoint of the ramp is the edge at either scale.
-    try testing.expectApproxEqAbs(@as(f32, 0.5), coverageAt(store, id, 10, 50, fine, 4), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 0.5), coverageAt(store, id, 10, 50, coarse, 4), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), coverageAt(store, id, 10, 50, fine), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), coverageAt(store, id, 10, 50, unit), 0.001);
+}
+
+test "the pixel footprint comes from the inverse, the way fwidth does" {
+    // Axis-aligned, with the page's flip: the scale itself.
+    const page = Scale.of(.{ .a = 2, .b = 0, .c = 0, .d = -3, .e = 5, .f = 7 });
+    try testing.expectApproxEqAbs(@as(f32, 2), page.x, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 3), page.y, 0.0001);
+
+    // A 45° rotation at unit scale: one pixel step moves √½ in x and √½ in
+    // y, so fwidth is √2 and the pixels per unit are √½.
+    const r = std.math.sqrt1_2;
+    const rot = Scale.of(.{ .a = r, .b = r, .c = -r, .d = r });
+    try testing.expectApproxEqAbs(@as(f32, r), rot.x, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, r), rot.y, 0.0001);
 }

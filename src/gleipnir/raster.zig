@@ -194,8 +194,6 @@ pub const SlugFill = struct {
     header: u32,
     /// Path space to device space.
     xform: Transform,
-    /// Sub-rows per pixel for the `∫ F(y) dy` midpoint rule.
-    rays: u32 = slug.default_rays,
 };
 
 /// One drawn image: decoded pixels, and the matrix that puts the unit square
@@ -452,7 +450,6 @@ pub const Canvas = struct {
         if (area.isEmpty()) return;
 
         const scale: slug.Scale = .of(f.xform);
-        const rays = @max(1, f.rays);
 
         var y: u32 = area.y0;
         while (y < area.y1) : (y += 1) {
@@ -465,7 +462,7 @@ pub const Canvas = struct {
                     .x = @as(f32, @floatFromInt(x)) + 0.5,
                     .y = @as(f32, @floatFromInt(y)) + 0.5,
                 });
-                const cov = slug.coverageAt(store.*, f.header, p.x, p.y, scale, rays);
+                const cov = slug.coverageAt(store.*, f.header, p.x, p.y, scale);
                 if (cov <= 0) continue;
                 c.blend(
                     @as(usize, y) * c.width() + x,

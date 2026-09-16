@@ -38,24 +38,37 @@
 //!
 //! ## The buffers
 //!
-//! Six storage buffers, all read-only, all in one descriptor set:
+//! Eight storage buffers, all read-only, all in one descriptor set:
 //!
 //!     0  curves     the quadratics, in path space
-//!     1  bands      slices of `indices`, one per row of a path
-//!     2  indices    curve ids, grouped by band
+//!     1  bands      slices of `indices`: a path's horizontal bands, then
+//!                   its vertical ones
+//!     2  indices    curve ids, grouped by band, sorted for the early exit
 //!     3  headers    one per uploaded outline
-//!     4  instances  one per drawn path: which outline, where, what colour
+//!     4  instances  one per drawn path or image: what, where, what colour
 //!     5  clips      the clip stack, as linked nodes
+//!     6  images     where each image's texels start, and its size
+//!     7  texels     every image's pixels, one `uint` each
 //!
-//! The first four are `slug.Store` uploaded verbatim -- the Zig structs are
+//! Bindings 0 to 3 are `slug.Store` uploaded verbatim -- the Zig structs are
 //! `extern` and the GLSL structs are their transcription, so it is a memcpy
-//! and not a serialisation. The last two are built per frame.
+//! and not a serialisation. 6 and 7 are recorded with the page the same way.
+//! 4 and 5 are built per frame.
 //!
-//! ## One draw
+//! "The GLSL structs are their transcription" is a claim std430 can make
+//! false without either side looking wrong: a struct aligns to its
+//! most-aligned member, so one `vec4` in a struct of scalars grows it to a
+//! multiple of sixteen. The test "the compiled shader lays out every buffer
+//! the way this file does" in `lyngvi/shaders.zig` reads the offsets and
+//! strides out of the SPIR-V and compares them with `@offsetOf` here.
 //!
-//! `vkCmdDraw(cmd, 4, instances, 0, 0)` with a triangle strip. No vertex
-//! buffer, no index buffer, no vertex attributes. The vertex shader builds
-//! the path's device-space box from its header and the instance's matrix.
+//! ## Few draws
+//!
+//! `vkCmdDraw(cmd, 4, n, 0, first)` with a triangle strip, once per run of
+//! instances that share a `Composite` -- on a page with no blend modes, once.
+//! No vertex buffer, no index buffer, no vertex attributes. The vertex shader
+//! builds the path's device-space box from its header and the instance's
+//! matrix.
 
 const std = @import("std");
 
@@ -120,13 +133,15 @@ pub const Instance = extern struct {
     /// pipelines that disagree about this composite correctly alone and
     /// wrongly against each other.
     color: [4]f32 = .{ 0, 0, 0, 1 },
-    /// Index into the headers buffer: which outline this draws.
+    /// Index into the headers buffer: which outline this draws. Unused by an
+    /// image, whose outline is always the unit square.
     header: u32 = 0,
     /// Index into the clips buffer, or `no_clip`.
     clip_node: u32 = no_clip,
-    /// Sub-rows per pixel.
-    rays: u32 = slug.default_rays,
+    /// The composite in the low byte, and the `flag` bits above it.
     flags: u32 = 0,
+    /// Index into the images buffer, for an instance with `flag.image`.
+    image: u32 = 0,
 
     /// Builds the instance for one fill. `alpha` is the constant alpha in
     /// force (`/ca` or `/CA`), folded in here rather than into the colour so
@@ -137,24 +152,133 @@ pub const Instance = extern struct {
         clip: [4]f32,
         color: Color,
         alpha: f32,
-        rays: u32,
+        composite: Composite,
     ) Instance {
-        const a = std.math.clamp(color.a, 0, 1) * std.math.clamp(alpha, 0, 1);
         return .{
             .xform = .{ xform.a, xform.b, xform.c, xform.d },
             .translate = .{ xform.e, xform.f },
             .clip = clip,
-            .color = .{
-                rect.srgbToLinear(std.math.clamp(color.r, 0, 1)) * a,
-                rect.srgbToLinear(std.math.clamp(color.g, 0, 1)) * a,
-                rect.srgbToLinear(std.math.clamp(color.b, 0, 1)) * a,
-                a,
-            },
+            .color = premultiplied(color, alpha),
             .header = header,
-            .rays = rays,
+            .flags = @intFromEnum(composite),
+        };
+    }
+
+    /// Builds the instance for one image. The unit square through `xform` is
+    /// where it lands (§8.9.5). `color` is only read for a stencil mask,
+    /// where it is the paint; an image with colours of its own carries just
+    /// the constant alpha.
+    pub fn initImage(
+        image: u32,
+        is_mask: bool,
+        xform: Transform,
+        clip: [4]f32,
+        color: Color,
+        alpha: f32,
+        composite: Composite,
+    ) Instance {
+        return .{
+            .xform = .{ xform.a, xform.b, xform.c, xform.d },
+            .translate = .{ xform.e, xform.f },
+            .clip = clip,
+            .color = if (is_mask) premultiplied(color, alpha) else .{ 0, 0, 0, std.math.clamp(alpha, 0, 1) },
+            .flags = @intFromEnum(composite) | flag.image | if (is_mask) flag.mask else 0,
+            .image = image,
+        };
+    }
+
+    pub fn compositeOf(it: Instance) Composite {
+        return @enumFromInt(it.flags & flag.composite_mask);
+    }
+};
+
+/// The bits of `Instance.flags` above the composite. Must match `FLAG_*` in
+/// `shader/slug.glsl`.
+pub const flag = struct {
+    pub const composite_mask: u32 = 0xff;
+    /// Sample the image named by `Instance.image` over the unit square,
+    /// instead of computing an outline's coverage.
+    pub const image: u32 = 1 << 8;
+    /// The image is a stencil: its alpha is coverage and `color` is the paint.
+    pub const mask: u32 = 1 << 9;
+};
+
+fn premultiplied(color: Color, alpha: f32) [4]f32 {
+    const a = std.math.clamp(color.a, 0, 1) * std.math.clamp(alpha, 0, 1);
+    return .{
+        rect.srgbToLinear(std.math.clamp(color.r, 0, 1)) * a,
+        rect.srgbToLinear(std.math.clamp(color.g, 0, 1)) * a,
+        rect.srgbToLinear(std.math.clamp(color.b, 0, 1)) * a,
+        a,
+    };
+}
+
+/// How an instance combines with what is already in the framebuffer: one
+/// pipeline each, and a draw call per run of instances that share one.
+///
+/// PDF has sixteen blend modes and a fixed-function blender can do four of
+/// them without reading the backdrop in the shader. Those four are the ones
+/// real documents use -- `/Multiply` is every highlighter annotation ever
+/// made -- and each is exact or close to it:
+///
+/// * **multiply** is `s·d + d·(1 − αs)` premultiplied, over an opaque
+///   backdrop: `DST_COLOR, ONE_MINUS_SRC_ALPHA`. The backdrop is always
+///   opaque here, since the frame is cleared to an opaque colour and the page
+///   under a path is paper. Exact.
+/// * **screen** is `s + d − s·d`: `ONE, ONE_MINUS_SRC_COLOR`. Exact at any
+///   alpha, because the premultiplied form is already that sum.
+/// * **darken** and **lighten** are `MIN` and `MAX`, which ignore the blend
+///   factors. For a fully covered pixel that is the mode exactly. For an
+///   antialiased edge the shader first composites the source over white
+///   (darken) or black (lighten), which is the identity of each operator, so
+///   a half-covered pixel moves halfway rather than all the way.
+///
+/// Everything else is drawn `normal` and counted in `Scene.Stats.blended`.
+pub const Composite = enum(u8) {
+    normal = 0,
+    multiply = 1,
+    screen = 2,
+    darken = 3,
+    lighten = 4,
+
+    pub const count = 5;
+
+    /// The pipeline for a PDF blend mode, or null for one that has none.
+    pub fn of(mode: paint.BlendMode) ?Composite {
+        return switch (mode) {
+            .normal => .normal,
+            .multiply => .multiply,
+            .screen => .screen,
+            .darken => .darken,
+            .lighten => .lighten,
+            else => null,
         };
     }
 };
+
+/// One image's place in the texel buffer. Matches `struct ImageInfo` in the
+/// shader.
+///
+/// Images go to the device the way outlines do -- appended to a flat array,
+/// renumbered on merge, uploaded when the store changes -- rather than as
+/// textures, because a descriptor array of textures is a fixed number of
+/// slots shared with everything else in the renderer, and a page of forty
+/// icons would run out of them. A storage buffer runs out of nothing but
+/// memory, and `scene.max_image_side` bounds that.
+pub const ImageInfo = extern struct {
+    /// First texel in the texels buffer.
+    offset: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    _pad: u32 = 0,
+};
+
+/// One texel: straight RGBA, eight bits a channel, sRGB-encoded, packed
+/// little-endian so `unpackUnorm4x8` in the shader reads red from the low
+/// byte.
+pub fn packTexel(r: u8, g: u8, b: u8, a: u8) u32 {
+    return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16) | (@as(u32, a) << 24);
+}
 
 /// One level of the clip stack. Matches `struct ClipNode` in the shader.
 ///
@@ -177,9 +301,10 @@ comptime {
     std.debug.assert(@offsetOf(Instance, "color") == 48);
     std.debug.assert(@offsetOf(Instance, "header") == 64);
     std.debug.assert(@offsetOf(Instance, "clip_node") == 68);
-    std.debug.assert(@offsetOf(Instance, "rays") == 72);
-    std.debug.assert(@offsetOf(Instance, "flags") == 76);
+    std.debug.assert(@offsetOf(Instance, "flags") == 72);
+    std.debug.assert(@offsetOf(Instance, "image") == 76);
     std.debug.assert(@sizeOf(ClipNode) == 32);
+    std.debug.assert(@sizeOf(ImageInfo) == 16);
     // The shader indexes `bands[]` and `indices[]` with the header's spans,
     // so the strides have to be what the Zig side writes.
     std.debug.assert(@sizeOf(slug.Curve) == 24);
@@ -187,7 +312,12 @@ comptime {
     std.debug.assert(@sizeOf(slug.Header) == 40);
 }
 
-/// The six storage buffer bindings, in set 0.
+/// The eight storage buffer bindings, in set 0.
+///
+/// Six of them change only when the set of recorded pages does -- the
+/// outlines and the images -- and two whenever the view moves. `placement`
+/// says which is which, and `PathRenderer.upload` sends only the half that
+/// changed.
 pub const binding = struct {
     pub const curves: u32 = 0;
     pub const bands: u32 = 1;
@@ -195,7 +325,15 @@ pub const binding = struct {
     pub const headers: u32 = 3;
     pub const instances: u32 = 4;
     pub const clips: u32 = 5;
-    pub const count: u32 = 6;
+    pub const images: u32 = 6;
+    pub const texels: u32 = 7;
+    pub const count: u32 = 8;
+
+    /// True for the bindings rebuilt by `Frame.place` rather than recorded
+    /// with a page.
+    pub fn placement(b: u32) bool {
+        return b == instances or b == clips;
+    }
 };
 
 /// The draw: a four-vertex strip, instanced.
@@ -235,7 +373,8 @@ pub const raster = struct {
 /// values.
 pub const samples: u32 = 1;
 
-/// Blend state, identical to the rect pipeline's.
+/// Blend state for `Composite.normal`, identical to the rect pipeline's. See
+/// `Composite` for the other four.
 ///
 /// `ONE / ONE_MINUS_SRC_ALPHA` over an `_SRGB` attachment, so the hardware
 /// decodes on read and encodes on write and the blend happens in linear
@@ -255,7 +394,7 @@ test "the instance's colour is premultiplied and linear" {
     // The contract with the blend state. A colour that is not premultiplied
     // here composites over the backdrop at the wrong weight and the page
     // comes out with a pale halo around every mark.
-    const it: Instance = .init(0, .identity, .{ 0, 0, 100, 100 }, .{ .r = 1, .g = 0, .b = 0, .a = 0.5 }, 1.0, 4);
+    const it: Instance = .init(0, .identity, .{ 0, 0, 100, 100 }, .{ .r = 1, .g = 0, .b = 0, .a = 0.5 }, 1.0, .normal);
     try testing.expectApproxEqAbs(@as(f32, 0.5), it.color[3], 0.001);
     // Red at full intensity is 1.0 in linear light too, halved by the alpha.
     try testing.expectApproxEqAbs(@as(f32, 0.5), it.color[0], 0.001);
@@ -263,12 +402,12 @@ test "the instance's colour is premultiplied and linear" {
 
     // A mid grey is where sRGB and linear part company, and where a pipeline
     // that forgot the conversion would still look plausible.
-    const grey: Instance = .init(0, .identity, .{ 0, 0, 1, 1 }, .gray(0.5), 1.0, 4);
+    const grey: Instance = .init(0, .identity, .{ 0, 0, 1, 1 }, .gray(0.5), 1.0, .normal);
     try testing.expectApproxEqAbs(@as(f32, 0.2140), grey.color[0], 0.001);
 }
 
 test "the constant alpha multiplies the colour's own" {
-    const it: Instance = .init(0, .identity, .{ 0, 0, 1, 1 }, .{ .r = 1, .g = 1, .b = 1, .a = 0.5 }, 0.5, 4);
+    const it: Instance = .init(0, .identity, .{ 0, 0, 1, 1 }, .{ .r = 1, .g = 1, .b = 1, .a = 0.5 }, 0.5, .normal);
     try testing.expectApproxEqAbs(@as(f32, 0.25), it.color[3], 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0.25), it.color[0], 0.001);
 }
@@ -279,7 +418,7 @@ test "the transform is stored column by column, as the shader reads it" {
     // every path on the page, which on an axis-aligned transform is invisible
     // and on a rotated one is not.
     const t: Transform = .{ .a = 2, .b = 3, .c = 5, .d = 7, .e = 11, .f = 13 };
-    const it: Instance = .init(0, t, .{ 0, 0, 1, 1 }, .black, 1.0, 4);
+    const it: Instance = .init(0, t, .{ 0, 0, 1, 1 }, .black, 1.0, .normal);
     try testing.expectEqual([4]f32{ 2, 3, 5, 7 }, it.xform);
     try testing.expectEqual([2]f32{ 11, 13 }, it.translate);
 }
@@ -304,9 +443,44 @@ test "every binding the shader declares has a number here" {
         .{ "binding = 3", binding.headers },
         .{ "binding = 4", binding.instances },
         .{ "binding = 5", binding.clips },
+        .{ "binding = 6", binding.images },
+        .{ "binding = 7", binding.texels },
     }, 0..) |pair, i| {
         try testing.expect(std.mem.indexOf(u8, shared_source, pair[0]) != null);
         try testing.expectEqual(@as(u32, @intCast(i)), pair[1]);
     }
-    try testing.expectEqual(@as(u32, 6), binding.count);
+    try testing.expectEqual(@as(u32, 8), binding.count);
+}
+
+test "the flag bits and composites are the shader's" {
+    try testing.expect(std.mem.indexOf(u8, shared_source, "FLAG_IMAGE = 256u") != null);
+    try testing.expect(std.mem.indexOf(u8, shared_source, "FLAG_MASK = 512u") != null);
+    try testing.expect(std.mem.indexOf(u8, shared_source, "COMPOSITE_DARKEN = 3u") != null);
+    try testing.expect(std.mem.indexOf(u8, shared_source, "COMPOSITE_LIGHTEN = 4u") != null);
+    try testing.expectEqual(@as(u32, 256), flag.image);
+    try testing.expectEqual(@as(u32, 512), flag.mask);
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(Composite.darken));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(Composite.lighten));
+
+    // The mask keeps the composite and the flags apart.
+    const it: Instance = .initImage(7, true, .identity, .{ 0, 0, 1, 1 }, .black, 1, .multiply);
+    try testing.expectEqual(Composite.multiply, it.compositeOf());
+    try testing.expect(it.flags & flag.image != 0);
+    try testing.expect(it.flags & flag.mask != 0);
+    try testing.expectEqual(@as(u32, 7), it.image);
+}
+
+test "the blend modes a fixed-function blender can do are the ones that get a pipeline" {
+    try testing.expectEqual(Composite.multiply, Composite.of(.multiply).?);
+    try testing.expectEqual(Composite.screen, Composite.of(.screen).?);
+    try testing.expectEqual(Composite.normal, Composite.of(.normal).?);
+    try testing.expect(Composite.of(.overlay) == null);
+    try testing.expect(Composite.of(.luminosity) == null);
+}
+
+test "a texel packs red into the low byte" {
+    // `unpackUnorm4x8` reads component zero from the least significant byte,
+    // so a texel packed the other way round comes out with red and alpha
+    // exchanged -- a figure drawn transparent wherever it was not red.
+    try testing.expectEqual(@as(u32, 0xff000080), packTexel(0x80, 0, 0, 0xff));
 }

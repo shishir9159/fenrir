@@ -22,14 +22,26 @@
 //! previous top; the nodes themselves are never removed, because an instance
 //! recorded earlier still refers to them.
 //!
-//! ## What it does not carry
+//! ## Blend modes
 //!
-//! Blend modes and transparency groups. The fragment shader composites with
-//! one blend equation, so a `/Multiply` highlight recorded here comes out as
-//! plain source-over. `Stats.blended` counts what was lost rather than
-//! letting the page look finished -- and the CPU rasteriser, which does
-//! implement all sixteen modes, is what a page with them on it should be
-//! drawn with until the pipeline grows a second pass.
+//! Each instance carries a `slugpipe.Composite`, and the device draws a run
+//! of instances with the same one through the pipeline for it. That covers
+//! normal, multiply, screen, darken and lighten -- which is what highlighter
+//! annotations and nearly every real document use. The other eleven modes
+//! need the backdrop read in the shader, which a single-pass pipeline cannot
+//! do; they are drawn normally and counted in `Stats.blended`, so a page with
+//! them on it does not look finished when it is not.
+//!
+//! ## Images
+//!
+//! Recorded the way outlines are: the pixels are appended to one flat texel
+//! array, each image gets an `ImageInfo` saying where its texels start, and
+//! an instance names it. Merging renumbers both, and the device gets them as
+//! two more storage buffers. Pixels are resampled on the way in to no more
+//! than `max_image_scale` texels per recorded pixel of the image's placement,
+//! because a scanned figure is often thousands of pixels printed an inch
+//! wide, and the device should hold what the page can show rather than what
+//! the file happened to contain.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -43,6 +55,14 @@ const Bounds = geom.Bounds;
 const Color = paint.Color;
 const FillRule = geom.FillRule;
 const Transform = geom.Transform;
+
+/// What names one glyph outline: which font, and both the ways a display list
+/// says which glyph. See `Scene.glyphHeader`.
+pub const GlyphKey = struct {
+    font: u32,
+    code: u32,
+    id: u32,
+};
 
 pub const Scene = struct {
     /// The outlines: curves, bands, band indices, headers. Uploaded verbatim.
@@ -62,10 +82,21 @@ pub const Scene = struct {
     /// discard anyway.
     clip_box: [4]f32 = .{ 0, 0, 0, 0 },
 
+    /// Where each image's texels are. See the module comment.
+    images: std.ArrayList(slugpipe.ImageInfo) = .empty,
+    texels: std.ArrayList(u32) = .empty,
+    /// Images already recorded in this scene, by the address of the pixels
+    /// they came from, so a logo drawn forty times is stored once. Only
+    /// meaningful while recording: a merged scene's images came from pixels
+    /// that may since have been freed, and `merge` does not carry it.
+    image_seen: std.AutoHashMapUnmanaged(ImageKey, u32) = .empty,
+    /// Glyph outlines already in the store, by font and glyph id. Recording
+    /// only; `merge` does not carry it, because the headers it names are
+    /// renumbered on the way in and the next page will ask for its own.
+    glyphs: std.AutoHashMapUnmanaged(GlyphKey, u32) = .empty,
+
     /// The framebuffer, which is the widest any scissor can be.
     viewport: [2]f32 = .{ 1, 1 },
-    /// Sub-rows per pixel, written into every instance.
-    rays: u32 = slug.default_rays,
 
     /// Bumped whenever the store changes.
     ///
@@ -79,28 +110,50 @@ pub const Scene = struct {
     stats: Stats = .{},
 
     const SavedClip = struct { top: u32, box: [4]f32 };
+    const ImageKey = struct { ptr: usize, width: u32, height: u32 };
 
     pub const Stats = struct {
         paths: u32 = 0,
         clips: u32 = 0,
+        images: u32 = 0,
         /// Clips nested deeper than the shader will walk. What is drawn shows
         /// too much rather than too little, which is the safe direction but
         /// is still wrong.
         clips_too_deep: u32 = 0,
-        /// Instances whose blend mode is not `normal`, and so composite
-        /// wrongly. See the module comment.
+        /// Instances whose blend mode has no pipeline, and so were drawn
+        /// `normal`. See the module comment.
         blended: u32 = 0,
+        /// Images left out because the scene's texel budget was spent.
+        images_dropped: u32 = 0,
         /// Paths with no curves after conversion: an empty subpath, or a
         /// degenerate one.
         empty: u32 = 0,
+        /// Glyph outlines recorded. A page of text draws thousands of glyphs
+        /// and records a few hundred outlines; the ratio is what the store
+        /// costs instead of what it would have.
+        glyph_outlines: u32 = 0,
     };
+
 
     pub fn deinit(s: *Scene, gpa: Allocator) void {
         s.store.deinit(gpa);
         s.instances.deinit(gpa);
         s.clips.deinit(gpa);
         s.clip_stack.deinit(gpa);
+        s.images.deinit(gpa);
+        s.texels.deinit(gpa);
+        s.image_seen.deinit(gpa);
+        s.glyphs.deinit(gpa);
         s.* = .{};
+    }
+
+    /// Bytes to upload for the two image bindings.
+    pub fn imageBytes(s: Scene) []const u8 {
+        return std.mem.sliceAsBytes(s.images.items);
+    }
+
+    pub fn texelBytes(s: Scene) []const u8 {
+        return std.mem.sliceAsBytes(s.texels.items);
     }
 
     /// Empties everything but the capacity, for the next page.
@@ -109,6 +162,10 @@ pub const Scene = struct {
         s.instances.clearRetainingCapacity();
         s.clips.clearRetainingCapacity();
         s.clip_stack.clearRetainingCapacity();
+        s.images.clearRetainingCapacity();
+        s.texels.clearRetainingCapacity();
+        s.image_seen.clearRetainingCapacity();
+        s.glyphs.clearRetainingCapacity();
         s.clip_top = slugpipe.no_clip;
         s.viewport = viewport;
         s.clip_box = .{ 0, 0, viewport[0], viewport[1] };
@@ -139,19 +196,121 @@ pub const Scene = struct {
             s.stats.empty += 1;
             return;
         }
-        if (blend != .normal) s.stats.blended += 1;
 
         const header = try s.store.add(gpa, curves, rule);
-        try s.instances.append(gpa, .init(
-            header,
+        try s.drawHeader(gpa, header, xform, color, alpha, blend);
+    }
+
+    /// Draws an outline already in the store: one instance, no curves.
+    ///
+    /// This is what makes a page of text cheap. A glyph is recorded once, in
+    /// em units, and every place it appears is eighty bytes naming it and the
+    /// matrix that puts it there -- which is the property the whole design is
+    /// spent on, applied to the thing a page has thousands of.
+    pub fn drawHeader(
+        s: *Scene,
+        gpa: Allocator,
+        header: u32,
+        xform: Transform,
+        color: Color,
+        alpha: f32,
+        blend: paint.BlendMode,
+    ) Allocator.Error!void {
+        var it: slugpipe.Instance = .init(header, xform, s.clip_box, color, alpha, s.compositeOf(blend));
+        it.clip_node = s.clip_top;
+        try s.instances.append(gpa, it);
+        s.stats.paths += 1;
+    }
+
+    /// The outline recorded for one glyph, if it has been seen.
+    ///
+    /// Not keyed by size: the outline is in em units, so the size is the
+    /// instance's matrix. Keyed by the character code *and* the glyph id
+    /// because a display list may carry either -- a simple font's glyph index
+    /// is often left unresolved for the font layer to work out from the code,
+    /// and keying on the id alone then names every glyph in the font the
+    /// same. It draws a page of one repeated letter, which is how this was
+    /// found.
+    pub fn glyphHeader(s: *const Scene, key: GlyphKey) ?u32 {
+        return s.glyphs.get(key);
+    }
+
+    /// Records a glyph's outline and remembers it under `key`.
+    pub fn addGlyph(
+        s: *Scene,
+        gpa: Allocator,
+        key: GlyphKey,
+        curves: []const slug.Curve,
+    ) Allocator.Error!u32 {
+        const header = try s.store.add(gpa, curves, .nonzero);
+        try s.glyphs.put(gpa, key, header);
+        s.stats.glyph_outlines += 1;
+        return header;
+    }
+
+    fn compositeOf(s: *Scene, blend: paint.BlendMode) slugpipe.Composite {
+        return slugpipe.Composite.of(blend) orelse {
+            s.stats.blended += 1;
+            return .normal;
+        };
+    }
+
+    /// What `drawImage` is given: straight RGBA, eight bits a channel.
+    pub const Bitmap = struct {
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        /// The alpha is a stencil and the colour is `color`.
+        is_mask: bool = false,
+    };
+
+    /// Records one image, placed by `xform` over the unit square.
+    pub fn drawImage(
+        s: *Scene,
+        gpa: Allocator,
+        bitmap: Bitmap,
+        xform: Transform,
+        color: Color,
+        alpha: f32,
+        blend: paint.BlendMode,
+    ) Allocator.Error!void {
+        if (bitmap.width == 0 or bitmap.height == 0) return;
+        if (bitmap.pixels.len < @as(usize, bitmap.width) * bitmap.height * 4) return;
+        s.stats.images += 1;
+
+        const key: ImageKey = .{
+            .ptr = @intFromPtr(bitmap.pixels.ptr),
+            .width = bitmap.width,
+            .height = bitmap.height,
+        };
+        const index = s.image_seen.get(key) orelse blk: {
+            const size = storedSize(bitmap.width, bitmap.height, xform);
+            const count = @as(usize, size[0]) * size[1];
+            if (s.texels.items.len + count > max_texels) {
+                s.stats.images_dropped += 1;
+                return;
+            }
+            const offset: u32 = @intCast(s.texels.items.len);
+            try s.texels.resize(gpa, s.texels.items.len + count);
+            resample(bitmap, s.texels.items[offset..], size[0], size[1]);
+
+            const id: u32 = @intCast(s.images.items.len);
+            try s.images.append(gpa, .{ .offset = offset, .width = size[0], .height = size[1] });
+            try s.image_seen.put(gpa, key, id);
+            break :blk id;
+        };
+
+        var it: slugpipe.Instance = .initImage(
+            index,
+            bitmap.is_mask,
             xform,
             s.clip_box,
             color,
             alpha,
-            s.rays,
-        ));
-        s.instances.items[s.instances.items.len - 1].clip_node = s.clip_top;
-        s.stats.paths += 1;
+            s.compositeOf(blend),
+        );
+        it.clip_node = s.clip_top;
+        try s.instances.append(gpa, it);
     }
 
     /// Opens a clip. The path's own curves, placed by `xform`, intersected
@@ -241,20 +400,37 @@ pub const Scene = struct {
             s.clips.appendAssumeCapacity(out);
         }
 
+        const image_base: u32 = @intCast(s.images.items.len);
+        const texel_base: u32 = @intCast(s.texels.items.len);
+        try s.texels.appendSlice(gpa, src.texels.items);
+        try s.images.ensureUnusedCapacity(gpa, src.images.items.len);
+        for (src.images.items) |info| {
+            var out = info;
+            out.offset += texel_base;
+            s.images.appendAssumeCapacity(out);
+        }
+
         try s.instances.ensureUnusedCapacity(gpa, src.instances.items.len);
         for (src.instances.items) |it| {
             var out = it;
-            out.header += header_base;
+            if (out.flags & slugpipe.flag.image != 0) {
+                out.image += image_base;
+            } else {
+                out.header += header_base;
+            }
             if (out.clip_node != slugpipe.no_clip) out.clip_node += clip_base;
             s.instances.appendAssumeCapacity(out);
         }
 
         s.stats.paths += src.stats.paths;
         s.stats.clips += src.stats.clips;
+        s.stats.images += src.stats.images;
         s.stats.clips_too_deep += src.stats.clips_too_deep;
         s.stats.blended += src.stats.blended;
-        s.generation +%= 1;
+        s.stats.images_dropped += src.stats.images_dropped;
         s.stats.empty += src.stats.empty;
+        s.stats.glyph_outlines += src.stats.glyph_outlines;
+        s.generation +%= 1;
         return s.rangeEnd(start);
     }
 
@@ -361,6 +537,86 @@ pub const Frame = struct {
         }
     }
 };
+
+/// Texels kept per pixel of an image's recorded placement, in each direction.
+///
+/// A page is recorded at one device pixel per point, and a reader zooms it.
+/// Four is enough to stay sharp to 400%, and an image is never stored larger
+/// than the file gave it.
+pub const max_image_scale: f32 = 4;
+
+/// The longest side an image is stored at, whatever its placement.
+pub const max_image_side: u32 = 4096;
+
+/// The most texels one scene holds: 128 MiB, which is the smallest storage
+/// buffer range Vulkan promises every device supports.
+pub const max_texels: usize = (128 << 20) / 4;
+
+/// How big an image is stored: its own size, or what `xform` shows of it at
+/// `max_image_scale`, whichever is smaller.
+fn storedSize(width: u32, height: u32, xform: Transform) [2]u32 {
+    // The unit square's sides through the matrix: how many recorded pixels
+    // the image's width and height span on the page.
+    const across = @sqrt(xform.a * xform.a + xform.b * xform.b) * max_image_scale;
+    const down = @sqrt(xform.c * xform.c + xform.d * xform.d) * max_image_scale;
+    return .{ fit(width, across), fit(height, down) };
+}
+
+fn fit(have: u32, want: f32) u32 {
+    const limit = @min(have, max_image_side);
+    if (!(want >= 1)) return 1;
+    if (want >= @as(f32, @floatFromInt(limit))) return limit;
+    return @max(1, @as(u32, @intFromFloat(@ceil(want))));
+}
+
+/// A box filter from `bitmap` into `out`, `w` by `h`, packed as texels.
+///
+/// Averaged premultiplied and stored straight, the same as the CPU sampler
+/// averages, so a transparent texel does not drag its colour into its
+/// neighbours'. At the source's own size it is a copy.
+fn resample(bitmap: Scene.Bitmap, out: []u32, w: u32, h: u32) void {
+    const sw = bitmap.width;
+    const sh = bitmap.height;
+    const px = bitmap.pixels;
+
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        const y0 = @as(u64, y) * sh / h;
+        const y1 = @max(y0 + 1, (@as(u64, y) + 1) * sh / h);
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const x0 = @as(u64, x) * sw / w;
+            const x1 = @max(x0 + 1, (@as(u64, x) + 1) * sw / w);
+
+            var acc: [4]u64 = @splat(0);
+            var n: u64 = 0;
+            var sy = y0;
+            while (sy < y1) : (sy += 1) {
+                var sx = x0;
+                while (sx < x1) : (sx += 1) {
+                    const at = (sy * sw + sx) * 4;
+                    const a: u64 = px[at + 3];
+                    acc[0] += @as(u64, px[at]) * a;
+                    acc[1] += @as(u64, px[at + 1]) * a;
+                    acc[2] += @as(u64, px[at + 2]) * a;
+                    acc[3] += a;
+                    n += 1;
+                }
+            }
+            const alpha = acc[3];
+            const texel = if (alpha == 0)
+                slugpipe.packTexel(0, 0, 0, 0)
+            else
+                slugpipe.packTexel(
+                    @intCast(@min(255, (acc[0] + alpha / 2) / alpha)),
+                    @intCast(@min(255, (acc[1] + alpha / 2) / alpha)),
+                    @intCast(@min(255, (acc[2] + alpha / 2) / alpha)),
+                    @intCast(@min(255, (alpha + n / 2) / n)),
+                );
+            out[@as(usize, y) * w + x] = texel;
+        }
+    }
+}
 
 /// Renumbers a clip index from a recording's numbering into a frame's, and
 /// leaves `no_clip` alone.
@@ -548,7 +804,7 @@ test "a reset keeps the capacity and forgets the page" {
     try testing.expect(s.instances.capacity > 0);
 }
 
-test "a blend mode the pipeline cannot honour is counted, not ignored" {
+test "a blend mode with a pipeline is carried, and one without is counted" {
     const gpa = testing.allocator;
     var s: Scene = .{};
     defer s.deinit(gpa);
@@ -559,9 +815,66 @@ test "a blend mode the pipeline cannot honour is counted, not ignored" {
     try square(gpa, &curves, 0, 0, 10, 10);
 
     try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1.0, .normal);
-    try testing.expectEqual(@as(u32, 0), s.stats.blended);
     try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1.0, .multiply);
+    try testing.expectEqual(@as(u32, 0), s.stats.blended);
+    try testing.expectEqual(slugpipe.Composite.multiply, s.instances.items[1].compositeOf());
+
+    try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1.0, .color_dodge);
     try testing.expectEqual(@as(u32, 1), s.stats.blended);
+    try testing.expectEqual(slugpipe.Composite.normal, s.instances.items[2].compositeOf());
+}
+
+test "an image is stored once however often it is drawn, and no larger than it shows" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 1000, 1000 });
+
+    // 64 by 64, drawn over ten recorded pixels: stored at forty.
+    var pixels: [64 * 64 * 4]u8 = undefined;
+    for (0..64 * 64) |i| {
+        pixels[i * 4 ..][0..4].* = .{ 255, 0, 0, 255 };
+    }
+    const bmp: Scene.Bitmap = .{ .pixels = &pixels, .width = 64, .height = 64 };
+    try s.drawImage(gpa, bmp, .scaling(10, 10), .black, 1, .normal);
+    try s.drawImage(gpa, bmp, Transform.scaling(10, 10).concat(.translation(50, 0)), .black, 1, .normal);
+
+    try testing.expectEqual(@as(usize, 1), s.images.items.len);
+    try testing.expectEqual(@as(usize, 2), s.instances.items.len);
+    try testing.expectEqual(@as(u32, 40), s.images.items[0].width);
+    try testing.expectEqual(@as(usize, 40 * 40), s.texels.items.len);
+    try testing.expectEqual(slugpipe.packTexel(255, 0, 0, 255), s.texels.items[123]);
+
+    // Drawn over a thousand pixels, it is kept at its own size.
+    try s.drawImage(gpa, .{ .pixels = &pixels, .width = 32, .height = 128 }, .scaling(1000, 1000), .black, 1, .normal);
+    try testing.expectEqual(@as(u32, 32), s.images.items[1].width);
+    try testing.expectEqual(@as(u32, 128), s.images.items[1].height);
+}
+
+test "merging renumbers images and their texels, and leaves paths' headers alone" {
+    const gpa = testing.allocator;
+    var a: Scene = .{};
+    defer a.deinit(gpa);
+    a.reset(.{ 100, 100 });
+    var b: Scene = .{};
+    defer b.deinit(gpa);
+    b.reset(.{ 100, 100 });
+
+    var pixels: [4 * 4 * 4]u8 = @splat(255);
+    try a.drawImage(gpa, .{ .pixels = &pixels, .width = 4, .height = 4 }, .scaling(100, 100), .black, 1, .normal);
+    try b.drawImage(gpa, .{ .pixels = &pixels, .width = 4, .height = 4 }, .scaling(100, 100), .black, 1, .normal);
+
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 10, 10);
+    try b.draw(gpa, curves.items, .nonzero, .identity, .black, 1.0, .normal);
+
+    _ = try a.merge(gpa, b);
+    try testing.expectEqual(@as(usize, 2), a.images.items.len);
+    try testing.expectEqual(@as(u32, 16), a.images.items[1].offset);
+    try testing.expectEqual(@as(u32, 1), a.instances.items[1].image);
+    // The path after the image points at the only header there is.
+    try testing.expectEqual(@as(u32, 0), a.instances.items[2].header);
 }
 
 test "merging a scene renumbers every index in it" {

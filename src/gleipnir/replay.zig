@@ -22,7 +22,10 @@
 //!   change. `Options.text_boxes` draws the advance rectangles instead, which
 //!   is a layout debugging aid and is off by default because a box is not a
 //!   letter and an image that pretends otherwise is worse than one with a gap.
-//! * **Images.** No image decoder yet. `Options.image_boxes` outlines them.
+//! * **Images.** An image XObject is decoded behind `ImageSource`; an inline
+//!   image (`BI ... ID ... EI`) carries its samples in the list and is turned
+//!   into pixels here, by `inlineBitmap`. `Options.image_boxes` outlines
+//!   whatever could not be had.
 //! * **Shadings and tiling patterns.** The interpreter resolves both into
 //!   `Paint`, and painting them needs a gradient rasteriser and a recursive
 //!   replay respectively. Solid paint is exact; these are skipped.
@@ -151,9 +154,6 @@ pub const Options = struct {
     max_clip_depth: u32 = 64,
     /// Which rasteriser fills an outline.
     path_backend: PathBackend = .stencil,
-    /// Sub-rows per pixel, for `.slug`. Ignored by `.stencil`, which has
-    /// `Canvas.samples` instead.
-    rays: u32 = slug.default_rays,
     /// How far a quadratic may stray from the cubic it stands in for, in the
     /// path's own units rather than in pixels.
     ///
@@ -284,7 +284,6 @@ pub fn record(
     var opts = options;
     // Recording has only one rasteriser to record for.
     opts.path_backend = .slug;
-    target.rays = opts.rays;
     return walk(gpa, .{ .scene = target }, list, xform, opts);
 }
 
@@ -341,6 +340,10 @@ const Replayer = struct {
     /// of allocations.
     curves: std.ArrayList(slug.Curve) = .empty,
     store: slug.Store = .{},
+    /// Glyph outlines already in `store`, by font and glyph id. The canvas
+    /// sink's half of what `Scene.glyphs` does: a page of text rasterises
+    /// from a few hundred outlines rather than converting one per glyph.
+    glyphs: std.AutoHashMapUnmanaged(scene_mod.GlyphKey, u32) = .empty,
 
     /// One entry per open clip, so `clip_pop` knows whether its `clip_push`
     /// actually took effect.
@@ -359,6 +362,7 @@ const Replayer = struct {
         r.outline.deinit(r.gpa);
         r.curves.deinit(r.gpa);
         r.store.deinit(r.gpa);
+        r.glyphs.deinit(r.gpa);
         r.clip_stack.deinit(r.gpa);
         r.alpha_stack.deinit(r.gpa);
     }
@@ -429,13 +433,16 @@ const Replayer = struct {
         if (r.curves.items.len == 0) return;
         switch (r.sink) {
             .canvas => |c| {
-                r.store.reset();
+                // Added and then dropped again: this outline is wanted for
+                // one fill. The glyphs kept in the same store below are the
+                // exception, which is why this rewinds rather than resets.
+                const mark = r.store.mark();
+                defer r.store.rewind(mark);
                 const id = try r.store.add(r.gpa, r.curves.items, rule);
                 c.fillSlug(.{
                     .store = &r.store,
                     .header = id,
                     .xform = xform,
-                    .rays = r.options.rays,
                 }, color, r.alpha);
             },
             .scene => |s| try s.draw(
@@ -787,6 +794,29 @@ const Replayer = struct {
             const scale = to_device.expansion();
             if (!(scale > 0) or !std.math.isFinite(scale)) continue;
 
+            // The analytic rasteriser takes the outline as curves, in em
+            // units, once per glyph -- however many times the glyph appears
+            // and at whatever sizes. See `drawGlyphOutline`.
+            if (r.options.path_backend == .slug) {
+                const em_place: Transform = .{
+                    .a = tr.size,
+                    .d = tr.size,
+                    .e = g.offset.x,
+                    .f = g.offset.y,
+                };
+                if (try r.drawGlyphOutline(
+                    .{ .font = tr.font, .code = g.code, .id = g.id },
+                    out,
+                    em_place.concat(tr.transform).concat(r.base),
+                    color,
+                )) {
+                    r.stats.glyphs_drawn += 1;
+                } else {
+                    r.stats.glyphs_blank += 1;
+                }
+                continue;
+            }
+
             r.flat.reset();
             r.flat.options = .{ .tolerance = r.options.tolerance, .scale = scale };
             var i: usize = 0;
@@ -824,36 +854,117 @@ const Replayer = struct {
         }
     }
 
+    /// One glyph, as the curves it is made of, drawn through `xform`.
+    ///
+    /// The outline goes into the store in em units and is kept there under
+    /// its font and glyph id, so the second `e` on a page costs an instance
+    /// and no curves at all. That is worth more here than anywhere else: a
+    /// page of prose is a few thousand glyphs drawn from a few hundred
+    /// outlines, and before this each occurrence carried its own flattened
+    /// copy -- 121,651 curves for the 3,805 glyphs of one page of a paper,
+    /// where 5,700 say the same thing.
+    ///
+    /// Keeping them as curves rather than flattening is the other half. A
+    /// flattened outline is only right for the size it was flattened at, so
+    /// it could not be shared between a heading and a footnote, and it is a
+    /// polygon at any zoom past the one it was made for.
+    ///
+    /// Returns false for an outline with nothing in it, which is a space.
+    fn drawGlyphOutline(
+        r: *Replayer,
+        key: scene_mod.GlyphKey,
+        out: GlyphOutline,
+        xform: Transform,
+        color: Color,
+    ) Error!bool {
+        const em = @as(f32, @floatFromInt(if (out.units_per_em == 0) 1000 else out.units_per_em));
+
+        switch (r.sink) {
+            .scene => |s| {
+                if (s.glyphHeader(key)) |header| {
+                    try s.drawHeader(r.gpa, header, xform, color, r.alpha, r.blend);
+                    return true;
+                }
+                r.curves.clearRetainingCapacity();
+                try slug.fromOutline(r.gpa, &r.curves, out.verbs, out.points, 1.0 / em, slug.glyph_tolerance);
+                if (r.curves.items.len == 0) return false;
+                const header = try s.addGlyph(r.gpa, key, r.curves.items);
+                try s.drawHeader(r.gpa, header, xform, color, r.alpha, r.blend);
+                return true;
+            },
+            .canvas => |c| {
+                const header = r.glyphs.get(key) orelse blk: {
+                    r.curves.clearRetainingCapacity();
+                    try slug.fromOutline(r.gpa, &r.curves, out.verbs, out.points, 1.0 / em, slug.glyph_tolerance);
+                    if (r.curves.items.len == 0) return false;
+                    const h = try r.store.add(r.gpa, r.curves.items, .nonzero);
+                    try r.glyphs.put(r.gpa, key, h);
+                    break :blk h;
+                };
+                c.fillSlug(.{ .store = &r.store, .header = header, .xform = xform }, color, r.alpha);
+                return true;
+            },
+        }
+    }
+
+    /// Pixels in hand, to whichever sink this replay ends in.
+    fn drawBitmap(r: *Replayer, img: DisplayList.Image, bitmap: ImageSource.Bitmap) Error!void {
+        const mask_color: Color = solid(img.fill) orelse .black;
+        const xform = img.transform.concat(r.base);
+        switch (r.sink) {
+            .canvas => |c| c.drawImage(.{
+                .pixels = bitmap.pixels,
+                .width = bitmap.width,
+                .height = bitmap.height,
+                .xform = xform,
+                .is_mask = bitmap.is_mask,
+                .mask_color = mask_color,
+            }, r.alpha),
+            .scene => |s| {
+                const dropped = s.stats.images_dropped;
+                try s.drawImage(r.gpa, .{
+                    .pixels = bitmap.pixels,
+                    .width = bitmap.width,
+                    .height = bitmap.height,
+                    .is_mask = bitmap.is_mask,
+                }, xform, mask_color, r.alpha, r.blend);
+                if (s.stats.images_dropped != dropped) {
+                    r.stats.images_not_drawn += 1;
+                    return;
+                }
+            },
+        }
+        r.stats.images_drawn += 1;
+    }
+
     fn image(r: *Replayer, img: DisplayList.Image) Error!void {
         r.stats.images += 1;
 
-        if (r.options.images) |source| {
+        if (img.isInline()) {
+            // The samples are in the list. Decoded here, drawn, and freed:
+            // §8.9.7 keeps an inline image to a few kilobytes, so there is
+            // nothing worth caching, and a scene copies what it keeps.
+            if (try inlineBitmap(r.gpa, r.list, img)) |pixels| {
+                defer r.gpa.free(pixels);
+                try r.drawBitmap(img, .{
+                    .pixels = pixels,
+                    .width = img.width,
+                    .height = img.height,
+                    .is_mask = img.is_mask,
+                });
+                return;
+            }
+        } else if (r.options.images) |source| {
             if (source.get(img.object, r.list.stringOf(img.name))) |bitmap| {
-                switch (r.sink) {
-                    .canvas => |c| {
-                        c.drawImage(.{
-                            .pixels = bitmap.pixels,
-                            .width = bitmap.width,
-                            .height = bitmap.height,
-                            .xform = img.transform.concat(r.base),
-                            .is_mask = bitmap.is_mask,
-                            .mask_color = solid(img.fill) orelse .black,
-                        }, r.alpha);
-                        r.stats.images_drawn += 1;
-                        return;
-                    },
-                    // The analytic pipeline has no sampler. An image recorded
-                    // for it would have to become a textured quad in the rect
-                    // pipeline, which is a different draw call and a real
-                    // feature; counting it is the honest placeholder.
-                    .scene => {},
-                }
+                try r.drawBitmap(img, bitmap);
+                return;
             }
         }
 
-        // Not drawn: no source, an undecodable codec, or a backend that
-        // cannot sample. The outline below is a debugging aid and is not the
-        // image, so it does not make the page complete.
+        // Not drawn: no source, undecodable samples, or a scene out of room
+        // for texels. The outline below
+        // is a debugging aid and is not the image, so it does not make the
+        // page complete.
         r.stats.images_not_drawn += 1;
         if (!r.options.image_boxes) return;
 
@@ -873,6 +984,85 @@ const Replayer = struct {
         try r.paintFlattened(flat, .nonzero, .{ .r = 0.85, .g = 0.85, .b = 0.9, .a = 0.5 });
     }
 };
+
+/// An inline image's samples as straight RGBA, or null for one whose samples
+/// do not add up to its size.
+///
+/// The interpreter has already run the filters and recorded how many
+/// components a sample has, but not the colour space itself -- a display list
+/// is replayable without a document, and a colour space can name a function.
+/// So one component is grey, three are RGB and four are CMYK, and that is
+/// right for every inline image in practice: they are small stencils, rules
+/// and logos, not calibrated photographs. An `/Indexed` inline image comes
+/// out as the grey of its index, which is the known gap.
+///
+/// A stencil mask (`/IM true`) paints where a sample is 0, per §8.9.6.2 --
+/// and where it is 1 under `/Decode [1 0]`, which is what `inverted` says.
+pub fn inlineBitmap(gpa: Allocator, list: DisplayList, img: DisplayList.Image) Allocator.Error!?[]u8 {
+    const data = list.bytesOf(img.data);
+    const w: usize = img.width;
+    const h: usize = img.height;
+    if (w == 0 or h == 0 or w * h > 1 << 24) return null;
+
+    const bpc: usize = if (img.is_mask) 1 else img.bits_per_component;
+    const comps: usize = if (img.is_mask) 1 else @max(img.components, 1);
+    if (bpc == 0 or bpc > 16) return null;
+    const row_bits = w * comps * bpc;
+    const row_bytes = (row_bits + 7) / 8;
+    if (data.len < row_bytes * h) return null;
+
+    const out = try gpa.alloc(u8, w * h * 4);
+    const max: u32 = if (bpc == 16) 65535 else (@as(u32, 1) << @intCast(bpc)) - 1;
+
+    for (0..h) |y| {
+        const row = data[y * row_bytes ..][0..row_bytes];
+        for (0..w) |x| {
+            var v: [4]f32 = @splat(0);
+            for (0..@min(comps, 4)) |k| {
+                const raw = readSample(row, (x * comps + k) * bpc, bpc);
+                var f = @as(f32, @floatFromInt(raw)) / @as(f32, @floatFromInt(max));
+                if (img.inverted and !img.is_mask) f = 1 - f;
+                v[k] = f;
+            }
+            const o = (y * w + x) * 4;
+            if (img.is_mask) {
+                const paints = (v[0] < 0.5) != img.inverted;
+                out[o..][0..4].* = .{ 0, 0, 0, if (paints) 255 else 0 };
+                continue;
+            }
+            const rgb: [3]f32 = switch (comps) {
+                1, 2 => .{ v[0], v[0], v[0] },
+                3 => .{ v[0], v[1], v[2] },
+                // The naive conversion, the same one Gjöll uses for
+                // `/DeviceCMYK` with no profile.
+                else => .{
+                    (1 - v[0]) * (1 - v[3]),
+                    (1 - v[1]) * (1 - v[3]),
+                    (1 - v[2]) * (1 - v[3]),
+                },
+            };
+            out[o..][0..4].* = .{ byteOf(rgb[0]), byteOf(rgb[1]), byteOf(rgb[2]), 255 };
+        }
+    }
+    return out;
+}
+
+/// `bits` bits starting `bit` bits into `row`, most significant first.
+fn readSample(row: []const u8, bit: usize, bits: usize) u32 {
+    if (bits == 8) return row[bit / 8];
+    if (bits == 16) return (@as(u32, row[bit / 8]) << 8) | row[bit / 8 + 1];
+    var v: u32 = 0;
+    for (0..bits) |i| {
+        const at = bit + i;
+        const b = (row[at / 8] >> @intCast(7 - at % 8)) & 1;
+        v = (v << 1) | b;
+    }
+    return v;
+}
+
+fn byteOf(v: f32) u8 {
+    return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
+}
 
 fn solid(p: paint.Paint) ?Color {
     return switch (p) {
@@ -1159,6 +1349,157 @@ test "the page transform is a scale and exactly one flip" {
     // look almost right on a symmetric page.
     try testing.expect(t.determinant() < 0);
     try testing.expectEqual([2]u32{ 400, 200 }, canvasSize(page, 2));
+}
+
+test "an inline image is drawn from its own samples, with no image source" {
+    const gpa = testing.allocator;
+    var r = try Rendered.init(gpa, 60, 60, 1, .{}, struct {
+        fn build(b: *Builder) !void {
+            // Two grey samples, black then white, over PDF (10,10)-(30,30).
+            try b.drawImage(.{
+                .transform = .{ .a = 20, .d = 20, .e = 10, .f = 10 },
+                .width = 2,
+                .height = 1,
+                .data = try b.blob(&.{ 0x00, 0xff }),
+                .bits_per_component = 8,
+                .components = 1,
+            });
+        }
+    }.build);
+    defer r.deinit(gpa);
+
+    try testing.expectEqual(@as(u32, 1), r.stats.images_drawn);
+    try testing.expect(r.stats.complete());
+    // PDF y 10..30 is image y 30..50.
+    try testing.expect(r.ink(15, 40) > 0.95);
+    try testing.expect(r.ink(25, 40) < 0.05);
+    try testing.expect(r.ink(15, 20) < 0.05);
+}
+
+test "an inline stencil paints its zeros, or its ones under an inverted decode" {
+    const gpa = testing.allocator;
+    var b: Builder = .init(gpa, .fromRect(0, 0, 10, 10));
+    defer b.deinit();
+    const img: DisplayList.Image = .{
+        .width = 8,
+        .height = 1,
+        .is_mask = true,
+        .data = try b.blob(&.{0b1010_0000}),
+    };
+    var list = try b.finish();
+    defer list.deinit(gpa);
+
+    const plain = (try inlineBitmap(gpa, list, img)).?;
+    defer gpa.free(plain);
+    try testing.expectEqual(@as(u8, 0), plain[0 * 4 + 3]);
+    try testing.expectEqual(@as(u8, 255), plain[1 * 4 + 3]);
+    try testing.expectEqual(@as(u8, 255), plain[7 * 4 + 3]);
+
+    var flipped = img;
+    flipped.inverted = true;
+    const inv = (try inlineBitmap(gpa, list, flipped)).?;
+    defer gpa.free(inv);
+    try testing.expectEqual(@as(u8, 255), inv[0 * 4 + 3]);
+    try testing.expectEqual(@as(u8, 0), inv[1 * 4 + 3]);
+
+    // Too few samples for the size it claims is not an image.
+    var short = img;
+    short.height = 2;
+    try testing.expect((try inlineBitmap(gpa, list, short)) == null);
+}
+
+/// A glyph source with one square outline per code, in 1000-unit em space.
+const Squares = struct {
+    verbs: [5]geom.Verb = .{ .move, .line, .line, .line, .close },
+    points: [4]Point = undefined,
+    asked: u32 = 0,
+
+    fn source(s: *Squares) GlyphSource {
+        return .{ .ptr = s, .lookup = lookup };
+    }
+
+    fn lookup(ptr: *anyopaque, font: DisplayList.FontId, g: DisplayList.Glyph) ?GlyphOutline {
+        _ = font;
+        const s: *Squares = @ptrCast(@alignCast(ptr));
+        s.asked += 1;
+        // A different square per code, so a cache that confuses two glyphs
+        // draws a visibly different shape.
+        const w = 200.0 + @as(f32, @floatFromInt(g.code % 4)) * 100.0;
+        s.points = .{
+            .{ .x = 0, .y = 0 },
+            .{ .x = w, .y = 0 },
+            .{ .x = w, .y = 700 },
+            .{ .x = 0, .y = 700 },
+        };
+        return .{ .verbs = &s.verbs, .points = &s.points, .units_per_em = 1000 };
+    }
+};
+
+test "a glyph's outline is recorded once however many times it is drawn" {
+    // The page of text this exists for: 3,805 glyphs drawn from a hundred
+    // outlines. Before it, each occurrence carried its own flattened copy.
+    const gpa = testing.allocator;
+    var b: Builder = .init(gpa, .fromRect(0, 0, 200, 100));
+    const font = try b.fontId(1, "F1", "Test", false);
+    try b.textRun(.{ .font = font, .size = 20, .transform = .translation(5, 20) }, &.{
+        .{ .code = 'a', .offset = .{ .x = 0, .y = 0 } },
+        .{ .code = 'b', .offset = .{ .x = 20, .y = 0 } },
+        .{ .code = 'a', .offset = .{ .x = 40, .y = 0 } },
+        .{ .code = 'a', .offset = .{ .x = 60, .y = 0 } },
+    });
+    var list = try b.finish();
+    defer list.deinit(gpa);
+
+    var glyphs: Squares = .{};
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 200, 100 });
+    const stats = try record(gpa, &s, list, pageTransform(list.page, 1), .{
+        .glyphs = glyphs.source(),
+    });
+
+    try testing.expectEqual(@as(u32, 4), stats.glyphs_drawn);
+    // Four instances, two outlines.
+    try testing.expectEqual(@as(usize, 4), s.instances.items.len);
+    try testing.expectEqual(@as(u32, 2), s.stats.glyph_outlines);
+    try testing.expectEqual(@as(usize, 2), s.store.headers.items.len);
+    try testing.expectEqual(s.instances.items[0].header, s.instances.items[2].header);
+    try testing.expect(s.instances.items[0].header != s.instances.items[1].header);
+
+    // The outline is in em units, so the size is the instance's matrix: a
+    // 700-unit tall square at 20pt is 14 device pixels, and the header's box
+    // is 0.7 of an em.
+    const h = s.store.headers.items[s.instances.items[0].header];
+    try testing.expectApproxEqAbs(@as(f32, 0.7), h.max_y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 20), s.instances.items[0].xform[0], 0.001);
+
+    // And each occurrence sits where the run put it.
+    try testing.expectApproxEqAbs(@as(f32, 5), s.instances.items[0].translate[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 45), s.instances.items[2].translate[0], 0.001);
+}
+
+test "a recorded image goes into the scene as texels" {
+    const gpa = testing.allocator;
+    var b: Builder = .init(gpa, .fromRect(0, 0, 60, 60));
+    try b.drawImage(.{
+        .transform = .{ .a = 20, .d = 20, .e = 10, .f = 10 },
+        .width = 2,
+        .height = 1,
+        .data = try b.blob(&.{ 0x00, 0xff }),
+        .components = 1,
+    });
+    var list = try b.finish();
+    defer list.deinit(gpa);
+
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 60, 60 });
+    const stats = try record(gpa, &s, list, pageTransform(list.page, 1), .{});
+
+    try testing.expectEqual(@as(u32, 1), stats.images_drawn);
+    try testing.expectEqual(@as(usize, 1), s.images.items.len);
+    try testing.expectEqual(@as(usize, 2), s.texels.items.len);
+    try testing.expect(s.instances.items[0].flags & @import("slugpipe.zig").flag.image != 0);
 }
 
 test "text and images are counted, and drawn only when asked" {
