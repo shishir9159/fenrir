@@ -1522,6 +1522,7 @@ pub const PfnCmdSetScissor = *const fn (CommandBuffer, u32, u32, [*]const Rect2D
 pub const PfnCmdDraw = *const fn (CommandBuffer, u32, u32, u32, u32) callconv(.c) void;
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(.c) void;
 pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, ImageLayout, u32, [*]const BufferImageCopy) callconv(.c) void;
+pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, ImageLayout, Buffer, u32, [*]const BufferImageCopy) callconv(.c) void;
 pub const PfnCmdPipelineBarrier = *const fn (
     CommandBuffer,
     u32,

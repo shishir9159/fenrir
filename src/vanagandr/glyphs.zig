@@ -58,7 +58,8 @@ const Binding = struct {
     /// CIDs, so a CID does not index glyphs directly.
     cid_keyed_cff: bool = false,
     /// `/CIDToGIDMap` as a stream: two big-endian bytes per CID. Empty means
-    /// `/Identity`, where the glyph index is the CID.
+    /// `/Identity`, where the glyph index is the CID. Borrowed from the
+    /// document, which decoded it; never freed here.
     cid_to_gid: []const u8 = &.{},
     /// `/Differences`, 256 entries, empty where the array said nothing.
     differences: [][]u8 = &.{},
@@ -73,7 +74,11 @@ const Binding = struct {
         if (b.face) |*f| f.deinit(gpa);
         for (b.differences) |d| gpa.free(d);
         gpa.free(b.differences);
-        gpa.free(b.cid_to_gid);
+        // Not `cid_to_gid`: it is `Document.streamData`'s output, which lives
+        // in the document's arena -- the same trap `Program.owned` is for.
+        // Freeing it is harmless under an arena and an invalid free under
+        // anything else, which is how the reader crashed on the first page
+        // with a composite font.
     }
 };
 

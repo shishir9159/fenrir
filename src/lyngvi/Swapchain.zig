@@ -85,6 +85,9 @@ render_finished: []vk.Semaphore = &.{},
 images_in_flight: []vk.Fence = &.{},
 
 vsync: choose.Vsync = .on,
+/// Every pixel is computed even where another window hides it, because the
+/// frame is going to be read back. Takes effect at the next `recreate`.
+readable: bool = false,
 
 pub fn init(
     gpa: Allocator,
@@ -205,9 +208,9 @@ fn build(s: *Swapchain, window_extent: vk.Extent2D, old: vk.SwapchainKHR) Error!
         .composite_alpha = choose.compositeAlpha(caps),
         .present_mode = s.present_mode,
         // Fragments hidden by another window need not be computed. The only
-        // reason to say no is if the frame is going to be read back, and the
-        // snapshot path copies from an image it rendered itself.
-        .clipped = 1,
+        // reason to say no is if the frame is going to be read back, which is
+        // what `readable` is for: `fenrir read --shot` with the GPU path.
+        .clipped = if (s.readable) 0 else 1,
         .old_swapchain = old,
     };
 

@@ -14,6 +14,16 @@ io: Io,
 out: *Io.Writer,
 /// Diagnostics. Kept separate so `fenrir extract | ...` stays clean.
 err: *Io.Writer,
+/// The process's environment, or null in a test. Read by Mímir to find where
+/// its database lives, and by nothing else: a command that wants a setting
+/// asks the library for it rather than the environment.
+environ: ?*std.process.Environ.Map = null,
+
+/// The value of an environment variable, or null.
+pub fn env(ctx: *const Context, name: []const u8) ?[]const u8 {
+    const map = ctx.environ orelse return null;
+    return map.get(name);
+}
 
 /// Reads a whole file into memory. Documents are random-access by nature --
 /// the cross-reference table is at the end and points backwards -- so there is

@@ -59,8 +59,6 @@ pub const usage =
     \\    --path P       Which rasteriser fills an outline: stencil (the
     \\                   default), slug, or both -- which renders the page
     \\                   twice and reports how far the two disagree.
-    \\    --rays N       Sub-rows per pixel for the analytic rasteriser.
-    \\                   Defaults to 4.
     \\
     \\    Text and images are drawn: Tyr reads TrueType, CFF and Type 1
     \\    outlines, and Gjoll decodes Flate and baseline JPEG images through
@@ -153,12 +151,6 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
                 .both
             else
                 return ctx.fail("--path wants stencil, slug or both, not {s}", .{argv[i]});
-        } else if (std.mem.eql(u8, arg, "--rays")) {
-            i += 1;
-            if (i == argv.len) return ctx.fail("--rays needs a count", .{});
-            replay_options.rays = std.fmt.parseInt(u32, argv[i], 10) catch
-                return ctx.fail("--rays wants a number, not {s}", .{argv[i]});
-            if (replay_options.rays == 0) return ctx.fail("--rays must be at least 1", .{});
         } else if (std.mem.eql(u8, arg, "--ascii")) {
             i += 1;
             if (i == argv.len) return ctx.fail("--ascii needs x,y,w,h", .{});
@@ -272,16 +264,22 @@ fn one(
     // viewers, like nothing at all.
     canvas.fb.clear(.white);
 
-    var glyphs: Glyphs = try .init(ctx.gpa, doc, result.list, ctx.io);
-    defer glyphs.deinit();
-
     // A real allocator and not `ctx.gpa`, which is the CLI's arena. A decoded
     // page image is tens of megabytes, `--all` decodes them a page at a time,
     // and on an arena `deinit` is a no-op -- so a scanned book would climb
-    // into the gigabytes before it finished. Everything else this command
-    // allocates is arena-shaped and bounded by the document; this is not.
+    // into the gigabytes before it finished.
+    //
+    // The glyph layer uses it too, and not for memory. The reader runs both
+    // on a real heap, where freeing something the document's arena owns is a
+    // crash; under the arena it is a silent no-op. Two of those have shipped
+    // -- an embedded font program, then a `/CIDToGIDMap` -- and each was found
+    // by a person opening a document. On this heap a corpus run finds them.
     var heap: std.heap.DebugAllocator(.{}) = .init;
     defer _ = heap.deinit();
+
+    var glyphs: Glyphs = try .init(heap.allocator(), doc, result.list, ctx.io);
+    defer glyphs.deinit();
+
     var images: Images = .init(heap.allocator(), doc, p.resources);
     defer images.deinit();
 
@@ -336,7 +334,7 @@ fn one(
         ctx.out.print("wrote {s}\n", .{dest}) catch {};
     }
 
-    if (job.path == .both) try second(ctx, doc, result.list, &glyphs, canvas.fb, dest, job, size);
+    if (job.path == .both) try second(ctx, doc, p.resources, result.list, &glyphs, canvas.fb, dest, job, size);
     return stats;
 }
 
@@ -351,6 +349,7 @@ fn one(
 fn second(
     ctx: *Context,
     doc: *fenrir.Document,
+    resources: ?fenrir.Dict,
     list: gelgja.DisplayList,
     glyphs: *Glyphs,
     reference: gleipnir.Framebuffer,
@@ -358,14 +357,21 @@ fn second(
     job: Job,
     size: [2]u32,
 ) !void {
-    _ = doc;
     var canvas = gleipnir.raster.Canvas.init(ctx.gpa, size[0], size[1], .{ .samples = job.samples }) catch
         return;
     defer canvas.deinit(ctx.gpa);
     canvas.fb.clear(.white);
 
+    // The same images as the reference pass, or every figure on the page is
+    // a difference that has nothing to do with either rasteriser.
+    var heap: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = heap.deinit();
+    var images: Images = .init(heap.allocator(), doc, resources);
+    defer images.deinit();
+
     var options = job.replay;
     options.glyphs = glyphs.source();
+    options.images = images.source();
     options.path_backend = .slug;
 
     _ = replay.render(
@@ -386,6 +392,21 @@ fn second(
         defer ctx.gpa.free(other);
         try writePng(ctx, other, canvas.fb);
         ctx.out.print("wrote {s}\n", .{other}) catch {};
+
+        // Where they disagree, amplified eight times, so a one-level
+        // difference is visible and a shape in the wrong place is glaring.
+        var diff = gleipnir.Framebuffer.init(ctx.gpa, size[0], size[1], .srgb) catch return;
+        defer diff.deinit(ctx.gpa);
+        for (0..@as(usize, size[0]) * size[1]) |i| {
+            var d: f32 = 0;
+            for (0..3) |c| d = @max(d, @abs(reference.pixels[i * 4 + c] - canvas.fb.pixels[i * 4 + c]));
+            const v = 1 - @min(1, d * 8);
+            diff.pixels[i * 4 ..][0..4].* = .{ v, v, v, 1 };
+        }
+        const name = suffixed(ctx, dest, "-diff") catch return;
+        defer ctx.gpa.free(name);
+        try writePng(ctx, name, diff);
+        ctx.out.print("wrote {s}\n", .{name}) catch {};
     }
 }
 

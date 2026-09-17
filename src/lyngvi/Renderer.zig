@@ -146,6 +146,19 @@ pub const Texture = struct {
     kind: TextureKind = .coverage,
 };
 
+/// A frame as the device drew it: what is on the screen, read back from the
+/// swapchain image after the frame finished, so a test of the GPU path is a
+/// test of the GPU and not of a model of it.
+///
+/// Eight-bit RGBA, sRGB-encoded -- the swapchain format is `_SRGB`, so the
+/// bytes stored are already the encoded ones -- and opaque, because the frame
+/// is cleared to an opaque colour.
+pub const Capture = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
+};
+
 const Frame = struct {
     pool: vk.CommandPool = vk.null_handle,
     cb: vk.CommandBuffer = null,
@@ -185,6 +198,15 @@ frames: [frames_in_flight]Frame = @splat(.{}),
 index: u32 = 0,
 
 textures: std.ArrayList(Texture) = .empty,
+
+/// Set to copy the next drawn frame back to the host. See `Capture`.
+capture_next: bool = false,
+/// The last frame copied back, if one was asked for. Owned, freed on the
+/// next capture and at `deinit`.
+captured: ?Capture = null,
+/// Host-visible, sized to the last capture. Kept so a second capture of the
+/// same size allocates nothing.
+readback: Device.Buffer = .{},
 
 // -- counters, because a renderer nobody can measure is a renderer nobody can
 // fix. Read by `fenrir view` on exit.
@@ -241,6 +263,8 @@ pub fn deinit(r: *Renderer) void {
 
     for (r.textures.items) |*t| r.destroyTexture(t);
     r.textures.deinit(r.gpa);
+    if (r.captured) |c| r.gpa.free(c.pixels);
+    d.destroyBuffer(&r.readback);
 
     for (&r.frames) |*f| {
         if (f.pool != vk.null_handle) dt.destroyCommandPool(d.handle, f.pool, null);
@@ -739,6 +763,16 @@ fn recordTransition(
             src_access = a.transfer_write;
             src_stage = p.transfer;
         }
+    } else if (to == .transfer_src_optimal) {
+        // A finished frame on its way to the host. The render pass has ended,
+        // so what it last did to the image was write colour.
+        dst_access = a.transfer_read;
+        dst_stage = p.transfer;
+        src_access = a.color_attachment_write;
+        src_stage = p.color_attachment_output;
+    } else if (to == .present_src_khr and from == .transfer_src_optimal) {
+        src_access = a.transfer_read;
+        src_stage = p.transfer;
     }
 
     const barrier: vk.ImageMemoryBarrier = .{
@@ -941,10 +975,36 @@ pub fn frameWith(
     // most one draw call, so a page of ten thousand marks under a scrollbar
     // is three.
     r.recordRects(f, split.under, 0);
-    if (paths) |p| p.renderer.record(f.cb, r.index, p.frame);
+    if (paths) |p| p.renderer.record(f.cb, r.index, p.frame, s.extent);
     r.recordRects(f, split.over, split.under);
 
     d.dt.cmdEndRenderPass(f.cb);
+
+    // The copy back, in the same command buffer: after the pass has left the
+    // image in PRESENT_SRC, and put back into it before the present.
+    const capturing = r.capture_next;
+    if (capturing) {
+        r.capture_next = false;
+        const bytes = @as(u64, s.extent.width) * s.extent.height * 4;
+        if (r.readback.size < bytes) {
+            d.destroyBuffer(&r.readback);
+            r.readback = try d.createBuffer(
+                bytes,
+                vk.BufferUsageFlags.transfer_dst,
+                vk.MemoryPropertyFlags.host_visible,
+                vk.MemoryPropertyFlags.host_cached,
+            );
+        }
+        const target = s.images[image.index];
+        recordTransition(d, f.cb, target, .present_src_khr, .transfer_src_optimal);
+        const region: vk.BufferImageCopy = .{
+            .image_subresource = .{ .aspect_mask = vk.ImageAspectFlags.color },
+            .image_extent = .{ .width = s.extent.width, .height = s.extent.height, .depth = 1 },
+        };
+        d.dt.cmdCopyImageToBuffer(f.cb, target, .transfer_src_optimal, r.readback.handle, 1, @ptrCast(&region));
+        recordTransition(d, f.cb, target, .transfer_src_optimal, .present_src_khr);
+    }
+
     try vk.check(d.dt.endCommandBuffer(f.cb));
 
     var wait_semaphore = f.image_available;
@@ -967,11 +1027,43 @@ pub fn frameWith(
     try vk.check(d.dt.queueSubmit(d.graphics_queue, 1, @ptrCast(&submit), f.fence));
     s.markInFlight(image.index, f.fence);
 
+    if (capturing) try r.finishCapture(f.fence);
+
     const presented = try s.present(image.index, image.render_finished);
 
     r.index = (r.index + 1) % frames_in_flight;
     r.frames_drawn += 1;
     return if (presented) .drawn else .needs_recreate;
+}
+
+/// Waits for the frame that recorded a copy back and keeps its pixels.
+///
+/// A full wait on this frame's fence, which is a stall of one frame; it is
+/// only ever asked for by a command that is about to write a file and exit.
+fn finishCapture(r: *Renderer, fence: vk.Fence) Error!void {
+    const d = r.device;
+    const s = r.swapchain;
+    var handle = fence;
+    try vk.check(d.dt.waitForFences(d.handle, 1, @ptrCast(&handle), 1, std.math.maxInt(u64)));
+
+    const w = s.extent.width;
+    const h = s.extent.height;
+    const n = @as(usize, w) * h * 4;
+    const src = r.readback.slice()[0..n];
+    const out = try r.gpa.alloc(u8, n);
+    const bgra = switch (s.format) {
+        .b8g8r8a8_srgb, .b8g8r8a8_unorm => true,
+        else => false,
+    };
+    var i: usize = 0;
+    while (i < n) : (i += 4) {
+        out[i + 0] = if (bgra) src[i + 2] else src[i];
+        out[i + 1] = src[i + 1];
+        out[i + 2] = if (bgra) src[i] else src[i + 2];
+        out[i + 3] = 255;
+    }
+    if (r.captured) |c| r.gpa.free(c.pixels);
+    r.captured = .{ .pixels = out, .width = w, .height = h };
 }
 
 /// How many instances came from each list, so the two draws know their ranges.
