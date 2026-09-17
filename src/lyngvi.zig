@@ -51,6 +51,7 @@ pub const shaders = @import("lyngvi/shaders.zig");
 pub const spirv = @import("lyngvi/spirv.zig");
 pub const vk = @import("lyngvi/vk.zig");
 
+pub const wayland = @import("lyngvi/wayland.zig");
 pub const win32 = @import("lyngvi/win32.zig");
 pub const x11 = @import("lyngvi/x11.zig");
 
@@ -60,11 +61,14 @@ pub const Native = Window.Native;
 pub const Options = Window.Options;
 pub const Vsync = choose.Vsync;
 
-/// Whether this build has a window backend for the target at all. False
-/// everywhere but Windows until the xcb backend is written; `fenrir view` uses
-/// it to say so in one line rather than failing halfway through creating an
-/// instance.
-pub const has_window = builtin.os.tag == .windows;
+/// Whether this build has a window backend for the target at all: Win32 on
+/// Windows, Wayland on the Unixes. `fenrir view` uses it to say so in one line
+/// rather than failing halfway through creating an instance.
+///
+/// True on Linux even though a given machine may have no compositor running
+/// -- that is a property of the session, not the build, and `open` is where
+/// it is discovered and reported.
+pub const has_window = builtin.os.tag == .windows or wayland.supported;
 
 /// Whether the shaders were compiled to SPIR-V when this binary was built.
 /// False means `Renderer.init` will refuse, and `fenrir view --probe` still
@@ -72,11 +76,24 @@ pub const has_window = builtin.os.tag == .windows;
 /// compiler.
 pub const has_shaders = shaders.available;
 
-/// Opens a window using whichever backend fits the target.
+/// Opens a window using whichever backend fits the target and the session.
+///
+/// On the Unixes that is a run-time decision, which is why `Window` is a
+/// vtable and not a comptime switch: the same binary may be started under a
+/// Wayland compositor or an X server. Wayland is tried first -- it is what a
+/// current desktop runs, and it is the one that reports per-monitor scale --
+/// and X11 second, which today means a clear "not supported" rather than a
+/// window.
 pub fn open(gpa: std.mem.Allocator, options: Options) Error!Window {
     return switch (builtin.os.tag) {
         .windows => win32.create(gpa, options),
-        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => x11.create(gpa, options),
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => wayland.create(gpa, options) catch |err| switch (err) {
+            // No compositor, no libwayland, or a compositor without
+            // xdg-shell: fall through. Out of memory is not a reason to try
+            // another display server.
+            error.UnsupportedPlatform, error.WindowCreationFailed => x11.create(gpa, options),
+            else => err,
+        },
         else => error.UnsupportedPlatform,
     };
 }
@@ -121,5 +138,8 @@ test {
     _ = spirv;
     _ = vk;
     _ = x11;
+    _ = wayland;
+    _ = @import("lyngvi/wayland/protocol.zig");
+    _ = @import("lyngvi/wayland/keymap.zig");
     if (builtin.os.tag == .windows) _ = win32;
 }

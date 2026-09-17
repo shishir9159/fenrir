@@ -136,7 +136,36 @@ pub const Event = union(enum) {
         modifiers: Modifiers = .{},
         /// True for the repeats a held key generates after the first.
         repeat: bool = false,
+        /// The character this key is *labelled with* under the layout in
+        /// force, with no modifier applied -- `w` for the key that types `w`,
+        /// wherever the layout puts it. Zero when the key has no character.
+        ///
+        /// This exists for chords and for nothing else. `Ctrl` suppresses the
+        /// text event on every platform, so `<C-w>` cannot be read from
+        /// `.text`, and reading it from `KeyCode` would mean putting letters
+        /// in that enum and promising a position on the keyboard. Asking the
+        /// layout what this key is called keeps the promise the enum refuses
+        /// to make: the answer is the letter printed on the key, whatever
+        /// layout is loaded.
+        char: u21 = 0,
     };
+};
+
+/// A key with modifiers held: `<C-w>`, written out.
+///
+/// `shift` is not part of it. A layout reports one character per key and the
+/// shifted form is a different character, so a chord that cared about shift
+/// would have to know that `<C-S-6>` is `<C-^>` on one layout and something
+/// else on the next. Chords here are ctrl and alt, which is what the ones in
+/// this reader use.
+pub const Chord = struct {
+    char: u21,
+    ctrl: bool = false,
+    alt: bool = false,
+
+    pub fn ctrlKey(c: u21) Chord {
+        return .{ .char = c, .ctrl = true };
+    }
 };
 
 /// One frame's worth of input. Everything here is what the platform saw since
@@ -193,7 +222,50 @@ pub const Input = struct {
         };
         return false;
     }
+
+    /// A modified key went down this frame: `<C-w>`, and the like.
+    ///
+    /// The first press only, for the same reason `pressedOnce` exists -- a
+    /// chord that fires on autorepeat splits the window four times while a
+    /// finger rests on the key.
+    pub fn chorded(in: Input, c: Chord) bool {
+        if (c.char == 0) return false;
+        for (in.events) |e| switch (e) {
+            .key_down => |k| {
+                if (k.repeat or k.char == 0) continue;
+                if (lowerAscii(k.char) != lowerAscii(c.char)) continue;
+                if (k.modifiers.ctrl != c.ctrl or k.modifiers.alt != c.alt) continue;
+                return true;
+            },
+            else => {},
+        };
+        return false;
+    }
+
+    /// An unmodified key went down this frame, by the character on it.
+    ///
+    /// Distinct from reading `.text`: this fires for a press whose text the
+    /// platform withheld, and it does not fire for text that arrived from an
+    /// IME or a paste. Use it where a key is a *command* -- `j` to go down a
+    /// line -- and `typedText` where it is a character being entered.
+    pub fn typedKey(in: Input, char: u21) bool {
+        for (in.events) |e| switch (e) {
+            .key_down => |k| {
+                if (k.char == 0 or k.modifiers.ctrl or k.modifiers.alt) continue;
+                if (lowerAscii(k.char) == lowerAscii(char)) return true;
+            },
+            else => {},
+        };
+        return false;
+    }
 };
+
+/// Case folding for the ASCII half only, which is where every chord in this
+/// program lives. A layout that reports an uppercase label for a key -- and
+/// Windows does, `MapVirtualKey` returns `W` -- should still answer to `w`.
+fn lowerAscii(c: u21) u21 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
 
 // -- tests ------------------------------------------------------------------
 

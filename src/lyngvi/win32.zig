@@ -153,6 +153,9 @@ const WM_MOUSEWHEEL: u32 = 0x020a;
 const WM_MOUSEHWHEEL: u32 = 0x020e;
 const WM_DPICHANGED: u32 = 0x02e0;
 
+/// `MapVirtualKey`: virtual key to the character the layout prints on it.
+const MAPVK_VK_TO_CHAR: u32 = 2;
+
 const SIZE_MINIMIZED: u32 = 1;
 
 const SWP_NOZORDER: u32 = 0x0004;
@@ -209,6 +212,7 @@ extern "user32" fn DestroyWindow(HWND) callconv(.winapi) BOOL;
 extern "user32" fn DefWindowProcW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn PeekMessageW(*MSG, HWND, u32, u32, u32) callconv(.winapi) BOOL;
 extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) BOOL;
+extern "user32" fn MapVirtualKeyW(u32, u32) callconv(.winapi) u32;
 extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(i32) callconv(.winapi) void;
 extern "user32" fn ShowWindow(HWND, i32) callconv(.winapi) BOOL;
@@ -596,6 +600,22 @@ fn mapKey(vk_code: u32) KeyCode {
     };
 }
 
+/// The character the current layout prints on a virtual key, or zero.
+///
+/// `MAPVK_VK_TO_CHAR` is the layout asking itself what this key is called,
+/// which is exactly the question a chord has to answer and the one `mapKey`
+/// refuses to: `KeyCode` names a function, this names a letter, and neither
+/// pretends to be the other. The top bit marks a dead key -- returned with
+/// the character, and not one we want to chord on.
+fn labelOf(vk_code: u32) u21 {
+    const mapped = MapVirtualKeyW(vk_code, MAPVK_VK_TO_CHAR);
+    if (mapped == 0 or mapped & 0x8000_0000 != 0) return 0;
+    const c: u32 = mapped & 0xffff;
+    // Control characters and the surrogate range are not labels.
+    if (c < 0x20 or (c >= 0xd800 and c <= 0xdfff)) return 0;
+    return @intCast(c);
+}
+
 fn loWord(v: usize) u16 {
     return @truncate(v);
 }
@@ -718,7 +738,8 @@ fn handle(self: *Win32, hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) 
             // Bit 30 of lParam is the previous key state: set means this is a
             // repeat rather than a fresh press.
             const repeat = (@as(usize, @bitCast(l_param)) >> 30) & 1 != 0;
-            self.events.key(mapKey(@intCast(w_param & 0xff)), true, repeat) catch {
+            const vk: u32 = @intCast(w_param & 0xff);
+            self.events.keyChar(mapKey(vk), labelOf(vk), true, repeat) catch {
                 self.oom = true;
             };
             // System keys still go to `DefWindowProc`, which is what turns
@@ -728,7 +749,8 @@ fn handle(self: *Win32, hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) 
         },
         WM_KEYUP, WM_SYSKEYUP => {
             self.events.setModifiers(currentModifiers());
-            self.events.key(mapKey(@intCast(w_param & 0xff)), false, false) catch {
+            const vk: u32 = @intCast(w_param & 0xff);
+            self.events.keyChar(mapKey(vk), labelOf(vk), false, false) catch {
                 self.oom = true;
             };
             if (msg == WM_SYSKEYUP) return DefWindowProcW(self.hwnd, msg, w_param, l_param);

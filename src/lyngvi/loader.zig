@@ -389,6 +389,7 @@ pub const DeviceTable = struct {
     cmdDraw: vk.PfnCmdDraw,
     cmdCopyBuffer: vk.PfnCmdCopyBuffer,
     cmdCopyBufferToImage: vk.PfnCmdCopyBufferToImage,
+    cmdCopyImageToBuffer: vk.PfnCmdCopyImageToBuffer,
     cmdPipelineBarrier: vk.PfnCmdPipelineBarrier,
 };
 

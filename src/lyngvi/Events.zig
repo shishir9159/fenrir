@@ -144,7 +144,22 @@ pub fn setModifiers(e: *Events, m: Modifiers) void {
 }
 
 pub fn key(e: *Events, code: KeyCode, down: bool, repeat: bool) Error!void {
-    const ev: Event.KeyEvent = .{ .code = code, .modifiers = e.modifiers, .repeat = repeat };
+    try e.keyChar(code, 0, down, repeat);
+}
+
+/// The same, with the character the layout prints on that key.
+///
+/// Separate from `key` because most keys have no character and the backends
+/// that can answer the question have to ask the layout to do it. See
+/// `Event.KeyEvent.char`: this is what makes `<C-w>` reachable at all, since
+/// no platform sends text for a key held with ctrl.
+pub fn keyChar(e: *Events, code: KeyCode, char: u21, down: bool, repeat: bool) Error!void {
+    const ev: Event.KeyEvent = .{
+        .code = code,
+        .modifiers = e.modifiers,
+        .repeat = repeat,
+        .char = char,
+    };
     try e.push(if (down) .{ .key_down = ev } else .{ .key_up = ev });
 }
 
