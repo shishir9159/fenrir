@@ -40,14 +40,25 @@ pub fn build(b: *std.Build) void {
         std.process.exit(1);
     }
 
-    // Lyngvi's shaders. The GLSL is the source of truth and SPIR-V is what a
-    // driver takes, so the translation belongs to the build -- but a shader
-    // compiler is part of the Vulkan SDK, and requiring the SDK to build a PDF
-    // reader is exactly the dependency `vk.zig` exists to avoid. So: compile
-    // them if a compiler is on PATH, and if not, build a binary that opens a
-    // window, creates a device, and refuses to make a pipeline with a message
-    // naming the command that would fix it.
-    const shaders = compileShaders(b);
+    // Lyngvi's shaders, and where their SPIR-V comes from. See `ShaderSource`.
+    //
+    //   zig build -Dshaders=glsl    compile src/gleipnir/shader/*.vert|frag
+    //   zig build -Dshaders=slang   compile src/gleipnir/shader/slang/*.slang
+    //   zig build -Dshaders=spirv   embed src/gleipnir/shader/spirv/*.spv as is
+    //   zig build spirv             regenerate that directory from the source
+    //                               -Dshaders names (glsl unless told)
+    const shader_source = b.option(
+        ShaderSource,
+        "shaders",
+        "Where the SPIR-V comes from: auto, glsl, slang or spirv (default: auto)",
+    ) orelse .auto;
+    const glsl_compiler = b.option(
+        GlslCompiler,
+        "glsl-compiler",
+        "Which GLSL compiler -Dshaders=glsl runs: auto, glslc or glslang (default: auto)",
+    ) orelse .auto;
+    const slangc_path = b.option([]const u8, "slangc", "Path to slangc, when it is not on PATH");
+    const shaders = compileShaders(b, shader_source, glsl_compiler, slangc_path);
 
     // Which path rasteriser the *window* uses, and which `--path` will
     // accept.
@@ -62,11 +73,10 @@ pub fn build(b: *std.Build) void {
     // never creates the analytic pipeline -- for a machine whose driver
     // cannot be trusted with it.
     //
-    // The default stays `both` in every mode, and deliberately. The GPU path
-    // draws every mark on a page and cannot yet sample an image or composite
-    // a blend mode, so a release build that had only it would show a document
-    // with its figures missing and its highlights opaque. `both` is the
-    // default until that is no longer true.
+    // The default stays `both` in every mode, and deliberately: a build with
+    // both is a build that can check one against the other. The GPU path
+    // draws images and the blend modes documents use, and the CPU one is
+    // still the only one with all sixteen modes.
     //
     // What this does *not* do is remove the CPU rasteriser from the binary.
     // `fenrir raster` and `fenrir read --shot` both render with no device in
@@ -81,7 +91,32 @@ pub fn build(b: *std.Build) void {
         "Which path rasteriser the window uses: cpu, gpu, or both (default: both)",
     ) orelse PathBackend.both;
 
+    // Mímir's store. SQLite is the one library this project links on purpose:
+    // the recent files, the settings and the reading positions are small,
+    // structured, and have to survive a crash mid-write, which is a
+    // transactional database and not a file format worth inventing. It is
+    // compiled from the amalgamation by this build -- one C file, pinned by
+    // hash in `build.zig.zon` -- rather than linked from the system.
+    //
+    // A lazy dependency, so `-Dsqlite=false` neither downloads nor compiles
+    // it and the binary links no C at all. Everything else still works; the
+    // reader simply forgets where you were.
+    const want_sqlite = b.option(bool, "sqlite", "Store recent files, places, settings and highlights in SQLite (default: true)") orelse true;
+    // Resolved before the module is created, because `build_options` has to
+    // say whether Mímir has a database; linked after, which is below.
+    const sqlite_dep = if (want_sqlite) b.lazyDependency("sqlite", .{}) else null;
+    const have_sqlite = sqlite_dep != null;
+
+    // Galdr, the plugin system, and the Lua it runs. The second library this
+    // project links on purpose, compiled from the pinned release by this
+    // build exactly as SQLite is. `-Dlua=false` builds a reader that runs no
+    // scripts, and links no Lua.
+    const want_lua = b.option(bool, "lua", "Run Lua plugins and init.lua with Galdr (default: true)") orelse true;
+    const lua_dep = if (want_lua) b.lazyDependency("lua", .{}) else null;
+
     const opts = b.addOptions();
+    opts.addOption(bool, "sqlite", have_sqlite);
+    opts.addOption(bool, "lua", lua_dep != null);
     opts.addOption(bool, "path_cpu", path_backend != .gpu);
     opts.addOption(bool, "path_gpu", path_backend != .cpu);
     opts.addOption([]const u8, "path_backend", @tagName(path_backend));
@@ -101,6 +136,49 @@ pub fn build(b: *std.Build) void {
     });
     fenrir.addOptions("build_options", opts);
 
+    if (sqlite_dep) |dep| {
+        const sqlite = b.addLibrary(.{
+            .name = "sqlite3",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        sqlite.root_module.addCSourceFile(.{
+            .file = dep.path("sqlite3.c"),
+            .flags = &sqlite_flags,
+        });
+        fenrir.link_libc = true;
+        fenrir.linkLibrary(sqlite);
+    }
+
+    if (lua_dep) |dep| {
+        const lua = b.addLibrary(.{
+            .name = "lua",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        // Every library file, and neither of the two programs: `lua.c` is the
+        // interpreter's `main` and `luac.c` the compiler's.
+        const flags: []const []const u8 = if (target.result.os.tag == .windows)
+            &lua_flags
+        else
+            &(lua_flags ++ [_][]const u8{"-DLUA_USE_POSIX"});
+        lua.root_module.addCSourceFiles(.{
+            .root = dep.path("src"),
+            .files = &lua_sources,
+            .flags = flags,
+        });
+        fenrir.link_libc = true;
+        fenrir.linkLibrary(lua);
+    }
+
     // `@embedFile`d by `lyngvi/shaders.zig`. Always present, empty when there
     // was nothing to compile them with, so the import never has to be
     // conditional in the Zig source.
@@ -114,6 +192,20 @@ pub fn build(b: *std.Build) void {
     // Windows target already.
     if (target.result.os.tag == .windows) {
         fenrir.linkSystemLibrary("user32", .{});
+    }
+
+    // Lyngvi's Wayland backend, and the Vulkan loader on every Unix, open
+    // their libraries with the system's `dlopen`. That is not a preference.
+    // The Vulkan driver loads libwayland-client itself and calls it on the
+    // `wl_display` this process hands over, so there must be exactly one
+    // libwayland in the process -- the one the system dynamic linker loaded.
+    // Zig's own ELF loader, which is what `std.DynLib` uses without libc,
+    // would map a second private copy, and the driver would be handed proxies
+    // belonging to a library it has never seen. Nothing is linked at build
+    // time: libwayland, libxkbcommon and libvulkan are all found when the
+    // program runs, so the binary still starts on a machine without them.
+    if (target.result.os.tag == .linux or target.result.os.tag.isBSD()) {
+        fenrir.link_libc = true;
     }
 
     if (want_freetype) {
@@ -154,6 +246,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&lib_tests.step);
     test_step.dependOn(&exe_tests.step);
+
+    // `zig build spirv`: the modules this build compiled, written back into
+    // the tree, so a checkout builds with `-Dshaders=spirv` and no compiler.
+    const spirv_step = b.step("spirv", "Regenerate src/gleipnir/shader/spirv/ from -Dshaders=glsl|slang");
+    if (shaders.generated) {
+        const update = b.addUpdateSourceFiles();
+        for (shader_stages, 0..) |stage, i| {
+            update.addCopyFileToSource(shaders.spv[i], b.fmt("{s}/spirv/{s}.spv", .{ shader_dir, stage }));
+        }
+        spirv_step.dependOn(&update.step);
+    } else {
+        spirv_step.dependOn(&b.addFail(
+            "nothing to write: this build compiled no shaders. Pass -Dshaders=glsl or -Dshaders=slang.",
+        ).step);
+    }
 }
 
 /// The two rasterisers, and the build that keeps both.
@@ -166,6 +273,51 @@ pub fn build(b: *std.Build) void {
 ///   in the fragment shader. Resolution independent, one draw call a page, no
 ///   stencil attachment and no multisampling.
 const PathBackend = enum { cpu, gpu, both };
+
+/// How SQLite is compiled. Each of these either removes something this
+/// program does not use or refuses something it should never do.
+///
+/// `DQS=0` makes a double-quoted string a syntax error rather than a fallback
+/// to an identifier, which is the misfeature that turns a typo in a column
+/// name into a silently constant string. `THREADSAFE=1` because the reader
+/// has a rasterising thread and the frame loop, and a serialised connection
+/// is cheaper than the rule that only one of them may ever touch it.
+const sqlite_flags = [_][]const u8{
+    "-DSQLITE_DQS=0",
+    "-DSQLITE_THREADSAFE=1",
+    "-DSQLITE_DEFAULT_MEMSTATUS=0",
+    "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+    "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+    "-DSQLITE_MAX_EXPR_DEPTH=0",
+    "-DSQLITE_OMIT_DECLTYPE",
+    "-DSQLITE_OMIT_DEPRECATED",
+    "-DSQLITE_OMIT_LOAD_EXTENSION",
+    "-DSQLITE_OMIT_SHARED_CACHE",
+    "-DSQLITE_OMIT_AUTOINIT",
+    "-DSQLITE_USE_ALLOCA",
+};
+
+/// Lua's library, file by file: everything in `src/` but the two programs.
+/// `loadlib.c`, `liolib.c` and `loslib.c` are compiled and never opened --
+/// Galdr's sandbox does not load `package`, `io` or `os` -- because leaving
+/// them out would mean patching `linit.c`, and an untouched upstream source
+/// is worth a few unused kilobytes.
+const lua_sources = [_][]const u8{
+    "lapi.c",    "lcode.c",   "lctype.c",  "ldebug.c",   "ldo.c",     "ldump.c",
+    "lfunc.c",   "lgc.c",     "llex.c",    "lmem.c",     "lobject.c", "lopcodes.c",
+    "lparser.c", "lstate.c",  "lstring.c", "ltable.c",   "ltm.c",     "lundump.c",
+    "lvm.c",     "lzio.c",    "lauxlib.c", "lbaselib.c", "lcorolib.c", "ldblib.c",
+    "liolib.c",  "lmathlib.c", "loadlib.c", "loslib.c",  "lstrlib.c", "ltablib.c",
+    "lutf8lib.c", "linit.c",
+};
+
+/// Lua compiles cleanly as C99. Nothing is tuned: the defaults -- 64-bit
+/// integers, double floats -- are what the declarations in
+/// `src/galdr/lua.zig` are written against, and changing either here without
+/// changing them there is a stack corrupted at run time.
+const lua_flags = [_][]const u8{
+    "-std=gnu99",
+};
 
 const shader_dir = "src/gleipnir/shader";
 
@@ -204,46 +356,100 @@ fn importName(comptime stage: []const u8) []const u8 {
     }
 }
 
+/// Where the SPIR-V in the binary comes from.
+///
+///   **glsl** -- `src/gleipnir/shader/*.vert` and `*.frag`, through glslc or
+///   glslang. The GLSL is the source every other form is checked against.
+///
+///   **slang** -- `src/gleipnir/shader/slang/*.slang`, through slangc: one
+///   module per pipeline with a `vertexMain` and a `fragmentMain`. Held to
+///   the same tests as the GLSL, including the one that reads every storage
+///   buffer's layout back out of the compiled module.
+///
+///   **spirv** -- `src/gleipnir/shader/spirv/*.spv`, committed, embedded as
+///   they are. No compiler at all, which is what a machine with a driver and
+///   no SDK needs to get a window that draws. `zig build spirv` rewrites the
+///   directory from whichever of the other two `-Dshaders` names.
+///
+///   **auto** -- glsl if a GLSL compiler is on PATH, else spirv if the
+///   committed modules are there, else a binary with no shaders that opens a
+///   window and says what is missing.
+///
+/// An explicit choice whose tool or files are missing fails the build and
+/// says so; only `auto` falls back.
+const ShaderSource = enum { auto, glsl, slang, spirv };
+
+const GlslCompiler = enum { auto, glslc, glslang };
+
 const Shaders = struct {
     spv: [shader_stages.len]std.Build.LazyPath,
     compiled: bool,
+    /// What made them, for `lyngvi_shader_compiler`: `glslc`, `glslang`,
+    /// `slangc`, `spirv` for the committed modules, or empty.
     compiler: []const u8,
+    /// True when these came out of a compiler this build ran, which is what
+    /// `zig build spirv` can write back into the tree.
+    generated: bool = false,
 };
 
-/// Turns `src/gleipnir/shader/*.{vert,frag}` into SPIR-V, if anything on this
-/// machine can.
-///
-/// Three names, because the same job has three spellings. `glslc` is shaderc's
-/// and the one the compile command in `gleipnir/pipeline.zig` is written for.
-/// `glslang` is the current name of the Khronos reference compiler, and
-/// `glslangValidator` is what it was called before 14.0 and still is in a
-/// Linux distribution's `glslang-tools` package. Finding none is not an error:
-/// the build succeeds with empty modules and `lyngvi_spirv` false, which is
-/// what makes `zig build test` work on a machine with a driver and no SDK.
-fn compileShaders(b: *std.Build) Shaders {
-    if (b.findProgram(&.{"glslc"}, &.{})) |exe| {
-        return compileWith(b, .glslc, exe, "glslc");
-    } else |_| {}
-
-    // Both spellings take identical flags -- it is the same binary under two
-    // names -- so the only thing that differs is which one is on PATH.
-    if (b.findProgram(&.{ "glslang", "glslangValidator" }, &.{})) |exe| {
-        return compileWith(b, .glslang, exe, "glslang");
-    } else |_| {}
-
-    // Empty rather than absent, so `@embedFile` still resolves and the failure
-    // is one `if` at pipeline creation rather than a conditional import.
-    const empty = b.addWriteFiles();
-    var out: Shaders = .{ .spv = undefined, .compiled = false, .compiler = "" };
-    for (shader_stages, 0..) |stage, i| {
-        out.spv[i] = empty.add(b.fmt("{s}.spv", .{stage}), "");
+fn compileShaders(
+    b: *std.Build,
+    source: ShaderSource,
+    glsl_compiler: GlslCompiler,
+    slangc_path: ?[]const u8,
+) Shaders {
+    switch (source) {
+        .glsl => return compileGlsl(b, glsl_compiler) orelse
+            fatal("-Dshaders=glsl needs glslc or glslang on PATH (or pick -Dshaders=spirv)", .{}),
+        .slang => {
+            const exe = slangc_path orelse (b.findProgram(&.{"slangc"}, &.{}) catch
+                fatal("-Dshaders=slang needs slangc on PATH, or -Dslangc=<path>", .{}));
+            return compileSlang(b, exe);
+        },
+        .spirv => return prebuilt(b) orelse
+            fatal("-Dshaders=spirv needs {s}/spirv/*.spv; run `zig build spirv` where a compiler is installed", .{shader_dir}),
+        .auto => {
+            if (compileGlsl(b, glsl_compiler)) |s| return s;
+            if (prebuilt(b)) |s| return s;
+            // Empty rather than absent, so `@embedFile` still resolves and
+            // the failure is one `if` at pipeline creation rather than a
+            // conditional import.
+            const empty = b.addWriteFiles();
+            var out: Shaders = .{ .spv = undefined, .compiled = false, .compiler = "" };
+            for (shader_stages, 0..) |stage, i| {
+                out.spv[i] = empty.add(b.fmt("{s}.spv", .{stage}), "");
+            }
+            return out;
+        },
     }
-    return out;
 }
 
-const Compiler = enum { glslc, glslang };
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("error: " ++ fmt ++ "\n", args);
+    std.process.exit(1);
+}
 
-fn compileWith(b: *std.Build, which: Compiler, exe: []const u8, label: []const u8) Shaders {
+/// Three names, because the same job has three spellings. `glslc` is
+/// shaderc's. `glslang` is the current name of the Khronos reference
+/// compiler, and `glslangValidator` is what it was called before 14.0 and
+/// still is in a Linux distribution's `glslang-tools` package.
+fn compileGlsl(b: *std.Build, which: GlslCompiler) ?Shaders {
+    if (which != .glslang) {
+        if (b.findProgram(&.{"glslc"}, &.{})) |exe| {
+            return compileGlslWith(b, .glslc, exe);
+        } else |_| {
+            if (which == .glslc) fatal("-Dglsl-compiler=glslc: glslc is not on PATH", .{});
+        }
+    }
+    if (b.findProgram(&.{ "glslang", "glslangValidator" }, &.{})) |exe| {
+        return compileGlslWith(b, .glslang, exe);
+    } else |_| {
+        if (which == .glslang) fatal("-Dglsl-compiler=glslang: glslang is not on PATH", .{});
+    }
+    return null;
+}
+
+fn compileGlslWith(b: *std.Build, which: GlslCompiler, exe: []const u8) Shaders {
     // Absolute. The step runs with the cache directory as its working
     // directory and is handed an absolute path to the shader, so a relative
     // include path resolves against the wrong root and the only symptom is
@@ -251,18 +457,24 @@ fn compileWith(b: *std.Build, which: Compiler, exe: []const u8, label: []const u
     // plainly there.
     const include = b.pathFromRoot(shader_dir);
 
-    var out: Shaders = .{ .spv = undefined, .compiled = true, .compiler = label };
+    var out: Shaders = .{
+        .spv = undefined,
+        .compiled = true,
+        .compiler = @tagName(which),
+        .generated = true,
+    };
     for (shader_stages, 0..) |stage, i| {
         const run = switch (which) {
             // `-O` is shaderc's optimiser. glslang has no equivalent without
             // linking SPIRV-Tools, and the difference is a few hundred bytes
             // of module that the driver's own compiler folds away anyway.
-            .glslc => b.addSystemCommand(&.{ exe, "-I", include, "--target-env=vulkan1.2", "-O" }),
+            .glslc, .auto => b.addSystemCommand(&.{ exe, "-I", include, "--target-env=vulkan1.2", "-O" }),
             // glslang wants the include directory attached to the flag, and
             // rejects it as a separate argument.
             .glslang => b.addSystemCommand(&.{
                 exe,
                 "-V",
+                "--quiet",
                 "--target-env",
                 "vulkan1.2",
                 b.fmt("-I{s}", .{include}),
@@ -274,6 +486,40 @@ fn compileWith(b: *std.Build, which: Compiler, exe: []const u8, label: []const u
         }
         run.addArg("-o");
         out.spv[i] = run.addOutputFileArg(b.fmt("{s}.spv", .{stage}));
+    }
+    return out;
+}
+
+/// `slangc <pipeline>.slang -entry vertexMain -stage vertex`, and the same
+/// for the fragment half. Slang names the SPIR-V entry point `main` unless
+/// told otherwise, which is what the pipelines ask for.
+fn compileSlang(b: *std.Build, exe: []const u8) Shaders {
+    var out: Shaders = .{ .spv = undefined, .compiled = true, .compiler = "slangc", .generated = true };
+    for (shader_stages, 0..) |stage, i| {
+        const dot = std.mem.indexOfScalar(u8, stage, '.').?;
+        const module = stage[0..dot];
+        const kind = stage[dot + 1 ..];
+        const is_vertex = std.mem.eql(u8, kind, "vert");
+        const run = b.addSystemCommand(&.{exe});
+        run.addFileArg(b.path(b.fmt("{s}/slang/{s}.slang", .{ shader_dir, module })));
+        run.addArgs(&.{
+            "-target",                                        "spirv",
+            "-entry",                                         if (is_vertex) "vertexMain" else "fragmentMain",
+            "-stage",                                         if (is_vertex) "vertex" else "fragment",
+            "-o",
+        });
+        out.spv[i] = run.addOutputFileArg(b.fmt("{s}.spv", .{stage}));
+    }
+    return out;
+}
+
+/// The committed modules, if every one of them is there.
+fn prebuilt(b: *std.Build) ?Shaders {
+    var out: Shaders = .{ .spv = undefined, .compiled = true, .compiler = "spirv" };
+    for (shader_stages, 0..) |stage, i| {
+        const sub = b.fmt("{s}/spirv/{s}.spv", .{ shader_dir, stage });
+        b.build_root.handle.access(b.graph.io, sub, .{}) catch return null;
+        out.spv[i] = b.path(sub);
     }
     return out;
 }

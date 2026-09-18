@@ -3,7 +3,23 @@
     .version = "0.0.1",
     .fingerprint = 0xb8054929e77b0e2a,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip",
+            .hash = "N-V-__8AAGVtrgCcOcmjrOJnagmnRyMrcKaOo09KbU-vu8w8",
+            // Lazy: a build with -Dsqlite=false never downloads it.
+            .lazy = true,
+        },
+        // Galdr's scripting language. The release tarball, whose SHA-256
+        // (2335b6c5...b8e6) matches the one lua.org publishes; the hash below
+        // is Zig's hash of its unpacked contents.
+        .lua = .{
+            .url = "https://www.lua.org/ftp/lua-5.4.9.tar.gz",
+            .hash = "N-V-__8AAEQ_FAAnte7Oq7KSLG9FZh_9mjvQimoekgYqkKSK",
+            // Lazy: a build with -Dlua=false never downloads it.
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
