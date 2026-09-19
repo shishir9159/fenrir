@@ -37,6 +37,12 @@ pub const gelgja = @import("gelgja.zig");
 /// written; the path pipeline and the Vulkan backend are not.
 pub const gleipnir = @import("gleipnir.zig");
 
+/// Mímir: what the reader remembers between sessions -- recent files, where
+/// you were in each, and the settings that are yours. The only component that
+/// links a library, and `-Dsqlite=false` compiles it down to a store that
+/// remembers nothing.
+pub const mimir = @import("mimir.zig");
+
 /// Lyngvi: the platform -- the window, its input, and the Vulkan device that
 /// draws into it. The only layer that talks to the operating system, and the
 /// only one that can fail for reasons that have nothing to do with the file
@@ -47,6 +53,16 @@ pub const lyngvi = @import("lyngvi.zig");
 /// signals. Above every other layer and the only one that imports across
 /// them.
 pub const thviti = @import("thviti.zig");
+
+/// Hliðskjálf: buffers and the windows onto them. One open document, many
+/// views of it, and the split tree that says where each view is -- so that a
+/// highlight drawn in one window is in the other because they share the
+/// document, not because anything copied it across.
+pub const hlidskjalf = @import("hlidskjalf.zig");
+
+/// Galdr: plugins, in a sandboxed Lua. `init.lua`, a `plugins/` directory, and
+/// a `fenrir` table in the place Neovim has `vim`.
+pub const galdr = @import("galdr.zig");
 
 /// Týr: the font layer. Two runtime interfaces, `Face` for glyph outlines
 /// and `Shaper` for UI text, with the choice of backend made in one place.
@@ -83,8 +99,11 @@ test {
     _ = Document;
     _ = gelgja;
     _ = gleipnir;
+    _ = mimir;
     _ = lyngvi;
     _ = thviti;
+    _ = hlidskjalf;
+    _ = galdr;
     _ = tyr;
     _ = Lexer;
     _ = Page;

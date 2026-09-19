@@ -18,6 +18,8 @@ const raster = @import("vanagandr/raster.zig");
 const read = @import("vanagandr/read.zig");
 const trace = @import("vanagandr/trace.zig");
 const ui = @import("vanagandr/ui.zig");
+const library = @import("vanagandr/library.zig");
+const plugins = @import("vanagandr/plugins.zig");
 const view = @import("vanagandr/view.zig");
 const xref = @import("vanagandr/xref.zig");
 
@@ -36,6 +38,10 @@ const commands = [_]Command{
     .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run },
     .{ .name = "raster", .summary = "rasterise a page to a PNG on the CPU", .usage = raster.usage, .run = raster.run },
     .{ .name = "read", .summary = "open the document in a window and scroll through it", .usage = read.usage, .run = read.run },
+    .{ .name = "recent", .summary = "the documents opened before, and where you were", .usage = library.recent_usage, .run = library.recentRun },
+    .{ .name = "config", .summary = "the settings the reader remembers", .usage = library.config_usage, .run = library.configRun },
+    .{ .name = "marks", .summary = "the highlights made in a document", .usage = library.marks_usage, .run = library.marksRun },
+    .{ .name = "plugins", .summary = "load init.lua and the plugins, and report", .usage = plugins.usage, .run = plugins.run },
     .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
     .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run },
@@ -62,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
         .io = io,
         .out = &out_file.interface,
         .err = &err_file.interface,
+        .environ = init.environ_map,
     };
 
     const argv = try init.minimal.args.toSlice(gpa);

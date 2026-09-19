@@ -1,54 +1,52 @@
-//! `fenrir read <file>` -- the document, in a window, scrollable.
+//! `fenrir read <file>...` -- the documents, in windows, scrollable.
 //!
 //! This is the command the rest of the project was for. Gjöll reads the file,
 //! the interpreter turns each page into a display list, `gleipnir.replay`
-//! rasterises it, Lyngvi opens a window and puts it on the screen, and the
-//! loop below joins them and answers the wheel.
+//! rasterises or records it, Lyngvi opens a window and puts it on the screen,
+//! and the loop below joins them.
+//!
+//! ## Buffers and windows
+//!
+//! The reader does not show *a document*. It holds a list of open documents
+//! -- buffers -- and a tree of windows onto them, which is `hlidskjalf`. One
+//! document can be in four windows at once; each has its own scroll, zoom and
+//! cursor, and all four share the document's highlights, because the
+//! highlights belong to the buffer. `<C-w>v` splits, `<C-w>c` closes,
+//! `<C-w>hjkl` moves between them, as in Vim.
+//!
+//! Everything about *where* a window is looking lives in `hlidskjalf.View`
+//! and is tested there without a device. What lives here is the part that
+//! needs a document and a GPU: which pages to render, where to put the
+//! pixels, and how to get out of the way of the rasterising thread.
 //!
 //! ## Where the page is drawn
 //!
-//! On the CPU, into an RGBA8 image, which is then uploaded as a texture and
-//! drawn by the rect pipeline as one quad. That is a deliberate intermediate
-//! and not the end state:
+//! Two backends, chosen by `--path`:
 //!
-//! * `gleipnir/pathpipe.zig` specifies the GPU path pipeline and its shaders
-//!   compile, but `lyngvi/Renderer.zig` has not been taught to create it --
-//!   there is no stencil attachment, no multisampled colour attachment, and
-//!   no vertex buffer. Until there is, the GPU cannot fill a path.
-//! * The CPU rasteriser already draws every page in the corpus correctly,
-//!   including clips, transparency groups and blend modes, and clipping is
-//!   the part of a page the GPU pipeline has no answer for yet.
+//!   **cpu** -- rasterised into an image and uploaded as a texture. Every
+//!   feature the renderer has: all sixteen blend modes, antialiased clips,
+//!   transparency groups. Costs a page of work per zoom change.
 //!
-//! So the choice is between a reader today whose pixels are exactly
-//! `fenrir raster`'s, and no reader until a second rasteriser catches up with
-//! the first. Every page you see here is the reference image.
-//!
-//! It also means the window is not a benchmark of the Vulkan path. What it
-//! does exercise is the swapchain, the resize path, the descriptor array, the
-//! upload path with megabyte-sized images rather than atlas patches, and the
-//! frame loop -- all of which the GPU pipeline will need working underneath
-//! it.
+//!   **gpu** -- the outlines go to the device and the fragment shader works
+//!   out coverage from the curves. Resolution independent, so a zoom is a
+//!   matrix and not a re-render, and a page is one draw call.
 //!
 //! ## Cost, and why there is a second thread
 //!
-//! A page costs one interpretation and one rasterisation. For a page of prose
-//! that is a couple of hundred milliseconds in a release build; for a page
-//! whose figure is a scatter plot of several thousand separately clipped
-//! markers it is a second, because the CPU rasteriser's work is proportional
-//! to the summed area of its stencil fans and that page has three million
-//! device pixels of them.
+//! A page costs one interpretation and one rasterisation: a couple of hundred
+//! milliseconds for prose, a second for a page whose figure is a scatter plot
+//! of several thousand separately clipped markers. Either number is far
+//! longer than a frame, so rasterising on the frame thread would not make the
+//! reader slow, it would make it *stop*. Rasterisation happens on a thread of
+//! its own and the loop never blocks on it: it collects whatever finished,
+//! uploads it, and draws. A page not ready yet is blank paper for a few
+//! frames.
 //!
-//! Either number is far longer than a frame. Rasterising on the frame thread
-//! therefore does not make the reader slow, it makes it *stop* -- smooth
-//! scrolling until a heavy page comes into view, then a freeze, then smooth
-//! scrolling again. So rasterisation happens on a thread of its own and the
-//! loop never blocks on it: it collects whatever finished, uploads it, and
-//! draws. A page not ready yet is blank paper for a few frames.
-//!
-//! The document is the reason it is one thread and not a pool. `Document.get`
-//! fills an object cache, so it is not safe to call from two threads at once.
-//! The worker owns it; the frame loop touches only `pages[i]`, which is a
-//! value copy of geometry resolved when the file was opened.
+//! One thread and not a pool, because it owns every `Document`. `Document.get`
+//! fills an object cache, so it is not safe to call from two threads at once;
+//! the worker is the only thread that touches one. The frame loop sees only
+//! `pages`, which is resolved when the file is opened and never written
+//! again, and the text maps and pixels the worker hands over.
 //!
 //! ## Memory
 //!
@@ -56,9 +54,8 @@
 //! Every other command is a short-lived process for which never freeing is
 //! the right trade; a reader is not. A page's framebuffer is four floats per
 //! pixel and its texture four bytes, so an arena would grow by tens of
-//! megabytes per page scrolled past, and the allocator's own cost would grow
-//! with it -- which is felt as a scroll that gets stickier the longer you
-//! read.
+//! megabytes per page scrolled past -- felt as a scroll that gets stickier
+//! the longer you read.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -69,103 +66,177 @@ const fenrir = @import("fenrir");
 const Context = @import("Context.zig");
 const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
+const library = @import("library.zig");
+const Library = library.Library;
 
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
 const gleipnir = fenrir.gleipnir;
+const galdr = fenrir.galdr;
+const hlidskjalf = fenrir.hlidskjalf;
 const lyngvi = fenrir.lyngvi;
 const replay = gleipnir.replay;
 
 const Bounds = gelgja.Bounds;
 const Color = gelgja.Color;
+const Point = gelgja.Point;
 const DrawList = gleipnir.DrawList;
 const Glyphs = glyphmod.Fonts;
 const Scene = gleipnir.scene.Scene;
+
+const Buffer = hlidskjalf.Buffer;
+const Layout = hlidskjalf.Layout;
+const Marks = hlidskjalf.Marks;
+const View = hlidskjalf.View;
+const keys = hlidskjalf.keys;
+const text = hlidskjalf.text;
 
 /// Which path rasteriser this binary has, from `-Dpath`.
 const have_cpu = fenrir.build_options.path_cpu;
 const have_gpu = fenrir.build_options.path_gpu;
 
-/// Where a page's marks are turned into pixels.
-///
-///   **cpu** -- rasterised into an image and uploaded as a texture. Every
-///   feature the renderer has: all sixteen blend modes, antialiased clips,
-///   transparency groups. Costs a page of work per zoom change and hundreds
-///   of milliseconds for a heavy page.
-///
-///   **gpu** -- the outlines go to the device and the fragment shader works
-///   out coverage from the curves. Resolution independent, so a zoom is a
-///   matrix and not a re-render, and a page is one draw call. Does not yet
-///   composite blend modes.
 const Backend = enum { cpu, gpu };
 
 pub const usage =
-    \\fenrir read <file> [--page N] [--zoom N | --dpi N] [--size WxH]
-    \\                   [--samples N] [--vsync on|off|adaptive]
-    \\                   [--validate] [--gpu NAME] [--frames N]
+    \\fenrir read <file>... [--page N] [--zoom N | --dpi N] [--size WxH]
+    \\                      [--samples N] [--vsync on|off|adaptive]
+    \\                      [--validate] [--gpu NAME] [--frames N]
     \\
-    \\    Opens the document in a window and scrolls through it.
+    \\    Opens the documents in a window and scrolls through them. More than
+    \\    one file opens them as buffers; the first is shown and the rest are
+    \\    reachable with <C-w>n.
     \\
-    \\    --page N     Start at this page, numbered from 1.
+    \\    --page N     Start at this page, numbered from 1. Without it, the
+    \\                 place this document was last left at -- which is a page
+    \\                 and how far down it, not just the page.
     \\    --zoom N     Device pixels per PDF point. 1.0 is 72 dpi. Without
-    \\                 it the page is fitted to the width of the window,
-    \\                 which is what a reader opened on a document wants.
+    \\                 it the zoom this document was last read at, or the
+    \\                 width of the window if it is new.
     \\    --dpi N      The same thing in the other unit.
     \\    --size WxH   The window's initial size.
     \\    --samples N  Multisampling for the page raster: 1, 2, 4 or 8.
     \\                 Defaults to 8.
     \\    --frames N   Run N frames and exit, so the command can be scripted.
-    \\    --shot F     Write one composed frame to F as a PNG and exit, with
-    \\                 no window and no device. What the reader would look
-    \\                 like, on a machine with no display and in a test.
+    \\    --shot F     Write one composed frame to F as a PNG and exit. With
+    \\                 --path cpu there is no window and no device: what the
+    \\                 reader would look like, on a machine with no display
+    \\                 and in a test. With --path gpu the frame is drawn by
+    \\                 the device into a hidden window and read back, once
+    \\                 every visible page is ready.
+    \\    --split D    Start with the window split: v, h, or a repeat like
+    \\                 vh. Mostly for scripting a screenshot of a layout.
+    \\    --device     With --shot and --path cpu: read the frame back from
+    \\                 the device too, rather than modelling it.
     \\    --path P     Which path rasteriser draws the page: cpu or gpu.
-    \\                 Only what this build has; see -Dpath. With cpu the
-    \\                 page is rasterised into a texture, with gpu its
-    \\                 outlines are drawn by the analytic pipeline.
+    \\                 Only what this build has; see -Dpath.
     \\    --vsync      on (default), off, or adaptive.
     \\    --validate   Turn on the Khronos validation layers, if installed.
     \\    --gpu NAME   Prefer a device whose name contains NAME.
+    \\    --db FILE    Remember recent files, settings and highlights in FILE
+    \\                 instead of the default. $FENRIR_DB does the same.
+    \\    --config DIR Read init.lua and plugins/ from DIR instead of the
+    \\                 configuration directory. $FENRIR_CONFIG does the same.
+    \\    --clean      Run no plugins and no init.lua.
     \\
-    \\keys:
-    \\    wheel, up/down       scroll
+    \\commands, after : in normal mode:
+    \\    :12                  page 12
+    \\    :page +2, :page -1   pages forward and back
+    \\    :zoom 150, :fit      a zoom, or fit the width
+    \\    :sp, :vs, :close     split below, split beside, close the window
+    \\    :only, :bn, :bp      close the others, next / previous document
+    \\    :q, :qa              close the window, close the reader
+    \\    :undo, :redo         highlight history
+    \\    :marks, :marks clear how many highlights, or remove them all
+    \\    :lua CODE            run Lua, with the fenrir table
+    \\    :plugins, :messages  what loaded, and what went wrong
+    \\    :echo TEXT           show TEXT
+    \\    :Name ARGS           a command a plugin registered
+    \\
+    \\windows:
+    \\    <C-w>v  <C-w>s       split beside / below
+    \\    <C-w>c, <C-w>q       close this window
+    \\    <C-w>o               close every other window
+    \\    <C-w>h j k l         go to the window that way
+    \\    <C-w>w, <C-w>W       the next / previous window
+    \\    <C-w>=               make them all the same size
+    \\    <C-w>n, <C-w>b       show the next / previous open document here
+    \\
+    \\normal mode (reading):
+    \\    drag the scrollbar   scroll; a press on the track moves a screen
+    \\    wheel, ctrl+wheel    scroll, zoom
+    \\    arrows, h j k l      move the cursor; the page follows it
+    \\    w / b / e            the next word, the word before, the word's end
+    \\    ^ / $                the start and end of the line
+    \\    escape               put the cursor away
     \\    page up / page down  a screen at a time
     \\    home / end           the first and last page
     \\    n / p                the next and previous page
+    \\    drag over text       highlight it; press a highlight to remove it
+    \\    m                    highlight the cursor's line, or remove the one
+    \\                         under the cursor
+    \\    M                    remove every highlight in this document
+    \\    u / ctrl+r           undo / redo a highlight change
     \\    + / -                zoom in and out
-    \\    0                    fit the page width to the window
-    \\    1                    one hundred per cent
-    \\    escape, q            close
+    \\    0 / 1                fit the width / one hundred per cent
+    \\    q                    close this window, then the reader
+    \\    Q                    close the reader
+    \\    v / V / i            visual, visual line, and edit mode
+    \\    :                    the command line
+    \\
+    \\visual mode (selecting), from v or V:
+    \\    any motion           extend the selection
+    \\    o                    go to the other end of the selection
+    \\    m, y, enter          highlight it in the accent colour
+    \\    1 .. 8               highlight it in that colour: accent, yellow,
+    \\                         green, blue, pink, orange, purple, red
+    \\    d, x                 remove the highlights it touches
+    \\    v / V                leave, or switch between the two
+    \\    escape               leave without doing anything
+    \\
+    \\edit mode (changing highlights), from i:
+    \\    n / N, j / k, tab    the next and previous highlight
+    \\    1 .. 8               recolour it
+    \\    d, x, delete         delete it, and take the next
+    \\    a, enter             write a note on it; enter keeps the note,
+    \\                         escape throws it away
+    \\    u / ctrl+r           undo / redo
+    \\    escape, q            back to normal mode
+    \\
+    \\    The title bar shows the mode, the highlight in hand, its note, the
+    \\    note or command as it is being typed, and messages from plugins.
+    \\
+    \\    Keys bound by plugins with fenrir.keymap come before these; see
+    \\    `fenrir plugins` for what is bound.
     \\
     \\    The percentage in the title bar is relative to the page's true
     \\    physical size on this display: 100% means a 72-point inch is an
-    \\    inch, display scaling included. It is not the `--zoom` number,
-    \\    which counts device pixels per point and is a different thing on
-    \\    every screen.
+    \\    inch, display scaling included.
 ;
 
-/// How many rendered pages to keep. Six covers a screen and a half at any
-/// sensible zoom, so scrolling back a page never re-renders it, and at four
-/// bytes a pixel it is tens of megabytes rather than hundreds.
-const cache_slots = 6;
+/// How many rendered pages to keep. Two per window at a sensible zoom, plus
+/// room to scroll back without re-rendering, and at four bytes a pixel it is
+/// tens of megabytes rather than hundreds.
+const cache_slots = 12;
 
-/// Between pages, and around the document, in device pixels rather than
-/// points: the gap is a property of the screen you are reading on, not of the
-/// paper, so it should not grow when you zoom in.
-const gap = 14.0;
-
-const min_zoom = 0.15;
-const max_zoom = 8.0;
+const gap = View.gap;
+const min_zoom = View.min_zoom;
+const max_zoom = View.max_zoom;
 
 /// A ceiling on one page's texture, matching `fenrir raster`. A page that
 /// wants more than this at the requested zoom is rendered at whatever zoom
 /// does fit rather than refused, because refusing means a blank window.
 const max_page_pixels: u64 = 64 << 20;
 
+/// Frames a device shot waits for the visible pages before taking what it has.
+const shot_patience: u32 = 3000;
+
 pub fn run(ctx: *Context, args: []const []const u8) !void {
-    var name: ?[]const u8 = null;
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(ctx.gpa);
+
     var start_page: u32 = 1;
-    // Null means "fit the width", which needs a window size to mean anything
-    // and so cannot be resolved until there is one.
+    var page_given = false;
+    var db_path: ?[]const u8 = null;
     var zoom: ?f32 = null;
     var width: u32 = 1000;
     var height: u32 = 900;
@@ -175,6 +246,10 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     var prefer: ?[]const u8 = null;
     var samples: gleipnir.raster.Samples = .eight;
     var shot: ?[]const u8 = null;
+    var splits: []const u8 = &.{};
+    var clean = false;
+    var config_dir: ?[]const u8 = null;
+    var on_device = false;
     var backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu;
 
     var i: usize = 0;
@@ -188,6 +263,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
             start_page = std.fmt.parseInt(u32, args[i], 10) catch
                 return ctx.fail("--page wants a number, not '{s}'", .{args[i]});
             if (start_page == 0) return ctx.fail("pages are numbered from 1", .{});
+            page_given = true;
         } else if (std.mem.eql(u8, arg, "--zoom")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--zoom needs a number", .{});
@@ -214,6 +290,25 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
             if (i >= args.len) return ctx.fail("--frames needs a count", .{});
             frames = std.fmt.parseInt(u32, args[i], 10) catch
                 return ctx.fail("--frames wants a number, not '{s}'", .{args[i]});
+        } else if (std.mem.eql(u8, arg, "--db")) {
+            i += 1;
+            if (i >= args.len) return ctx.fail("--db needs a file", .{});
+            db_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--split")) {
+            i += 1;
+            if (i >= args.len) return ctx.fail("--split needs v, h, or a run of them", .{});
+            for (args[i]) |c| {
+                if (c != 'v' and c != 'h') return ctx.fail("--split wants v and h, not '{c}'", .{c});
+            }
+            splits = args[i];
+        } else if (std.mem.eql(u8, arg, "--clean")) {
+            clean = true;
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= args.len) return ctx.fail("--config needs a directory", .{});
+            config_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--device")) {
+            on_device = true;
         } else if (std.mem.eql(u8, arg, "--shot")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--shot needs a file", .{});
@@ -257,14 +352,12 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
             if (width == 0 or height == 0) return ctx.fail("--size must be positive", .{});
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ctx.fail("unknown option {s}", .{arg});
-        } else if (name == null) {
-            name = arg;
         } else {
-            return ctx.fail("read takes one file", .{});
+            try files.append(ctx.gpa, arg);
         }
     }
 
-    const file = name orelse return ctx.fail("read needs a file", .{});
+    if (files.items.len == 0) return ctx.fail("read needs a file", .{});
     if (zoom) |z| {
         if (!(z > 0) or !std.math.isFinite(z)) {
             return ctx.fail("a zoom has to be positive and finite", .{});
@@ -273,7 +366,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
 
     if (shot == null and !lyngvi.has_window) {
         return ctx.fail(
-            "no window backend for this platform yet: Lyngvi speaks Win32, and the xcb backend is a stub",
+            "no window backend for this platform yet: Lyngvi speaks Win32 and Wayland, and the X11 backend is a stub",
             .{},
         );
     }
@@ -291,45 +384,70 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     else
         std.heap.smp_allocator;
 
-    // With `gpa` and not `ctx.gpa`: `Document` owns these bytes and frees
-    // them with the allocator it was opened with.
-    const bytes = ctx.readFileWith(gpa, file) catch |err|
-        return ctx.fail("cannot read {s}: {t}", .{ file, err });
-
-    var doc = fenrir.open(gpa, bytes) catch |err|
-        return ctx.fail("cannot open {s}: {t}", .{ file, err });
-    defer doc.deinit();
-
-    const pages = fenrir.pages.all(&doc) catch |err|
-        return ctx.fail("cannot read the page tree: {t}", .{err});
-    if (pages.len == 0) return ctx.fail("this document has no pages", .{});
-    if (start_page > pages.len) {
-        return ctx.fail("page {d}: this document has {d} pages", .{ start_page, pages.len });
-    }
-
-    var reader: Reader = .{
+    var session: Session = .{
         .ctx = ctx,
         .gpa = gpa,
-        .doc = &doc,
-        .pages = pages,
-        .file = file,
-        // A placeholder until there is a window to fit to, or to scale the
-        // requested zoom against. Never used to render at.
-        .zoom = std.math.clamp(zoom orelse 1.0, min_zoom, max_zoom),
-        .fit_on_open = zoom == null,
         .samples = samples,
         .backend = backend,
+        .io = ctx.io,
     };
-    defer reader.deinit();
+    defer session.deinit();
 
-    if (shot) |dest| return reader.shoot(dest, width, height, start_page - 1);
+    // Mímir, if this build and this machine have one. A shot is a script
+    // writing a file and not a person reading, so it neither reads the
+    // remembered position nor records having been there.
+    session.library = library.openWith(ctx, gpa, db_path);
+    session.remembers_place = shot == null;
+    if (session.library) |l| {
+        if (l.accent() catch null) |c| session.accent = c;
+    }
 
-    try reader.open(.{
+    for (files.items) |file| {
+        _ = session.openBuffer(file) catch |err| {
+            return ctx.fail("cannot open {s}: {t}", .{ file, err });
+        };
+    }
+
+    // The first window, looking at the first document.
+    const first = &session.buffers.items[0];
+    if (start_page > first.pages.len) {
+        return ctx.fail("page {d}: {s} has {d} pages", .{ start_page, first.title, first.pages.len });
+    }
+    try session.layout.init(gpa, .{
+        .buffer = 0,
+        .pages = first.pages,
+        .zoom = std.math.clamp(zoom orelse 1.0, min_zoom, max_zoom),
+        .fit_on_open = zoom == null,
+    });
+
+    const resumed = session.restore(session.layout.current(), 0, page_given, zoom == null);
+    if (!page_given and resumed == null) session.layout.current().scrollToPage(start_page - 1);
+    if (resumed) |p| {
+        ctx.note("resuming at page {d} of {d}", .{ p.page + 1, first.pages.len });
+    }
+
+    // Galdr. Not for a shot, for the same reason a shot does not resume where
+    // you were: a script asking for a picture must get the same picture
+    // whatever is in your configuration directory.
+    if (shot == null and !clean) session.startPlugins(config_dir);
+
+    if (shot) |dest| {
+        if (backend == .cpu and !on_device) {
+            return session.shoot(dest, width, height, start_page - 1, splits);
+        }
+    }
+
+    try session.open(.{
         .width = width,
         .height = height,
         .frames = frames,
-        .vsync = vsync,
+        .shot = shot,
+        // Presenting to a hidden window with FIFO can wait for a vertical
+        // blank that a window nobody can see is never given.
+        .vsync = if (shot != null) .off else vsync,
         .start_page = start_page - 1,
+        .page_given = page_given,
+        .splits = splits,
         .device = .{ .validation = validate, .prefer = prefer },
     });
 }
@@ -338,8 +456,12 @@ const Settings = struct {
     width: u32,
     height: u32,
     frames: ?u32,
+    /// Read one frame back from the device into this file, and exit.
+    shot: ?[]const u8 = null,
     vsync: lyngvi.Vsync,
     start_page: u32,
+    page_given: bool,
+    splits: []const u8 = &.{},
     device: lyngvi.Device.Options,
 };
 
@@ -350,6 +472,7 @@ const Settings = struct {
 /// two mean different things, so they are kept apart and asserted equal rather
 /// than assumed to be one field.
 const Slot = struct {
+    buffer: u32 = 0,
     page: u32 = no_page,
     zoom: f32 = 0,
     gpu: u32 = 0,
@@ -361,8 +484,8 @@ const Slot = struct {
 
     const no_page = std.math.maxInt(u32);
 
-    fn matches(s: Slot, page: u32, zoom: f32) bool {
-        return s.page == page and s.zoom == zoom;
+    fn matches(s: Slot, buffer: u32, page: u32, zoom: f32) bool {
+        return s.buffer == buffer and s.page == page and s.zoom == zoom;
     }
 };
 
@@ -370,7 +493,7 @@ const Slot = struct {
 /// device. The window does not use this: there the pixels go to the GPU and
 /// the buffer is freed the same frame.
 const CpuTextures = struct {
-    entries: [cache_slots]?Reader.Image = @splat(null),
+    entries: [cache_slots]?Session.Image = @splat(null),
 
     fn deinit(t: *CpuTextures, gpa: std.mem.Allocator) void {
         for (&t.entries) |*e| {
@@ -409,24 +532,18 @@ const CpuTextures = struct {
 /// device as one set of buffers; `ranges` says which instances belong to
 /// which page. Recording is in *page space*, with no zoom and no scroll baked
 /// in, which is what makes a scroll cost a matrix per instance rather than a
-/// re-record.
-///
-/// The store is rebuilt from scratch whenever the set of cached pages
-/// changes, because a `slug.Store` is append-only and evicting a page from
-/// the middle of it would mean renumbering every header after it. Pages come
-/// into view rarely -- once per page scrolled past -- so a rebuild there is
-/// cheaper than the bookkeeping to avoid it.
+/// re-record -- and what lets two windows at different zooms share one
+/// recording.
 const Recorded = struct {
-    /// Every cached page's outlines, merged into one store so they reach the
-    /// device as one set of buffers.
     scene: Scene = .{},
     /// This frame's placement: one instance per drawn path, rebuilt whenever
-    /// the scroll or the zoom moves.
+    /// any window moves.
     frame: gleipnir.scene.Frame = .{},
     pages: [cache_slots]Entry = @splat(.{}),
     stamp: u64 = 0,
 
     const Entry = struct {
+        buffer: u32 = 0,
         page: u32 = Slot.no_page,
         used: u64 = 0,
         /// The page as it was recorded, kept so the shared store can be
@@ -446,16 +563,16 @@ const Recorded = struct {
         rc.frame.deinit(gpa);
     }
 
-    fn has(rc: *const Recorded, page: u32) bool {
+    fn has(rc: *const Recorded, buffer: u32, page: u32) bool {
         for (rc.pages) |e| {
-            if (e.page == page and e.source != null) return true;
+            if (e.buffer == buffer and e.page == page and e.source != null) return true;
         }
         return false;
     }
 
     /// Takes ownership of a recording and puts it in a slot, evicting the
     /// least recently drawn page if there is no free one.
-    fn insert(rc: *Recorded, gpa: Allocator, page: u32, source: Scene) Allocator.Error!void {
+    fn insert(rc: *Recorded, gpa: Allocator, buffer: u32, page: u32, source: Scene) Allocator.Error!void {
         var chosen: usize = 0;
         var oldest: u64 = std.math.maxInt(u64);
         for (&rc.pages, 0..) |*e, i| {
@@ -470,16 +587,25 @@ const Recorded = struct {
         }
 
         const slot = &rc.pages[chosen];
+        const evicted = slot.source != null;
         if (slot.source) |*old| old.deinit(gpa);
-        slot.* = .{ .page = page, .used = rc.stamp, .source = source };
-        try rc.rebuild(gpa);
+        slot.* = .{ .buffer = buffer, .page = page, .used = rc.stamp, .source = source };
+
+        if (evicted) {
+            // The store is append-only, so a page leaving the middle of it
+            // means renumbering everything after the hole. Merging the
+            // survivors again is the cheaper answer, and it happens once per
+            // page scrolled past rather than per frame.
+            try rc.rebuild(gpa);
+            return;
+        }
+
+        // Filling an empty slot, which is every page until the cache is full:
+        // the pages already in the scene keep their ranges, and only the new
+        // one is copied in.
+        slot.range = try rc.scene.merge(gpa, slot.source.?);
     }
 
-    /// Merges every kept recording into the shared scene again.
-    ///
-    /// Runs once per page that comes into view, not once per frame: it is a
-    /// few tens of megabytes of copying, which is a few milliseconds, and the
-    /// alternative is a free-list inside a store whose indices are absolute.
     fn rebuild(rc: *Recorded, gpa: Allocator) Allocator.Error!void {
         rc.scene.reset(.{ 1, 1 });
         for (&rc.pages) |*e| {
@@ -487,37 +613,50 @@ const Recorded = struct {
         }
     }
 
-    fn touch(rc: *Recorded, page: u32) void {
+    fn touch(rc: *Recorded, buffer: u32, page: u32) void {
         for (&rc.pages) |*e| {
-            if (e.page == page) e.used = rc.stamp;
+            if (e.buffer == buffer and e.page == page) e.used = rc.stamp;
         }
     }
 };
 
-/// One page, at one zoom: everything that decides what a rasterisation will
-/// produce, and so everything needed to say whether one is still wanted.
+/// The path a document is remembered under: absolute, so the same file opened
+/// from two different directories is one entry in the library rather than
+/// two. Falls back to what was typed, which still remembers something.
+fn absolutePath(ctx: *Context, gpa: Allocator, file: []const u8) ?[]u8 {
+    if (Io.Dir.cwd().realPathFileAlloc(ctx.io, file, gpa)) |real| {
+        // Copied, and the original freed as the `[:0]u8` it is. Returning it
+        // as a plain slice would hand back a length one byte short of the
+        // allocation, and freeing *that* is an invalid free -- which is
+        // exactly how this line failed the first time it ran.
+        defer gpa.free(real);
+        return gpa.dupe(u8, real) catch null;
+    } else |_| {}
+    return gpa.dupe(u8, file) catch null;
+}
+
+/// One page of one document, at one zoom: everything that decides what a
+/// rasterisation will produce, and so everything needed to say whether one is
+/// still wanted.
 const Job = struct {
+    buffer: u32,
     page: u32,
     zoom: f32,
 
     fn eql(a: Job, b: Job) bool {
-        return a.page == b.page and a.zoom == b.zoom;
+        return a.buffer == b.buffer and a.page == b.page and a.zoom == b.zoom;
     }
 };
 
 /// The rasterising thread.
 ///
-/// One thread, not a pool, because it owns the `Document` -- see the note at
-/// the top of the file. One job in flight and one waiting, with the waiting
-/// one replaced rather than queued: if the loop has asked for three pages
-/// while this thread rendered one, the third is the one on screen now and the
-/// other two are behind the scroll.
-///
-/// Everything under `mutex` is small and every critical section is a handful
-/// of assignments; the rasterising itself happens with the lock released, or
-/// the thread would be an elaborate way to do the work in the same place.
+/// One thread, not a pool, because it owns every `Document` -- see the note
+/// at the top of the file. One job in flight and one waiting, with the
+/// waiting one replaced rather than queued: if the loop has asked for three
+/// pages while this thread rendered one, the third is the one on screen now
+/// and the other two are behind the scroll.
 const Rasteriser = struct {
-    reader: *Reader,
+    session: *Session,
     /// A copy of the process's `Io`, which is what the lock and the condition
     /// are implemented in terms of. Both sides only ever use the uncancelable
     /// operations: this thread is joined explicitly and has nothing to unwind.
@@ -525,28 +664,26 @@ const Rasteriser = struct {
     thread: ?std.Thread = null,
 
     mutex: Io.Mutex = .init,
-    /// Signalled by both sides: by the loop when there is a new job or the
-    /// finished one has been collected, by the worker when a job is done.
     change: Io.Condition = .init,
 
-    /// What the loop wants next, if anything.
     want: ?Job = null,
-    /// What the worker is rasterising right now.
     busy: ?Job = null,
-    /// What the worker finished and the loop has not collected. A null image
-    /// means the page would not rasterise.
     done: ?Finished = null,
     quit: bool = false,
 
-    /// What one job produced. A CPU page is pixels; a GPU page is an outline
-    /// recorded in page space, which the frame loop merges into the shared
-    /// store and then places with a matrix.
+    /// What one job produced.
+    ///
+    /// The text map comes with it because both come from one interpretation
+    /// of the page, and interpreting it twice -- once for pixels and once for
+    /// the cursor -- would double the cost of every page for a feature most
+    /// frames do not use.
     const Finished = struct {
         job: Job,
         result: ?Result,
+        map: ?text.Page = null,
 
         const Result = union(Backend) {
-            cpu: Reader.Image,
+            cpu: Session.Image,
             gpu: Scene,
         };
     };
@@ -570,14 +707,12 @@ const Rasteriser = struct {
         thread.join();
         rz.thread = null;
 
-        // Whatever it managed to finish on the way out is still ours to free.
         if (rz.done) |*f| {
-            rz.reader.discard(f);
+            rz.session.discard(f);
             rz.done = null;
         }
     }
 
-    /// Queues a job, unless it is already queued or in flight.
     fn post(rz: *Rasteriser, job: Job) void {
         rz.mutex.lockUncancelable(rz.io);
         defer rz.mutex.unlock(rz.io);
@@ -599,8 +734,6 @@ const Rasteriser = struct {
         defer rz.mutex.unlock(rz.io);
         const f = rz.done orelse return null;
         rz.done = null;
-        // The worker holds off on the next page until this one is taken, so
-        // that a result is never dropped on the floor. Tell it there is room.
         rz.change.signal(rz.io);
         return f;
     }
@@ -608,7 +741,6 @@ const Rasteriser = struct {
     fn work(rz: *Rasteriser) void {
         while (true) {
             rz.mutex.lockUncancelable(rz.io);
-            // Wait for work, and for somewhere to put the last answer.
             while (!rz.quit and (rz.want == null or rz.done != null)) {
                 rz.change.waitUncancelable(rz.io, &rz.mutex);
             }
@@ -621,231 +753,1995 @@ const Rasteriser = struct {
             rz.busy = job;
             rz.mutex.unlock(rz.io);
 
-            const result: ?Finished.Result = rz.reader.produce(job) catch null;
+            var finished: Finished = .{ .job = job, .result = null };
+            rz.session.produce(job, &finished) catch {};
 
             rz.mutex.lockUncancelable(rz.io);
             rz.busy = null;
-            rz.done = .{ .job = job, .result = result };
+            rz.done = finished;
             rz.change.signal(rz.io);
             rz.mutex.unlock(rz.io);
         }
     }
 };
 
-const Reader = struct {
+const Session = struct {
     ctx: *Context,
     /// The reader's heap, not the CLI's arena, and safe to call from the
     /// rasterising thread.
     gpa: Allocator,
-    doc: *fenrir.Document,
-    pages: []const fenrir.Page,
-    file: []const u8,
-    zoom: f32,
     samples: gleipnir.raster.Samples,
 
-    /// Which rasteriser draws the page.
+    /// The open documents, and the tree of windows onto them.
+    buffers: std.ArrayList(Buffer) = .empty,
+    layout: Layout = .{},
+    keymap: keys.State = .{},
+
     backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu,
-    /// What the last `placeVisible` was built for, so it is not rebuilt for
-    /// a frame in which nothing moved.
-    placed: ?Placement = null,
-    /// The pages recorded for the GPU pipeline. Unused under `.cpu`.
+    placed: ?u64 = null,
     recorded: Recorded = .{},
 
-    /// Device pixels per logical pixel, from the platform. 1.0 on an
-    /// unscaled display, 1.5 at 150%, and so on.
-    dpi_scale: f32 = 1,
-    /// Fit the page width to the window as soon as there is a window to fit
-    /// to. Set when neither `--zoom` nor `--dpi` was given.
-    fit_on_open: bool = false,
+    /// The colour the interface draws its own marks in: the scrollbar thumb
+    /// and a highlight made by hand. Remembered between sessions; see `mimir`.
+    accent: Color = .white,
 
-    /// The top of the viewport, in document pixels at the current zoom.
-    scroll: f32 = 0,
-    /// Sideways, for when a page is wider than the window.
-    pan: f32 = 0,
-    viewport: [2]f32 = .{ 1, 1 },
+    library: ?Library = null,
+    /// False for `--shot`: settings still apply, the reading position does
+    /// not, and nothing is written back.
+    remembers_place: bool = true,
+
+    /// Set when the loop should end, by `q` on the last window or by `Q`.
+    quit: bool = false,
+
+    /// A drag over text with the mouse, as its two ends. Becomes a highlight
+    /// when the button is let go.
+    drag: ?Drag = null,
+
+    /// The highlight in hand in edit mode, by its session key.
+    focus_mark: ?u64 = null,
+    /// The note being typed in note mode. Written to the highlight on enter.
+    note: std.ArrayList(u8) = .empty,
+    /// Whether the last visual mode entered was `V`. Read after the key that
+    /// ends visual mode has already set the mode back to normal.
+    last_visual_line: bool = false,
+    /// A sentence for the title bar about what just happened -- "no
+    /// highlights to edit", "already at oldest change". Cleared by the next
+    /// key. The title bar is the only text this window draws.
+    status: []const u8 = "",
+    /// The process's `Io`, for timestamps. Null in tests.
+    io: ?Io = null,
+
+    /// Galdr, when this build has Lua and plugins were not turned off.
+    plugins: ?*galdr.Runtime = null,
+    /// Where `init.lua` and `plugins/` are read from. Owned.
+    config_dir: ?[]u8 = null,
+    /// The `:` line being typed.
+    cmdline: std.ArrayList(u8) = .empty,
+    /// Where `status` points when the message is not a literal: a plugin's
+    /// `fenrir.notify`, or a command's answer.
+    status_buf: [512]u8 = undefined,
+    /// A highlight's colour as text, for the one `highlightAt` being answered.
+    hex_buf: [7]u8 = undefined,
+    /// What events were last reported with, so that `page` and `mode` fire on
+    /// a change and not on every frame.
+    reported_page: u32 = std.math.maxInt(u32),
+    reported_mode: keys.Mode = .normal,
 
     slots: [cache_slots]Slot = @splat(.{}),
     stamp: u64 = 0,
 
-    /// Set when something moved, so the title is only rewritten when it would
-    /// change: `setTitle` is a system call and a taskbar update.
     dirty_title: bool = true,
-    shown_page: u32 = Slot.no_page,
-    shown_zoom: f32 = 0,
+    shown: struct { buffer: u32 = 0, page: u32 = Slot.no_page, zoom: f32 = 0, windows: u32 = 0 } = .{},
 
     pages_rendered: u64 = 0,
 
     /// Pages that would not rasterise, so `firstMissing` stops asking for
     /// them every frame. Small and forgetful on purpose: a page that failed
-    /// because memory was tight should get another chance eventually, and a
-    /// ring of sixteen gives it one.
-    failures: [16]Job = @splat(.{ .page = Slot.no_page, .zoom = 0 }),
+    /// because memory was tight should get another chance eventually.
+    failures: [16]Job = @splat(.{ .buffer = 0, .page = Slot.no_page, .zoom = 0 }),
     failure_next: usize = 0,
 
-    fn deinit(r: *Reader) void {
-        r.recorded.deinit(r.gpa);
+    const Drag = struct {
+        buffer: u32,
+        from: View.Position,
+        to: View.Position,
+    };
+
+    pub const Image = struct { pixels: []u8, width: u32, height: u32 };
+
+    fn deinit(s: *Session) void {
+        // Before the buffers: a plugin's last handlers may still read them.
+        if (s.plugins) |p| p.destroy();
+        if (s.config_dir) |d| s.gpa.free(d);
+        s.cmdline.deinit(s.gpa);
+        s.note.deinit(s.gpa);
+        s.recorded.deinit(s.gpa);
+        s.layout.deinit(s.gpa);
+        for (s.buffers.items) |*b| {
+            b.doc.deinit();
+            s.gpa.destroy(b.doc);
+            b.deinit(s.gpa);
+        }
+        s.buffers.deinit(s.gpa);
     }
 
+    // -- buffers -------------------------------------------------------------
+
+    /// Opens a document and adds it to the list. The `Document` is on the
+    /// heap because a buffer holds a pointer to it and the list moves when
+    /// the next file is opened.
+    fn openBuffer(s: *Session, file: []const u8) !u32 {
+        const gpa = s.gpa;
+
+        // With `gpa` and not `ctx.gpa`: `Document` owns these bytes and frees
+        // them with the allocator it was opened with.
+        const bytes = try s.ctx.readFileWith(gpa, file);
+
+        const doc = try gpa.create(fenrir.Document);
+        errdefer gpa.destroy(doc);
+        doc.* = try fenrir.open(gpa, bytes);
+        errdefer doc.deinit();
+
+        const pages = try fenrir.pages.all(doc);
+        if (pages.len == 0) return error.NoPages;
+
+        const path = absolutePath(s.ctx, gpa, file) orelse return error.OutOfMemory;
+        errdefer gpa.free(path);
+
+        try s.buffers.append(gpa, .{
+            .path = path,
+            .title = std.fs.path.basename(path),
+            .doc = doc,
+            .pages = pages,
+        });
+
+        const id: u32 = @intCast(s.buffers.items.len - 1);
+        s.loadMarks(id);
+        return id;
+    }
+
+    fn buffer(s: *Session, index: u32) *Buffer {
+        return &s.buffers.items[index];
+    }
+
+    fn view(s: *Session) *View {
+        return s.layout.current();
+    }
+
+    /// Points the focused window at another open document. `<C-w>n`.
+    fn showBuffer(s: *Session, delta: i32) void {
+        if (s.buffers.items.len < 2) return;
+        const v = s.view();
+        const n: i32 = @intCast(s.buffers.items.len);
+        const next: u32 = @intCast(@mod(@as(i32, @intCast(v.buffer)) + delta + n, n));
+        if (next == v.buffer) return;
+
+        // Where this window was in the old document is worth keeping: coming
+        // back to it with `<C-w>b` should not have lost your place.
+        s.rememberPlace(v);
+
+        v.buffer = next;
+        v.pages = s.buffer(next).pages;
+        v.cursor = .{};
+        v.scroll = 0;
+        v.pan = 0;
+        _ = s.restore(v, next, false, true);
+        v.clampScroll();
+        s.dirty_title = true;
+    }
+
+    // -- what the library remembers ------------------------------------------
+
+    /// Takes from the library where this document was left, and puts the view
+    /// there. Returns the place if there was one.
+    ///
+    /// `--page` and `--zoom` win: an explicit argument is a person saying
+    /// where to start, and remembering over the top of that is the kind of
+    /// helpfulness that has to be fought.
+    fn restore(s: *Session, v: *View, index: u32, page_given: bool, zoom_free: bool) ?View.Place {
+        if (!s.remembers_place) return null;
+        const lib = s.library orelse return null;
+        const b = s.buffer(index);
+
+        const seen = (lib.lastSeen(b.path) catch null) orelse return null;
+        defer lib.freeRecent(seen);
+
+        if (zoom_free and seen.zoom > 0) {
+            v.zoom = std.math.clamp(seen.zoom, min_zoom, max_zoom);
+            v.fit_on_open = false;
+        }
+        if (page_given or seen.page >= b.pages.len) return null;
+        if (seen.page == 0 and seen.offset <= 0) return null;
+
+        const place: View.Place = .{ .page = seen.page, .offset = seen.offset, .zoom = v.zoom };
+        v.goTo(place);
+        return place;
+    }
+
+    /// Reads this document's highlights into its buffer.
+    fn loadMarks(s: *Session, index: u32) void {
+        const lib = s.library orelse return;
+        const b = s.buffer(index);
+
+        const list = lib.highlights(b.path) catch return;
+        defer lib.freeHighlights(list, list.len);
+
+        for (list) |h| {
+            const color = Library.parseColor(h.color) orelse s.accent;
+            _ = b.marks.add(s.gpa, .{
+                .id = h.id,
+                .page = h.page,
+                .box = .fromRect(h.x0, h.y0, h.x1, h.y1),
+                .color = color,
+                .note = h.note,
+            }, true) catch return;
+        }
+    }
+
+    /// Writes down that a document was opened, and where.
+    fn remember(s: *Session, v: *View) void {
+        if (!s.remembers_place) return;
+        const lib = s.library orelse return;
+        const b = s.buffer(v.buffer);
+        lib.visit(b.path, b.title, placeOf(v), library.now(s.ctx.io)) catch {};
+    }
+
+    /// Writes down where a window was left, without counting another opening.
+    fn rememberPlace(s: *Session, v: *View) void {
+        if (!s.remembers_place) return;
+        const lib = s.library orelse return;
+        const b = s.buffer(v.buffer);
+        lib.leaveAt(b.path, placeOf(v)) catch {};
+    }
+
+    fn placeOf(v: *View) Library.Place {
+        const p = v.place();
+        return .{ .page = p.page, .offset = p.offset, .zoom = p.zoom };
+    }
+
+    /// On the way out: every open window's place, oldest window first, so the
+    /// focused one is written last and wins for a document open twice.
+    fn rememberAll(s: *Session) void {
+        if (!s.remembers_place) return;
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            if (v == s.layout.current()) continue;
+            s.rememberPlace(v);
+        }
+        s.rememberPlace(s.layout.current());
+    }
+
+    // -- work ----------------------------------------------------------------
+
     /// One job's worth of work, on the rasterising thread, in whichever form
-    /// this backend wants it.
-    fn produce(r: *Reader, job: Job) !Rasteriser.Finished.Result {
-        return switch (r.backend) {
-            .cpu => .{ .cpu = try r.rasterise(job) },
+    /// this backend wants it -- plus the page's text map, since both come out
+    /// of one interpretation.
+    fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
+        const gpa = s.gpa;
+        const b = s.buffer(job.buffer);
+
+        var result = try content.page(gpa, b.doc, b.pages[job.page], .{});
+        defer result.deinit(gpa);
+
+        // The text map first, and separately failable: a page whose pixels
+        // will not come out should still be one the cursor can move through,
+        // and vice versa.
+        out.map = text.build(gpa, result.list) catch null;
+        errdefer if (out.map) |*m| m.deinit(gpa);
+
+        out.result = switch (s.backend) {
+            .cpu => .{ .cpu = try s.rasterise(job, result.list, b) },
             // No zoom in it: the outline is recorded in page space and the
             // frame loop places it. That is the whole reason a zoom on the
             // GPU path is instant and on the CPU path is a re-render.
-            .gpu => .{ .gpu = try r.recordPage(job.page) },
+            .gpu => .{ .gpu = try s.recordPage(job, result.list, b) },
         };
     }
 
     /// Frees a finished job the frame loop is not going to use.
-    fn discard(r: *Reader, f: *Rasteriser.Finished) void {
+    fn discard(s: *Session, f: *Rasteriser.Finished) void {
+        if (f.map) |*m| m.deinit(s.gpa);
+        f.map = null;
         const result = &(f.result orelse return);
         switch (result.*) {
-            .cpu => |image| r.gpa.free(image.pixels),
-            .gpu => |*s| s.deinit(r.gpa),
+            .cpu => |image| s.gpa.free(image.pixels),
+            .gpu => |*scene| scene.deinit(s.gpa),
         }
         f.result = null;
     }
 
-    fn failed(r: *const Reader, page: u32, zoom: f32) bool {
-        for (r.failures) |f| {
-            if (f.page == page and f.zoom == zoom) return true;
+    fn failed(s: *const Session, job: Job) bool {
+        for (s.failures) |f| {
+            if (f.eql(job)) return true;
         }
         return false;
     }
 
-    fn noteFailure(r: *Reader, job: Job) void {
-        r.failures[r.failure_next] = job;
-        r.failure_next = (r.failure_next + 1) % r.failures.len;
+    fn noteFailure(s: *Session, job: Job) void {
+        s.failures[s.failure_next] = job;
+        s.failure_next = (s.failure_next + 1) % s.failures.len;
     }
 
-    // -- zoom, as a number a person recognises -------------------------------
-
-    /// The `zoom` at which the page is its true physical size.
+    /// One page, rasterised. The same calls `fenrir raster` makes, which is
+    /// why the two produce identical images.
     ///
-    /// A PDF point is 1/72 inch and an unscaled display is 96 dpi by
-    /// convention, so 100% is 96/72 device pixels per point -- times the
-    /// display's own scaling, which is the part that makes the number mean
-    /// the same thing on a laptop panel and an external monitor.
-    ///
-    /// Reporting `zoom` itself as a percentage is what made the title bar say
-    /// 153%: the old default was `--dpi 110`, 110/72 = 1.528, and that is a
-    /// perfectly good number to render at and a meaningless one to show
-    /// someone.
-    fn hundredPercent(r: *const Reader) f32 {
-        return r.dpi_scale * (96.0 / 72.0);
-    }
+    /// **Runs on the rasterising thread.** The zoom comes from the job rather
+    /// than from the view, because a view belongs to the frame loop and can
+    /// change underneath this at any moment.
+    fn rasterise(s: *Session, job: Job, list: gelgja.DisplayList, b: *Buffer) !Image {
+        const gpa = s.gpa;
 
-    fn percent(r: *const Reader) f32 {
-        return r.zoom / r.hundredPercent() * 100.0;
-    }
+        var zoom = job.zoom;
+        var size = replay.canvasSize(list.page, zoom);
+        while (@as(u64, size[0]) * size[1] > max_page_pixels and zoom > min_zoom) {
+            zoom *= 0.5;
+            size = replay.canvasSize(list.page, zoom);
+        }
 
-    // -- layout -------------------------------------------------------------
+        var canvas = try gleipnir.raster.Canvas.init(gpa, size[0], size[1], .{ .samples = s.samples });
+        defer canvas.deinit(gpa);
+        canvas.fb.clear(.white);
 
-    /// A page's size in device pixels, rounded exactly the way
-    /// `replay.canvasSize` rounds it, so the texture and the rectangle it is
-    /// drawn into are the same size to the pixel.
-    fn pageSize(r: *const Reader, index: usize) [2]f32 {
-        const p = r.pages[index];
+        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io);
+        defer glyphs.deinit();
+
+        var images: Images = .init(gpa, b.doc, b.pages[job.page].resources);
+        defer images.deinit();
+
+        _ = try replay.render(
+            gpa,
+            &canvas,
+            list,
+            replay.pageTransform(list.page, zoom),
+            .{ .glyphs = glyphs.source(), .images = images.source() },
+        );
+
         return .{
-            @max(1.0, @ceil(@as(f32, @floatCast(p.displayWidth())) * r.zoom)),
-            @max(1.0, @ceil(@as(f32, @floatCast(p.displayHeight())) * r.zoom)),
+            .pixels = try canvas.fb.toRgba8(gpa),
+            .width = size[0],
+            .height = size[1],
         };
     }
 
-    /// The top of page `index` in document pixels. Pages are stacked with a
-    /// fixed gap, so this is a running sum rather than a table -- documents
-    /// with thousands of pages would want the table.
-    fn pageTop(r: *const Reader, index: usize) f32 {
-        var y: f32 = gap;
-        var i: usize = 0;
-        while (i < index) : (i += 1) y += r.pageSize(i)[1] + gap;
-        return y;
+    /// One page, recorded as outlines for the GPU pipeline, in *page space*:
+    /// the page's own flip, with no zoom and no scroll in it. The curves that
+    /// come out are good at every zoom, which is what the pipeline is for --
+    /// and why two windows at two zooms share one recording.
+    fn recordPage(s: *Session, job: Job, list: gelgja.DisplayList, b: *Buffer) !Scene {
+        const gpa = s.gpa;
+
+        var scene: Scene = .{};
+        errdefer scene.deinit(gpa);
+        const size = replay.canvasSize(list.page, 1.0);
+        scene.reset(.{ @floatFromInt(size[0]), @floatFromInt(size[1]) });
+
+        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io);
+        defer glyphs.deinit();
+
+        var images: Images = .init(gpa, b.doc, b.pages[job.page].resources);
+        defer images.deinit();
+
+        _ = try replay.record(
+            gpa,
+            &scene,
+            list,
+            replay.pageTransform(list.page, 1.0),
+            .{ .glyphs = glyphs.source(), .images = images.source() },
+        );
+        return scene;
     }
 
-    fn documentHeight(r: *const Reader) f32 {
-        return r.pageTop(r.pages.len);
+    // -- the cache -----------------------------------------------------------
+
+    /// Whether a page is ready to draw for a given view.
+    ///
+    /// The two backends disagree about what "at this zoom" means, and that
+    /// difference is the whole point of the GPU one: a rasterised page is
+    /// pixels at one scale and a recorded one is curves at every scale, so a
+    /// zoom throws away the CPU cache and leaves the GPU cache untouched --
+    /// and two windows at two zooms need two CPU entries and one GPU entry.
+    fn cached(s: *const Session, v: *const View, page: u32) bool {
+        return switch (s.backend) {
+            .cpu => s.find(v.buffer, page, v.zoom) != null,
+            .gpu => s.recorded.has(v.buffer, page),
+        };
     }
 
-    fn widestPage(r: *const Reader) f32 {
-        var w: f32 = 1;
-        for (0..r.pages.len) |i| w = @max(w, r.pageSize(i)[0]);
-        return w;
-    }
-
-    fn maxScroll(r: *const Reader) f32 {
-        return @max(0, r.documentHeight() - r.viewport[1]);
-    }
-
-    fn clampScroll(r: *Reader) void {
-        r.scroll = std.math.clamp(r.scroll, 0, r.maxScroll());
-        const slack = @max(0, r.widestPage() + gap * 2 - r.viewport[0]);
-        r.pan = std.math.clamp(r.pan, -slack / 2, slack / 2);
-    }
-
-    /// The page occupying the middle of the viewport: what "which page am I
-    /// on" means when two of them are on screen at once.
-    fn currentPage(r: *const Reader) u32 {
-        const middle = r.scroll + r.viewport[1] * 0.5;
-        var i: usize = 0;
-        while (i < r.pages.len) : (i += 1) {
-            if (middle < r.pageTop(i) + r.pageSize(i)[1] + gap * 0.5) return @intCast(i);
+    fn find(s: *const Session, buf: u32, page: u32, zoom: f32) ?*const Slot {
+        for (&s.slots) |*slot| {
+            if (slot.matches(buf, page, zoom)) return slot;
         }
-        return @intCast(r.pages.len - 1);
+        return null;
     }
 
-    fn scrollToPage(r: *Reader, index: usize) void {
-        r.scroll = r.pageTop(index) - gap;
-        r.clampScroll();
+    fn slotFor(s: *Session, buf: u32, page: u32, zoom: f32) ?*Slot {
+        for (&s.slots) |*slot| {
+            if (slot.matches(buf, page, zoom)) return slot;
+        }
+        return null;
     }
 
-    /// Changes the zoom about the middle of the viewport, so the line you were
-    /// reading stays where it was rather than sliding off the top.
-    fn setZoom(r: *Reader, want: f32) void {
-        const next = std.math.clamp(want, min_zoom, max_zoom);
-        if (next == r.zoom) return;
-        // Which page, and how far down it, the middle of the screen is on.
-        const page = r.currentPage();
-        const top = r.pageTop(page);
-        const into = (r.scroll + r.viewport[1] * 0.5 - top) / @max(1, r.pageSize(page)[1]);
-
-        r.zoom = next;
-        r.scroll = r.pageTop(page) + into * r.pageSize(page)[1] - r.viewport[1] * 0.5;
-        r.clampScroll();
-        r.dirty_title = true;
+    /// The first page any window needs and has not got.
+    ///
+    /// Windows are asked in layout order and pages top-down within each, so a
+    /// fresh split fills in the way a person reads rather than in page order.
+    /// The focused window goes first, because that is the one being looked at.
+    fn firstMissing(s: *Session) ?Job {
+        if (s.missingIn(s.layout.current())) |job| return job;
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            if (s.missingIn(v)) |job| return job;
+        }
+        return null;
     }
 
-    fn fitWidth(r: *Reader) void {
-        const page = r.currentPage();
-        const points: f32 = @floatCast(r.pages[page].displayWidth());
-        if (points > 0) r.setZoom((r.viewport[0] - gap * 2) / points);
-        r.pan = 0;
+    fn missingIn(s: *Session, v: *View) ?Job {
+        const range = v.visiblePages();
+        var i = range.first;
+        while (i < range.end) : (i += 1) {
+            const job: Job = .{ .buffer = v.buffer, .page = i, .zoom = v.zoom };
+            if (s.failed(job)) continue;
+            if (!s.cached(v, i)) return job;
+        }
+        // The cursor needs a text map even for a page whose pixels are
+        // already cached -- a window that has not moved since the map was
+        // evicted would otherwise have a cursor that cannot cross a page.
+        if (v.cursor.visible and !s.buffer(v.buffer).hasMap(v.cursor.page)) {
+            const job: Job = .{ .buffer = v.buffer, .page = v.cursor.page, .zoom = v.zoom };
+            if (!s.failed(job)) return job;
+        }
+        // A selection's text on every page it spans, so a selection extended
+        // off the screen still draws -- a few pages each way, not a whole
+        // chapter's worth of interpretation for one held key.
+        if (v.selection()) |sel| {
+            const last = @min(sel[1].page, sel[0].page + 8);
+            var page = sel[0].page;
+            while (page <= last and page < v.pages.len) : (page += 1) {
+                if (s.buffer(v.buffer).hasMap(page)) continue;
+                const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom };
+                if (!s.failed(job)) return job;
+            }
+        }
+        return null;
     }
 
-    // -- one frame, with no device ------------------------------------------
+    /// Takes whatever the rasterising thread finished and puts it away,
+    /// returning the pixel buffer the caller must keep alive until the frame
+    /// has been submitted -- `Upload.pixels` is read during `frame`.
+    fn collectPage(
+        s: *Session,
+        worker: *Rasteriser,
+        renderer: *lyngvi.Renderer,
+        list: *DrawList,
+        uploads: *std.ArrayList(lyngvi.Renderer.Upload),
+    ) !?[]u8 {
+        const gpa = s.gpa;
+        var finished = worker.collect() orelse return null;
+
+        if (finished.map) |map| {
+            s.buffer(finished.job.buffer).putMap(gpa, finished.job.page, map);
+            finished.map = null;
+        }
+
+        const result = finished.result orelse {
+            // A page that will not interpret is a blank page, not a dead
+            // reader. Remembering that it failed is what stops the loop
+            // asking for it again on every frame for the rest of the session.
+            s.noteFailure(finished.job);
+            return null;
+        };
+
+        if (result == .gpu) {
+            // The recording is in page space, so a zoom change does not make
+            // it stale the way it makes a rasterised page stale.
+            var source = result.gpu;
+            errdefer source.deinit(gpa);
+            try s.recorded.insert(gpa, finished.job.buffer, finished.job.page, source);
+            s.pages_rendered += 1;
+            s.placed = null;
+            return null;
+        }
+
+        const image = result.cpu;
+        errdefer gpa.free(image.pixels);
+
+        // The zoom may have changed while this was rendering, which makes the
+        // image the right picture at the wrong size. Caching it would put a
+        // stale page on screen that never refreshes.
+        if (!s.wantedNow(finished.job)) {
+            gpa.free(image.pixels);
+            return null;
+        }
+
+        const slot = try s.claim(renderer, list, image.width, image.height);
+        slot.buffer = finished.job.buffer;
+        slot.page = finished.job.page;
+        slot.zoom = finished.job.zoom;
+        slot.width = image.width;
+        slot.height = image.height;
+        slot.used = s.stamp;
+
+        try uploads.append(gpa, .{
+            .texture = slot.gpu,
+            .x = 0,
+            .y = 0,
+            .w = image.width,
+            .h = image.height,
+            .pixels = image.pixels,
+            .stride = image.width * 4,
+        });
+        s.pages_rendered += 1;
+        return image.pixels;
+    }
+
+    /// Whether any window still wants this exact job. With one window that is
+    /// "did the zoom change"; with four it is a question that has to be asked
+    /// of all of them, because the window that asked may have closed while
+    /// another one still wants the page.
+    fn wantedNow(s: *Session, job: Job) bool {
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            if (v.buffer == job.buffer and v.zoom == job.zoom) return true;
+        }
+        return false;
+    }
+
+    /// A slot to render into: an unused one, then the stalest, with its
+    /// texture resized if the page is a different size from the last thing
+    /// that lived there.
+    fn claim(
+        s: *Session,
+        renderer: *lyngvi.Renderer,
+        list: *DrawList,
+        width: u32,
+        height: u32,
+    ) !*Slot {
+        var chosen: usize = 0;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (&s.slots, 0..) |*slot, i| {
+            if (slot.gpu == 0) {
+                // Never used: create the pair of registrations now. They are
+                // handed out in creation order by both sides, which is what
+                // makes the two ids equal -- checked, not trusted.
+                const gpu = try renderer.createTexture(width, height, .color);
+                const in_list = try list.registerTexture(width, height);
+                std.debug.assert(gpu == in_list);
+                slot.gpu = gpu;
+                slot.list = in_list;
+                slot.width = width;
+                slot.height = height;
+                return slot;
+            }
+            if (slot.used < oldest) {
+                oldest = slot.used;
+                chosen = i;
+            }
+        }
+
+        const slot = &s.slots[chosen];
+        if (slot.width != width or slot.height != height) {
+            // A device-wide wait. Only on a zoom change or a document whose
+            // pages differ in size, which is not per frame.
+            try renderer.resizeTexture(slot.gpu, width, height);
+            list.setTextureSize(slot.list, width, height);
+        }
+        return slot;
+    }
+
+    // -- the cursor ----------------------------------------------------------
+
+    /// Moves the focused window's cursor, fetching the neighbouring page's
+    /// text map when the cursor runs off the end of this one.
+    ///
+    /// A move that needs a map which is not built yet does nothing this
+    /// frame: `missingIn` will ask for it, and the next press works. That is
+    /// the same bargain as a page that is still blank paper.
+    fn moveCursor(s: *Session, step: View.Step) void {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        if (v.cursor.page >= v.pages.len) v.cursor.page = v.currentPage();
+
+        // A cursor being shown for the first time appears on the page in
+        // front of you, not on whichever page it was left on.
+        if (!v.cursor.visible) v.cursor.page = v.currentPage();
+
+        const map = b.textMap(v.cursor.page) orelse {
+            v.cursor.visible = true;
+            return;
+        };
+
+        switch (v.moveCursor(step, map)) {
+            .moved, .blocked => {},
+            .page_above => {
+                if (v.cursor.page == 0) return;
+                const above = v.cursor.page - 1;
+                const other = b.textMap(above) orelse return;
+                v.enterPage(above, other, step);
+            },
+            .page_below => {
+                if (v.cursor.page + 1 >= v.pages.len) return;
+                const below = v.cursor.page + 1;
+                const other = b.textMap(below) orelse return;
+                v.enterPage(below, other, step);
+            },
+        }
+        v.scrollToCursor();
+    }
+
+    /// Makes sure the focused window has a caret to work from: the one it
+    /// has, or one at the top of the page in front of the reader. Returns
+    /// false when that page's text is not ready yet.
+    fn ensureCursor(s: *Session) bool {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        if (!v.cursor.visible or v.cursor.page >= v.pages.len) {
+            const page = v.currentPage();
+            const map = b.textMap(page) orelse {
+                v.cursor.page = page;
+                v.cursor.visible = true;
+                return false;
+            };
+            v.cursorToPage(page, map, false);
+            return true;
+        }
+        return b.hasMap(v.cursor.page);
+    }
+
+    /// The text position under a window point, or null if it is not over
+    /// text whose map is ready.
+    fn positionAt(s: *Session, v: *View, p: Point) ?View.Position {
+        const page = v.pageAt(p) orelse return null;
+        const at = v.userSpaceAt(page, p) orelse return null;
+        const map = s.buffer(v.buffer).textMap(page) orelse return null;
+        if (map.isEmpty()) return null;
+        const line = map.lineAt(at.y);
+        return .{ .page = page, .line = line, .column = map.columnAt(line, at.x) };
+    }
+
+    // -- highlights ----------------------------------------------------------
+
+    /// One box on one page: what a selection and a highlight are made of.
+    const PageBox = struct { page: u32, box: Bounds };
+
+    /// The colour a digit names. `1` is the accent colour, so the key a person
+    /// reaches for first gives the colour they chose; the rest are the named
+    /// colours `fenrir config accent` accepts, in rainbow order.
+    fn paletteColor(s: *const Session, index: ?u8) Color {
+        const names = [_][]const u8{ "yellow", "green", "blue", "pink", "orange", "purple", "red" };
+        const i = index orelse return s.accent;
+        if (i == 0 or i > names.len) return s.accent;
+        return Library.parseColor(names[i - 1]).?;
+    }
+
+    /// The glyphs between two text positions, as one box per line per page.
+    ///
+    /// Inclusive of both ends, as a Vim selection is: `v` on a letter selects
+    /// that letter. `lines` widens every line to its whole length, which is
+    /// `V`. Pages whose text is not ready are skipped rather than waited for;
+    /// `missingIn` asks for them, and the selection fills in a frame later.
+    fn selectionBoxes(
+        s: *Session,
+        buffer_index: u32,
+        from: View.Position,
+        to: View.Position,
+        lines: bool,
+        out: *std.ArrayList(PageBox),
+    ) !void {
+        out.clearRetainingCapacity();
+        const b = s.buffer(buffer_index);
+        const ends = View.Position.ordered(from, to);
+
+        var page = ends[0].page;
+        while (page <= ends[1].page and page < b.pages.len) : (page += 1) {
+            const map = b.textMap(page) orelse continue;
+            if (map.isEmpty()) continue;
+            const last_line: u32 = @intCast(map.lines.len - 1);
+
+            const first = if (page == ends[0].page) @min(ends[0].line, last_line) else 0;
+            const last = if (page == ends[1].page) @min(ends[1].line, last_line) else last_line;
+
+            var line = first;
+            while (line <= last) : (line += 1) {
+                const glyphs = map.lines[line].glyphs(map);
+                const starts_here = !lines and page == ends[0].page and line == ends[0].line;
+                const ends_here = !lines and page == ends[1].page and line == ends[1].line;
+                const lo: usize = if (starts_here) @min(ends[0].column, glyphs.len) else 0;
+                const hi: usize = if (ends_here) @min(ends[1].column + 1, glyphs.len) else glyphs.len;
+                if (lo >= hi) continue;
+
+                var box: Bounds = .empty;
+                for (glyphs[lo..hi]) |g| box = box.unionWith(g.box);
+                if (!box.isEmpty()) try out.append(s.gpa, .{ .page = page, .box = box });
+            }
+        }
+    }
+
+    /// Highlights a run of boxes as one undo step.
+    ///
+    /// A box laid mostly over an existing highlight replaces it rather than
+    /// stacking on it, so selecting highlighted words and pressing `3`
+    /// recolours them instead of darkening them.
+    fn highlightBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color) void {
+        const b = s.buffer(buffer_index);
+        b.marks.beginGroup();
+        defer b.marks.beginGroup();
+
+        for (boxes) |pb| {
+            var i = b.marks.count();
+            while (i > 0) {
+                i -= 1;
+                const mark = b.marks.items()[i];
+                if (mark.page != pb.page) continue;
+                const shared = mark.box.intersect(pb.box);
+                if (shared.isEmpty()) continue;
+                if (area(shared) < area(mark.box) * 0.5) continue;
+                _ = b.marks.removeAt(s.gpa, i) catch return;
+            }
+            _ = b.marks.add(s.gpa, .{ .page = pb.page, .box = pb.box, .color = color }, false) catch return;
+        }
+    }
+
+    fn area(box: Bounds) f32 {
+        if (box.isEmpty()) return 0;
+        return box.width() * box.height();
+    }
+
+    /// `m` in normal mode: highlight the cursor's line, or remove the
+    /// highlight the cursor is inside.
+    fn toggleMark(s: *Session) void {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        if (!v.cursor.visible or v.cursor.caret.isEmpty()) return;
+
+        const at: Point = .{
+            .x = v.cursor.caret.min_x,
+            .y = (v.cursor.caret.min_y + v.cursor.caret.max_y) * 0.5,
+        };
+        if (b.marks.at(v.cursor.page, at)) |index| {
+            b.marks.beginGroup();
+            _ = b.marks.removeAt(s.gpa, index) catch {};
+            return;
+        }
+
+        const map = b.textMap(v.cursor.page) orelse return;
+        if (map.isEmpty()) return;
+        const line = map.lines[@min(v.cursor.line, map.lines.len - 1)];
+        s.highlightBoxes(v.buffer, &.{.{ .page = v.cursor.page, .box = line.box }}, s.accent);
+    }
+
+    fn clearMarks(s: *Session) void {
+        const b = s.buffer(s.view().buffer);
+        b.marks.clear(s.gpa) catch {};
+        s.status = if (b.marks.canUndo()) "highlights cleared -- u to bring them back" else "";
+    }
+
+    /// Visual mode's `m`, `y`, enter or a digit.
+    fn highlightSelection(s: *Session, colour: ?u8) void {
+        const v = s.view();
+        const sel = v.selection() orelse return;
+        defer v.endSelection();
+
+        var boxes: std.ArrayList(PageBox) = .empty;
+        defer boxes.deinit(s.gpa);
+        s.selectionBoxes(v.buffer, sel[0], sel[1], s.lineSelection(), &boxes) catch return;
+        s.highlightBoxes(v.buffer, boxes.items, s.paletteColor(colour));
+    }
+
+    /// Visual mode's `d`: every highlight the selection touches goes.
+    fn unhighlightSelection(s: *Session) void {
+        const v = s.view();
+        const sel = v.selection() orelse return;
+        defer v.endSelection();
+        const b = s.buffer(v.buffer);
+
+        var boxes: std.ArrayList(PageBox) = .empty;
+        defer boxes.deinit(s.gpa);
+        s.selectionBoxes(v.buffer, sel[0], sel[1], s.lineSelection(), &boxes) catch return;
+
+        b.marks.beginGroup();
+        defer b.marks.beginGroup();
+        var removed: u32 = 0;
+        var i = b.marks.count();
+        while (i > 0) {
+            i -= 1;
+            const mark = b.marks.items()[i];
+            for (boxes.items) |pb| {
+                if (pb.page != mark.page or mark.box.intersect(pb.box).isEmpty()) continue;
+                _ = b.marks.removeAt(s.gpa, i) catch return;
+                removed += 1;
+                break;
+            }
+        }
+        if (removed == 0) s.status = "no highlights in the selection";
+    }
+
+    fn lineSelection(s: *const Session) bool {
+        return s.keymap.mode == .visual_line or (s.keymap.mode == .normal and s.last_visual_line);
+    }
+
+    // -- edit mode -----------------------------------------------------------
+
+    /// `i`: take hold of the highlight at or after the cursor.
+    fn enterEdit(s: *Session) void {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        if (b.marks.count() == 0) {
+            s.keymap.mode = .normal;
+            s.status = "no highlights to edit -- select text with v and press m";
+            return;
+        }
+
+        const key = if (v.cursor.visible and !v.cursor.caret.isEmpty())
+            b.marks.atOrAfter(v.cursor.page, .{
+                .x = v.cursor.caret.min_x,
+                .y = (v.cursor.caret.min_y + v.cursor.caret.max_y) * 0.5,
+            })
+        else blk: {
+            const page = v.currentPage();
+            break :blk b.marks.atOrAfter(page, .{ .x = 0, .y = v.pageBox(page).max_y });
+        };
+        s.focusMark(key);
+    }
+
+    /// Puts a highlight in hand: scrolls to it, and brings the cursor along so
+    /// that leaving edit mode leaves you where you were working.
+    fn focusMark(s: *Session, key: ?u64) void {
+        s.focus_mark = key;
+        const k = key orelse return;
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        const mark = b.marks.byKey(k) orelse return;
+        if (mark.page >= v.pages.len) return;
+
+        v.scrollToBox(mark.page, mark.box);
+        if (b.textMap(mark.page)) |map| {
+            if (!map.isEmpty()) {
+                const line = map.lineAt((mark.box.min_y + mark.box.max_y) * 0.5);
+                v.cursorTo(.{
+                    .page = mark.page,
+                    .line = line,
+                    .column = map.columnAt(line, mark.box.min_x),
+                }, map);
+            }
+        }
+    }
+
+    fn focusedMarkIndex(s: *Session) ?usize {
+        const key = s.focus_mark orelse return null;
+        return s.buffer(s.view().buffer).marks.indexOf(key);
+    }
+
+    fn stepMark(s: *Session, forwards: bool) void {
+        const b = s.buffer(s.view().buffer);
+        s.focusMark(b.marks.step(s.focus_mark, forwards));
+    }
+
+    fn recolourMark(s: *Session, colour: u8) void {
+        const i = s.focusedMarkIndex() orelse return;
+        const b = s.buffer(s.view().buffer);
+        b.marks.beginGroup();
+        b.marks.recolour(s.gpa, i, s.paletteColor(colour)) catch {};
+    }
+
+    /// `d` in edit mode: delete the highlight in hand and take hold of the
+    /// next one, so that deleting several in a row is `ddd`.
+    fn deleteMark(s: *Session) void {
+        const i = s.focusedMarkIndex() orelse return;
+        const b = s.buffer(s.view().buffer);
+        const next = b.marks.step(s.focus_mark, true);
+
+        b.marks.beginGroup();
+        _ = b.marks.removeAt(s.gpa, i) catch return;
+
+        if (b.marks.count() == 0) {
+            s.focus_mark = null;
+            s.keymap.mode = .normal;
+            s.status = "that was the last highlight";
+            return;
+        }
+        s.focusMark(if (next != s.focus_mark) next else b.marks.step(null, true));
+    }
+
+    fn beginNote(s: *Session) void {
+        const i = s.focusedMarkIndex() orelse {
+            s.keymap.mode = if (s.buffer(s.view().buffer).marks.count() == 0) .normal else .edit;
+            return;
+        };
+        s.note.clearRetainingCapacity();
+        s.note.appendSlice(s.gpa, s.buffer(s.view().buffer).marks.items()[i].note) catch {};
+    }
+
+    fn noteChar(s: *Session, c: u21) void {
+        if (s.note.items.len >= max_note) return;
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(c, &buf) catch return;
+        s.note.appendSlice(s.gpa, buf[0..n]) catch {};
+    }
+
+    /// Removes the last *character*, not the last byte: a note is UTF-8, and
+    /// cutting an accented letter in half leaves a note the library would
+    /// store as invalid text.
+    fn noteBackspace(s: *Session) void {
+        var n = s.note.items.len;
+        if (n == 0) return;
+        n -= 1;
+        while (n > 0 and s.note.items[n] & 0xc0 == 0x80) n -= 1;
+        s.note.shrinkRetainingCapacity(n);
+    }
+
+    fn commitNote(s: *Session) void {
+        defer s.note.clearRetainingCapacity();
+        const i = s.focusedMarkIndex() orelse return;
+        const b = s.buffer(s.view().buffer);
+        b.marks.beginGroup();
+        b.marks.setNote(s.gpa, i, s.note.items) catch {};
+    }
+
+    /// A note is a line of text on a highlight, not an essay. Bounded so that
+    /// a key held down does not fill the title bar, and the database, with a
+    /// megabyte of one letter.
+    const max_note = 1024;
+
+    fn undoMarks(s: *Session, forwards: bool) void {
+        const b = s.buffer(s.view().buffer);
+        const done = (if (forwards) b.marks.redo(s.gpa) else b.marks.undo(s.gpa)) catch false;
+        if (!done) {
+            s.status = if (forwards) "already at newest change" else "already at oldest change";
+            return;
+        }
+        // The highlight in hand may be the thing that was undone.
+        if (s.focus_mark) |k| {
+            if (b.marks.indexOf(k) == null) {
+                s.focus_mark = null;
+                if (s.keymap.mode == .edit) s.enterEdit();
+            }
+        }
+    }
+
+    // -- the library ---------------------------------------------------------
+
+    /// Writes whatever the highlights' history says has changed. Once a frame,
+    /// after the commands, so that a burst of edits is written as it settles
+    /// rather than one statement per keystroke inside the handler.
+    fn applyEffects(s: *Session) void {
+        for (s.buffers.items) |*b| {
+            if (b.marks.takeEffects().len == 0) continue;
+
+            // Taken out of the buffer before anything is told about them: a
+            // plugin handler for `highlight` may make another change, and
+            // that change belongs to the next pass rather than to this list.
+            const effects = s.gpa.dupe(Marks.Effect, b.marks.takeEffects()) catch continue;
+            defer s.gpa.free(effects);
+            b.marks.clearEffects();
+
+            for (effects) |e| {
+                s.writeEffect(b, e);
+                s.announceEffect(b, e);
+            }
+        }
+    }
+
+    fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
+        const lib = s.library orelse return;
+        switch (e) {
+            .insert => |key| {
+                const mark = b.marks.byKey(key) orelse return;
+                var hex: [7]u8 = undefined;
+                const id = lib.addHighlight(b.path, .{
+                    .page = mark.page,
+                    .x0 = mark.box.min_x,
+                    .y0 = mark.box.min_y,
+                    .x1 = mark.box.max_x,
+                    .y1 = mark.box.max_y,
+                    .color = @constCast(hexOf(mark.color, &hex)),
+                    .note = @constCast(mark.note),
+                }, s.now()) catch return;
+                b.marks.setId(key, id);
+            },
+            .delete => |mark| if (mark.saved()) lib.removeHighlight(mark.id) catch {},
+            .update => |key| {
+                const mark = b.marks.byKey(key) orelse return;
+                if (!mark.saved()) return;
+                var hex: [7]u8 = undefined;
+                lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note) catch {};
+            },
+        }
+    }
+
+    fn announceEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
+        const rt = s.plugins orelse return;
+        const action: []const u8, const mark: Marks.Mark = switch (e) {
+            .insert => |key| .{ "add", (b.marks.byKey(key) orelse return).* },
+            .update => |key| .{ "change", (b.marks.byKey(key) orelse return).* },
+            .delete => |m| .{ "remove", m },
+        };
+        var hex: [7]u8 = undefined;
+        rt.emit(.{ .highlight = .{ .action = action, .highlight = .{
+            .id = mark.key,
+            .page = mark.page + 1,
+            .x0 = mark.box.min_x,
+            .y0 = mark.box.min_y,
+            .x1 = mark.box.max_x,
+            .y1 = mark.box.max_y,
+            .color = hexOf(mark.color, &hex),
+            .note = mark.note,
+        } } });
+    }
+
+    fn hexOf(c: Color, buf: *[7]u8) []const u8 {
+        const byte = struct {
+            fn of(v: f32) u8 {
+                return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
+            }
+        }.of;
+        return std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ byte(c.r), byte(c.g), byte(c.b) }) catch unreachable;
+    }
+
+    fn now(s: *const Session) i64 {
+        const io = s.io orelse return 0;
+        return library.now(io);
+    }
+
+    // -- plugins, and the command line --------------------------------------
+
+    /// Finds the configuration directory, starts Galdr, and runs `init.lua`
+    /// and the plugins. Nothing here can stop the reader opening: a build
+    /// without Lua, a machine without a home, or a broken plugin each leave a
+    /// reader that works and a message saying what did not.
+    fn startPlugins(s: *Session, dir: ?[]const u8) void {
+        if (!galdr.available) return;
+        s.config_dir = if (dir) |d|
+            s.gpa.dupe(u8, d) catch return
+        else
+            galdr.configDir(s.gpa, library.environment(s.ctx)) catch return;
+
+        const rt = galdr.Runtime.create(s.gpa, s.host(), .{}) catch |err| {
+            s.ctx.note("plugins are off: {t}", .{err});
+            return;
+        };
+        s.plugins = rt;
+        rt.loadConfig();
+
+        var broken: usize = 0;
+        for (rt.plugins.items) |p| {
+            if (!p.ok) broken += 1;
+        }
+        if (broken != 0) {
+            s.ctx.note("{d} of {d} plugins failed to load; :messages shows why", .{ broken, rt.plugins.items.len });
+            for (rt.messages.items) |m| s.ctx.note("{s}", .{m});
+        }
+
+        for (s.buffers.items) |b| {
+            rt.emit(.{ .open = .{ .path = b.path, .title = b.title, .pages = @intCast(b.pages.len) } });
+        }
+    }
+
+    /// Puts a message of any lifetime on the message line.
+    fn say(s: *Session, comptime fmt: []const u8, args: anytype) void {
+        s.status = std.fmt.bufPrint(&s.status_buf, fmt, args) catch blk: {
+            // Too long for the line: as much as fits.
+            const n = @min(s.status_buf.len, fmt.len);
+            @memcpy(s.status_buf[0..n], fmt[0..n]);
+            break :blk s.status_buf[0..n];
+        };
+        s.dirty_title = true;
+    }
+
+    /// Runs a `:` command line. The built-in commands first, then the ones
+    /// plugins registered, so that a plugin cannot make `:q` mean something
+    /// else by accident.
+    ///
+    /// Returns false when the line did nothing, having said why.
+    fn exec(s: *Session, raw: []const u8) bool {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len == 0) return true;
+
+        // `:12` is page 12, as it is line 12 in Vim.
+        if (std.fmt.parseInt(u32, line, 10)) |page| {
+            return s.goToPage(page);
+        } else |_| {}
+
+        const space = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+        const name = line[0..space];
+        const args = std.mem.trim(u8, line[space..], " \t");
+        const v = s.view();
+
+        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, bn, bnext, bp, bprevious, page, zoom, fit, undo, redo, marks, lua, messages, plugins, echo };
+        const which = std.meta.stringToEnum(Builtin, name) orelse {
+            if (s.plugins) |rt| {
+                if (rt.runCommand(name, args)) |ran| return ran;
+            }
+            s.say("not a command: {s}", .{name[0..@min(name.len, 64)]});
+            return false;
+        };
+
+        switch (which) {
+            .q, .quit => {
+                if (!s.closeWindow()) s.quit = true;
+            },
+            .qa, .qall => s.quit = true,
+            .sp, .split => s.splitWindow(.horizontal),
+            .vs, .vsplit => s.splitWindow(.vertical),
+            .close => _ = s.closeWindow(),
+            .only => s.layout.only(s.gpa),
+            .bn, .bnext => s.showBuffer(1),
+            .bp, .bprevious => s.showBuffer(-1),
+            .page => {
+                // `:page 12`, `:page +2`, `:page -1`.
+                const relative = args.len > 0 and (args[0] == '+' or args[0] == '-');
+                const n = std.fmt.parseInt(i64, args, 10) catch {
+                    s.say(":page takes a number, or +N / -N", .{});
+                    return false;
+                };
+                const current: i64 = v.currentPage() + 1;
+                const target = if (relative) current + n else n;
+                return s.goToPage(@intCast(std.math.clamp(target, 1, @as(i64, @intCast(v.pages.len)))));
+            },
+            .zoom => {
+                const percent = std.fmt.parseFloat(f32, std.mem.trimEnd(u8, args, "%")) catch {
+                    s.say(":zoom takes a percentage, like :zoom 150", .{});
+                    return false;
+                };
+                if (!(percent > 0) or !std.math.isFinite(percent)) return false;
+                v.setZoom(v.hundredPercent() * percent / 100);
+            },
+            .fit => v.fitWidth(),
+            .undo => s.undoMarks(false),
+            .redo => s.undoMarks(true),
+            .marks => {
+                if (std.mem.eql(u8, args, "clear")) {
+                    s.clearMarks();
+                } else {
+                    s.say("{d} highlights in this document", .{s.buffer(v.buffer).marks.count()});
+                }
+            },
+            .lua => {
+                const rt = s.plugins orelse {
+                    s.say("plugins are off in this reader", .{});
+                    return false;
+                };
+                return rt.runString(":lua", args);
+            },
+            .messages => {
+                const rt = s.plugins orelse {
+                    s.say("plugins are off in this reader", .{});
+                    return false;
+                };
+                if (rt.messages.items.len == 0) {
+                    s.say("no messages", .{});
+                } else {
+                    // The title bar holds one line; stderr has them all.
+                    for (rt.messages.items) |m| s.ctx.note("{s}", .{m});
+                    const last = rt.messages.items[rt.messages.items.len - 1];
+                    s.say("{d} messages, the last: {s}", .{
+                        rt.messages.items.len,
+                        std.mem.sliceTo(last, '\n')[0..@min(std.mem.sliceTo(last, '\n').len, 300)],
+                    });
+                }
+            },
+            .plugins => {
+                const rt = s.plugins orelse {
+                    s.say("plugins are off in this reader", .{});
+                    return false;
+                };
+                var w: std.Io.Writer = .fixed(&s.status_buf);
+                w.print("{d} loaded:", .{rt.plugins.items.len}) catch {};
+                for (rt.plugins.items) |p| {
+                    w.print(" {s}{s}", .{ p.name, if (p.ok) "" else " (failed)" }) catch break;
+                }
+                s.status = s.status_buf[0..w.end];
+                s.dirty_title = true;
+            },
+            .echo => s.say("{s}", .{args[0..@min(args.len, 400)]}),
+        }
+        return true;
+    }
+
+    fn goToPage(s: *Session, page: u32) bool {
+        const v = s.view();
+        if (page < 1 or page > v.pages.len) {
+            s.say("page {d}: this document has {d} pages", .{ page, v.pages.len });
+            return false;
+        }
+        v.scrollToPage(page - 1);
+        return true;
+    }
+
+    // -- Galdr's view of the reader ------------------------------------------
+
+    fn host(s: *Session) galdr.Host {
+        return .{ .ptr = s, .vtable = &host_vtable };
+    }
+
+    fn hostSession(ptr: *anyopaque) *Session {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    const host_vtable: galdr.Host.VTable = .{
+        .notify = hostNotify,
+        .exec = hostExec,
+        .document = hostDocument,
+        .page = hostPage,
+        .goTo = hostGoTo,
+        .zoom = hostZoom,
+        .setZoom = hostSetZoom,
+        .mode = hostMode,
+        .cursor = hostCursor,
+        .selection = hostSelection,
+        .highlightCount = hostHighlightCount,
+        .highlightAt = hostHighlightAt,
+        .addHighlight = hostAddHighlight,
+        .removeHighlight = hostRemoveHighlight,
+        .storeGet = hostStoreGet,
+        .storeSet = hostStoreSet,
+        .readFile = hostReadFile,
+        .listDir = hostListDir,
+    };
+
+    fn hostNotify(ptr: *anyopaque, message: []const u8) void {
+        hostSession(ptr).say("{s}", .{message[0..@min(message.len, 480)]});
+    }
+
+    fn hostExec(ptr: *anyopaque, line: []const u8) bool {
+        return hostSession(ptr).exec(line);
+    }
+
+    fn hostDocument(ptr: *anyopaque) ?galdr.Host.Document {
+        const s = hostSession(ptr);
+        if (s.buffers.items.len == 0) return null;
+        const b = s.buffer(s.view().buffer);
+        return .{ .path = b.path, .title = b.title, .pages = @intCast(b.pages.len) };
+    }
+
+    fn hostPage(ptr: *anyopaque) ?u32 {
+        return hostSession(ptr).view().currentPage() + 1;
+    }
+
+    fn hostGoTo(ptr: *anyopaque, page: u32, offset: f32) bool {
+        const s = hostSession(ptr);
+        const v = s.view();
+        if (page < 1 or page > v.pages.len) return false;
+        v.goTo(.{ .page = page - 1, .offset = offset, .zoom = v.zoom });
+        return true;
+    }
+
+    fn hostZoom(ptr: *anyopaque) ?f32 {
+        return hostSession(ptr).view().percent();
+    }
+
+    fn hostSetZoom(ptr: *anyopaque, percent: f32) void {
+        const v = hostSession(ptr).view();
+        v.setZoom(v.hundredPercent() * percent / 100);
+    }
+
+    fn hostMode(ptr: *anyopaque) []const u8 {
+        return @tagName(hostSession(ptr).keymap.mode);
+    }
+
+    fn fromOne(p: View.Position) galdr.Host.Position {
+        return .{ .page = p.page + 1, .line = p.line + 1, .column = p.column + 1 };
+    }
+
+    fn hostCursor(ptr: *anyopaque) ?galdr.Host.Position {
+        const v = hostSession(ptr).view();
+        if (!v.cursor.visible) return null;
+        return fromOne(v.cursor.position());
+    }
+
+    fn hostSelection(ptr: *anyopaque) ?[2]galdr.Host.Position {
+        const sel = hostSession(ptr).view().selection() orelse return null;
+        return .{ fromOne(sel[0]), fromOne(sel[1]) };
+    }
+
+    fn hostHighlightCount(ptr: *anyopaque) usize {
+        const s = hostSession(ptr);
+        return s.buffer(s.view().buffer).marks.count();
+    }
+
+    fn hostHighlightAt(ptr: *anyopaque, index: usize) ?galdr.Host.Highlight {
+        const s = hostSession(ptr);
+        const marks = s.buffer(s.view().buffer).marks.items();
+        if (index >= marks.len) return null;
+        const m = marks[index];
+        return .{
+            .id = m.key,
+            .page = m.page + 1,
+            .x0 = m.box.min_x,
+            .y0 = m.box.min_y,
+            .x1 = m.box.max_x,
+            .y1 = m.box.max_y,
+            // Valid until the next call, which Galdr does not make until it
+            // has copied this one into Lua.
+            .color = hexOf(m.color, &s.hex_buf),
+            .note = m.note,
+        };
+    }
+
+    fn hostAddHighlight(ptr: *anyopaque, h: galdr.Host.Highlight) ?u64 {
+        const s = hostSession(ptr);
+        const v = s.view();
+        if (h.page < 1 or h.page > v.pages.len) return null;
+        const b = s.buffer(v.buffer);
+        const color = if (h.color.len == 0) s.accent else Library.parseColor(h.color) orelse s.accent;
+
+        b.marks.beginGroup();
+        defer b.marks.beginGroup();
+        const index = b.marks.add(s.gpa, .{
+            .page = h.page - 1,
+            .box = .fromRect(@min(h.x0, h.x1), @min(h.y0, h.y1), @max(h.x0, h.x1), @max(h.y0, h.y1)),
+            .color = color,
+            .note = h.note,
+        }, false) catch return null;
+        return b.marks.items()[index].key;
+    }
+
+    fn hostRemoveHighlight(ptr: *anyopaque, id: u64) bool {
+        const s = hostSession(ptr);
+        const b = s.buffer(s.view().buffer);
+        const index = b.marks.indexOf(id) orelse return false;
+        b.marks.beginGroup();
+        defer b.marks.beginGroup();
+        return (b.marks.removeAt(s.gpa, index) catch null) != null;
+    }
+
+    /// Plugin values live in Mímir's settings, under `galdr.`, so that
+    /// `fenrir config` shows them and a plugin cannot overwrite `author`.
+    fn storeKey(buf: []u8, key: []const u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "galdr.{s}", .{key}) catch null;
+    }
+
+    fn hostStoreGet(ptr: *anyopaque, gpa: Allocator, key: []const u8) ?[]u8 {
+        const s = hostSession(ptr);
+        const lib = s.library orelse return null;
+        var buf: [256]u8 = undefined;
+        const full = storeKey(&buf, key) orelse return null;
+        const value = (lib.get(full) catch return null) orelse return null;
+        // The library allocated with the reader's heap; hand back the
+        // caller's allocation, as the interface promises.
+        defer s.gpa.free(value);
+        return gpa.dupe(u8, value) catch null;
+    }
+
+    fn hostStoreSet(ptr: *anyopaque, key: []const u8, value: ?[]const u8) bool {
+        const s = hostSession(ptr);
+        const lib = s.library orelse return false;
+        var buf: [256]u8 = undefined;
+        const full = storeKey(&buf, key) orelse return false;
+        if (value) |val| {
+            lib.set(full, val) catch return false;
+        } else {
+            lib.remove(full) catch return false;
+        }
+        return true;
+    }
+
+    fn configPath(s: *Session, buf: []u8, rel: []const u8) ?[]const u8 {
+        const dir = s.config_dir orelse return null;
+        if (!galdr.Host.isContained(rel)) return null;
+        return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, rel }) catch null;
+    }
+
+    fn hostReadFile(ptr: *anyopaque, gpa: Allocator, rel: []const u8) ?[]u8 {
+        const s = hostSession(ptr);
+        var buf: [4096]u8 = undefined;
+        const full = s.configPath(&buf, rel) orelse return null;
+        const io = s.io orelse return null;
+        // A plugin is source code, not a document: a megabyte is far past
+        // any real one.
+        return Io.Dir.cwd().readFileAlloc(io, full, gpa, .limited(1 << 20)) catch null;
+    }
+
+    fn hostListDir(ptr: *anyopaque, gpa: Allocator, rel: []const u8) ?[][]u8 {
+        const s = hostSession(ptr);
+        var buf: [4096]u8 = undefined;
+        const full = s.configPath(&buf, rel) orelse return null;
+        const io = s.io orelse return null;
+
+        var dir = Io.Dir.cwd().openDir(io, full, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
+
+        var names: std.ArrayList([]u8) = .empty;
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            const name = switch (entry.kind) {
+                .directory => std.fmt.allocPrint(gpa, "{s}/", .{entry.name}),
+                .file, .sym_link => gpa.dupe(u8, entry.name),
+                else => continue,
+            } catch {
+                galdr.Host.freeList(gpa, names.toOwnedSlice(gpa) catch return null);
+                return null;
+            };
+            names.append(gpa, name) catch {
+                gpa.free(name);
+                galdr.Host.freeList(gpa, names.toOwnedSlice(gpa) catch return null);
+                return null;
+            };
+        }
+        // In order of name, so that plugins load in the same order on every
+        // file system -- which directory order is not.
+        std.mem.sort([]u8, names.items, {}, struct {
+            fn less(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        return names.toOwnedSlice(gpa) catch null;
+    }
+
+    // -- input ---------------------------------------------------------------
+
+    /// Returns true when the reader should close.
+    fn handle(s: *Session, in: lyngvi.Input) bool {
+        s.pointer(in);
+
+        const bindings = if (s.plugins) |rt| rt.lookup() else null;
+        const result = keys.commandWith(&s.keymap, in, bindings);
+        if (result.items().len != 0) {
+            s.status = "";
+            s.dirty_title = true;
+        }
+        for (result.items()) |cmd| {
+            if (s.apply(cmd)) return true;
+        }
+        s.applyEffects();
+
+        var it = s.layout.iterator();
+        while (it.next()) |v| v.clampScroll();
+        s.reportChanges();
+        return s.quit;
+    }
+
+    /// Fires `page` and `mode` when either has changed since last reported.
+    fn reportChanges(s: *Session) void {
+        const rt = s.plugins orelse return;
+        const page = s.view().currentPage();
+        if (page != s.reported_page) {
+            s.reported_page = page;
+            rt.emit(.{ .page = page + 1 });
+        }
+        if (s.keymap.mode != s.reported_mode) {
+            s.reported_mode = s.keymap.mode;
+            rt.emit(.{ .mode = @tagName(s.keymap.mode) });
+        }
+    }
+
+    /// One command. Returns true when the reader should close.
+    ///
+    /// Separate from `handle` so that tests can drive the reader with the
+    /// commands a keystroke would produce, without inventing keystrokes.
+    fn apply(s: *Session, cmd: keys.Command) bool {
+        const line = 60.0;
+        const v = s.view();
+        switch (cmd) {
+            .none => {},
+            .quit => if (!s.closeWindow()) return true,
+            .quit_all => return true,
+
+            .split => |dir| s.splitWindow(dir),
+            .close_window => _ = s.closeWindow(),
+            .only_window => s.layout.only(s.gpa),
+            .focus_side => |side| _ = s.layout.focusSide(side),
+            .cycle_window => |back| s.layout.cycle(s.gpa, back),
+            .equalise => s.layout.equalise(),
+
+            .next_buffer => s.showBuffer(1),
+            .previous_buffer => s.showBuffer(-1),
+
+            .scroll_lines => |n| v.scroll += n * line,
+            .scroll_screens => |n| v.scroll += n * v.height() * 0.9,
+            .to_start => v.scroll = 0,
+            .to_end => v.scroll = v.maxScroll(),
+            .next_page => v.scrollToPage(@min(v.currentPage() + 1, v.pages.len - 1)),
+            .previous_page => v.scrollToPage(v.currentPage() -| 1),
+
+            .zoom_by => |f| v.setZoom(v.zoom * f),
+            .zoom_to => |f| v.setZoom(v.hundredPercent() * f),
+            .fit_width => v.fitWidth(),
+
+            .move_cursor => |step| s.moveCursor(step),
+            .hide_cursor => {
+                // Escape puts the caret away first and closes second, so that
+                // leaving cursor mode is not the same key as leaving.
+                if (!v.cursor.visible) return true;
+                v.cursor.visible = false;
+            },
+
+            .enter_visual, .enter_visual_line => {
+                s.last_visual_line = cmd == .enter_visual_line;
+                _ = s.ensureCursor();
+                if (v.anchor == null) v.beginSelection();
+            },
+            .enter_edit => s.enterEdit(),
+            .enter_note => s.beginNote(),
+            .leave_mode => {
+                v.endSelection();
+                s.note.clearRetainingCapacity();
+                s.cmdline.clearRetainingCapacity();
+                if (s.keymap.mode == .normal) s.focus_mark = null;
+            },
+
+            .swap_selection_ends => {
+                const other = v.swapSelectionEnds() orelse return false;
+                if (s.buffer(v.buffer).textMap(other.page)) |map| v.cursorTo(other, map);
+                v.scrollToCursor();
+            },
+            .highlight_selection => |colour| s.highlightSelection(colour),
+            .unhighlight_selection => s.unhighlightSelection(),
+
+            .toggle_highlight => s.toggleMark(),
+            .clear_highlights => s.clearMarks(),
+
+            .next_mark => s.stepMark(true),
+            .previous_mark => s.stepMark(false),
+            .recolour_mark => |colour| s.recolourMark(colour),
+            .delete_mark => s.deleteMark(),
+
+            .note_char => |c| s.noteChar(c),
+            .note_backspace => s.noteBackspace(),
+            .note_commit => s.commitNote(),
+
+            .enter_command => s.cmdline.clearRetainingCapacity(),
+            .command_char => |c| {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(c, &buf) catch return false;
+                if (s.cmdline.items.len + n <= max_note) s.cmdline.appendSlice(s.gpa, buf[0..n]) catch {};
+            },
+            .command_backspace => {
+                var n = s.cmdline.items.len;
+                if (n == 0) {
+                    // Backspace on an empty line leaves it, as in Vim.
+                    s.keymap.mode = .normal;
+                    return false;
+                }
+                n -= 1;
+                while (n > 0 and s.cmdline.items[n] & 0xc0 == 0x80) n -= 1;
+                s.cmdline.shrinkRetainingCapacity(n);
+            },
+            .command_run => {
+                // Copied out first: the command may be `:lua` code that opens
+                // another command line, which would clear this one under it.
+                var copy: [max_note]u8 = undefined;
+                const len = s.cmdline.items.len;
+                @memcpy(copy[0..len], s.cmdline.items);
+                s.cmdline.clearRetainingCapacity();
+                _ = s.exec(copy[0..len]);
+                return s.quit;
+            },
+            .plugin_key => |id| if (s.plugins) |rt| rt.runKeymap(id),
+
+            .undo => s.undoMarks(false),
+            .redo => s.undoMarks(true),
+        }
+        return false;
+    }
+
+    /// The pointer: which window it is in, the scrollbar, and the page.
+    ///
+    /// Dragging over text is a visual selection made with the mouse, and it
+    /// becomes a highlight when the button is let go -- the same boxes, the
+    /// same replace-don't-stack rule, the same undo step. In edit mode a press
+    /// on a highlight takes hold of it instead.
+    fn pointer(s: *Session, in: lyngvi.Input) void {
+        const down = in.buttons.left;
+        const pressed = down and !s.view().was_down;
+
+        if (pressed) _ = s.layout.focusAt(in.mouse);
+
+        // Every window's scrollbar is live, not only the focused one's: a
+        // thumb you can see and cannot drag is worse than no thumb.
+        var handled = false;
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            const inside = v.rect.contains(in.mouse) or v.dragging != null;
+            if (v.dragScrollbar(if (inside) in.mouse else .{ .x = -1e9, .y = -1e9 }, down and inside)) {
+                handled = true;
+            }
+        }
+        if (handled) {
+            s.drag = null;
+            return;
+        }
+
+        const v = s.view();
+        if (!down) {
+            if (s.drag) |d| {
+                s.drag = null;
+                if (!std.meta.eql(d.from, d.to)) {
+                    var boxes: std.ArrayList(PageBox) = .empty;
+                    defer boxes.deinit(s.gpa);
+                    s.selectionBoxes(d.buffer, d.from, d.to, false, &boxes) catch return;
+                    s.highlightBoxes(d.buffer, boxes.items, s.accent);
+                    s.applyEffects();
+                }
+            }
+            return;
+        }
+
+        if (s.drag) |*d| {
+            if (d.buffer == v.buffer) {
+                if (s.positionAt(v, in.mouse)) |p| d.to = p;
+            }
+            return;
+        }
+        if (!pressed) return;
+
+        const page = v.pageAt(in.mouse) orelse return;
+        const user = v.userSpaceAt(page, in.mouse) orelse return;
+        const b = s.buffer(v.buffer);
+
+        if (b.marks.at(page, user)) |index| {
+            const key = b.marks.items()[index].key;
+            if (s.keymap.mode == .edit) {
+                s.focusMark(key);
+            } else {
+                // A press on a highlight takes it away, the eraser on the end
+                // of the highlighter. `u` puts it back.
+                b.marks.beginGroup();
+                _ = b.marks.removeAt(s.gpa, index) catch {};
+                s.applyEffects();
+            }
+            s.dirty_title = true;
+            return;
+        }
+
+        const p = s.positionAt(v, in.mouse) orelse return;
+        s.drag = .{ .buffer = v.buffer, .from = p, .to = p };
+    }
+
+    fn splitWindow(s: *Session, dir: Layout.Direction) void {
+        // A split copies the window, and a copied selection would be two
+        // windows each claiming to be selecting.
+        s.view().endSelection();
+        if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
+
+        const made = s.layout.split(s.gpa, dir) catch null;
+        if (made == null) {
+            s.status = "no room to split";
+            return;
+        }
+        s.placed = null;
+    }
+
+    /// Closes the focused window. False when it was the last one, which the
+    /// caller turns into a quit.
+    fn closeWindow(s: *Session) bool {
+        if (s.layout.count() < 2) return false;
+        s.rememberPlace(s.view());
+        _ = s.layout.close(s.gpa);
+        s.placed = null;
+        return true;
+    }
+
+    // -- the frame -----------------------------------------------------------
+
+    /// The backdrop a page sits on. Dark enough that white paper is obviously
+    /// paper and not the whole window, and neutral so it does not tint what is
+    /// next to it.
+    const page_backdrop: Color = .gray(0.16);
+    const paper: Color = .white;
+    const shadow: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0.45 };
+    const white: Color = .white;
+    /// The line between two windows, and the one round the focused one.
+    const divider: Color = .gray(0.08);
+
+    fn compose(s: *Session, list: *DrawList, over: *DrawList) !void {
+        s.stamp += 1;
+        s.recorded.stamp = s.stamp;
+
+        var order: std.ArrayList(u32) = .empty;
+        defer order.deinit(s.gpa);
+        try s.layout.leaves(&order, s.gpa);
+
+        for (order.items) |leaf| {
+            const v = s.layout.viewAt(s.layout.nodes.items[leaf].view);
+            // Everything a window draws is confined to its own rectangle, or
+            // a page scrolled past the bottom of one split would appear in
+            // the next.
+            list.pushClip(v.rect);
+            over.pushClip(v.rect);
+            defer list.popClip();
+            defer over.popClip();
+            try s.composeView(v, list, over);
+        }
+
+        // The lines between windows, then the focus ring, on top of
+        // everything so neither is covered by a page.
+        var lines: std.ArrayList(Bounds) = .empty;
+        defer lines.deinit(s.gpa);
+        try s.layout.borders(&lines, s.gpa);
+        for (lines.items) |b| try over.fill(b, divider);
+
+        if (s.layout.count() > 1) {
+            const focused = s.layout.nodes.items[s.layout.focus].rect;
+            try over.border(focused, .all(0), 2, .{
+                .r = s.accent.r,
+                .g = s.accent.g,
+                .b = s.accent.b,
+                .a = 0.9,
+            });
+        }
+    }
+
+    fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
+        const b = s.buffer(v.buffer);
+        const range = v.visiblePages();
+
+        var i = range.first;
+        while (i < range.end) : (i += 1) {
+            const rect = v.pageRect(i);
+
+            // The shadow first, so the page sits on it rather than under it.
+            try list.shadow(
+                .fromRect(rect.min_x, rect.min_y + 3, rect.max_x, rect.max_y + 3),
+                .{},
+                8,
+                shadow,
+            );
+
+            if (s.backend == .gpu) {
+                // Blank paper. The path pipeline draws on it, in its own pass
+                // between this list and `over`.
+                s.recorded.touch(v.buffer, i);
+                try list.fill(rect, paper);
+            } else if (s.slotFor(v.buffer, i, v.zoom)) |slot| {
+                slot.used = s.stamp;
+                try list.image(
+                    rect,
+                    slot.list,
+                    .fromRect(0, 0, @floatFromInt(slot.width), @floatFromInt(slot.height)),
+                    white,
+                );
+            } else {
+                // Paper with nothing on it yet. Better than a hole, and it
+                // tells you the page exists and is coming.
+                try list.fill(rect, paper);
+            }
+
+            try s.drawMarks(v, b, i, over);
+        }
+
+        v.marks_seen = b.marks.revision;
+        try s.drawSelection(v, over);
+        try s.drawCaret(v, over);
+        try s.drawScrollbar(v, over);
+    }
+
+    /// The highlights on one page.
+    ///
+    /// Drawn over the page rather than under it, with alpha, because a PDF's
+    /// paper is opaque: a highlight beneath it would not be visible at all.
+    /// That means dark text shows through a light wash, which is what a
+    /// highlighter does to paper.
+    ///
+    /// The one in hand in edit mode is stronger and outlined, and one with a
+    /// note carries a small tab at its top-right corner -- the note's text is
+    /// in the title bar while the highlight is in hand, since the title bar
+    /// is the only text this window draws.
+    fn drawMarks(s: *Session, v: *View, b: *Buffer, page: u32, over: *DrawList) !void {
+        const editing = s.keymap.mode == .edit or s.keymap.mode == .note;
+        const in_focus = v == s.layout.current();
+        for (b.marks.items()) |mark| {
+            if (mark.page != page) continue;
+            const box = v.windowBox(page, mark.box);
+            const held = editing and in_focus and s.focus_mark == mark.key;
+            const c = mark.color;
+            try over.fill(box, .{ .r = c.r, .g = c.g, .b = c.b, .a = if (held) 0.55 else 0.35 });
+            if (held) {
+                const pad = 2.0;
+                try over.border(
+                    .fromRect(box.min_x - pad, box.min_y - pad, box.max_x + pad, box.max_y + pad),
+                    .all(2),
+                    2,
+                    .{ .r = c.r * 0.6, .g = c.g * 0.6, .b = c.b * 0.6, .a = 1 },
+                );
+            }
+            if (mark.note.len != 0) {
+                const tab = @max(4.0, 3.0 * v.zoom);
+                try over.fill(
+                    .fromRect(box.max_x - tab, box.min_y - tab * 0.5, box.max_x + tab * 0.5, box.min_y + tab),
+                    .{ .r = c.r * 0.7, .g = c.g * 0.7, .b = c.b * 0.7, .a = 1 },
+                );
+            }
+        }
+    }
+
+    /// The selection being made, drawn close to the way the highlight it is
+    /// about to become will be, so that committing it changes the colour and
+    /// nothing else. From the keyboard in visual mode, or from the mouse.
+    fn drawSelection(s: *Session, v: *View, over: *DrawList) !void {
+        const from: View.Position, const to: View.Position, const lines: bool =
+            if (v.selection()) |sel|
+                .{ sel[0], sel[1], s.lineSelection() }
+            else if (s.drag != null and v == s.layout.current() and s.drag.?.buffer == v.buffer)
+                .{ s.drag.?.from, s.drag.?.to, false }
+            else
+                return;
+
+        var boxes: std.ArrayList(PageBox) = .empty;
+        defer boxes.deinit(s.gpa);
+        s.selectionBoxes(v.buffer, from, to, lines, &boxes) catch return;
+        for (boxes.items) |pb| {
+            if (pb.page >= v.pages.len) continue;
+            try over.fill(v.windowBox(pb.page, pb.box), .{ .r = 0.2, .g = 0.45, .b = 0.95, .a = 0.28 });
+        }
+    }
+
+    /// The caret: a thin bar at the leading edge of the glyph it is on.
+    fn drawCaret(s: *Session, v: *View, over: *DrawList) !void {
+        if (!v.cursor.visible or v.cursor.caret.isEmpty()) return;
+        if (v.cursor.page >= v.pages.len) return;
+
+        const box = v.windowBox(v.cursor.page, v.cursor.caret);
+        // A hairline at this zoom, never thinner than a pixel, so it is
+        // visible on a page scaled down to a thumbnail.
+        const w = @max(1.5, v.zoom);
+        const focused = v == s.layout.current();
+        try over.fill(
+            .fromRect(box.min_x - w * 0.5, box.min_y, box.min_x + w * 0.5, box.max_y),
+            if (focused) .{ .r = 0.1, .g = 0.45, .b = 0.95, .a = 1 } else .gray(0.55),
+        );
+    }
+
+    fn drawScrollbar(s: *Session, v: *View, list: *DrawList) !void {
+        const bar = v.scrollbarAt() orelse return;
+        const alpha: f32 = if (v.dragging != null) 0.75 else if (v.hot_thumb) 0.55 else 0.35;
+        try list.rounded(
+            .fromRect(bar.x0, bar.y, bar.x1, bar.y + bar.height),
+            .all(3),
+            .{ .r = s.accent.r, .g = s.accent.g, .b = s.accent.b, .a = alpha },
+        );
+    }
+
+    /// Everything the GPU placement depends on, hashed: if this has not
+    /// changed, the instances on the device are still right.
+    ///
+    /// Compared rather than invalidated by hand: a `dirty` flag has to be set
+    /// in every place that moves a view, and the one place it is forgotten is
+    /// a window that stops following its own scroll.
+    fn placementKey(s: *Session) u64 {
+        var h: u64 = 1469598103934665603;
+        const mix = struct {
+            fn go(acc: *u64, value: anytype) void {
+                const bits: u64 = switch (@TypeOf(value)) {
+                    f32 => @as(u32, @bitCast(value)),
+                    else => @intCast(value),
+                };
+                acc.* = (acc.* ^ bits) *% 1099511628211;
+            }
+        }.go;
+
+        for (s.recorded.pages) |e| {
+            mix(&h, e.page);
+            mix(&h, e.buffer);
+        }
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            mix(&h, v.buffer);
+            mix(&h, v.scroll);
+            mix(&h, v.pan);
+            mix(&h, v.zoom);
+            mix(&h, v.rect.min_x);
+            mix(&h, v.rect.min_y);
+            mix(&h, v.rect.max_x);
+            mix(&h, v.rect.max_y);
+        }
+        return h;
+    }
+
+    /// Builds this frame's instance list: every visible page of every window,
+    /// placed.
+    ///
+    /// Cheap on purpose. It touches no curve and no band -- only one matrix
+    /// concatenation and one scissor per instance -- so scrolling costs a few
+    /// hundred kilobytes of writes rather than a re-render.
+    fn placeVisible(s: *Session) !void {
+        s.recorded.frame.reset();
+
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            const box: [4]f32 = .{ v.rect.min_x, v.rect.min_y, v.rect.max_x, v.rect.max_y };
+            const range = v.visiblePages();
+            var i = range.first;
+            while (i < range.end) : (i += 1) {
+                for (s.recorded.pages) |entry| {
+                    if (entry.buffer != v.buffer or entry.page != i) continue;
+                    try s.recorded.frame.place(
+                        s.gpa,
+                        s.recorded.scene,
+                        entry.range,
+                        v.placement(i),
+                        box,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    fn updateTitle(s: *Session, window: lyngvi.Window) void {
+        const v = s.view();
+        const page = v.currentPage();
+        const windows = s.layout.count();
+        if (!s.dirty_title and page == s.shown.page and v.zoom == s.shown.zoom and
+            v.buffer == s.shown.buffer and windows == s.shown.windows) return;
+
+        s.dirty_title = false;
+        s.shown = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .windows = windows };
+
+        var buf: [1024]u8 = undefined;
+        window.setTitle(s.titleText(&buf, page, windows));
+    }
+
+    /// What the title bar says: the document and where you are in it, then
+    /// the mode, then whatever the mode has to show.
+    ///
+    /// The title is the only text this window draws, so it carries the mode
+    /// line as well -- the note being typed, which highlight is in hand, the
+    /// reason a key did nothing.
+    fn titleText(s: *Session, buf: []u8, page: u32, windows: u32) []const u8 {
+        const v = s.view();
+        const base = s.buffer(v.buffer).title;
+        var w: std.Io.Writer = .fixed(buf);
+
+        w.print("{s} -- page {d} of {d} -- {d:.0}%", .{
+            base[0..@min(base.len, 160)], page + 1, v.pages.len, v.percent(),
+        }) catch return buf[0..w.end];
+        if (windows > 1) w.print(" -- {d} windows", .{windows}) catch return buf[0..w.end];
+
+        const mode = s.keymap.mode;
+        if (mode != .normal) w.print("   {s}", .{mode.label()}) catch return buf[0..w.end];
+
+        const marks = &s.buffer(v.buffer).marks;
+        switch (mode) {
+            .edit, .note => if (s.focusedMarkIndex()) |i| {
+                // Its place in reading order, which is the order `n` walks.
+                var place: usize = 1;
+                const held = marks.items()[i];
+                for (marks.items()) |m| {
+                    if (Marks.readsBefore(m, held)) place += 1;
+                }
+                w.print(" {d}/{d}", .{ place, marks.count() }) catch return buf[0..w.end];
+                if (mode == .note) {
+                    w.print(" {s}_", .{s.note.items[0..@min(s.note.items.len, 400)]}) catch return buf[0..w.end];
+                } else if (held.note.len != 0) {
+                    w.print(" \"{s}\"", .{held.note[0..@min(held.note.len, 400)]}) catch return buf[0..w.end];
+                }
+            },
+            else => {},
+        }
+        if (mode == .command) {
+            w.print("{s}_", .{s.cmdline.items[0..@min(s.cmdline.items.len, 400)]}) catch return buf[0..w.end];
+        }
+        if (s.status.len != 0) w.print("   {s}", .{s.status}) catch return buf[0..w.end];
+        return buf[0..w.end];
+    }
+
+    // -- one frame, with no device -------------------------------------------
 
     /// Composes a frame and rasterises it with the CPU model of the rect
     /// pipeline, exactly as `fenrir ui` does.
     ///
     /// The point is not the picture. It is that the layout -- where a page
-    /// lands, how big it is, what the scroll offset means -- can be checked on
-    /// a machine with no display, in a test, and in a diff, rather than only
-    /// by looking at a window. The pages inside it are the same images the
-    /// window uploads.
-    fn shoot(r: *Reader, dest: []const u8, width: u32, height: u32, start_page: u32) !void {
-        const ctx = r.ctx;
-        const gpa = r.gpa;
+    /// lands, how big it is, where a split falls -- can be checked on a
+    /// machine with no display, in a test, and in a diff, rather than only by
+    /// looking at a window.
+    fn shoot(s: *Session, dest: []const u8, width: u32, height: u32, start_page: u32, splits: []const u8) !void {
+        const ctx = s.ctx;
+        const gpa = s.gpa;
 
         // There is no device here, so there is no path pipeline either: a
         // shot is always the CPU rasteriser, whatever the window would use.
-        r.backend = .cpu;
+        s.backend = .cpu;
 
-        r.viewport = .{ @floatFromInt(width), @floatFromInt(height) };
-        if (r.fit_on_open) r.fitWidth();
-        r.scrollToPage(start_page);
+        s.layout.arrange(.fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
+        s.applySplits(splits);
 
-        var list: DrawList = .init(gpa, .fromRect(0, 0, r.viewport[0], r.viewport[1]));
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            if (v.fit_on_open) v.fitWidth();
+            if (v.scroll == 0) v.scrollToPage(start_page);
+        }
+
+        var list: DrawList = .init(gpa, .fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
         defer list.deinit();
 
         var images: CpuTextures = .{};
@@ -854,14 +2750,25 @@ const Reader = struct {
         // Every visible page, rendered up front: there is no next frame to
         // finish in, and no thread to finish it on.
         var slot: usize = 0;
-        while (r.firstMissing()) |page| {
+        while (s.firstMissing()) |job| {
             if (slot >= cache_slots) break;
-            const image = r.rasterise(.{ .page = page, .zoom = r.zoom }) catch break;
+
+            const b = s.buffer(job.buffer);
+            var result = content.page(gpa, b.doc, b.pages[job.page], .{}) catch break;
+            defer result.deinit(gpa);
+
+            if (text.build(gpa, result.list) catch null) |map| b.putMap(gpa, job.page, map);
+
+            const image = s.rasterise(job, result.list, b) catch {
+                s.noteFailure(job);
+                continue;
+            };
             const id = try list.registerTexture(image.width, image.height);
             images.entries[id - 1] = image;
-            r.slots[slot] = .{
-                .page = page,
-                .zoom = r.zoom,
+            s.slots[slot] = .{
+                .buffer = job.buffer,
+                .page = job.page,
+                .zoom = job.zoom,
                 .gpu = id,
                 .list = id,
                 .width = image.width,
@@ -872,7 +2779,7 @@ const Reader = struct {
 
         // `--shot` models the rect pipeline only, so the two layers go into
         // one list: there is no path pass between them to separate.
-        try r.compose(&list, &list);
+        try s.compose(&list, &list);
 
         var fb = try gleipnir.Framebuffer.init(gpa, width, height, .linear);
         defer fb.deinit(gpa);
@@ -890,26 +2797,37 @@ const Reader = struct {
         writer.interface.flush() catch |err|
             return ctx.fail("cannot write {s}: {t}", .{ dest, err });
 
-        ctx.out.print("wrote {d}x{d} to {s}: {d} page{s} at {d:.0}%\n", .{
+        ctx.out.print("wrote {d}x{d} to {s}: {d} page{s} in {d} window{s} at {d:.0}%\n", .{
             width,
             height,
             dest,
             slot,
             if (slot == 1) "" else "s",
-            r.percent(),
+            s.layout.count(),
+            if (s.layout.count() == 1) "" else "s",
+            s.view().percent(),
         }) catch {};
     }
 
-    // -- the window ---------------------------------------------------------
+    /// `--split vh`: the splits a scripted shot asked for.
+    fn applySplits(s: *Session, spec: []const u8) void {
+        for (spec) |c| {
+            s.splitWindow(if (c == 'v') .vertical else .horizontal);
+        }
+    }
 
-    fn open(r: *Reader, settings: Settings) !void {
-        const ctx = r.ctx;
-        const gpa = r.gpa;
+    // -- the window ----------------------------------------------------------
+
+    fn open(s: *Session, settings: Settings) !void {
+        const ctx = s.ctx;
+        const gpa = s.gpa;
 
         var window = lyngvi.open(gpa, .{
             .title = "fenrir",
             .width = settings.width,
             .height = settings.height,
+            // A shot is read back from the device, not looked at.
+            .visible = settings.shot == null,
         }) catch |err| return ctx.fail("could not open a window: {s}", .{@errorName(err)});
         defer window.destroy();
 
@@ -936,6 +2854,12 @@ const Reader = struct {
             return ctx.fail("could not create a swapchain: {s}", .{@errorName(err)});
         };
         defer swapchain.deinit();
+        if (settings.shot != null) {
+            swapchain.readable = true;
+            swapchain.recreate(.{ .width = size.width, .height = size.height }) catch |err| {
+                return ctx.fail("could not create a swapchain: {s}", .{@errorName(err)});
+            };
+        }
 
         var renderer = lyngvi.Renderer.init(gpa, &device, &swapchain) catch |err| {
             return switch (err) {
@@ -948,11 +2872,12 @@ const Reader = struct {
         };
         defer renderer.deinit();
 
-        ctx.note("{s}, {d}x{d}, {s}", .{
+        ctx.note("{s}, {d}x{d}, {s}, shaders from {s}", .{
             device.name(),
             swapchain.extent.width,
             swapchain.extent.height,
             @tagName(swapchain.present_mode),
+            if (lyngvi.shaders.compiler.len == 0) "nowhere" else lyngvi.shaders.compiler,
         });
         if (renderer.shaders_missing) {
             ctx.note("no SPIR-V in this build, so the window clears and presents but draws nothing", .{});
@@ -962,13 +2887,13 @@ const Reader = struct {
 
         // The analytic path pipeline, if this build has it and the reader is
         // using it. Created lazily: a `--path cpu` session should not pay for
-        // six storage buffers and a pipeline compile it will never bind.
-        var paths_renderer: ?lyngvi.PathRenderer = if (have_gpu and r.backend == .gpu)
+        // storage buffers and a pipeline compile it will never bind.
+        var paths_renderer: ?lyngvi.PathRenderer = if (have_gpu and s.backend == .gpu)
             lyngvi.PathRenderer.init(gpa, &device, &swapchain) catch |err| blk: {
                 ctx.note("no GPU path pipeline ({s}); falling back to the CPU rasteriser", .{
                     @errorName(err),
                 });
-                r.backend = .cpu;
+                s.backend = .cpu;
                 break :blk null;
             }
         else
@@ -978,30 +2903,51 @@ const Reader = struct {
         if (paths_renderer) |p| {
             if (p.shaders_missing) {
                 ctx.note("no SPIR-V for the path pipeline; falling back to the CPU rasteriser", .{});
-                r.backend = .cpu;
+                s.backend = .cpu;
             }
         }
-        ctx.note("paths: {s}", .{@tagName(r.backend)});
+        ctx.note("paths: {s}", .{@tagName(s.backend)});
 
         var list: DrawList = .init(gpa, .fromRect(0, 0, 1, 1));
         defer list.deinit();
-        // The layer above the document: the scrollbar, and anything else that
-        // must not be covered by the page it sits on.
+        // The layer above the document: scrollbars, highlights, the caret,
+        // and anything else that must not be covered by the page it sits on.
         var over: DrawList = .init(gpa, .fromRect(0, 0, 1, 1));
         defer over.deinit();
 
-        r.viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height) };
         // Now there is a display to be a percentage of, and a window to fit
         // to. Both have to happen before the first `scrollToPage`, because
         // the zoom decides where every page starts.
-        r.dpi_scale = window.scale();
-        if (r.fit_on_open) r.fitWidth();
-        r.scrollToPage(settings.start_page);
+        const scale = window.scale();
+        s.layout.arrange(.fromRect(0, 0, @floatFromInt(size.width), @floatFromInt(size.height)));
+        {
+            const v = s.view();
+            v.dpi_scale = scale;
+            if (v.fit_on_open) v.fitWidth();
+        }
+        s.applySplits(settings.splits);
+        {
+            // After the splits, because a split refits the zoom and a zoom
+            // moves where every page starts: scrolling to `--page` first
+            // would land above it by however much the refit moved things.
+            var it = s.layout.iterator();
+            while (it.next()) |v| {
+                v.dpi_scale = scale;
+                if (settings.page_given) v.scrollToPage(settings.start_page);
+            }
+        }
+        s.remember(s.view());
+        // The window exists and every window is where it will start, so a
+        // plugin reacting to `start` can split, scroll or zoom and see it.
+        if (s.plugins) |rt| {
+            rt.emit(.start);
+            s.reportChanges();
+        }
 
         var uploads: std.ArrayList(lyngvi.Renderer.Upload) = .empty;
         defer uploads.deinit(gpa);
 
-        var worker: Rasteriser = .{ .reader = r, .io = ctx.io };
+        var worker: Rasteriser = .{ .session = s, .io = ctx.io };
         worker.start() catch |err| {
             return ctx.fail("could not start the rasterising thread: {s}", .{@errorName(err)});
         };
@@ -1031,12 +2977,13 @@ const Reader = struct {
                 continue;
             }
 
-            r.viewport = .{
+            s.layout.arrange(.fromRect(
+                0,
+                0,
                 @floatFromInt(swapchain.extent.width),
                 @floatFromInt(swapchain.extent.height),
-            };
-            if (r.handle(input)) break;
-            r.clampScroll();
+            ));
+            if (s.handle(input)) break;
 
             // Collect whatever the rasterising thread finished, and ask it
             // for the next page. Neither waits: the frame is drawn from what
@@ -1047,41 +2994,59 @@ const Reader = struct {
             // `Upload.pixels` is read during `frame`.
             var pixels: ?[]u8 = null;
             defer if (pixels) |p| gpa.free(p);
-            pixels = r.collectPage(&worker, &renderer, &list, &uploads) catch |err| switch (err) {
+            pixels = s.collectPage(&worker, &renderer, &list, &uploads) catch |err| switch (err) {
                 error.OutOfMemory => return ctx.fail("out of memory rendering a page", .{}),
                 else => null,
             };
-            if (r.firstMissing()) |page| worker.post(.{ .page = page, .zoom = r.zoom });
+            if (s.firstMissing()) |job| worker.post(job);
 
-            list.reset(.fromRect(0, 0, r.viewport[0], r.viewport[1]));
-            over.reset(.fromRect(0, 0, r.viewport[0], r.viewport[1]));
-            try r.compose(&list, &over);
-            r.updateTitle(window);
+            const extent: Bounds = .fromRect(
+                0,
+                0,
+                @floatFromInt(swapchain.extent.width),
+                @floatFromInt(swapchain.extent.height),
+            );
+            list.reset(extent);
+            over.reset(extent);
+            try s.compose(&list, &over);
+            s.updateTitle(window);
 
             // The path pass, between the two rect lists. Placing is a matrix
             // per instance and nothing else, so this runs every frame even
             // while scrolling at the refresh rate.
             var paths: ?lyngvi.Renderer.Paths = null;
-            if (r.backend == .gpu) {
+            if (s.backend == .gpu) {
                 if (paths_renderer) |*pr| {
-                    // Only when the view has actually moved. A reader sitting
-                    // still then uploads nothing at all: the outlines are on
-                    // the device and so is the placement.
-                    const key = r.placementKey();
-                    if (r.placed == null or !std.meta.eql(r.placed.?, key)) {
-                        try r.placeVisible();
-                        r.placed = key;
+                    // Only when something has actually moved. A reader
+                    // sitting still then uploads nothing at all: the outlines
+                    // are on the device and so is the placement.
+                    const key = s.placementKey();
+                    if (s.placed == null or s.placed.? != key) {
+                        try s.placeVisible();
+                        s.placed = key;
                     }
                     paths = .{
                         .renderer = pr,
-                        .scene = &r.recorded.scene,
-                        .frame = &r.recorded.frame,
+                        .scene = &s.recorded.scene,
+                        .frame = &s.recorded.frame,
                     };
                 }
             }
 
+            // A shot waits for every visible page, or gives up after a few
+            // seconds' worth of frames and takes what there is.
+            const shooting = settings.shot != null and
+                (s.firstMissing() == null or drawn >= shot_patience);
+            renderer.capture_next = shooting;
+
             switch (try renderer.frameWith(&list, uploads.items, page_backdrop, paths, &over)) {
-                .drawn => drawn += 1,
+                .drawn => {
+                    drawn += 1;
+                    if (shooting) {
+                        if (renderer.captured) |c| try s.writeShot(settings.shot.?, c);
+                        break;
+                    }
+                },
                 .needs_recreate => {
                     try swapchain.recreate(.{ .width = client.width, .height = client.height });
                     try renderer.refresh();
@@ -1092,482 +3057,61 @@ const Reader = struct {
         }
 
         renderer.waitIdle();
+        // Before the place is written, so a plugin that moves on `quit` is
+        // remembered where it left the reader.
+        if (s.plugins) |rt| {
+            rt.emit(.quit);
+            s.applyEffects();
+        }
+        s.rememberAll();
         ctx.note("{d} frames drawn, {d} pages prepared, {d} MiB uploaded", .{
             renderer.frames_drawn,
-            r.pages_rendered,
+            s.pages_rendered,
             renderer.bytes_uploaded / (1024 * 1024),
         });
         if (paths_renderer) |p| {
             ctx.note(
-                "paths: {d} drawn, {d} instances at most, {d} curves, {d} MiB uploaded",
+                "paths: {d} instances at most, {d} curves, {d} image texels, {d} draw calls over {d} frames, {d} MiB uploaded",
                 .{
-                    p.paths_drawn,
                     p.instance_high_water,
                     p.curve_high_water,
+                    p.texel_high_water,
+                    p.draw_calls,
+                    renderer.frames_drawn,
                     p.bytes_uploaded / (1024 * 1024),
                 },
             );
-            const s = r.recorded.scene.stats;
-            if (s.blended != 0 or s.clips_too_deep != 0) {
+            const stats = s.recorded.scene.stats;
+            if (stats.blended != 0 or stats.clips_too_deep != 0 or stats.images_dropped != 0) {
                 ctx.note(
-                    "         {d} path{s} with a blend mode this pipeline cannot honour, {d} clip{s} too deep",
-                    .{
-                        s.blended,
-                        if (s.blended == 1) "" else "s",
-                        s.clips_too_deep,
-                        if (s.clips_too_deep == 1) "" else "s",
-                    },
+                    "         {d} with a blend mode drawn normal, {d} clips too deep, {d} images over the texel budget",
+                    .{ stats.blended, stats.clips_too_deep, stats.images_dropped },
                 );
             }
         }
     }
 
-    fn updateTitle(r: *Reader, window: lyngvi.Window) void {
-        const page = r.currentPage();
-        if (!r.dirty_title and page == r.shown_page and r.zoom == r.shown_zoom) return;
-        r.dirty_title = false;
-        r.shown_page = page;
-        r.shown_zoom = r.zoom;
+    /// Writes a frame read back from the device.
+    fn writeShot(s: *Session, dest: []const u8, c: lyngvi.Renderer.Capture) !void {
+        const ctx = s.ctx;
+        var file = Io.Dir.cwd().createFile(ctx.io, dest, .{}) catch |err|
+            return ctx.fail("cannot create {s}: {t}", .{ dest, err });
+        defer file.close(ctx.io);
 
-        var buf: [512]u8 = undefined;
-        const base = std.fs.path.basename(r.file);
-        const title = std.fmt.bufPrint(&buf, "{s} -- page {d} of {d} -- {d:.0}%", .{
-            base[0..@min(base.len, 200)],
-            page + 1,
-            r.pages.len,
-            r.percent(),
-        }) catch return;
-        window.setTitle(title);
-    }
+        var buf: [64 * 1024]u8 = undefined;
+        var writer = file.writer(ctx.io, &buf);
+        gleipnir.png.write(s.gpa, &writer.interface, c.pixels, c.width, c.height) catch |err|
+            return ctx.fail("cannot write {s}: {t}", .{ dest, err });
+        writer.interface.flush() catch |err|
+            return ctx.fail("cannot write {s}: {t}", .{ dest, err });
 
-    // -- input --------------------------------------------------------------
-
-    /// Returns true when the reader should close.
-    fn handle(r: *Reader, in: lyngvi.Input) bool {
-        const line = 60.0;
-        const screen = r.viewport[1] * 0.9;
-
-        if (in.modifiers.ctrl and in.scroll.y != 0) {
-            // Ctrl and the wheel is zoom everywhere else, so it is zoom here.
-            r.setZoom(r.zoom * std.math.pow(f32, 1.0015, in.scroll.y));
-        } else {
-            r.scroll -= in.scroll.y;
-            r.pan += in.scroll.x;
-        }
-
-        if (in.repeated(.down)) r.scroll += line;
-        if (in.repeated(.up)) r.scroll -= line;
-        if (in.repeated(.right)) r.pan -= line;
-        if (in.repeated(.left)) r.pan += line;
-        if (in.repeated(.page_down)) r.scroll += screen;
-        if (in.repeated(.page_up)) r.scroll -= screen;
-        if (in.pressedOnce(.home)) r.scroll = 0;
-        if (in.pressedOnce(.end)) r.scroll = r.maxScroll();
-        if (in.pressedOnce(.escape)) return true;
-
-        var buf: [32]u8 = undefined;
-        for (in.typedText(&buf)) |c| switch (c) {
-            'q', 'Q' => return true,
-            'n', 'N', ' ' => r.scrollToPage(@min(r.currentPage() + 1, r.pages.len - 1)),
-            'p', 'P' => r.scrollToPage(r.currentPage() -| 1),
-            '+', '=' => r.setZoom(r.zoom * 1.25),
-            '-', '_' => r.setZoom(r.zoom / 1.25),
-            '0' => r.fitWidth(),
-            '1' => r.setZoom(r.hundredPercent()),
-            else => {},
-        };
-        return false;
-    }
-
-    // -- the cache ----------------------------------------------------------
-
-    /// Takes whatever the rasterising thread finished and puts it in a slot,
-    /// returning the pixel buffer the caller must keep alive until the frame
-    /// has been submitted -- `Upload.pixels` is read during `frame`.
-    ///
-    /// Nothing here waits. If the worker is still on the page, this frame
-    /// draws without it.
-    fn collectPage(
-        r: *Reader,
-        worker: *Rasteriser,
-        renderer: *lyngvi.Renderer,
-        list: *DrawList,
-        uploads: *std.ArrayList(lyngvi.Renderer.Upload),
-    ) !?[]u8 {
-        const gpa = r.gpa;
-        const finished = worker.collect() orelse return null;
-
-        const result = finished.result orelse {
-            // A page that will not interpret is a blank page, not a dead
-            // reader. Remembering that it failed is what stops the loop
-            // asking for it again on every frame for the rest of the session.
-            r.noteFailure(finished.job);
-            return null;
-        };
-
-        if (result == .gpu) {
-            // The recording is in page space, so a zoom change does not make
-            // it stale the way it makes a rasterised page stale. It goes in
-            // whatever the zoom is now.
-            var source = result.gpu;
-            errdefer source.deinit(gpa);
-            try r.recorded.insert(gpa, finished.job.page, source);
-            r.pages_rendered += 1;
-            return null;
-        }
-
-        const image = result.cpu;
-        errdefer gpa.free(image.pixels);
-
-        // The zoom may have changed while this was rendering, which makes the
-        // image the right picture at the wrong size. Caching it would put a
-        // stale page on screen that never refreshes, because `matches` would
-        // find it at a zoom nobody is looking at.
-        if (finished.job.zoom != r.zoom) {
-            gpa.free(image.pixels);
-            return null;
-        }
-
-        const slot = try r.claim(renderer, list, image.width, image.height);
-        slot.page = finished.job.page;
-        slot.zoom = finished.job.zoom;
-        slot.width = image.width;
-        slot.height = image.height;
-        slot.used = r.stamp;
-
-        try uploads.append(gpa, .{
-            .texture = slot.gpu,
-            .x = 0,
-            .y = 0,
-            .w = image.width,
-            .h = image.height,
-            .pixels = image.pixels,
-            .stride = image.width * 4,
-        });
-        r.pages_rendered += 1;
-        return image.pixels;
-    }
-
-    /// The first visible page with no up-to-date texture, nearest the top of
-    /// the screen -- so a fresh window fills in downwards the way a person
-    /// reads rather than in page order.
-    fn firstMissing(r: *const Reader) ?u32 {
-        var i: usize = 0;
-        while (i < r.pages.len) : (i += 1) {
-            const top = r.pageTop(i) - r.scroll;
-            const bottom = top + r.pageSize(i)[1];
-            // A page whose last row is exactly on the top edge contributes no
-            // pixels, and neither does one whose first row is exactly on the
-            // bottom. Rendering either is a page of work for nothing.
-            if (bottom <= 0) continue;
-            if (top >= r.viewport[1]) break;
-            if (r.failed(@intCast(i), r.zoom)) continue;
-            if (!r.cached(@intCast(i))) return @intCast(i);
-        }
-        return null;
-    }
-
-    /// Whether page `index` is ready to draw at the current zoom.
-    ///
-    /// The two backends disagree about what "at the current zoom" means, and
-    /// that difference is the whole point of the GPU one: a rasterised page
-    /// is pixels at one scale and a recorded one is curves at every scale, so
-    /// a zoom throws away the CPU cache and leaves the GPU cache untouched.
-    fn cached(r: *const Reader, page: u32) bool {
-        return switch (r.backend) {
-            .cpu => r.find(page) != null,
-            .gpu => r.recorded.has(page),
-        };
-    }
-
-    fn find(r: *const Reader, page: u32) ?*const Slot {
-        for (&r.slots) |*s| {
-            if (s.matches(page, r.zoom)) return s;
-        }
-        return null;
-    }
-
-    /// A slot to render into: an unused one, then the stalest, with its
-    /// texture resized if the page is a different size from the last thing
-    /// that lived there.
-    fn claim(
-        r: *Reader,
-        renderer: *lyngvi.Renderer,
-        list: *DrawList,
-        width: u32,
-        height: u32,
-    ) !*Slot {
-        var chosen: usize = 0;
-        var oldest: u64 = std.math.maxInt(u64);
-        for (&r.slots, 0..) |*s, i| {
-            if (s.gpu == 0) {
-                // Never used: create the pair of registrations now. They are
-                // handed out in creation order by both sides, which is what
-                // makes the two ids equal -- checked, not trusted.
-                const gpu = try renderer.createTexture(width, height, .color);
-                const in_list = try list.registerTexture(width, height);
-                std.debug.assert(gpu == in_list);
-                s.gpu = gpu;
-                s.list = in_list;
-                s.width = width;
-                s.height = height;
-                return s;
-            }
-            if (s.used < oldest) {
-                oldest = s.used;
-                chosen = i;
-            }
-        }
-
-        const s = &r.slots[chosen];
-        if (s.width != width or s.height != height) {
-            // A device-wide wait. Only on a zoom change or a document whose
-            // pages differ in size, which is not per frame.
-            try renderer.resizeTexture(s.gpu, width, height);
-            list.setTextureSize(s.list, width, height);
-        }
-        return s;
-    }
-
-    pub const Image = struct { pixels: []u8, width: u32, height: u32 };
-
-    /// One page, interpreted and rasterised. The same three calls
-    /// `fenrir raster` makes, which is why the two produce identical images.
-    ///
-    /// **Runs on the rasterising thread.** It touches `r.doc`, which nothing
-    /// else may while it does, and `r.pages` and `r.samples`, which are fixed
-    /// for the life of the reader. The zoom comes from the job rather than
-    /// from `r.zoom`, because `r.zoom` belongs to the frame loop and can
-    /// change underneath this at any moment.
-    fn rasterise(r: *Reader, job: Job) !Image {
-        const gpa = r.gpa;
-
-        var result = try content.page(gpa, r.doc, r.pages[job.page], .{});
-        defer result.deinit(gpa);
-
-        var zoom = job.zoom;
-        var size = replay.canvasSize(result.list.page, zoom);
-        while (@as(u64, size[0]) * size[1] > max_page_pixels and zoom > min_zoom) {
-            zoom *= 0.5;
-            size = replay.canvasSize(result.list.page, zoom);
-        }
-
-        var canvas = try gleipnir.raster.Canvas.init(gpa, size[0], size[1], .{ .samples = r.samples });
-        defer canvas.deinit(gpa);
-        canvas.fb.clear(.white);
-
-        var glyphs: Glyphs = try .init(gpa, r.doc, result.list, r.ctx.io);
-        defer glyphs.deinit();
-
-        var images: Images = .init(gpa, r.doc, r.pages[job.page].resources);
-        defer images.deinit();
-
-        _ = replay.render(
-            gpa,
-            &canvas,
-            result.list,
-            replay.pageTransform(result.list.page, zoom),
-            .{ .glyphs = glyphs.source(), .images = images.source() },
-        ) catch |err| return err;
-
-        return .{
-            .pixels = try canvas.fb.toRgba8(gpa),
-            .width = size[0],
-            .height = size[1],
-        };
-    }
-
-    /// One page, interpreted and recorded as outlines for the GPU pipeline.
-    ///
-    /// **Runs on the rasterising thread**, like `rasterise`, and under the
-    /// same rules about what it may touch.
-    ///
-    /// Recorded in *page space*: the transform is the page's own flip, with
-    /// no zoom and no scroll in it, because those are what the frame loop
-    /// applies per instance. The curves that come out of this are good at
-    /// every zoom, which is what the pipeline is for.
-    fn recordPage(r: *Reader, index: u32) !Scene {
-        const gpa = r.gpa;
-
-        var result = try content.page(gpa, r.doc, r.pages[index], .{});
-        defer result.deinit(gpa);
-
-        var s: Scene = .{};
-        errdefer s.deinit(gpa);
-        const size = replay.canvasSize(result.list.page, 1.0);
-        s.reset(.{ @floatFromInt(size[0]), @floatFromInt(size[1]) });
-
-        var glyphs: Glyphs = try .init(gpa, r.doc, result.list, r.ctx.io);
-        defer glyphs.deinit();
-
-        _ = try replay.record(
-            gpa,
-            &s,
-            result.list,
-            replay.pageTransform(result.list.page, 1.0),
-            .{ .glyphs = glyphs.source() },
-        );
-        return s;
-    }
-
-    /// Where page `index` sits on screen, as a matrix from its own page-pixel
-    /// space to the framebuffer.
-    ///
-    /// The recording was made at zoom 1, so this is the zoom and the scroll
-    /// together -- and it is all that changes when either of them does.
-    fn placement(r: *const Reader, index: usize) gelgja.Transform {
-        const size = r.pageSize(index);
-        const x = @round((r.viewport[0] - size[0]) * 0.5 + r.pan);
-        const y = @round(r.pageTop(index) - r.scroll);
-        return gelgja.Transform.scaling(r.zoom, r.zoom).concat(.translation(x, y));
-    }
-
-    /// Everything the placement depends on.
-    ///
-    /// Compared rather than invalidated by hand: a `dirty` flag has to be set
-    /// in every place that moves the view, and the one place it is forgotten
-    /// is a page that stops following the scroll.
-    const Placement = struct {
-        scroll: f32,
-        pan: f32,
-        zoom: f32,
-        viewport: [2]f32,
-        cache: u64,
-    };
-
-    fn placementKey(r: *const Reader) Placement {
-        var cache: u64 = 0;
-        for (r.recorded.pages) |e| cache = cache *% 31 +% e.page;
-        return .{
-            .scroll = r.scroll,
-            .pan = r.pan,
-            .zoom = r.zoom,
-            .viewport = r.viewport,
-            .cache = cache,
-        };
-    }
-
-    /// Builds this frame's instance list: every visible page, placed.
-    ///
-    /// Cheap on purpose. It touches no curve and no band -- only one matrix
-    /// concatenation and one scissor per instance -- so scrolling a document
-    /// costs a few hundred kilobytes of writes rather than a re-render.
-    fn placeVisible(r: *Reader) !void {
-        r.recorded.frame.reset();
-        const box: [4]f32 = .{ 0, 0, r.viewport[0], r.viewport[1] };
-
-        var i: usize = 0;
-        while (i < r.pages.len) : (i += 1) {
-            const size = r.pageSize(i);
-            const top = r.pageTop(i) - r.scroll;
-            if (top + size[1] <= 0) continue;
-            if (top >= r.viewport[1]) break;
-
-            for (r.recorded.pages) |entry| {
-                if (entry.page != i) continue;
-                try r.recorded.frame.place(
-                    r.gpa,
-                    r.recorded.scene,
-                    entry.range,
-                    r.placement(i),
-                    box,
-                );
-                break;
-            }
-        }
-    }
-
-    // -- the frame ----------------------------------------------------------
-
-    /// The backdrop a page sits on. Dark enough that white paper is obviously
-    /// paper and not the whole window, and neutral so it does not tint what is
-    /// next to it.
-    const page_backdrop: Color = .gray(0.16);
-    const paper: Color = .white;
-    const shadow: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0.45 };
-    const white: Color = .white;
-
-    /// The rectangles under the page: the shadow, and the paper.
-    ///
-    /// Under `.cpu` the paper *is* the page -- the rasterised image is drawn
-    /// as one textured quad on top of it. Under `.gpu` the paper stays blank
-    /// here and the marks are drawn over it by the path pipeline, which is
-    /// why the two layers are separate draw lists rather than one.
-    fn compose(r: *Reader, list: *DrawList, over: *DrawList) !void {
-        r.stamp += 1;
-        r.recorded.stamp = r.stamp;
-
-        var i: usize = 0;
-        while (i < r.pages.len) : (i += 1) {
-            const size = r.pageSize(i);
-            const top = r.pageTop(i) - r.scroll;
-            if (top + size[1] <= 0) continue;
-            if (top >= r.viewport[1]) break;
-
-            const x = @round((r.viewport[0] - size[0]) * 0.5 + r.pan);
-            const y = @round(top);
-            const rect: Bounds = .fromRect(x, y, x + size[0], y + size[1]);
-
-            // The shadow first, so the page sits on it rather than under it.
-            try list.shadow(
-                .fromRect(rect.min_x, rect.min_y + 3, rect.max_x, rect.max_y + 3),
-                .{},
-                8,
-                shadow,
-            );
-
-            if (r.backend == .gpu) {
-                // Blank paper. The path pipeline draws on it, in its own pass
-                // between this list and `over`.
-                r.recorded.touch(@intCast(i));
-                try list.fill(rect, paper);
-                continue;
-            }
-
-            if (r.slotFor(@intCast(i))) |s| {
-                s.used = r.stamp;
-                try list.image(
-                    rect,
-                    s.list,
-                    .fromRect(0, 0, @floatFromInt(s.width), @floatFromInt(s.height)),
-                    white,
-                );
-            } else {
-                // Paper with nothing on it yet. Better than a hole, and it
-                // tells you the page exists and is coming.
-                try list.fill(rect, paper);
-            }
-        }
-
-        // On top of the document, so it is not covered by the page it
-        // measures.
-        try r.scrollbar(over);
-    }
-
-    fn slotFor(r: *Reader, page: u32) ?*Slot {
-        for (&r.slots) |*s| {
-            if (s.matches(page, r.zoom)) return s;
-        }
-        return null;
-    }
-
-    /// A thumb on the right edge, wide enough to see and narrow enough to
-    /// ignore. Not interactive yet -- it reports where you are, which is the
-    /// half of a scrollbar that matters while reading.
-    fn scrollbar(r: *Reader, list: *DrawList) !void {
-        const total = r.documentHeight();
-        if (total <= r.viewport[1]) return;
-
-        const track = r.viewport[1] - gap * 2;
-        const height = @max(24.0, track * r.viewport[1] / total);
-        const travel = track - height;
-        const y = gap + travel * (r.scroll / @max(1, r.maxScroll()));
-
-        try list.rounded(
-            .fromRect(r.viewport[0] - 12, y, r.viewport[0] - 6, y + height),
-            .all(3),
-            .{ .r = 1, .g = 1, .b = 1, .a = 0.35 },
-        );
+        ctx.out.print("wrote {d}x{d} to {s}: read back from the device, paths on the {s}, at {d:.0}%\n", .{
+            c.width,
+            c.height,
+            dest,
+            @tagName(s.backend),
+            s.view().percent(),
+        }) catch {};
     }
 };
 
@@ -1575,8 +3119,8 @@ const Reader = struct {
 
 const testing = std.testing;
 
-/// `n` identical Letter-sized pages, with nothing in them: the layout below
-/// reads only the boxes, so a page needs no document behind it to be laid out.
+/// `n` identical Letter-sized pages, with nothing in them: the layout reads
+/// only the boxes, so a page needs no document behind it to be laid out.
 fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
     const letter: fenrir.Page.Rect = .{ .x0 = 0, .y0 = 0, .x1 = 600, .y1 = 800 };
     for (buf[0..n], 0..) |*p, i| p.* = .{
@@ -1591,195 +3135,640 @@ fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
     return buf[0..n];
 }
 
-fn layoutOf(pages: []fenrir.Page, zoom: f32, viewport: [2]f32) Reader {
-    return .{
-        .ctx = undefined,
-        .gpa = testing.allocator,
-        .doc = undefined,
+/// A session with one buffer of `n` blank pages and one window on it. No
+/// document: everything tested here reads `pages` and the caches.
+fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !Session {
+    var s: Session = .{ .ctx = undefined, .gpa = gpa, .samples = .four };
+    errdefer s.deinit();
+    try s.buffers.append(gpa, .{
+        .path = try gpa.dupe(u8, "/docs/a.pdf"),
+        .title = "a.pdf",
         .pages = pages,
-        .file = "test.pdf",
-        .zoom = zoom,
-        .samples = .four,
-        .viewport = viewport,
-    };
-}
-
-test "pages stack with a gap and the document is as tall as their sum" {
-    var buf: [4]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 3), 1, .{ 700, 500 });
-
-    try testing.expectEqual(@as(f32, 600), r.pageSize(0)[0]);
-    try testing.expectEqual(@as(f32, 800), r.pageSize(0)[1]);
-
-    try testing.expectEqual(@as(f32, gap), r.pageTop(0));
-    try testing.expectEqual(@as(f32, gap + 800 + gap), r.pageTop(1));
-    try testing.expectEqual(@as(f32, 3 * (800 + gap) + gap), r.documentHeight());
-}
-
-test "a page's size is the ceiling of its points times the zoom" {
-    // Exactly what `replay.canvasSize` does, because the rectangle the page is
-    // drawn into has to be the size of the texture to the pixel or the image
-    // is resampled -- which on text is immediately visible.
-    var buf: [1]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 1), 0.3333, .{ 700, 500 });
-    const size = r.pageSize(0);
-    try testing.expectEqual(replay.canvasSize(.fromRect(0, 0, 600, 800), 0.3333), [2]u32{
-        @intFromFloat(size[0]),
-        @intFromFloat(size[1]),
     });
+    try s.layout.init(gpa, .{ .buffer = 0, .pages = pages, .zoom = zoom });
+    s.layout.arrange(.fromRect(0, 0, w, h));
+    return s;
 }
 
-test "scrolling is clamped to the document, both ends" {
+/// `Session.deinit` frees documents, and a test session has none.
+fn closeSession(s: *Session) void {
+    s.note.deinit(s.gpa);
+    s.recorded.deinit(s.gpa);
+    s.layout.deinit(s.gpa);
+    for (s.buffers.items) |*b| {
+        b.marks.deinit(s.gpa);
+        for (&b.maps) |*m| m.map.deinit(s.gpa);
+        s.gpa.free(b.path);
+    }
+    s.buffers.deinit(s.gpa);
+}
+
+test "a split is two windows on one document, scrolling apart" {
+    const gpa = testing.allocator;
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.splitWindow(.vertical);
+    try testing.expectEqual(@as(u32, 2), s.layout.count());
+
+    // Both are looking at the same buffer...
+    var it = s.layout.iterator();
+    while (it.next()) |v| try testing.expectEqual(@as(u32, 0), v.buffer);
+
+    // ...and scrolling one does not move the other, which is the whole point
+    // of the scroll living in the view.
+    s.view().scroll = 500;
+    var others: u32 = 0;
+    var walk = s.layout.iterator();
+    while (walk.next()) |v| {
+        if (v != s.layout.current() and v.scroll != 500) others += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), others);
+}
+
+test "a highlight made in one window is in the other" {
+    // The requirement in one test: two views, one underlying document, and a
+    // change made through one visible through the other with nothing copied.
+    const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 3), 1, .{ 700, 500 });
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
 
-    r.scroll = -1000;
-    r.clampScroll();
-    try testing.expectEqual(@as(f32, 0), r.scroll);
+    s.splitWindow(.vertical);
+    const before = s.buffer(0).marks.revision;
 
-    r.scroll = 1e9;
-    r.clampScroll();
-    try testing.expectEqual(r.documentHeight() - 500, r.scroll);
+    s.highlightBoxes(0, &.{.{ .page = 1, .box = .fromRect(100, 700, 300, 712) }}, s.accent);
+
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+    try testing.expect(s.buffer(0).marks.revision != before);
+
+    var it = s.layout.iterator();
+    while (it.next()) |v| {
+        try testing.expect(v.marks_seen != s.buffer(v.buffer).marks.revision);
+    }
 }
 
-test "a document shorter than the window does not scroll at all" {
-    var buf: [1]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 1), 0.2, .{ 700, 900 });
-    r.scroll = 500;
-    r.clampScroll();
-    try testing.expectEqual(@as(f32, 0), r.scroll);
-}
-
-test "the current page is the one under the middle of the viewport" {
-    var buf: [4]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 3), 1, .{ 700, 400 });
-
-    r.scrollToPage(0);
-    try testing.expectEqual(@as(u32, 0), r.currentPage());
-    r.scrollToPage(1);
-    try testing.expectEqual(@as(u32, 1), r.currentPage());
-    r.scrollToPage(2);
-    try testing.expectEqual(@as(u32, 2), r.currentPage());
-
-    // And past the end it stays on the last one rather than running off the
-    // array, which is what a document whose final page is shorter than the
-    // window does on every `end` press.
-    r.scroll = 1e9;
-    r.clampScroll();
-    try testing.expectEqual(@as(u32, 2), r.currentPage());
-}
-
-test "zooming keeps the middle of the screen on the same part of the page" {
-    // The property that makes zoom usable: the line you were reading is still
-    // the line you are reading. Anchoring on the top of the document instead
-    // sends you to a different chapter every time you press a key.
-    var buf: [4]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 3), 1, .{ 700, 500 });
-    r.scrollToPage(1);
-    r.scroll += 200;
-
-    const page = r.currentPage();
-    const before = (r.scroll + 250 - r.pageTop(page)) / r.pageSize(page)[1];
-    r.setZoom(2);
-    const after = (r.scroll + 250 - r.pageTop(page)) / r.pageSize(page)[1];
-
-    try testing.expectEqual(page, r.currentPage());
-    try testing.expectApproxEqAbs(before, after, 1e-3);
-}
-
-test "fit-width makes the page as wide as the window, less the margins" {
-    var buf: [1]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 1), 1, .{ 928, 500 });
-    r.fitWidth();
-    try testing.expectApproxEqAbs(@as(f32, 900), r.pageSize(0)[0], 1);
-}
-
-test "the zoom stays inside its limits however hard it is pushed" {
-    var buf: [1]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 1), 1, .{ 700, 500 });
-    for (0..64) |_| r.setZoom(r.zoom * 4);
-    try testing.expectEqual(@as(f32, max_zoom), r.zoom);
-    for (0..64) |_| r.setZoom(r.zoom / 4);
-    try testing.expectEqual(@as(f32, min_zoom), r.zoom);
-}
-
-test "only the pages on screen are asked for" {
-    // The cache is six slots and a document is hundreds of pages, so the
-    // decision of what to render has to be driven by the viewport rather than
-    // by the page list.
+test "every window's visible pages are asked for, focused window first" {
+    const gpa = testing.allocator;
     var buf: [64]fenrir.Page = undefined;
-    // Half scale, so two pages fit on the screen at once and "the next one
-    // down" is a page that is actually visible.
-    var r = layoutOf(fakePages(&buf, 40), 0.5, .{ 700, 500 });
-    r.scrollToPage(20);
+    // Half scale, so two pages fit at once.
+    var s = try sessionOf(gpa, fakePages(&buf, 40), 0.5, 1000, 800);
+    defer closeSession(&s);
 
-    // Nothing cached: the first thing wanted is the page at the top of the
-    // screen, not page zero.
-    try testing.expectEqual(@as(u32, 20), r.firstMissing().?);
+    s.view().scrollToPage(20);
+    s.splitWindow(.vertical);
+    s.view().scrollToPage(4);
 
-    // With that one cached, the next one down.
-    r.slots[0] = .{ .page = 20, .zoom = r.zoom, .gpu = 1, .list = 1 };
-    try testing.expectEqual(@as(u32, 21), r.firstMissing().?);
+    // The focused window is the one that just scrolled to page 4.
+    try testing.expectEqual(@as(u32, 4), s.firstMissing().?.page);
 
-    // A slot rendered at a different zoom is not a hit.
-    r.slots[0].zoom = r.zoom * 2;
-    try testing.expectEqual(@as(u32, 20), r.firstMissing().?);
+    // With that cached, the rest of the focused window, then the other one.
+    s.slots[0] = .{ .buffer = 0, .page = 4, .zoom = s.view().zoom, .gpu = 1, .list = 1 };
+    const next = s.firstMissing().?;
+    try testing.expect(next.page == 5 or next.page == 20);
 }
 
-test "the percentage is the page's physical size, not the raster scale" {
-    // The bug this pins: the title bar said 153% on a fresh window and never
-    // anything else, because it was showing `zoom` -- device pixels per point
-    // -- as though it were a percentage. The default was `--dpi 110`, so it
-    // said 110/72 = 153% forever.
-    var buf: [1]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 1), 1, .{ 700, 500 });
+test "two windows at different zooms need two rasters and one recording" {
+    // The difference between the backends, as a test: the CPU cache is keyed
+    // by zoom because its contents are pixels, and the GPU cache is not
+    // because its contents are curves.
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
 
-    // An unscaled display: 100% is 96 dpi over 72, and a zoom of 1.0 -- one
-    // device pixel per point -- is a page shown at three quarters of its real
-    // size, which is what it is.
-    r.dpi_scale = 1;
-    r.zoom = 1;
-    try testing.expectApproxEqAbs(@as(f32, 75), r.percent(), 0.01);
-    r.zoom = r.hundredPercent();
-    try testing.expectApproxEqAbs(@as(f32, 100), r.percent(), 0.01);
-    try testing.expectApproxEqAbs(@as(f32, 4.0 / 3.0), r.zoom, 0.001);
+    s.splitWindow(.vertical);
+    s.view().setZoom(2);
 
-    // The same document at 100% on a 150% display needs half again as many
-    // device pixels per point, and still reads as 100%: the page is the same
-    // size in millimetres, which is the thing the number is about.
-    r.dpi_scale = 1.5;
-    r.zoom = r.hundredPercent();
-    try testing.expectApproxEqAbs(@as(f32, 100), r.percent(), 0.01);
-    try testing.expectApproxEqAbs(@as(f32, 2.0), r.zoom, 0.001);
+    const a = s.layout.viewAt(0);
+    const b = s.layout.viewAt(1);
+    try testing.expect(a.zoom != b.zoom);
 
-    // And the old default, which is where 153% came from.
-    r.dpi_scale = 1;
-    r.zoom = 110.0 / 72.0;
-    try testing.expectApproxEqAbs(@as(f32, 114.58), r.percent(), 0.01);
+    s.backend = .cpu;
+    s.slots[0] = .{ .buffer = 0, .page = 0, .zoom = a.zoom, .gpu = 1, .list = 1 };
+    try testing.expect(s.cached(a, 0));
+    try testing.expect(!s.cached(b, 0));
+
+    s.backend = .gpu;
+    s.recorded.pages[0] = .{ .buffer = 0, .page = 0, .source = .{} };
+    try testing.expect(s.cached(a, 0));
+    try testing.expect(s.cached(b, 0));
+    s.recorded.pages[0].source = null;
+}
+
+test "a page rendered for a window that has closed is not cached" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(s.wantedNow(.{ .buffer = 0, .page = 0, .zoom = 1 }));
+    // Nobody is looking at this document at this zoom any more.
+    try testing.expect(!s.wantedNow(.{ .buffer = 0, .page = 0, .zoom = 3.5 }));
+    try testing.expect(!s.wantedNow(.{ .buffer = 9, .page = 0, .zoom = 1 }));
+}
+
+test "closing the last window is a quit, and closing others is not" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(!s.closeWindow());
+    s.splitWindow(.vertical);
+    try testing.expect(s.closeWindow());
+    try testing.expectEqual(@as(u32, 1), s.layout.count());
+    try testing.expect(!s.closeWindow());
+}
+
+/// `rows` lines of `cols` glyphs each, twenty points apart, as page `page`'s
+/// text map in buffer 0. Words are two glyphs long.
+fn putText(s: *Session, page: u32, rows: usize, cols: usize) !void {
+    const gpa = s.gpa;
+    const glyphs = try gpa.alloc(gelgja.DisplayList.Glyph, rows * cols);
+    defer gpa.free(glyphs);
+    const cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, rows);
+    defer gpa.free(cmds);
+    for (0..rows) |row| {
+        for (0..cols) |col| {
+            // Every second glyph is followed by a wider advance: a word gap.
+            const x = 10 * @as(f32, @floatFromInt(col)) + 6 * @as(f32, @floatFromInt(col / 2));
+            glyphs[row * cols + col] = .{ .code = 'a', .offset = .{ .x = x, .y = 0 } };
+        }
+        cmds[row] = .{ .text = .{
+            .size = 10,
+            .transform = .translation(100, 700 - 20 * @as(f32, @floatFromInt(row))),
+            .glyphs = .{ .start = @intCast(row * cols), .count = @intCast(cols) },
+        } };
+    }
+    s.buffer(0).putMap(gpa, page, try text.build(gpa, .{ .glyphs = glyphs, .cmds = cmds }));
+}
+
+test "a selection runs in reading order, inclusive, and across pages" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    try putText(&s, 0, 3, 4);
+    try putText(&s, 1, 3, 4);
+
+    var boxes: std.ArrayList(Session.PageBox) = .empty;
+    defer boxes.deinit(gpa);
+
+    // From the middle of the first line to the middle of the last: three
+    // boxes, the middle one whole and the ends partial.
+    try s.selectionBoxes(0, .{ .page = 0, .line = 0, .column = 2 }, .{ .page = 0, .line = 2, .column = 1 }, false, &boxes);
+    try testing.expectEqual(@as(usize, 3), boxes.items.len);
+    try testing.expect(boxes.items[1].box.width() > boxes.items[0].box.width());
+    try testing.expect(boxes.items[1].box.width() > boxes.items[2].box.width());
+
+    // Backwards is the same selection.
+    var backwards: std.ArrayList(Session.PageBox) = .empty;
+    defer backwards.deinit(gpa);
+    try s.selectionBoxes(0, .{ .page = 0, .line = 2, .column = 1 }, .{ .page = 0, .line = 0, .column = 2 }, false, &backwards);
+    try testing.expectEqual(boxes.items.len, backwards.items.len);
+    try testing.expectApproxEqAbs(boxes.items[0].box.min_x, backwards.items[0].box.min_x, 0.01);
+
+    // One glyph is a selection of one glyph: `v` then `m` highlights the
+    // letter under the cursor, as it does in Vim.
+    try s.selectionBoxes(0, .{ .page = 0, .line = 1, .column = 1 }, .{ .page = 0, .line = 1, .column = 1 }, false, &boxes);
+    try testing.expectEqual(@as(usize, 1), boxes.items.len);
+
+    // Line-wise, and over a page break: the last line of page 0 and the
+    // first of page 1, both whole.
+    try s.selectionBoxes(0, .{ .page = 0, .line = 2, .column = 3 }, .{ .page = 1, .line = 0, .column = 0 }, true, &boxes);
+    try testing.expectEqual(@as(usize, 2), boxes.items.len);
+    try testing.expectEqual(@as(u32, 0), boxes.items[0].page);
+    try testing.expectEqual(@as(u32, 1), boxes.items[1].page);
+    try testing.expectApproxEqAbs(boxes.items[0].box.width(), boxes.items[1].box.width(), 0.01);
+}
+
+test "visual mode: select with motions, highlight in a colour, undo it" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+    try putText(&s, 0, 3, 4);
+
+    // `v`, `j`, `w`, `3`: what the keymap turns those keys into.
+    s.keymap.mode = .visual;
+    _ = s.apply(.enter_visual);
+    try testing.expect(s.view().anchor != null);
+    _ = s.apply(.{ .move_cursor = .down });
+    _ = s.apply(.{ .move_cursor = .word_next });
+    s.keymap.mode = .normal;
+    _ = s.apply(.{ .highlight_selection = 2 });
+
+    const marks = &s.buffer(0).marks;
+    // Two lines selected, so two marks, in the third palette colour.
+    try testing.expectEqual(@as(usize, 2), marks.count());
+    try testing.expectEqual(Library.parseColor("green").?, marks.items()[0].color);
+    try testing.expect(s.view().anchor == null);
+
+    // And one `u` takes both back.
+    _ = s.apply(.undo);
+    try testing.expectEqual(@as(usize, 0), marks.count());
+    _ = s.apply(.redo);
+    try testing.expectEqual(@as(usize, 2), marks.count());
+}
+
+test "highlighting over a highlight replaces it rather than stacking" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const line: Session.PageBox = .{ .page = 0, .box = .fromRect(100, 695, 160, 710) };
+    s.highlightBoxes(0, &.{line}, Library.parseColor("yellow").?);
+    s.highlightBoxes(0, &.{line}, Library.parseColor("blue").?);
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+    try testing.expectEqual(Library.parseColor("blue").?, s.buffer(0).marks.items()[0].color);
+}
+
+test "visual d removes the highlights the selection touches" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+    try putText(&s, 0, 3, 4);
+
+    // A highlight on each of the three lines.
+    const map = s.buffer(0).textMap(0).?;
+    for (map.lines) |l| s.highlightBoxes(0, &.{.{ .page = 0, .box = l.box }}, s.accent);
+    try testing.expectEqual(@as(usize, 3), s.buffer(0).marks.count());
+
+    // Select from the second line to the third, and delete.
+    s.view().cursorTo(.{ .page = 0, .line = 1, .column = 0 }, map);
+    s.keymap.mode = .visual;
+    _ = s.apply(.enter_visual);
+    _ = s.apply(.{ .move_cursor = .down });
+    s.keymap.mode = .normal;
+    _ = s.apply(.unhighlight_selection);
+
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+}
+
+test "edit mode walks highlights in reading order, recolours, notes and deletes, and the library follows" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    s.library = lib;
+
+    // Made bottom first, so reading order and creation order differ.
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 600, 200, 612) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+    s.applyEffects();
+    {
+        const rows = try lib.highlights("/docs/a.pdf");
+        defer lib.freeHighlights(rows, rows.len);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+    }
+
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    const marks = &s.buffer(0).marks;
+    // No cursor out, so the first in reading order: the higher one.
+    try testing.expectApproxEqAbs(@as(f32, 700), marks.items()[s.focusedMarkIndex().?].box.min_y, 0.01);
+
+    _ = s.apply(.next_mark);
+    try testing.expectApproxEqAbs(@as(f32, 600), marks.items()[s.focusedMarkIndex().?].box.min_y, 0.01);
+
+    _ = s.apply(.{ .recolour_mark = 4 });
+    s.keymap.mode = .note;
+    _ = s.apply(.enter_note);
+    for ("check") |c| _ = s.apply(.{ .note_char = c });
+    _ = s.apply(.note_backspace);
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    s.applyEffects();
+
+    {
+        const rows = try lib.highlights("/docs/a.pdf");
+        defer lib.freeHighlights(rows, rows.len);
+        var found = false;
+        for (rows) |r| {
+            if (r.y0 != 600) continue;
+            found = true;
+            try testing.expectEqualStrings("#ef476f", r.color);
+            try testing.expectEqualStrings("chec", r.note);
+        }
+        try testing.expect(found);
+    }
+
+    // Delete it: focus moves on to the other one, and the row goes.
+    _ = s.apply(.delete_mark);
+    s.applyEffects();
+    try testing.expectEqual(@as(usize, 1), marks.count());
+    try testing.expect(s.focus_mark != null);
+    {
+        const rows = try lib.highlights("/docs/a.pdf");
+        defer lib.freeHighlights(rows, rows.len);
+        try testing.expectEqual(@as(usize, 1), rows.len);
+    }
+
+    // Undo the deletion: a row again, with its colour and note.
+    _ = s.apply(.undo);
+    s.applyEffects();
+    {
+        const rows = try lib.highlights("/docs/a.pdf");
+        defer lib.freeHighlights(rows, rows.len);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        var note_back = false;
+        for (rows) |r| {
+            if (std.mem.eql(u8, r.note, "chec")) note_back = true;
+        }
+        try testing.expect(note_back);
+    }
+}
+
+test "edit mode on a document with no highlights says so and stays in normal" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    try testing.expectEqual(keys.Mode.normal, s.keymap.mode);
+    try testing.expect(s.status.len != 0);
+}
+
+test "backspace in a note removes a character, not a byte" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.noteChar('a');
+    s.noteChar(0xe9); // two bytes in UTF-8
+    s.noteBackspace();
+    try testing.expectEqualStrings("a", s.note.items);
+}
+
+test "the title bar carries the mode and what it is showing" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    var title: [1024]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, s.titleText(&title, 0, 1), "VISUAL") == null);
+
+    s.keymap.mode = .visual;
+    try testing.expect(std.mem.indexOf(u8, s.titleText(&title, 0, 1), "-- VISUAL --") != null);
+
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+    s.keymap.mode = .note;
+    s.focus_mark = s.buffer(0).marks.items()[0].key;
+    for ("hello") |c| s.noteChar(c);
+    try testing.expect(std.mem.indexOf(u8, s.titleText(&title, 0, 1), "-- NOTE -- 1/1 hello_") != null);
+}
+
+test "the cursor's line can be highlighted and cleared again" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const glyphs = try gpa.alloc(gelgja.DisplayList.Glyph, 3);
+    defer gpa.free(glyphs);
+    for (glyphs, 0..) |*g, i| g.* = .{
+        .code = 'a',
+        .offset = .{ .x = 10 * @as(f32, @floatFromInt(i)), .y = 0 },
+    };
+    var cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, 1);
+    defer gpa.free(cmds);
+    cmds[0] = .{ .text = .{
+        .size = 10,
+        .transform = .translation(100, 700),
+        .glyphs = .{ .start = 0, .count = 3 },
+    } };
+    const map = try text.build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    s.buffer(0).putMap(gpa, 0, map);
+
+    s.view().cursorToPage(0, s.buffer(0).textMap(0).?, false);
+    s.toggleMark();
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+
+    // Again on the same line: the cursor is inside the mark it just made, so
+    // this takes it away rather than stacking a second one on top.
+    s.toggleMark();
+    try testing.expectEqual(@as(usize, 0), s.buffer(0).marks.count());
+}
+
+test "showing another document in a window keeps the place in the first" {
+    const gpa = testing.allocator;
+    var buf: [20]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try s.buffers.append(gpa, .{
+        .path = try gpa.dupe(u8, "/docs/b.pdf"),
+        .title = "b.pdf",
+        .pages = fakePages(buf[10..], 6),
+    });
+
+    s.view().scrollToPage(5);
+    const was = s.view().scroll;
+
+    s.showBuffer(1);
+    try testing.expectEqual(@as(u32, 1), s.view().buffer);
+    try testing.expectEqual(@as(usize, 6), s.view().pages.len);
+    try testing.expectApproxEqAbs(@as(f32, 0), s.view().scroll, 0.001);
+
+    // And back, which without a library does not restore the place -- so the
+    // test asserts what it can: the pages are the first document's again.
+    s.showBuffer(-1);
+    try testing.expectEqual(@as(u32, 0), s.view().buffer);
+    try testing.expectEqual(@as(usize, 10), s.view().pages.len);
+    try testing.expect(was > 0);
+}
+
+test "a job only equals a job for the same page of the same document at the same zoom" {
+    const a: Job = .{ .buffer = 0, .page = 3, .zoom = 1.5 };
+    try testing.expect(a.eql(.{ .buffer = 0, .page = 3, .zoom = 1.5 }));
+    try testing.expect(!a.eql(.{ .buffer = 1, .page = 3, .zoom = 1.5 }));
+    try testing.expect(!a.eql(.{ .buffer = 0, .page = 4, .zoom = 1.5 }));
+    try testing.expect(!a.eql(.{ .buffer = 0, .page = 3, .zoom = 1.25 }));
 }
 
 test "a page that will not rasterise is asked for once, not every frame" {
-    // Without this the frame loop posts the same doomed page to the worker
-    // forever: it never lands in a slot, so `firstMissing` keeps returning it
-    // and the reader burns a core rendering nothing.
+    const gpa = testing.allocator;
     var buf: [8]fenrir.Page = undefined;
-    var r = layoutOf(fakePages(&buf, 4), 0.5, .{ 700, 500 });
+    var s = try sessionOf(gpa, fakePages(&buf, 4), 0.5, 1000, 800);
+    defer closeSession(&s);
 
-    try testing.expectEqual(@as(u32, 0), r.firstMissing().?);
-    r.noteFailure(.{ .page = 0, .zoom = r.zoom });
-    try testing.expectEqual(@as(u32, 1), r.firstMissing().?);
+    try testing.expectEqual(@as(u32, 0), s.firstMissing().?.page);
+    s.noteFailure(.{ .buffer = 0, .page = 0, .zoom = s.view().zoom });
+    try testing.expectEqual(@as(u32, 1), s.firstMissing().?.page);
 
     // The failure is remembered per zoom, because a page that ran out of
     // memory at one scale may well fit at another.
-    r.zoom = 0.25;
-    try testing.expectEqual(@as(u32, 0), r.firstMissing().?);
+    s.view().zoom = 0.25;
+    try testing.expectEqual(@as(u32, 0), s.firstMissing().?.page);
 }
 
-test "a job only equals a job for the same page at the same zoom" {
-    // What keeps a page rendered before a zoom change from being uploaded
-    // into a slot that claims to hold the page at the new one.
-    const a: Job = .{ .page = 3, .zoom = 1.5 };
-    try testing.expect(a.eql(.{ .page = 3, .zoom = 1.5 }));
-    try testing.expect(!a.eql(.{ .page = 4, .zoom = 1.5 }));
-    try testing.expect(!a.eql(.{ .page = 3, .zoom = 1.25 }));
+test "the place written down is where the reader was, to the point" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+    s.library = lib;
+
+    // 150 pixels below the top of page 5, which at zoom 1 is 150 points.
+    s.view().scroll = s.view().pageTop(5) + 150;
+
+    // What the reader writes on the way out. Through `placeOf`, which is the
+    // conversion being tested; `remember` itself only adds a clock.
+    try lib.visit(s.buffer(0).path, "a.pdf", Session.placeOf(s.view()), 1);
+
+    // Reopened at twice the zoom, the same *point* of the same page is at
+    // the top -- which is the whole reason the offset is in points and not
+    // in the pixels it was scrolled by.
+    var other = try sessionOf(gpa, fakePages(&buf, 10), 2, 1000, 800);
+    defer closeSession(&other);
+    other.library = lib;
+
+    const place = other.restore(other.view(), 0, false, false).?;
+    try testing.expectEqual(@as(u32, 5), place.page);
+    try testing.expectApproxEqAbs(@as(f32, 150), place.offset, 1.0);
+    try testing.expectEqual(@as(u32, 5), other.view().currentPage());
+    // 150 points at zoom 2 is 300 pixels below the top of the page.
+    try testing.expectApproxEqAbs(
+        other.view().pageTop(5) + 300,
+        other.view().scroll,
+        1.0,
+    );
+}
+
+test "highlights come back out of the library the next time it is opened" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    s.library = lib;
+    s.ctx = undefined;
+
+    // Written through the session, so the row and the in-memory mark are
+    // made by the same call a keypress would make.
+    _ = try lib.addHighlight(s.buffer(0).path, .{
+        .page = 2,
+        .x0 = 100,
+        .y0 = 700,
+        .x1 = 300,
+        .y1 = 712,
+        .color = @constCast("#ff0000"),
+    }, 1);
+
+    var reopened = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&reopened);
+    reopened.library = lib;
+    reopened.loadMarks(0);
+
+    try testing.expectEqual(@as(usize, 1), reopened.buffer(0).marks.count());
+    const mark = reopened.buffer(0).marks.items()[0];
+    try testing.expectEqual(@as(u32, 2), mark.page);
+    try testing.expectApproxEqAbs(@as(f32, 1), mark.color.r, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0), mark.color.g, 0.01);
+    // Loading is not an edit, so closing again writes nothing back.
+    try testing.expect(!reopened.buffer(0).marks.dirty);
+}
+
+test "command lines: page numbers, relative pages, zoom, and unknown names" {
+    const gpa = testing.allocator;
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(s.exec("7"));
+    try testing.expectEqual(@as(u32, 6), s.view().currentPage());
+    try testing.expect(s.exec("page +2"));
+    try testing.expectEqual(@as(u32, 8), s.view().currentPage());
+    try testing.expect(s.exec("page -1"));
+    try testing.expectEqual(@as(u32, 7), s.view().currentPage());
+
+    try testing.expect(!s.exec("99"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "10 pages") != null);
+
+    try testing.expect(s.exec("zoom 200%"));
+    try testing.expectApproxEqAbs(@as(f32, 200), s.view().percent(), 0.5);
+
+    try testing.expect(s.exec("vsplit"));
+    try testing.expectEqual(@as(u32, 2), s.layout.count());
+    try testing.expect(s.exec("q"));
+    try testing.expectEqual(@as(u32, 1), s.layout.count());
+    try testing.expect(!s.quit);
+    try testing.expect(s.exec("q"));
+    try testing.expect(s.quit);
+
+    try testing.expect(!s.exec("frobnicate now"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "frobnicate") != null);
+}
+
+test "a plugin drives the real reader: bindings, commands, highlights, events" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    s.plugins = rt;
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    try testing.expect(rt.runString("init.lua",
+        \\events = {}
+        \\fenrir.on("highlight", function(h) events[#events + 1] = h.action .. ":" .. h.page end)
+        \\fenrir.on("page", function(p) last_page = p end)
+        \\fenrir.keymap("n", "g", function() fenrir.go(fenrir.document().pages) end)
+        \\fenrir.command("Mark", function(args)
+        \\  fenrir.highlight{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", note = "from lua" }
+        \\end)
+    ));
+
+    // The binding, through the keymap, as a key press would reach it.
+    const out = keys.commandWith(&s.keymap, .{ .events = &.{.{ .text = "g" }} }, rt.lookup());
+    try testing.expect(!s.apply(out.items()[0]));
+    try testing.expectEqual(@as(u32, 9), s.view().currentPage());
+
+    // A plugin command from the command line.
+    try testing.expect(s.exec("Mark 3"));
+    s.applyEffects();
+    const marks = s.buffer(0).marks.items();
+    try testing.expectEqual(@as(usize, 1), marks.len);
+    try testing.expectEqual(@as(u32, 2), marks[0].page);
+    try testing.expectEqualStrings("from lua", marks[0].note);
+    try testing.expectEqual(Library.parseColor("blue").?, marks[0].color);
+
+    // Undo is the reader's, and the plugin hears about both.
+    _ = s.apply(.undo);
+    s.applyEffects();
+    s.reportChanges();
+    try testing.expect(s.exec("lua assert(events[1] == 'add:3' and events[2] == 'remove:3', table.concat(events, ',')) assert(last_page == 10)"));
+    try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
+
+    // A broken binding reports and leaves the reader running.
+    try testing.expect(rt.runString("more", "fenrir.keymap('n', 'x', function() error('boom') end)"));
+    const bad = keys.commandWith(&s.keymap, .{ .events = &.{.{ .text = "x" }} }, rt.lookup());
+    try testing.expect(!s.apply(bad.items()[0]));
+    try testing.expect(std.mem.indexOf(u8, s.status, "boom") != null);
 }
