@@ -720,6 +720,11 @@ differently -- is the reader's plugin system, and it is Neovim's model: Lua,
 an `init.lua`, a directory of plugins, and one table of functions for talking
 to the program.
 
+Neovim's *model*, not Neovim's interpreter. Neovim is LuaJIT and its permanent
+interface is Lua 5.1; this is PUC-Rio Lua 5.4, which is neither source
+compatible with it nor as fast. Why, and what the difference costs, is
+[below](#why-lua-54-and-not-luajit).
+
 ### Where they live
 
 ```
@@ -863,6 +868,82 @@ Not there yet: bindings for key *sequences* (`gg`, `<leader>x`) -- a binding is
 one key or one chord, and anything longer is refused with that reason; timers;
 drawing on the page; and reading the page's text as characters, which waits on
 character codes being mapped to Unicode.
+
+### Why Lua 5.4 and not LuaJIT
+
+Neovim's Lua *is* LuaJIT. `:help lua-compat` says it plainly -- "Lua 5.1 is the
+permanent interface for Nvim Lua" -- and a Neovim built against anything else
+is the unusual one. Galdr borrows Neovim's *shape* and not its interpreter: it
+embeds PUC-Rio Lua 5.4. That costs something real in both speed and
+compatibility, so here is the case on both sides rather than a version number
+and no reason.
+
+**What LuaJIT would buy.** Speed, and source compatibility with the Lua that
+Neovim plugin authors already write. LuaJIT compiles hot traces to machine
+code where 5.4 interprets bytecode, and a tight numeric loop is its best case
+-- several times faster, not a few percent.
+
+Measured in this build, ReleaseFast, one desktop core. Each row is the cost of
+one iteration and includes the loop that drives it:
+
+| loop body | per iteration |
+|---|---|
+| `s = s + i` | 12 ns |
+| `n = n + f()`, calling a Lua function | 60 ns |
+| `if fenrir.mode() then n = n + 1 end`, calling into the reader | 81 ns |
+
+and loading a configuration -- starting Lua, building the sandbox, running
+`init.lua` -- is about 10 ms for the whole process.
+
+**What it would cost.** Two things, and the first is the sandbox.
+
+- **The FFI.** LuaJIT ships `ffi`, and `ffi.cdef` with `ffi.C` calls any C
+  function in the process and reads and writes arbitrary memory. That is not a
+  hole in a sandbox; it is the absence of one. Everything claimed above -- no
+  files, no processes, no native code -- is a claim PUC Lua lets this program
+  make by leaving three library files unopened. Making the same claim on
+  LuaJIT means removing `ffi` and `jit`, checking what `bit` and the loader
+  still reach, and defending that again at every release. A plugin directory
+  is a place people paste code from strangers, and that is the one thing this
+  system is not willing to be casual about.
+- **The build.** PUC Lua is thirty-odd C files with no dependencies of their
+  own, which is why `build.zig` compiles it for whatever target Zig is pointed
+  at, and why the Android section below is as short as it is. LuaJIT is a
+  two-stage build: DynASM generates a host tool, the host tool emits assembly
+  for the target, and only then does the target build run. That is expressible
+  in a Zig build graph, but it is a great deal more than a list of source
+  files, and it works only on the architectures LuaJIT has a backend for.
+
+**Why the speed did not decide it.** A keypress runs one handler that makes a
+handful of calls -- single-digit microseconds against a 16 ms frame. Galdr has
+no timers, cannot draw, and cannot read a page's text as characters, so there
+is currently nothing for a plugin to loop over except its own arithmetic. The
+interpreter is not where a plugin's time goes, and 12 ns an iteration is not
+the reason a frame is late.
+
+That argument has an expiry date. When the missing pieces land -- page text,
+drawing, timers -- a plugin will start looping over real data, and the right
+response then is to measure this again rather than re-argue it. The sandbox
+objection does not expire, so a move would more likely be to LuaJIT's
+*interpreter* with the FFI compiled out than to LuaJIT as it ships.
+
+**Writing for both.** `fenrir.lua` is the string `"Lua 5.4"`, so a plugin that
+wants to run under either can branch on it. The differences that actually bite
+someone arriving from Neovim:
+
+| LuaJIT / 5.1 | here, 5.4 |
+|---|---|
+| `unpack(t)` | `table.unpack(t)` |
+| `loadstring(s)` | `load(s)` -- and source only, never bytecode |
+| `setfenv`, `getfenv`, `module` | gone; use an explicit table |
+| `bit.band(a, b)` | the operators `&`, `\|`, `~`, `<<`, `>>` |
+| `math.pow(a, b)`, `math.mod` | `a ^ b`, `a % b` |
+| `tostring(4 / 1)` is `"4"` | `"4.0"` -- 5.3 split integers from floats, and this one shows up in concatenated messages |
+| `ffi`, `jit` | not there, on purpose |
+
+It runs the other way too: `//`, `<const>`, `<close>` and the bitwise operators
+are *syntax* in 5.4, so a plugin that uses them will not even load under
+LuaJIT.
 
 ## Layout
 
