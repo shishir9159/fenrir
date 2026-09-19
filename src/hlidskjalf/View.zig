@@ -325,8 +325,12 @@ pub fn pageRect(v: View, index: usize) Bounds {
     return .fromRect(x, y, x + size[0], y + size[1]);
 }
 
+/// A half-open range of pages. Named rather than anonymous so that a caller
+/// can pass one on to something else.
+pub const Visible = struct { first: u32, end: u32 };
+
 /// Which pages have pixels in this view, as a half-open range.
-pub fn visiblePages(v: View) struct { first: u32, end: u32 } {
+pub fn visiblePages(v: View) Visible {
     var first: u32 = 0;
     var end: u32 = 0;
     var seen = false;

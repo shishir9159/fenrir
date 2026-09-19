@@ -841,6 +841,17 @@ const Session = struct {
     failures: [16]Job = @splat(.{ .buffer = 0, .page = Slot.no_page, .zoom = 0 }),
     failure_next: usize = 0,
 
+    /// Scratch for `compose`, held rather than made fresh each time.
+    ///
+    /// These three are rebuilt from nothing every frame -- the windows in
+    /// draw order, the lines between them, and the boxes a selection covers
+    /// -- and a reader scrolling at the refresh rate would otherwise ask the
+    /// allocator for them sixty times a second forever. Kept here they are a
+    /// few allocations for the life of the session.
+    order: std.ArrayList(u32) = .empty,
+    borders: std.ArrayList(Bounds) = .empty,
+    boxes: std.ArrayList(PageBox) = .empty,
+
     const Drag = struct {
         buffer: u32,
         from: View.Position,
@@ -863,6 +874,9 @@ const Session = struct {
             b.deinit(s.gpa);
         }
         s.buffers.deinit(s.gpa);
+        s.order.deinit(s.gpa);
+        s.borders.deinit(s.gpa);
+        s.boxes.deinit(s.gpa);
     }
 
     // -- buffers -------------------------------------------------------------
@@ -2427,11 +2441,10 @@ const Session = struct {
         s.stamp += 1;
         s.recorded.stamp = s.stamp;
 
-        var order: std.ArrayList(u32) = .empty;
-        defer order.deinit(s.gpa);
-        try s.layout.leaves(&order, s.gpa);
+        s.order.clearRetainingCapacity();
+        try s.layout.leaves(&s.order, s.gpa);
 
-        for (order.items) |leaf| {
+        for (s.order.items) |leaf| {
             const v = s.layout.viewAt(s.layout.nodes.items[leaf].view);
             // Everything a window draws is confined to its own rectangle, or
             // a page scrolled past the bottom of one split would appear in
@@ -2445,10 +2458,9 @@ const Session = struct {
 
         // The lines between windows, then the focus ring, on top of
         // everything so neither is covered by a page.
-        var lines: std.ArrayList(Bounds) = .empty;
-        defer lines.deinit(s.gpa);
-        try s.layout.borders(&lines, s.gpa);
-        for (lines.items) |b| try over.fill(b, divider);
+        s.borders.clearRetainingCapacity();
+        try s.layout.borders(&s.borders, s.gpa);
+        for (s.borders.items) |b| try over.fill(b, divider);
 
         if (s.layout.count() > 1) {
             const focused = s.layout.nodes.items[s.layout.focus].rect;
@@ -2496,8 +2508,9 @@ const Session = struct {
                 try list.fill(rect, paper);
             }
 
-            try s.drawMarks(v, b, i, over);
         }
+
+        try s.drawMarks(v, b, range, over);
 
         v.marks_seen = b.marks.revision;
         try s.drawSelection(v, over);
@@ -2505,7 +2518,7 @@ const Session = struct {
         try s.drawScrollbar(v, over);
     }
 
-    /// The highlights on one page.
+    /// The highlights on the pages a window can see.
     ///
     /// Drawn over the page rather than under it, with alpha, because a PDF's
     /// paper is opaque: a highlight beneath it would not be visible at all.
@@ -2516,11 +2529,23 @@ const Session = struct {
     /// note carries a small tab at its top-right corner -- the note's text is
     /// in the title bar while the highlight is in hand, since the title bar
     /// is the only text this window draws.
-    fn drawMarks(s: *Session, v: *View, b: *Buffer, page: u32, over: *DrawList) !void {
+    ///
+    /// The whole range at once, rather than a call per page: a buffer's marks
+    /// are one list in no particular page order, so a call per page would
+    /// walk all of them once for each page on screen, and a well-marked
+    /// document with four windows open would walk it a dozen times a frame.
+    fn drawMarks(
+        s: *Session,
+        v: *View,
+        b: *Buffer,
+        range: View.Visible,
+        over: *DrawList,
+    ) !void {
         const editing = s.keymap.mode == .edit or s.keymap.mode == .note;
         const in_focus = v == s.layout.current();
         for (b.marks.items()) |mark| {
-            if (mark.page != page) continue;
+            if (mark.page < range.first or mark.page >= range.end) continue;
+            const page = mark.page;
             const box = v.windowBox(page, mark.box);
             const held = editing and in_focus and s.focus_mark == mark.key;
             const c = mark.color;
@@ -2556,10 +2581,9 @@ const Session = struct {
             else
                 return;
 
-        var boxes: std.ArrayList(PageBox) = .empty;
-        defer boxes.deinit(s.gpa);
-        s.selectionBoxes(v.buffer, from, to, lines, &boxes) catch return;
-        for (boxes.items) |pb| {
+        s.boxes.clearRetainingCapacity();
+        s.selectionBoxes(v.buffer, from, to, lines, &s.boxes) catch return;
+        for (s.boxes.items) |pb| {
             if (pb.page >= v.pages.len) continue;
             try over.fill(v.windowBox(pb.page, pb.box), .{ .r = 0.2, .g = 0.45, .b = 0.95, .a = 0.28 });
         }
