@@ -502,30 +502,42 @@ pub const Canvas = struct {
         const steps_y = sampleSteps(fy * @as(f32, @floatFromInt(img.height)));
         const n = @as(f32, @floatFromInt(steps_x * steps_y));
 
+        // The sample offsets within a pixel, and the image's own size as a
+        // float. All of them are the same for every pixel of the image, and
+        // there are up to sixteen samples per pixel over a figure that covers
+        // half a page -- so working them out here rather than in the innermost
+        // loop takes two divisions and two conversions off every one of them.
+        var offs_x: [4]f32 = undefined;
+        var offs_y: [4]f32 = undefined;
+        for (offs_x[0..steps_x], 0..) |*o, k| {
+            o.* = (@as(f32, @floatFromInt(k)) + 0.5) / @as(f32, @floatFromInt(steps_x));
+        }
+        for (offs_y[0..steps_y], 0..) |*o, k| {
+            o.* = (@as(f32, @floatFromInt(k)) + 0.5) / @as(f32, @floatFromInt(steps_y));
+        }
+        const img_w: f32 = @floatFromInt(img.width);
+        const img_h: f32 = @floatFromInt(img.height);
+
         var y: u32 = area.y0;
         while (y < area.y1) : (y += 1) {
+            const fyp: f32 = @floatFromInt(y);
             var x: u32 = area.x0;
             while (x < area.x1) : (x += 1) {
                 const clip = c.clipAt(x, y);
                 if (clip == 0) continue;
 
+                const fxp: f32 = @floatFromInt(x);
                 var acc: [4]f32 = @splat(0);
                 var taken: u32 = 0;
-                var sy: u32 = 0;
-                while (sy < steps_y) : (sy += 1) {
-                    var sx: u32 = 0;
-                    while (sx < steps_x) : (sx += 1) {
-                        const px = @as(f32, @floatFromInt(x)) +
-                            (@as(f32, @floatFromInt(sx)) + 0.5) / @as(f32, @floatFromInt(steps_x));
-                        const py = @as(f32, @floatFromInt(y)) +
-                            (@as(f32, @floatFromInt(sy)) + 0.5) / @as(f32, @floatFromInt(steps_y));
+                for (offs_y[0..steps_y]) |oy| {
+                    for (offs_x[0..steps_x]) |ox| {
+                        const px = fxp + ox;
+                        const py = fyp + oy;
                         const uv = inverse.apply(.{ .x = px, .y = py });
                         if (uv.x < 0 or uv.x >= 1 or uv.y < 0 or uv.y >= 1) continue;
 
-                        const ix: u32 = @min(img.width - 1, @as(u32, @intFromFloat(uv.x *
-                            @as(f32, @floatFromInt(img.width)))));
-                        const iy: u32 = @min(img.height - 1, @as(u32, @intFromFloat((1 - uv.y) *
-                            @as(f32, @floatFromInt(img.height)))));
+                        const ix: u32 = @min(img.width - 1, @as(u32, @intFromFloat(uv.x * img_w)));
+                        const iy: u32 = @min(img.height - 1, @as(u32, @intFromFloat((1 - uv.y) * img_h)));
                         const at = (@as(usize, iy) * img.width + ix) * 4;
                         if (at + 4 > img.pixels.len) continue;
 
@@ -686,19 +698,55 @@ pub const Canvas = struct {
         const positions = c.samples.positions();
         const n = c.samples.count();
 
+        // The three edge tests, bracketed over a pixel. See `Edge`.
+        const edges: [3]Edge = .{
+            .of(p0, p1, area_px),
+            .of(p1, p2, area_px),
+            .of(p2, p0, area_px),
+        };
+
         var y: u32 = area_px.y0;
         while (y < area_px.y1) : (y += 1) {
+            const fy: f32 = @floatFromInt(y);
             var x: u32 = area_px.x0;
             while (x < area_px.x1) : (x += 1) {
                 const pixel = @as(usize, y) * c.width() + x;
 
                 if (c.clipAt(x, y) == 0) continue;
 
+                // Which side of each edge the pixel's corner is on, and
+                // whether its samples can straddle the edge at all. A pixel
+                // wholly outside any edge is skipped without touching a
+                // sample, and one wholly inside all three takes every sample
+                // without testing it -- between them that is most of the
+                // pixels in a triangle's box, and all of the arithmetic.
+                const fx: f32 = @floatFromInt(x);
+                var whole = true;
+                var outside = false;
+                for (edges) |e| {
+                    const d = e.dx * (fy - e.ay) - e.dy * (fx - e.ax);
+                    if (d + e.hi < -e.margin) {
+                        outside = true;
+                        break;
+                    }
+                    if (d + e.lo <= e.margin) whole = false;
+                }
+                if (outside) continue;
+
+                // A cover triangle over a pixel no stencil triangle reached
+                // has nothing to test and nothing to clear. Worth checking
+                // because the cover quad is the whole path's box while the
+                // path is usually a small part of it -- an `o` fills about a
+                // third of its own box, and a comma a twentieth.
+                if (pass == .cover and allClear(c.stencil[pixel * n ..][0..n])) continue;
+
                 var covered: u32 = 0;
                 for (positions, 0..) |off, si| {
-                    const px = @as(f32, @floatFromInt(x)) + off[0];
-                    const py = @as(f32, @floatFromInt(y)) + off[1];
-                    if (!inside(p0, p1, p2, px, py)) continue;
+                    if (!whole) {
+                        const px = fx + off[0];
+                        const py = fy + off[1];
+                        if (!inside(p0, p1, p2, px, py)) continue;
+                    }
 
                     const slot = pixel * n + si;
                     switch (pass) {
@@ -796,6 +844,14 @@ fn apply(t: Transform, v: Vertex) Vertex {
     };
 }
 
+/// Whether every sample of one pixel is clear. Folded rather than compared so
+/// that the whole pixel is one or two machine words either way.
+fn allClear(samples: []const u8) bool {
+    var acc: u8 = 0;
+    for (samples) |s| acc |= s;
+    return acc == 0;
+}
+
 fn signedArea(a: Vertex, b: Vertex, c: Vertex) f32 {
     return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 }
@@ -803,6 +859,59 @@ fn signedArea(a: Vertex, b: Vertex, c: Vertex) f32 {
 fn inside(p0: Vertex, p1: Vertex, p2: Vertex, x: f32, y: f32) bool {
     return edgeInside(p0, p1, x, y) and edgeInside(p1, p2, x, y) and edgeInside(p2, p0, x, y);
 }
+
+/// One directed edge of a triangle, with the range its test can take across a
+/// single pixel.
+///
+/// `edgeInside` evaluates `dx*(y - ay) - dy*(x - ax)` at a sample, and every
+/// sample of a pixel lies in the unit square at that pixel's corner. Since
+/// the expression is affine, `d(x + u, y + v) = d(x, y) + dx*v - dy*u`, so
+/// the corner's value plus `lo .. hi` brackets everything the pixel's samples
+/// can produce. A bracket entirely below zero means no sample is inside and a
+/// bracket entirely above it means all of them are, and either way the
+/// per-sample tests can be skipped -- which on a page of text is most of the
+/// pixels in a triangle's box, since a glyph's triangles are thin and their
+/// boxes are not.
+const Edge = struct {
+    dx: f32,
+    dy: f32,
+    ax: f32,
+    ay: f32,
+    lo: f32,
+    hi: f32,
+    /// How far clear of zero the bracket has to be before it is believed.
+    ///
+    /// The bracket and the per-sample test are the same arithmetic in a
+    /// different order, so they can disagree in the last bits, and a
+    /// disagreement exactly on an edge would light or drop a sample that the
+    /// exact test would not -- which is the one thing the top-left rule
+    /// exists to prevent. This is the largest `d` the triangle's box can
+    /// produce, times a hundred times the float's own epsilon: anything
+    /// inside it takes the slow path rather than guessing.
+    margin: f32,
+
+    fn of(a: Vertex, b: Vertex, box: Box) Edge {
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const span_x = @max(
+            @abs(@as(f32, @floatFromInt(box.x0)) - a.x),
+            @abs(@as(f32, @floatFromInt(box.x1)) - a.x),
+        );
+        const span_y = @max(
+            @abs(@as(f32, @floatFromInt(box.y0)) - a.y),
+            @abs(@as(f32, @floatFromInt(box.y1)) - a.y),
+        );
+        return .{
+            .dx = dx,
+            .dy = dy,
+            .ax = a.x,
+            .ay = a.y,
+            .lo = @min(dx, 0) - @max(dy, 0),
+            .hi = @max(dx, 0) - @min(dy, 0),
+            .margin = (@abs(dx) * span_y + @abs(dy) * span_x) * 1e-5,
+        };
+    }
+};
 
 /// The top-left fill rule. A sample exactly on a shared edge belongs to
 /// whichever triangle has that edge as a top or a left edge, so it is covered

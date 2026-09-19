@@ -467,8 +467,46 @@ pub const Mesh = struct {
     }
 };
 
+/// Storage a caller keeps so that meshing a path is not an allocation.
+///
+/// A page of prose is thousands of filled outlines, and `mesh` is two
+/// allocations and two frees for each of them. Held here and reused, it is
+/// two allocations for the whole page: the buffers settle at the largest
+/// path's size within the first few and never grow again.
+pub const MeshBuffers = struct {
+    vertices: std.ArrayList(Vertex) = .empty,
+    indices: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(m: *MeshBuffers, gpa: Allocator) void {
+        m.vertices.deinit(gpa);
+        m.indices.deinit(gpa);
+        m.* = .{};
+    }
+};
+
 /// Builds the fan and the cover quad. The caller owns the result.
 pub fn mesh(gpa: Allocator, f: Flattened) Allocator.Error!Mesh {
+    var buffers: MeshBuffers = .{};
+    errdefer buffers.deinit(gpa);
+    const m = try meshInto(gpa, &buffers, f);
+    return .{
+        .vertices = try buffers.vertices.toOwnedSlice(gpa),
+        .indices = try buffers.indices.toOwnedSlice(gpa),
+        .stencil_count = m.stencil_count,
+        .cover_first = m.cover_first,
+        .bounds = m.bounds,
+    };
+}
+
+/// The same mesh, built into buffers the caller keeps.
+///
+/// The slices in the result belong to `into` and are good only until the next
+/// call on the same buffers, so the result must not be `deinit`ed -- the
+/// buffers are, once, when the caller is finished with them.
+pub fn meshInto(gpa: Allocator, into: *MeshBuffers, f: Flattened) Allocator.Error!Mesh {
+    into.vertices.clearRetainingCapacity();
+    into.indices.clearRetainingCapacity();
+
     // A closed loop of n points has n edges, two of which are degenerate
     // against an anchor that is one of its own points, so it contributes
     // n - 2 triangles. Fewer than three points is a line or a dot and
@@ -480,29 +518,26 @@ pub fn mesh(gpa: Allocator, f: Flattened) Allocator.Error!Mesh {
 
     if (triangles == 0 or f.bounds.isEmpty()) {
         return .{
-            .vertices = try gpa.alloc(Vertex, 0),
-            .indices = try gpa.alloc(u32, 0),
+            .vertices = into.vertices.items,
+            .indices = into.indices.items,
             .stencil_count = 0,
             .cover_first = 0,
             .bounds = .empty,
         };
     }
 
-    const vertices = try gpa.alloc(Vertex, f.points.len + 4);
-    errdefer gpa.free(vertices);
-    @memcpy(vertices[0..f.points.len], f.points);
+    try into.vertices.ensureTotalCapacity(gpa, f.points.len + 4);
+    into.vertices.appendSliceAssumeCapacity(f.points);
 
     const b = f.bounds;
-    vertices[f.points.len + 0] = .{ .x = b.min_x, .y = b.min_y };
-    vertices[f.points.len + 1] = .{ .x = b.max_x, .y = b.min_y };
-    vertices[f.points.len + 2] = .{ .x = b.max_x, .y = b.max_y };
-    vertices[f.points.len + 3] = .{ .x = b.min_x, .y = b.max_y };
+    into.vertices.appendAssumeCapacity(.{ .x = b.min_x, .y = b.min_y });
+    into.vertices.appendAssumeCapacity(.{ .x = b.max_x, .y = b.min_y });
+    into.vertices.appendAssumeCapacity(.{ .x = b.max_x, .y = b.max_y });
+    into.vertices.appendAssumeCapacity(.{ .x = b.min_x, .y = b.max_y });
 
     const stencil_count: u32 = @intCast(triangles * 3);
-    const indices = try gpa.alloc(u32, triangles * 3 + Mesh.cover_count);
-    errdefer gpa.free(indices);
+    try into.indices.ensureTotalCapacity(gpa, triangles * 3 + Mesh.cover_count);
 
-    var w: usize = 0;
     for (f.subpaths) |s| {
         if (s.count < 3) continue;
         // Edges (p1,p2) through (p[n-2],p[n-1]). The two edges touching the
@@ -510,21 +545,19 @@ pub fn mesh(gpa: Allocator, f: Flattened) Allocator.Error!Mesh {
         // no winding number and would only cost the rasteriser a setup each.
         var i: u32 = 1;
         while (i + 1 < s.count) : (i += 1) {
-            indices[w + 0] = s.start;
-            indices[w + 1] = s.start + i;
-            indices[w + 2] = s.start + i + 1;
-            w += 3;
+            into.indices.appendAssumeCapacity(s.start);
+            into.indices.appendAssumeCapacity(s.start + i);
+            into.indices.appendAssumeCapacity(s.start + i + 1);
         }
     }
-    std.debug.assert(w == stencil_count);
+    std.debug.assert(into.indices.items.len == stencil_count);
 
     const q: u32 = @intCast(f.points.len);
-    const cover = [_]u32{ q, q + 1, q + 2, q, q + 2, q + 3 };
-    @memcpy(indices[w..][0..Mesh.cover_count], &cover);
+    into.indices.appendSliceAssumeCapacity(&.{ q, q + 1, q + 2, q, q + 2, q + 3 });
 
     return .{
-        .vertices = vertices,
-        .indices = indices,
+        .vertices = into.vertices.items,
+        .indices = into.indices.items,
         .stencil_count = stencil_count,
         .cover_first = stencil_count,
         .bounds = b,

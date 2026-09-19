@@ -333,6 +333,11 @@ const Replayer = struct {
     /// The stroker's output, kept separate so a stroke does not have to
     /// destroy the flattened input it is being built from.
     outline: path.Flattener,
+    /// Scratch for `.stencil`: the fan and cover quad of the path being
+    /// filled. Reused for the same reason `flat` is -- meshing was two
+    /// allocations and two frees per glyph, which on a page of prose is
+    /// thousands of both.
+    meshes: path.MeshBuffers = .{},
 
     /// Scratch for `.slug`: one path's curves, and the store that holds the
     /// bands built over them. Both are reset rather than reallocated per
@@ -360,6 +365,7 @@ const Replayer = struct {
     fn deinit(r: *Replayer) void {
         r.flat.deinit(r.gpa);
         r.outline.deinit(r.gpa);
+        r.meshes.deinit(r.gpa);
         r.curves.deinit(r.gpa);
         r.store.deinit(r.gpa);
         r.glyphs.deinit(r.gpa);
@@ -504,8 +510,7 @@ const Replayer = struct {
                     .canvas => |c| c,
                     .scene => unreachable,
                 };
-                var m = try path.mesh(r.gpa, flat);
-                defer m.deinit(r.gpa);
+                const m = try path.meshInto(r.gpa, &r.meshes, flat);
                 c.fill(m, xform, rule, color, r.alpha);
             },
             .slug => {
@@ -640,8 +645,7 @@ const Replayer = struct {
 
         switch (r.sink) {
             .canvas => |c| {
-                var m = try path.mesh(r.gpa, flat);
-                defer m.deinit(r.gpa);
+                const m = try path.meshInto(r.gpa, &r.meshes, flat);
                 try c.pushClip(r.gpa, m, r.base, rule);
             },
             .scene => |s| {
