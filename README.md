@@ -33,7 +33,10 @@ Týr still loses the hand. That part is not optional.
 | **Gleipnir** | `src/gleipnir/` | rasteriser: rect and path pipelines, Vulkan backend | the ribbon that holds | both pipelines, on the CPU and the GPU |
 | **Týr** | `src/tyr/` | fonts: outlines, encodings, glyph atlas | the hand it cost | three parsers, encodings, atlas |
 | **Þviti** | `src/thviti/` | the interface: box tree, layout solver, signals | the stone that pins the fetter down | core done |
-| **Lyngvi** | `src/lyngvi/` | platform: window, input, Vulkan device | the island it happened on | window and device done |
+| **Lyngvi** | `src/lyngvi/` | platform: window, input, Vulkan device | the island it happened on | Win32 and Wayland, device done |
+| **Mímir** | `src/mimir/` | what the reader remembers: recent files, settings, highlights | the well of memory | recents, places, settings, highlights |
+| **Hliðskjálf** | `src/hlidskjalf/` | buffers and windows: splits, the cursor, shared highlights | Odin's seat, from which every world is seen at once | splits, cursor, marks |
+| **Galdr** | `src/galdr/` | plugins: `init.lua`, a `plugins/` directory, a sandboxed Lua | a spell: runes or words that make the world act differently | keys, commands, events, sandbox |
 | **Vánagandr** | `src/vanagandr/` | the command-line tool | "monster of the river Ván", his other name | done |
 
 Directory and identifier names are ASCII-folded — `gjoll`, `tyr`,
@@ -69,22 +72,56 @@ stb_truetype remain optional and preferred when present. The encoding chain —
 `/Differences`, the three standard encodings, glyph names to code points,
 CID-keyed lookups — resolves codes to glyphs.
 
-Lyngvi opens a window on Win32 and creates a Vulkan instance, device,
+Lyngvi opens a window on Win32 or Wayland and creates a Vulkan instance, device,
 swapchain and pipeline through bindings written by hand and loaded at run
-time, so the default build still links no C and needs no SDK. With a shader
-compiler on `PATH` the GLSL becomes SPIR-V at build time.
+time, so the default build still links no C and needs no SDK. The SPIR-V comes
+from GLSL, from Slang, or from the modules committed in the tree; see Shaders.
 
 There are two path rasterisers and the reader will use either. `--path cpu`
 rasterises each page into an image and uploads it as a texture, which is
 exactly the picture `fenrir raster` writes. `--path gpu` sends the *outlines*
 to the device and works out coverage in the fragment shader, analytically,
-from the curves — so a page is one draw call, a zoom is a matrix rather than
-a re-render, and a clip is multiplied in instead of needing a stencil buffer.
-`-Dpath=cpu|gpu|both` decides which the window may use; the default is both,
-so the two can be compared, and `fenrir raster --path both` is that
-comparison. The GPU path draws every mark on a page but cannot yet sample an
-image or composite a blend mode, so `--path cpu` is still the one that draws
-a document in full.
+from the curves, the way Eric Lengyel's
+[Slug](https://github.com/EricLengyel/Slug) does — so a page is a draw call
+or three, a zoom is a matrix rather than a re-render, and a clip is
+multiplied in instead of needing a stencil buffer. Images go to the device
+as texels in a storage buffer and highlights composite through a multiply
+pipeline, so a page drawn either way shows the same figures and the same
+see-through highlights. `-Dpath=cpu|gpu|both` decides which the window may
+use; the default is both, so the two can be compared, and `fenrir raster
+--path both` is that comparison.
+
+A glyph's outline goes to the device once, in em units, and every place it
+appears is a matrix naming it. One page of a paper is 3,805 glyphs drawn from
+5,683 curves rather than the 121,651 it took when each occurrence carried its
+own flattened copy — and they stay curves, so the same buffers are right at
+every zoom.
+
+Mímir remembers. Recent files with the place each was left at -- the page
+and how far down it, in points, so reopening at another zoom lands on the same
+line -- the highlights drawn in each, the author name, and the accent colour
+live in a SQLite database in the platform's data directory. `fenrir recent`,
+`fenrir marks` and `fenrir config` read and write it, and `-Dsqlite=false`
+builds a reader that forgets.
+
+Hliðskjálf is the reader's buffers and windows, modelled on Vim's. Each open
+document is a buffer; each window is a view onto one, with its own scroll,
+zoom and text cursor. `<C-w>v` and `<C-w>s` split, `<C-w>c` closes,
+`<C-w>hjkl` moves between windows. Highlights belong to the buffer, not the
+window, so a highlight drawn in one split is in every other split of the same
+document -- there is one list and they all read it.
+
+The cursor stands on text: each page's glyphs are regrouped into lines by
+position rather than by the order the file emitted them, so `j` and `k` go down
+and up lines of a two-column paper the way you read it, and the page scrolls to
+keep the caret on screen.
+
+Galdr is plugins, the way Neovim has them: an `init.lua`, a `plugins/`
+directory, and a `fenrir` table where Neovim has `vim`. A plugin can bind keys,
+add `:` commands, react when a page turns or a highlight is made, and keep
+settings of its own -- in a sandbox with no files, no processes and a limit on
+memory and time, because a plugin directory is where people paste code from
+strangers. See *Plugins*.
 
 Images decode. Flate and the other byte filters give samples directly, and
 `/DCTDecode` goes through a baseline JPEG decoder written for this, so the
@@ -93,11 +130,287 @@ JBIG2 are counted and skipped.
 
 ## Building
 
+### What you need
+
+| | Needed for | |
+|---|---|---|
+| **Zig 0.16.0** | everything | The only hard requirement. [ziglang.org/download](https://ziglang.org/download/); `winget install zig.zig` on Windows. `zig version` must print `0.16.0` -- the standard library changes between releases and this tree follows one of them. |
+| **Network, once** | SQLite and Lua | The build downloads two archives the first time -- SQLite's 2.9 MB zip and Lua's 0.4 MB tarball -- and never again. Not needed for either one you turn off (`-Dsqlite=false`, `-Dlua=false`), and not needed at all if they are fetched by hand; see *Without a network*. |
+| A Vulkan driver | running `read`/`view` | Not for building. Any current GPU driver ships the loader; the Vulkan SDK is not required. |
+| A shader compiler | changing a shader | Optional. The compiled SPIR-V is committed, and the build uses it when no compiler is found. See *Shaders*. |
+| libwayland-client, libxkbcommon | the window on Linux | Opened at run time, not linked; every Wayland desktop has both. |
+
+Nothing else: no CMake, no pkg-config, no Python, no system SQLite or Lua,
+no Vulkan SDK, no C compiler beyond the one inside Zig.
+
+### Quick start
+
 ```
-zig build              # zig-out/bin/fenrir
-zig build test         # 626 tests
-zig build run -- info file.pdf
+git clone <this repository> fenrir
+cd fenrir
+zig build                          # zig-out/bin/fenrir, downloading SQLite and Lua the first time
+zig build test                     # 771 tests
+zig-out/bin/fenrir read paper.pdf
 ```
+
+`zig build run -- <command> <args>` builds and runs in one step, e.g.
+`zig build run -- info paper.pdf`.
+
+### What `zig build` does, in order
+
+1. **Reads `build.zig.zon`** and resolves the two dependencies that are
+   turned on: the SQLite amalgamation (unless `-Dsqlite=false`) and Lua's
+   source (unless `-Dlua=false`). If a package with its hash is already in
+   Zig's global cache it is used as is; otherwise it is downloaded, unpacked,
+   hashed, and **refused unless the hash matches** the one pinned in the file.
+   A download that was tampered with, truncated, or silently replaced by a
+   different release fails here, before anything is compiled.
+2. **Chooses where the SPIR-V comes from** (`-Dshaders`): compiles
+   `src/gleipnir/shader/*.vert|frag` with `glslc` or `glslang`, compiles the
+   Slang sources with `slangc`, or embeds the committed `.spv` files.
+3. **Compiles SQLite and Lua** -- `sqlite3.c`, one file, and Lua's thirty-two
+   library files -- into two static libraries with Zig's bundled C compiler
+   and the flags listed below.
+4. **Compiles fenrir** -- the library module in `src/root.zig` and the CLI in
+   `src/main.zig` -- with the build options baked in (`fenrir fonts` and
+   `fenrir config` report them), and links SQLite, Lua, libc where needed, and
+   `user32` on Windows.
+5. **Installs** `zig-out/bin/fenrir` (and `fenrir.pdb` on Windows).
+
+Compiled output is cached in `.zig-cache/`, so a second build compiles only
+what changed; SQLite and Lua in particular are compiled once per optimisation mode
+and target. Both `.zig-cache/` and `zig-out/` are ignored by git and safe to
+delete.
+
+### The SQLite dependency
+
+SQLite is one of two libraries this project links on purpose, and only Mímir
+uses it. The reason is the job: a handful of small facts -- where you were in each
+document, your highlights, your settings -- that have to survive the program
+being killed, written by two processes that may both have the document open.
+That is a transaction over a file, which is a database; the alternative is a
+config file rewritten in place, which is the same problem solved worse.
+
+It is pinned in `build.zig.zon`:
+
+```zig
+.sqlite = .{
+    .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip",
+    .hash = "N-V-__8AAGVtrgCcOcmjrOJnagmnRyMrcKaOo09KbU-vu8w8",
+    .lazy = true,
+},
+```
+
+- **Version 3.53.4**, the amalgamation: the whole library as one C file and
+  its header. Compiled by this build rather than linked from the system, so
+  there is no SDK to find and no version to be surprised by. The declarations
+  fenrir uses are written by hand in `src/mimir/Db.zig`, the way Vulkan's are;
+  `sqlite3.h` is never included.
+- **The hash is of the unpacked contents**, not of the zip. It is Zig's
+  package hash, and it is what makes the pin a pin: the URL says where to look,
+  the hash says what is acceptable to find there.
+- **Lazy**, so `zig build -Dsqlite=false` never downloads it.
+- **Cached globally**, once per machine, not per checkout: `zig env` prints
+  `global_cache_dir`, and the package lives under `p/` there.
+
+#### Fetching ahead of time
+
+```
+zig build --fetch=all      # download every dependency, lazy ones included, and stop
+```
+
+Run this once while online and every later build works without a network --
+on a laptop about to go offline, or in a CI step before the network is cut.
+
+#### Without a network, or behind a proxy that Zig cannot use
+
+Download the zip by any means, check it, and hand it to Zig directly:
+
+```
+curl -LO https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+zig fetch sqlite-amalgamation-3530400.zip
+# N-V-__8AAGVtrgCcOcmjrOJnagmnRyMrcKaOo09KbU-vu8w8
+zig build
+```
+
+`zig fetch` on a local file puts the package in the global cache and prints its
+hash. **That printed hash must be identical to the one in `build.zig.zon`**;
+if it is, the build finds the package in the cache and never goes to the
+network. If it is not, the file is not the release this tree was tested with,
+and the build will refuse it -- which is the point.
+
+The zip can come from anywhere: a mirror, a USB stick, another machine's
+download folder. Only its contents are checked.
+
+To keep the whole cache somewhere else -- a shared build machine, a
+directory that is backed up -- pass the same `--global-cache-dir` to both
+commands, and create the directory first:
+
+```
+mkdir -p /opt/zig-cache/tmp
+zig fetch --global-cache-dir /opt/zig-cache sqlite-amalgamation-3530400.zip
+zig build --global-cache-dir /opt/zig-cache
+```
+
+(`ZIG_GLOBAL_CACHE_DIR=/opt/zig-cache` does the same for every command.)
+
+#### Upgrading SQLite
+
+```
+zig fetch --save=sqlite https://www.sqlite.org/<year>/sqlite-amalgamation-<version>.zip
+zig build test
+```
+
+`--save=sqlite` downloads the new release, hashes it, and rewrites the `url`
+and `hash` of the `sqlite` entry. Check afterwards that `.lazy = true` is
+still there, and add it back if not. Then run the tests: they include checks
+that the library opens, that `SQLITE_DQS=0` took effect, and that the schema
+migrates, and `fenrir config` prints the version it was built with. SQLite's
+download page lists each release's amalgamation zip; the number in its name
+spells the version, so 3.53.4 is `3530400`.
+
+#### How it is compiled
+
+```
+-DSQLITE_DQS=0                     "double quotes" name a column, never a string
+-DSQLITE_THREADSAFE=1              serialised: safe to call from any thread
+-DSQLITE_DEFAULT_FOREIGN_KEYS=1
+-DSQLITE_DEFAULT_MEMSTATUS=0       no global allocation counters
+-DSQLITE_LIKE_DOESNT_MATCH_BLOBS
+-DSQLITE_MAX_EXPR_DEPTH=0
+-DSQLITE_OMIT_AUTOINIT             Db.open initialises it explicitly
+-DSQLITE_OMIT_DECLTYPE
+-DSQLITE_OMIT_DEPRECATED
+-DSQLITE_OMIT_LOAD_EXTENSION       no loading code into the process from a file
+-DSQLITE_OMIT_SHARED_CACHE
+-DSQLITE_USE_ALLOCA
+```
+
+Most are the options SQLite's documentation recommends for a copy compiled
+into one program. The choices that are this project's own: it stays
+thread-safe, foreign keys are enforced, extensions cannot be loaded, and a
+double-quoted word in SQL is only ever a name -- SQLite's legacy behaviour
+quietly turns a misspelt column into a string instead.
+
+#### Building without it
+
+```
+zig build -Dsqlite=false
+```
+
+No download, no C, no libc on Windows. Everything works except memory:
+`fenrir read` opens every document at the top, highlights last only as long
+as the window, and `recent`, `marks` and `config` say the build has no
+library. The tests that need a database are skipped rather than failed.
+
+### The Lua dependency
+
+Lua is the other library linked on purpose, and only Galdr uses it: plugins
+are Lua because that is what Neovim's are, and because Lua is a language
+designed to be embedded -- thirty-odd C files with no dependencies of their
+own.
+
+```zig
+.lua = .{
+    .url = "https://www.lua.org/ftp/lua-5.4.9.tar.gz",
+    .hash = "N-V-__8AAEQ_FAAnte7Oq7KSLG9FZh_9mjvQimoekgYqkKSK",
+    .lazy = true,
+},
+```
+
+- **Version 5.4.9**, the release tarball from lua.org. Its SHA-256,
+  `2335b6c5...5c6fb8e6`, matches the checksum lua.org publishes for it; the
+  `hash` above is Zig's hash of its unpacked contents.
+- **Every library file in `src/` but `lua.c` and `luac.c`**, which are the
+  standalone interpreter and compiler. `liolib.c`, `loslib.c` and
+  `loadlib.c` are compiled but never opened -- the sandbox leaves out `io`,
+  `os` and `package` -- so that the upstream sources stay untouched.
+- **Compiled as C99 with Lua's defaults**: 64-bit integers, double floats.
+  The declarations in `src/galdr/lua.zig` are written against exactly those,
+  so the build does not tune them. `LUA_USE_POSIX` is added on every target
+  but Windows.
+- **Lazy**, like SQLite: `zig build -Dlua=false` never downloads it.
+
+Fetching it by hand works the same way as SQLite:
+
+```
+curl -LO https://www.lua.org/ftp/lua-5.4.9.tar.gz
+zig fetch lua-5.4.9.tar.gz
+# N-V-__8AAEQ_FAAnte7Oq7KSLG9FZh_9mjvQimoekgYqkKSK
+```
+
+and `zig build --fetch=all` fetches both. To move to a later 5.4 release,
+`zig fetch --save=lua https://www.lua.org/ftp/lua-5.4.<n>.tar.gz`, restore
+`.lazy = true` if it was dropped, and run the tests -- they check every type
+that crosses between Zig and C, that an error raised in Zig code reaches a
+Lua `pcall`, and that the sandbox is intact. Lua 5.5 is a different API in
+places and is not a drop-in change.
+
+`zig build -Dlua=false` builds a reader that runs no plugins: no download, no
+Lua in the binary, `fenrir plugins` says the build has none, and the tests
+that need Lua are skipped.
+
+### Options
+
+| Option | Default | |
+|---|---|---|
+| `-Doptimize=Debug\|ReleaseSafe\|ReleaseFast\|ReleaseSmall` | `Debug` | `ReleaseSafe` is the one to read documents with: fast, and it still stops on an out-of-bounds index rather than drawing garbage. `Debug` also checks every allocation for leaks and double frees when the reader closes. |
+| `-Dsqlite=true\|false` | `true` | Mímir's database; see above. |
+| `-Dlua=true\|false` | `true` | Galdr's Lua, and with it plugins; see above. |
+| `-Dpath=cpu\|gpu\|both` | `both` | Which path rasteriser the window may use; see *Which path rasteriser*. |
+| `-Dshaders=auto\|glsl\|slang\|spirv` | `auto` | Where the SPIR-V comes from; see *Shaders*. |
+| `-Dglsl-compiler=auto\|glslc\|glslang` | `auto` | Which GLSL compiler `-Dshaders=glsl` runs. |
+| `-Dslangc=PATH` | on `PATH` | Where `slangc` is. |
+| `-Dfreetype`, `-Dstb-truetype`, `-Dharfbuzz` | off | Optional font backends; see *Font backends*. |
+| `-Dtarget=TRIPLE` | this machine | Cross-compile; see below. |
+
+`zig build --help` lists them all with their current descriptions.
+
+### Steps
+
+```
+zig build                 build and install zig-out/bin/fenrir
+zig build test            every test in the library and the CLI
+zig build run -- ARGS     build, then run fenrir with ARGS
+zig build spirv           regenerate src/gleipnir/shader/spirv/ from GLSL or Slang
+```
+
+`--summary all` after any step prints what was built, what was cached, and
+the test counts.
+
+### Cross-compiling
+
+Zig carries every target's libc headers and linker, so a Linux binary builds on
+Windows and the reverse with no extra toolchain:
+
+```
+zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
+zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+```
+
+SQLite is compiled for the target along with everything else, from the same
+cached package. The tests of a cross-compiled build compile but cannot run on
+the host -- `zig build test -Dtarget=...` stops with "unable to execute" --
+so run them on the target, or use this as a check that the other platform's
+code still compiles.
+
+On Linux the binary needs glibc at run time (for `dlopen`), and opens
+`libvulkan.so.1`, `libwayland-client.so.0` and `libxkbcommon.so.0` when the
+reader starts. None is needed to build, and none is needed for the commands
+that do not open a window.
+
+### When the build fails
+
+| Message | Cause, and what to do |
+|---|---|
+| `hash mismatch` for `sqlite` or `lua` | The zip that arrived is not the pinned release. A proxy returning an error page, a mirror serving a different version, or a truncated download. Fetch it by hand as above and compare the printed hash. |
+| A network error while fetching `sqlite` or `lua` | No network, or a proxy Zig cannot see. Fetch the archive by hand, as above, or build without it: `-Dsqlite=false`, `-Dlua=false`. |
+| `failed to create temporary zip file: FileNotFound` | A `--global-cache-dir` that does not exist yet. Create it, including its `tmp` subdirectory. |
+| An explicit `-Dshaders` whose compiler is not found | The build names the missing compiler. Install one, or use `-Dshaders=spirv`, or leave `-Dshaders` out. |
+| `-Dshaders=spirv needs .../spirv/*.spv` | A checkout without the committed SPIR-V. Run `zig build spirv` where a compiler is installed. |
+| Errors in the standard library, `no member named ...` | The wrong Zig. `zig version` must be `0.16.0`. |
+| Builds, but `read` says "no Vulkan loader" | Not a build problem: install the GPU driver. `--shot` with `--path cpu` renders with no device at all. |
 
 ### Which path rasteriser
 
@@ -115,45 +428,61 @@ The flag decides what the *window* draws with, not what the binary contains:
 `fenrir raster` and `fenrir read --shot` render with no device in the process
 at all, so the CPU rasteriser is compiled either way.
 
-`both` is the default in every optimisation mode, and stays so until the GPU
-path can sample an image and composite a blend mode -- a release build with
-only that one would show a document with its figures missing and its
-highlights opaque.
-
-Requires Zig 0.16.0. The default build links no C at all — not even Vulkan,
-which is opened by name at run time rather than linked, so a machine with no
-driver gets a sentence instead of a link error. On Windows the build links
-`user32`, because Lyngvi's window is Win32 calls declared by hand.
+`both` is the default in every optimisation mode, because a build that has
+both is a build that can check one against the other. The GPU path draws
+images and the four blend modes documents actually use; the other eleven
+modes, and shadings, are where the CPU rasteriser is still ahead.
 
 ### Shaders
 
-The GLSL in `src/gleipnir/shader/` is compiled to SPIR-V by the build, using
-`glslc`, `glslang` or `glslangValidator`, whichever is on `PATH` first. Neither
-being present is not an error:
+There are three sources for the SPIR-V in the binary, and the build picks one:
 
 ```
-zig build              # looks for a shader compiler; carries on without one
-fenrir view --probe    # says whether this binary has SPIR-V in it
+zig build -Dshaders=glsl    # src/gleipnir/shader/*.vert|frag, via glslc or glslang
+zig build -Dshaders=slang   # src/gleipnir/shader/slang/*.slang, via slangc
+zig build -Dshaders=spirv   # src/gleipnir/shader/spirv/*.spv, committed, no compiler
+zig build                   # auto: glsl if a compiler is on PATH, else spirv
+
+zig build spirv -Dshaders=glsl    # rewrite spirv/ from the GLSL (or =slang)
+zig build -Dshaders=glsl -Dglsl-compiler=glslang
+zig build -Dshaders=slang -Dslangc=C:/tools/slang/bin/slangc.exe
 ```
 
-**Getting a shader compiler.** Any one of these is enough; the build needs only
-the executable on `PATH`, never the SDK's headers or libraries.
+An explicit choice whose compiler or files are missing fails the build and
+says so; only `auto` falls back. `fenrir read` names the source it was built
+with (`shaders from glslang`).
+
+All three are held to the same tests: each module is the stage it claims,
+asks for descriptor indexing exactly where its pipeline needs it, and lays out
+every storage buffer the way the Zig struct is written — read back out of the
+compiled SPIR-V, not assumed. The Slang ports (one module per pipeline, a
+`vertexMain` and a `fragmentMain`) pass all 641 tests, and pages 1, 4 and 8
+of the test paper read back from the GPU are bit-identical to the GLSL build's,
+on the path pipeline and the rect pipeline both. GLSL stays the default until
+Slang has had wider use; nothing about the build prefers one over the other
+beyond that.
+
+`spirv/` is regenerated by hand, so after changing a shader, run `zig build
+spirv` before committing, or `-Dshaders=spirv` builds the old one.
+
+**Getting a shader compiler** — only to change a shader; `-Dshaders=spirv`
+needs none. Any one of these is enough, and the build needs only the
+executable, never the SDK's headers or libraries.
 
 | | |
 |---|---|
 | Vulkan SDK | [vulkan.lunarg.com](https://vulkan.lunarg.com) — gives `glslc` *and* the validation layers, which are the best debugging tool for a Vulkan bring-up. `winget install LunarG.VulkanSDK` on Windows. |
 | glslang alone | [github.com/KhronosGroup/glslang/releases](https://github.com/KhronosGroup/glslang/releases) — one ~5 MB `glslang` binary, no installer, no admin. Unzip and put `bin/` on `PATH`. |
 | A package manager | `apt install glslang-tools`, `brew install glslang`, `pacman -S shaderc` |
+| Slang | [github.com/shader-slang/slang/releases](https://github.com/shader-slang/slang/releases) — unzip; `bin/slangc` is the compiler. Also in the Vulkan SDK. Tested with 2026.17.1. |
 
 Every shader must ask for `GL_GOOGLE_include_directive` by name if it
 `#include`s anything. `glslc` enables it implicitly and `glslang` does not, so
 a shader without that line compiles with one and fails with the other. Tried aganst glslang-16.5.0-x86_64-release.
 
-A binary built without one opens its window, creates its device and swapchain,
-acquires and presents images, and draws nothing, with a message saying so. That
-is a deliberate half-measure rather than a failure: it keeps everything except
-the draw call testable on a machine with a driver and no SDK, which is the
-normal state of a machine that has never installed one.
+A binary built with `auto` on a checkout that has neither a compiler nor
+`spirv/` opens its window, creates its device and swapchain, acquires and
+presents images, and draws nothing, with a message naming `-Dshaders=spirv`.
 
 ### Font backends
 
@@ -199,13 +528,22 @@ fenrir raster <file> [--page N|--all]   a page rendered to a PNG, on the CPU
              [-o F] [--dpi N|--scale N]
              [--samples 1|2|4|8] [--fonts]
              [--tolerance N] [--stats]
-             [--path stencil|slug|both] [--rays N]
+             [--path stencil|slug|both]
              [--text-boxes] [--image-boxes]
              [--no-annots] [--ascii x,y,w,h]
-fenrir read <file> [--page N]           the document in a window, scrollable
-             [--zoom N|--dpi N] [--size WxH]
+fenrir read <file>... [--page N]        the documents in a window, scrollable,
+             [--zoom N|--dpi N] [--size WxH]    split and highlighted
              [--path cpu|gpu] [--samples N]
-             [--frames N] [--shot F] [--vsync ...]
+             [--frames N] [--shot F [--device]] [--vsync ...]
+             [--split v|h...] [--db FILE]
+             [--config DIR] [--clean]
+fenrir recent [--limit N] [--forget F]  the documents opened before, and where
+             [--clear] [--db FILE]      you were in each
+fenrir marks <file> [--clear]            the highlights made in a document
+             [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
+fenrir plugins [--config DIR]            load init.lua and the plugins, and report
+fenrir config [KEY [VALUE]]             the settings the reader remembers
+             [--unset KEY] [--db FILE]
 fenrir fonts                            what Týr can do in this build
 fenrir rects [--out F] [--size WxH]     a demo frame through the rect pipeline
 fenrir ui    [--out F] [--atlas F]      a frame of interface, text included
@@ -217,11 +555,89 @@ fenrir view --probe                     the devices, without opening anything
 ```
 
 `fenrir read file.pdf` is the one that opens a document to read. It opens
-fitted to the width of the window, scrolls continuously with the wheel, zooms
-with `+` and `-`, refits with `0`, and steps a page at a time with `n` and
-`p`. The percentage in the title bar is the page's true physical size on the
-display, display scaling included — not the raster scale, which is a
-different number on every screen.
+where you left it, fitted to the width of the window, scrolls continuously
+with the wheel or by dragging the scrollbar, zooms with `+` and `-`, refits
+with `0`, and steps a page at a time with `n` and `p`. The percentage in the
+title bar is the page's true physical size on the display, display scaling
+included — not the raster scale, which is a different number on every screen.
+
+The scrollbar on the right is a control and not a report: the thumb can be
+grabbed anywhere along it and keeps its grip while it is dragged, and a press
+on the track above or below moves a screen that way. `--page` or `--zoom`
+overrides what was remembered, because an argument is a person saying where
+to start.
+
+Windows work the way they do in Vim, and so does the rest: the reader has
+modes, and the same keys mean moving in one and changing in another.
+
+```
+windows (normal mode)
+<C-w>v  <C-w>s     split beside / below        <C-w>w  <C-w>W     next / previous window
+<C-w>c  <C-w>q     close this window           <C-w>=             make them equal
+<C-w>o             close all the others        <C-w>n  <C-w>b     next / previous document
+<C-w>h j k l       the window that way         q  /  Q            close window / the reader
+```
+
+**Normal mode** is reading. The cursor stands on text and the page follows it.
+
+```
+h j k l, arrows    a character, a line          m          highlight the cursor's line,
+w  b  e            next word, word start, end              or remove the one under it
+^  $               start / end of the line      M          remove every highlight here
+escape             put the cursor away          u  <C-r>   undo / redo a highlight change
+drag over text     highlight what it covers     v  V  i    visual, visual line, edit mode
+press a highlight  remove it
+```
+
+**Visual mode** is selecting. `v` drops an anchor at the cursor and every
+motion extends the selection from it, across lines and pages; `V` selects
+whole lines. The selection is drawn in blue as it grows.
+
+```
+any motion         extend the selection         d  x       remove the highlights it touches
+o                  go to the other end          v  V       leave, or switch between them
+m  y  enter        highlight in the accent      escape     leave, doing nothing
+1 .. 8             highlight in a colour: accent, yellow, green, blue, pink, orange, purple, red
+```
+
+Highlighting over an existing highlight replaces it rather than stacking a
+second, darker one: select highlighted words and press `4` to make them blue.
+
+**Edit mode** is changing highlights that already exist. `i` takes hold of the
+highlight at or after the cursor, outlines it, and scrolls to it.
+
+```
+n  N,  j  k,  tab  the next / previous highlight, in reading order
+1 .. 8             recolour it                  a  enter   write a note on it
+d  x  delete       delete it, and take the next u  <C-r>   undo / redo
+escape  q          back to normal mode
+```
+
+A note is typed in **note mode**: every key is text, backspace removes a
+character, enter keeps the note and escape throws it away. A highlight with a
+note has a small tab at its corner.
+
+Every change -- a highlight made, removed, recoloured or annotated -- is one
+step of undo, and a highlight made over several lines is one step, not one per
+line. Undo reaches back through the whole session and survives switching
+modes. Every change is written to Mímir as it settles, so a highlight made in
+one split is in every other split of the same document at once, and is there
+the next time the document is opened.
+
+The title bar is the mode line: it shows `-- VISUAL --`, `-- EDIT -- 2/5`
+with the highlight's note, the note being typed, or why a key did nothing
+("no highlights to edit").
+
+Fit-width is a mode, not a one-off: a fitted window refits when it is split
+or resized, and a zoom to a number leaves the mode. Every window's scrollbar
+is live, and a press in a window focuses it.
+
+```
+$ fenrir config author "Nahid Hasan"    # signs annotations, when they exist
+$ fenrir config accent yellow           # the scrollbar, the focus ring, highlights
+$ fenrir recent
+page    5  +312pt  /home/n/papers/An Alternative View.pdf  (An Alternative View.pdf)
+```
 
 Pages are prepared on a thread of their own and the frame loop never waits
 for one: a page that is not ready yet is blank paper for a few frames rather
@@ -230,8 +646,11 @@ is a scatter plot of a few thousand separately clipped markers takes about a
 second to rasterise, and doing that on the frame thread does not make the
 reader slow, it makes it stop.
 
-`--shot F` writes one composed frame to a PNG with no window and no device at
-all, which is how the layout is checked on a machine with no display.
+`--shot F` writes one composed frame to a PNG. With `--path cpu` there is no
+window and no device at all, which is how the layout is checked on a machine
+with no display. With `--path gpu` the frame is drawn by the device into a
+hidden window, once every visible page is ready, and read back from the
+swapchain image — so what it writes is what the GPU drew, not a model of it.
 
 `fenrir raster file.pdf --page 1` writes the same picture to a file: parser,
 interpreter, path pipeline and font layer end to end, on the CPU, with no
@@ -249,16 +668,17 @@ every mark on the page was drawn
 ```
 
 `--path both` renders the page through both rasterisers and reports how far
-apart they came out, in levels of 255. The mean halves every time the
-stencil rasteriser's sample count doubles, which is what it looks like when
-two implementations agree and one of them is the limit the other converges
-to:
+apart they came out, in levels of 255, and writes `-slug` and `-diff` images
+beside the PNG. The mean falls as the stencil rasteriser's sample count
+rises, and the difference image is ink only along glyph edges — two
+implementations that agree about where every shape is, and differ only in
+how they antialias:
 
 ```
 $ fenrir raster paper.pdf --page 1 --path both --samples 1 --stats
-         stencil vs slug: mean 8.067, worst 224.8, 13.292% over 1 level
+         stencil vs slug: mean 8.415, worst 221.9, 12.821% over 1 level, 12.083% over 8
 $ fenrir raster paper.pdf --page 1 --path both --samples 8 --stats
-         stencil vs slug: mean 1.527, worst 83.9, 12.202% over 1 level
+         stencil vs slug: mean 2.230, worst 127.5, 13.044% over 1 level, 8.908% over 8
 ```
 
 `--ascii x,y,w,h` prints a window of the result as text, one character per
@@ -292,6 +712,157 @@ device 0  NVIDIA GeForce GTX 1650 SUPER
 `indexing` is descriptor indexing, and it decides whether a frame is one draw
 call or one per run of instances sharing a texture — 1 against 18 for the demo
 interface.
+
+## Plugins
+
+Galdr -- a galdr is a spell, runes written or words sung to make the world act
+differently -- is the reader's plugin system, and it is Neovim's model: Lua,
+an `init.lua`, a directory of plugins, and one table of functions for talking
+to the program.
+
+### Where they live
+
+```
+<config>/init.lua                 run first
+<config>/plugins/<name>.lua       then each plugin, in order of name
+<config>/plugins/<name>/init.lua
+<config>/lua/<module>.lua         what require("module") finds; "a.b" is lua/a/b.lua
+```
+
+| | `<config>` |
+|---|---|
+| Windows | `%APPDATA%\fenrir` |
+| macOS | `~/Library/Application Support/fenrir` |
+| Linux and the BSDs | `$XDG_CONFIG_HOME/fenrir`, or `~/.config/fenrir` |
+
+`FENRIR_CONFIG` or `fenrir read --config DIR` points somewhere else;
+`fenrir read --clean` runs no plugins at all. A plugin that fails to load is
+reported and skipped -- the rest still load, and the reader still opens.
+
+### An example
+
+```lua
+-- init.lua
+
+-- <C-d> and <C-u> page down and up, as in a pager.
+fenrir.keymap("n", "<C-d>", function() fenrir.exec("page +1") end, "next page")
+fenrir.keymap("n", "<C-u>", function() fenrir.exec("page -1") end, "previous page")
+
+-- G goes to the last page; a string is run as a : command line.
+fenrir.keymap("n", "G", function() fenrir.go(fenrir.document().pages) end)
+fenrir.keymap("n", "g", "1")
+
+-- :Toc 3 jumps to page 3 of the table of contents, remembered per document.
+fenrir.command("Toc", function(args)
+  local key = "toc." .. fenrir.document().path
+  if args ~= "" then fenrir.store.set(key, args) end
+  local page = tonumber(fenrir.store.get(key) or "")
+  if page then fenrir.go(page) else fenrir.notify("no table of contents set: :Toc N") end
+end, "go to the table of contents")
+
+-- Say where each new highlight was made.
+fenrir.on("highlight", function(h)
+  if h.action == "add" and h.note == "" then
+    fenrir.notify(("highlighted on page %d"):format(h.page))
+  end
+end)
+```
+
+Check a configuration without opening a document. With the `init.lua` above,
+a working `plugins/pager/`, and a `plugins/broken.lua` that reaches for `io`:
+
+```
+$ fenrir plugins
+configuration: C:\Users\n\AppData\Roaming\fenrir
+  ok      init.lua
+  FAILED  broken
+  ok      pager
+keys:
+  n   <C-d>      next page
+  n   <C-u>      previous page
+  n   G          (function)
+  n   g          1
+commands:
+  :Toc            go to the table of contents
+messages:
+plugins/broken.lua: plugins/broken.lua:1: attempt to index a nil value (global 'io')
+stack traceback:
+	plugins/broken.lua:1: in main chunk
+```
+
+It exits non-zero when anything failed, so it can run in a script. Inside the
+reader, `:plugins` lists what loaded and `:messages` repeats the errors.
+
+### The `fenrir` table
+
+Pages, lines and columns are numbered from 1, as a person numbers them.
+Positions on a page are PDF points from the bottom-left corner, the same
+numbers `fenrir marks` prints.
+
+| | |
+|---|---|
+| `fenrir.keymap(modes, key, action, description?)` | Bind a key. `modes` is `"n"` (normal), `"v"` (visual), `"e"` (edit), a string of several (`"nv"`), or a table of them. `key` is one key: `"g"`, `"G"`, `"<C-k>"`, `"<A-x>"`, `"<C-A-s>"`, `"<Space>"`, `"<lt>"`. `action` is a function, or a string run as a `:` command line. A plugin binding comes before the built-in one, `<C-w>` included. |
+| `fenrir.unmap(modes, key)` | Remove a binding for those modes; other modes keep it. |
+| `fenrir.command(name, fn, description?)` | Add `:name args`; `fn` receives `args` as one string. Built-in commands are looked up first, so a plugin cannot redefine `:q`. |
+| `fenrir.exec(line)` | Run a `:` command line, as if typed. Returns whether it worked. |
+| `fenrir.on(event, fn)` | Call `fn` on an event; returns an id. |
+| `fenrir.off(id)` | Stop. |
+| `fenrir.notify(text)`, `print(...)` | Show a message in the title bar. |
+| `fenrir.document()` | `{path, title, pages}` of the focused window's document. |
+| `fenrir.page()` | The focused window's current page. |
+| `fenrir.go(page, offset?)` | Scroll to a page, and `offset` points down it. |
+| `fenrir.zoom(percent?)` | The zoom as a percentage of true size; with an argument, set it. |
+| `fenrir.mode()` | `"normal"`, `"visual"`, `"visual_line"`, `"edit"`, `"note"` or `"command"`. |
+| `fenrir.cursor()` | `{page, line, column}`, or nil when the cursor is put away. |
+| `fenrir.selection()` | `{from = {page, line, column}, to = {...}}` in visual mode, or nil. |
+| `fenrir.highlights()` | Every highlight on the document: `{id, page, x0, y0, x1, y1, color, note}`. |
+| `fenrir.highlight{page, x0, y0, x1, y1, color?, note?}` | Add one. `color` is a name or `#rrggbb`. Returns its id. It is saved, and undone by `u`, like any other. |
+| `fenrir.unhighlight(id)` | Remove one. |
+| `fenrir.store.get(key)`, `fenrir.store.set(key, value)` | Strings a plugin keeps between sessions, in Mímir. Stored as `galdr.<key>`, so `fenrir config` shows them and a plugin cannot overwrite a reader setting. `set(key, nil)` removes. |
+| `require(name)` | A module from `lua/` in the configuration directory, loaded once. |
+| `fenrir.version`, `fenrir.lua` | `"0.0.1"`, `"Lua 5.4"`. |
+
+### Events
+
+| Event | Argument | When |
+|---|---|---|
+| `start` | -- | Every plugin is loaded and the window is open. |
+| `open` | `{path, title, pages}` | Each document, after the plugins load. |
+| `page` | the page | The focused window's current page changed. |
+| `mode` | the mode's name | The mode changed. |
+| `highlight` | `{action, id, page, x0, y0, x1, y1, color, note}` | `action` is `"add"`, `"remove"` or `"change"`. From a key, the mouse, undo, or another plugin. |
+| `quit` | -- | The reader is closing. |
+
+A handler that causes its own event -- a `page` handler that turns the page --
+is cut off after four levels rather than recursing.
+
+### What a plugin cannot do
+
+A plugin runs in a sandbox, because a plugin directory is a place people paste
+code from strangers and a PDF reader is a program people point at files from
+strangers:
+
+- **No files, processes or native code.** `io`, `os`, `package` and `debug` are
+  not there, and neither are `dofile` or `loadfile`. `require` reads only
+  `lua/` under the configuration directory, and a name with `/` or `..` in it
+  is refused. `string`, `table`, `math`, `utf8` and `coroutine` are there.
+- **No bytecode.** `load` takes source text only, whatever mode is asked for:
+  Lua does not verify bytecode, and a crafted chunk can crash the interpreter.
+- **A memory limit.** 64 MB for all plugins together. Past it, an allocation
+  fails and the script gets an ordinary "not enough memory" error.
+- **A time limit.** A single key binding, command or event handler that runs
+  for more than about fifty million Lua instructions -- a few hundred
+  milliseconds -- is stopped with an error. `while true do end` freezes the
+  reader for a moment, not forever.
+
+Every call into a plugin is protected: an error is shown in the title bar with
+its first line, kept with its traceback for `:messages` and `fenrir plugins`,
+and the reader carries on.
+
+Not there yet: bindings for key *sequences* (`gg`, `<leader>x`) -- a binding is
+one key or one chord, and anything longer is refused with that reason; timers;
+drawing on the page; and reading the page's text as characters, which waits on
+character codes being mapped to Unicode.
 
 ## Layout
 
@@ -449,17 +1020,26 @@ the ones with `#xx` or `\` escapes are copied into the arena.
   space, which is what §11.3.8 asks for and what keeps a page from reading
   like a photocopy of one.
 - Gleipnir's **analytic** path rasteriser, in `slug.zig`, on both the CPU and
-  the GPU. Coverage comes out of the outline in closed form rather than out of
-  samples: a horizontal ray across a pixel gives the exact covered length of
-  that row, and only the integral down the pixel's height is sampled. A
-  vertical edge — most of what a page of text is made of — lands on its true
-  coverage from a single ray, where eight multisamples would give it nine
-  possible values. The curves go to the device as curves, so a zoom is a
-  matrix rather than a re-tessellation, and a clip is another outline whose
-  coverage is multiplied in. `fenrir raster --path both` renders a page each
-  way and reports the difference; on a page of text the two converge as the
-  stencil rasteriser's sample count rises, which is the evidence that they
-  agree and that the analytic one is the limit.
+  the GPU, following Eric Lengyel's
+  [Slug reference shaders](https://github.com/EricLengyel/Slug). Two rays
+  leave each pixel's centre, one along x and one along y; each sums its
+  crossings with the outline, ramped across the pixel, and reports how close
+  its nearest crossing came. The two are blended by that closeness, so a
+  vertical edge takes the x ray's exact answer, a horizontal edge the y
+  ray's, and nothing is quantised. Each path is cut into horizontal and
+  vertical bands whose curves are sorted by reach, so a fragment tests one
+  band of each and stops at the first curve behind it; a straight line is
+  left out of the bands it runs along. The root solve is the numerically
+  stable one rather than the reference's epsilon, because page coordinates
+  and em units are three orders of magnitude apart. The curves go to the
+  device as curves, so a zoom is a matrix rather than a re-tessellation, and
+  a clip is another outline whose coverage is multiplied in. On the device,
+  images are texels in a storage buffer sampled the way the CPU samples
+  them, and normal, multiply, screen, darken and lighten each get a pipeline.
+  A test reads the buffer layouts back out of the compiled SPIR-V and
+  compares them with the Zig structs, because a std430 struct that is
+  silently eight bytes longer than the one written draws a page as its own
+  glyphs scattered across it — which happened.
 - Image decoding: the packing (1, 2, 4, 8 and 16 bits a component, rows byte
   aligned), every colour space `color.zig` knows including `/Indexed`
   palettes and `/Separation` tint transforms, `/Decode` arrays, `/ImageMask`
@@ -554,8 +1134,10 @@ in it — still reads completely.
   decoded**, so a fax-coded or JBIG2 scan still renders as its invisible OCR
   layer over nothing. Progressive JPEG is refused rather than decoded as
   baseline. Each is counted and named in the report. Inline images
-  (`BI ... ID ... EI`) carry their samples in the display list and are not
-  reached yet either.
+  (`BI ... ID ... EI`) are drawn from the samples the display list carries,
+  as grey, RGB or CMYK by their component count: an `/Indexed` inline image
+  comes out as the grey of its indices, because the list records how many
+  components a sample has and not the palette.
 - **Shadings and tiling patterns.** The interpreter resolves both into a
   `Paint`; painting them needs a gradient rasteriser and a recursive replay.
   Solid paint is exact and everything else is counted and skipped.
@@ -565,13 +1147,12 @@ in it — still reads completely.
   contents do not overlap — a highlight, a stamp, most of what a group is used
   for — and wrong when they do. Doing it properly needs an offscreen canvas
   per group.
-- **The GPU path pipeline does not composite blend modes, and cannot sample
-  an image.** It draws every fill, stroke and glyph on a page in one call and
-  clips them analytically, but a `/Multiply` highlight comes out as plain
-  source-over, and an image has to be drawn by the rect pipeline as a
-  textured quad — which `--path gpu` does not yet arrange, so under it a page
-  draws its marks and not its figures. Both are counted. `--path cpu` has all
-  of it and is the default in a build with both.
+- **The GPU path pipeline has five of the sixteen blend modes.** Normal,
+  multiply, screen, darken and lighten are fixed-function blend states and
+  are drawn right; the other eleven need the backdrop read in the shader and
+  are drawn normal and counted. Images are stored at no more than four texels
+  per point of their placement, so past 400% a large photograph is softer on
+  the GPU than on the CPU, which samples the decoded image itself.
 - **Stencil-and-cover was specified and then not used.** `gleipnir/pathpipe.zig`
   is a complete contract for the classical GPU path fill and `raster.zig` is a
   faithful CPU model of it, down to the eight-bit stencil wraparound. The
@@ -587,8 +1168,112 @@ in it — still reads completely.
   half an em per glyph; the AFM files are not in the tree.
 - A real widget set on top of Þviti — text fields with selection and an IME,
   menus, tab bars, trees, splitters.
-- Lyngvi's xcb backend, and everything platform-shaped a reader eventually
-  needs: file dialogs, menus, the clipboard.
+- Lyngvi's X11 backend, and everything platform-shaped a reader eventually
+  needs: file dialogs, menus, the clipboard. The Wayland backend compiles and
+  its protocol tables and key handling are tested, but it has not yet been run
+  against a real compositor.
+- Highlights are kept in Mímir and not written into the PDF as `/Annots`;
+  there is no export yet. Notes are shown in the title bar, not on the page.
+- Word motions find word boundaries from the spacing of the glyphs, because
+  most PDFs draw no space characters; a tightly kerned or letter-spaced line
+  can put a boundary in the wrong place.
+- Windows are resized only by the layout, not by dragging the divider.
+
+## Porting to Android
+
+Nothing here targets Android today, but most of the work of getting there is
+already done, and it was done by accident: the platform layer is one module
+with a vtable in front of it, and everything above it is portable Zig. This
+section is what a port would actually have to touch, written from the code
+rather than from hope.
+
+### What crosses unchanged
+
+- **Everything above Lyngvi.** Gjöll, Gelgja, Týr, Gleipnir, Þviti, Hliðskjálf
+  and Galdr make no system calls beyond asking an allocator for memory. They
+  cross-compile as they are.
+- **The Vulkan loader.** Lyngvi never links a loader; it opens one at run time
+  by name and reads the entry points out of it (`src/lyngvi/loader.zig`).
+  Android's is `libvulkan.so`, which is already the second name on the list
+  for a Unix, so the loader needs a one-line change at most.
+- **The two C libraries.** SQLite and Lua are compiled from source by
+  `build.zig` rather than taken from the system, so they cross with the flags
+  the other Unixes already use. No prebuilt `.so` to find, no version to match
+  against the phone's.
+- **The shaders.** `-Dshaders=spirv` uses the SPIR-V committed in
+  `src/gleipnir/shader/spirv/`, so the build needs no shader compiler for any
+  target.
+- **The rasterising thread.** `std.Thread`, and nothing else.
+
+Building for a handset is then roughly:
+
+```
+zig build -Dtarget=aarch64-linux-android -Dshaders=spirv -Doptimize=ReleaseFast \
+    --sysroot $NDK/toolchains/llvm/prebuilt/<host>/sysroot
+```
+
+### What has to be written
+
+**A window backend**, `src/lyngvi/android.zig`, beside `win32.zig` and
+`wayland.zig`. `Window` is a vtable of ten functions and `lyngvi.open`
+chooses between implementations at run time, so this is one new file and one
+new arm. The surface is an `ANativeWindow*` through `VK_KHR_android_surface`,
+which adds a fifth case to `Window.Native`, to `Native.extensionFor`, and to
+`Device.createSurface`, plus one `VkAndroidSurfaceCreateInfoKHR` in `vk.zig`.
+It is smaller than the Wayland backend: Android's side is a C header rather
+than a wire protocol, so there is no marshalling to write.
+
+**A library entry point.** Android starts a process and calls into a `.so`;
+there is no `main`. That means `libfenrir.so` rather than an executable, with
+`android_main` in place of `main.zig`'s command dispatch, and the CLI
+commands simply absent on that target.
+
+**Surviving surface loss.** A window is destroyed and recreated when the app
+is backgrounded or rotated. `Swapchain.recreate` copes with a resize; it would
+have to also cope with the surface itself going away and returning, which
+means tearing down the surface as well as the swapchain on
+`APP_CMD_TERM_WINDOW` and building both again on `APP_CMD_INIT_WINDOW`.
+
+**Touch, which is not a port but a design.** The reader's entire interface is
+the modal keymap, and a phone has no `<C-w>`. It needs drag and fling to
+scroll, pinch to zoom, long-press and drag to select, and something on screen
+for the modes and for `:`. The shape of the code helps here more than it looks
+like it should: `Session.apply` takes a `keys.Command` and never sees a
+keystroke, so a toolbar button and a gesture can go through exactly the same
+entry point the keyboard does, and the modes keep working without being
+re-implemented.
+
+**Files arrive as descriptors.** An Android app cannot open a path the user
+chose. The Storage Access Framework hands back a `content://` URI, and through
+JNI a file descriptor. `Document.open` takes bytes rather than a path, so this
+is confined to the layer that reads the file -- but the recent-documents list
+in Mímir keys on a path, and a URI is not one.
+
+**Somewhere to write.** `galdr.configDir` and `mimir.defaultPath` branch on the
+operating system and end at `$HOME`, which Android does not have. Both would
+take the app's private directory from `Context.getFilesDir()` through JNI
+instead of from the environment. Plugins living in `files/fenrir/` are then
+reachable only over `adb` or a file picker, which is worth saying plainly
+before promising plugin support on a phone.
+
+**Substitute fonts.** A document that embeds no font program is drawn from one
+found on the machine. On Android those are in `/system/fonts`, and the family
+names there are not the desktop ones.
+
+### What to expect once it runs
+
+- **Vulkan 1.1 is the practical floor**, which is Android 10 and API 29.
+  The path pipeline asks for descriptor indexing, and that is not universal on
+  older mobile drivers. `fenrir view --probe` already prints what a device can
+  do, and it is the first thing worth running on a handset.
+- **The CPU rasteriser is the fallback**, and it is a fallback with a cost: a
+  page of dense text is about two hundred milliseconds at 96 dpi and eight
+  samples on one desktop core, and a phone core is slower than that.
+- **Memory is the real constraint.** A software canvas is 26 bytes a pixel at
+  eight samples -- sixteen for the framebuffer, eight for the stencil, one
+  each for the clip and cover -- so a 1080x2400 screen is about 67 MB before
+  any document is decoded. The GPU path does not pay this, which makes the
+  device probe matter more on a phone than on a desktop.
 
 ## Where this is going
 
