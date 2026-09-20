@@ -1186,6 +1186,88 @@ const Session = struct {
         while (it.next()) |v| {
             if (s.missingIn(v)) |job| return job;
         }
+
+        return null;
+    }
+
+    /// What to hand the rasterising thread next: everything on screen first,
+    /// and then, if the cache has room to spare, the pages just past the edge
+    /// of a window.
+    ///
+    /// Separate from `firstMissing` because the two questions differ. "Is
+    /// anything missing?" decides whether `--shot` may take its picture, and
+    /// a shot that waited for pages outside the frame would wait for pages it
+    /// is never going to photograph.
+    fn nextJob(s: *Session) ?Job {
+        if (s.firstMissing()) |job| return job;
+        if (!s.hasSpareSlot()) return null;
+
+        // Only once nothing on screen is outstanding: a page just off the
+        // edge must never be rendered ahead of one the reader is looking at,
+        // or a split would sit on blank paper while the worker filled a page
+        // nobody can see.
+        if (s.aheadIn(s.layout.current())) |job| return job;
+        var it = s.layout.iterator();
+        while (it.next()) |v| {
+            if (s.aheadIn(v)) |job| return job;
+        }
+        return null;
+    }
+
+    /// Whether the cache has a slot the windows are not already using.
+    ///
+    /// Without this, four windows at a zoom that shows three pages each would
+    /// want more slots for what is on screen than there are, and every
+    /// read-ahead page would evict a page a window is looking at -- which the
+    /// next frame would ask for again. The reader would render continuously
+    /// and show nothing new. Read-ahead is a use for slack, so it only
+    /// happens when there is slack.
+    fn hasSpareSlot(s: *Session) bool {
+        var held: usize = 0;
+        switch (s.backend) {
+            .cpu => for (&s.slots) |*slot| {
+                if (slot.page != Slot.no_page and slot.used >= s.stamp) held += 1;
+            },
+            .gpu => for (&s.recorded.pages) |*e| {
+                if (e.source != null and e.used >= s.recorded.stamp) held += 1;
+            },
+        }
+        return held < cache_slots;
+    }
+
+    /// How many pages past each edge of the viewport to render before the
+    /// reader asks for them.
+    ///
+    /// One each way, not more. A page is tens of megabytes and a hundred-odd
+    /// milliseconds, the cache holds twelve of them across every window, and
+    /// the worker renders one at a time -- so a deeper run-up would spend the
+    /// cache on pages a reader who turns round never sees, and would put a
+    /// real page behind a speculative one for a tenth of a second at a time.
+    /// One is what a scroll needs: by the time the page below the fold comes
+    /// into view it has been there for a while.
+    const read_ahead = 1;
+
+    /// The pages just outside a window, rendered before they are needed.
+    ///
+    /// Below first, then above, because reading goes downwards and a wheel
+    /// that has been turning one way will keep turning that way.
+    fn aheadIn(s: *Session, v: *View) ?Job {
+        const range = v.visiblePages();
+
+        var after = range.end;
+        while (after < @min(range.end + read_ahead, v.pages.len)) : (after += 1) {
+            const job: Job = .{ .buffer = v.buffer, .page = after, .zoom = v.zoom };
+            if (s.failed(job)) continue;
+            if (!s.cached(v, after)) return job;
+        }
+
+        var back: u32 = 0;
+        while (back < read_ahead and back < range.first) : (back += 1) {
+            const page = range.first - 1 - back;
+            const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom };
+            if (s.failed(job)) continue;
+            if (!s.cached(v, page)) return job;
+        }
         return null;
     }
 
@@ -3025,7 +3107,7 @@ const Session = struct {
                 error.OutOfMemory => return ctx.fail("out of memory rendering a page", .{}),
                 else => null,
             };
-            if (s.firstMissing()) |job| worker.post(job);
+            if (s.nextJob()) |job| worker.post(job);
 
             const extent: Bounds = .fromRect(
                 0,
