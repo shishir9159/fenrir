@@ -56,6 +56,10 @@ pub const usage =
     \\    --no-annots    Draw only the content stream, leaving out highlights,
     \\                   stamps, form fields and every other annotation.
     \\    --stats        Report and write nothing.
+    \\    --time         Time each page and hash its framebuffer, on stderr.
+    \\                   The hash proves the pixels did not move and the clock
+    \\                   says whether a change was worth making, both out of
+    \\                   one run over one set of pixels.
     \\    --path P       Which rasteriser fills an outline: stencil (the
     \\                   default), slug, or both -- which renders the page
     \\                   twice and reports how far the two disagree.
@@ -78,6 +82,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var page_number: u32 = 1;
     var all = false;
     var stats_only = false;
+    var timing = false;
     var dpi: f32 = 96;
     var scale: ?f32 = null;
     var samples: gleipnir.raster.Samples = .eight;
@@ -138,6 +143,8 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             options.annotations = false;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             stats_only = true;
+        } else if (std.mem.eql(u8, arg, "--time")) {
+            timing = true;
         } else if (std.mem.eql(u8, arg, "--fonts")) {
             list_fonts = true;
         } else if (std.mem.eql(u8, arg, "--path")) {
@@ -192,19 +199,23 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         .options = options,
         .replay = replay_options,
         .stats_only = stats_only,
+        .timing = timing,
         .ascii = ascii,
         .list_fonts = list_fonts,
     };
 
+    var clocked: Timing = .{};
+    const time: ?*Timing = if (timing) &clocked else null;
     if (all) {
         var total: replay.Stats = .{};
         for (pages, 0..) |p, index| {
             const out = try numbered(ctx, dest, index + 1);
             defer ctx.gpa.free(out);
-            const s = try one(ctx, &doc, p, out, job);
+            const s = try one(ctx, &doc, p, out, job, time);
             accumulate(&total, s);
         }
         ctx.note("{d} pages", .{pages.len});
+        reportTime(ctx, time);
         report(ctx, total);
         return;
     }
@@ -215,7 +226,8 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const out = dest orelse try numbered(ctx, null, page_number);
     defer if (dest == null) ctx.gpa.free(out);
 
-    const s = try one(ctx, &doc, pages[page_number - 1], out, job);
+    const s = try one(ctx, &doc, pages[page_number - 1], out, job, time);
+    reportTime(ctx, time);
     report(ctx, s);
 }
 
@@ -225,6 +237,7 @@ const Job = struct {
     options: content.Options,
     replay: replay.Options,
     stats_only: bool,
+    timing: bool = false,
     ascii: ?[4]u32 = null,
     list_fonts: bool = false,
     path: PathChoice = .stencil,
@@ -235,16 +248,74 @@ const Job = struct {
 /// checked against the one that is known to be right.
 const PathChoice = enum { stencil, slug, both };
 
+/// What `--time` measures, in nanoseconds, summed over the pages it saw.
+///
+/// Split three ways because the three move independently: interpreting is
+/// Gjoll's decode and the content stream, the fonts line is every embedded
+/// font program parsed again for this page, and rendering is Gleipnir. A
+/// change that halves one of them and is invisible in the total is a change
+/// aimed at the wrong third.
+const Timing = struct {
+    pages: u64 = 0,
+    canvas: u64 = 0,
+    interpret: u64 = 0,
+    fonts: u64 = 0,
+    render: u64 = 0,
+    /// Every page's framebuffer hash, folded together in page order. Two runs
+    /// that agree here rendered the same pixels; see `CLAUDE.md`.
+    hash: u64 = 0,
+
+    fn total(t: Timing) u64 {
+        return t.interpret + t.canvas + t.fonts + t.render;
+    }
+};
+
+/// Milliseconds, for printing. Nanoseconds are what is measured, because a
+/// page can be under a millisecond and a truncated zero is worse than useless.
+fn ms(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+/// A stopwatch over `Io`'s monotonic clock, since Zig 0.16 has no `std.time
+/// .Timer` and `lyngvi.Clock` answers in seconds of `f32` -- too coarse for a
+/// page that renders in two milliseconds.
+///
+/// `awake` rather than `real` for the same reason the frame clock uses it: a
+/// wall clock corrected by NTP mid-run would report a negative page.
+const Lap = struct {
+    io: Io,
+    last: Io.Timestamp,
+
+    fn start(io: Io) Lap {
+        return .{ .io = io, .last = Io.Clock.awake.now(io) };
+    }
+
+    fn lap(l: *Lap) u64 {
+        const now = Io.Clock.awake.now(l.io);
+        const ns = l.last.durationTo(now).nanoseconds;
+        l.last = now;
+        return if (ns <= 0) 0 else @intCast(ns);
+    }
+};
+
 fn one(
     ctx: *Context,
     doc: *fenrir.Document,
     p: fenrir.Page,
     dest: []const u8,
     job: Job,
+    time: ?*Timing,
 ) !replay.Stats {
+    // Started even when `--time` was not asked for: one `Timer.start` per
+    // page is nothing beside interpreting it, and branching on the flag in
+    // four places to save it would only make the code harder to read.
+    var clock: Lap = .start(ctx.io);
+
     var result = content.page(ctx.gpa, doc, p, job.options) catch |err|
         return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
     defer result.deinit(ctx.gpa);
+
+    const interpret_ns = clock.lap();
 
     const size = replay.canvasSize(result.list.page, job.factor);
     const pixels = @as(u64, size[0]) * size[1];
@@ -263,6 +334,12 @@ fn one(
     // shows. A transparent page would composite correctly and look, in most
     // viewers, like nothing at all.
     canvas.fb.clear(.white);
+
+    // A lap of its own, and not part of the font one it used to hide inside.
+    // A page at 96dpi is fourteen megabytes of `f32`, allocated and then
+    // written once, and folding that into another column made the other
+    // column look like the expensive one.
+    const canvas_ns = clock.lap();
 
     // A real allocator and not `ctx.gpa`, which is the CLI's arena. A decoded
     // page image is tens of megabytes, `--all` decodes them a page at a time,
@@ -283,6 +360,8 @@ fn one(
     var images: Images = .init(heap.allocator(), doc, p.resources);
     defer images.deinit();
 
+    const fonts_ns = clock.lap();
+
     var options = job.replay;
     options.glyphs = glyphs.source();
     options.images = images.source();
@@ -295,6 +374,38 @@ fn one(
         replay.pageTransform(result.list.page, job.factor),
         options,
     ) catch |err| return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
+
+    const render_ns = clock.lap();
+
+    if (time) |t| {
+        // The hash is over the float framebuffer rather than over a PNG, so
+        // neither the encoder nor the eight-bit conversion is between the
+        // rasteriser and the number that proves it did not change.
+        const bytes = std.mem.sliceAsBytes(canvas.fb.pixels);
+        const page_hash = std.hash.Wyhash.hash(0, bytes);
+
+        t.pages += 1;
+        t.interpret += interpret_ns;
+        t.canvas += canvas_ns;
+        t.fonts += fonts_ns;
+        t.render += render_ns;
+        // Order-dependent on purpose: two runs that render the same pages in
+        // a different order are not the same run.
+        t.hash = std.hash.Wyhash.hash(t.hash, std.mem.asBytes(&page_hash));
+
+        ctx.note(
+            "page {d}  {d:.2}ms  interpret {d:.2}  canvas {d:.2}  fonts {d:.2}  render {d:.2}  {x:0>16}",
+            .{
+                p.index + 1,
+                ms(interpret_ns + canvas_ns + fonts_ns + render_ns),
+                ms(interpret_ns),
+                ms(canvas_ns),
+                ms(fonts_ns),
+                ms(render_ns),
+                page_hash,
+            },
+        );
+    }
 
     // The invariant from `raster.zig`, checked on real documents rather than
     // only on the shapes a test could think of. A page that leaves the stencil
@@ -474,6 +585,26 @@ fn writePng(ctx: *Context, dest: []const u8, fb: gleipnir.Framebuffer) !void {
         return ctx.fail("cannot write {s}: {t}", .{ dest, err });
     writer.interface.flush() catch |err|
         return ctx.fail("cannot write {s}: {t}", .{ dest, err });
+}
+
+/// The one line a benchmark reads: the total, its three parts, and the hash
+/// that says the pixels behind it are the same ones as last time.
+fn reportTime(ctx: *Context, time: ?*Timing) void {
+    const t = (time orelse return).*;
+    if (t.pages == 0) return;
+    ctx.note(
+        "time {d:.2}ms over {d} page{s}  interpret {d:.2}  canvas {d:.2}  fonts {d:.2}  render {d:.2}  hash {x:0>16}",
+        .{
+            ms(t.total()),
+            t.pages,
+            if (t.pages == 1) "" else "s",
+            ms(t.interpret),
+            ms(t.canvas),
+            ms(t.fonts),
+            ms(t.render),
+            t.hash,
+        },
+    );
 }
 
 fn accumulate(total: *replay.Stats, s: replay.Stats) void {
