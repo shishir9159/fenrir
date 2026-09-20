@@ -101,7 +101,11 @@ pub const Command = union(enum) {
     previous_buffer,
 
     // -- moving
-    scroll_lines: f32,
+    /// Document pixels, not lines and not notches. How far a notch of the
+    /// wheel is worth is a platform preference -- Windows has a system
+    /// setting for it and Wayland sends the distance outright -- so it is
+    /// decided in the platform layer and arrives here already converted.
+    scroll_pixels: f32,
     scroll_screens: f32,
     to_start,
     to_end,
@@ -284,7 +288,7 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
     if (in.modifiers.ctrl and in.scroll.y != 0) {
         out.push(.{ .zoom_by = std.math.pow(f32, 1.0015, in.scroll.y) });
     } else if (in.scroll.y != 0) {
-        out.push(.{ .scroll_lines = -in.scroll.y });
+        out.push(.{ .scroll_pixels = -in.scroll.y });
     }
 
     if (in.repeated(.page_down)) out.push(.{ .scroll_screens = 1 });
@@ -750,7 +754,7 @@ test "ctrl and the wheel is a zoom, and the wheel alone is a scroll" {
     const zoom = command(&state, .{ .scroll = .{ .x = 0, .y = 120 }, .modifiers = .{ .ctrl = true } });
     try testing.expect(zoom.items()[0].zoom_by > 1);
     const scroll = command(&state, .{ .scroll = .{ .x = 0, .y = 120 } });
-    try testing.expect(scroll.items()[0].scroll_lines < 0);
+    try testing.expect(scroll.items()[0].scroll_pixels < 0);
 }
 
 test "a frame of nothing produces no commands" {

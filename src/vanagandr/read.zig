@@ -2223,7 +2223,6 @@ const Session = struct {
     /// Separate from `handle` so that tests can drive the reader with the
     /// commands a keystroke would produce, without inventing keystrokes.
     fn apply(s: *Session, cmd: keys.Command) bool {
-        const line = 60.0;
         const v = s.view();
         switch (cmd) {
             .none => {},
@@ -2240,7 +2239,11 @@ const Session = struct {
             .next_buffer => s.showBuffer(1),
             .previous_buffer => s.showBuffer(-1),
 
-            .scroll_lines => |n| v.scroll += n * line,
+            // Straight through. The wheel already arrives in document pixels:
+            // the platform layer multiplied the notch by the system's line
+            // count and the display scale, and multiplying again here by a
+            // "line" of sixty was what made one notch jump most of a page.
+            .scroll_pixels => |n| v.scroll += n,
             .scroll_screens => |n| v.scroll += n * v.height() * 0.9,
             .to_start => v.scroll = 0,
             .to_end => v.scroll = v.maxScroll(),
