@@ -248,6 +248,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     var shot: ?[]const u8 = null;
     var splits: []const u8 = &.{};
     var clean = false;
+    var timing = false;
     var config_dir: ?[]const u8 = null;
     var on_device = false;
     var backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu;
@@ -290,6 +291,8 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
             if (i >= args.len) return ctx.fail("--frames needs a count", .{});
             frames = std.fmt.parseInt(u32, args[i], 10) catch
                 return ctx.fail("--frames wants a number, not '{s}'", .{args[i]});
+        } else if (std.mem.eql(u8, arg, "--time")) {
+            timing = true;
         } else if (std.mem.eql(u8, arg, "--db")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--db needs a file", .{});
@@ -393,10 +396,17 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     };
     defer session.deinit();
 
+    // `--time`'s stopwatch for startup. Every stage between here and the
+    // first frame reports through it, so "the reader takes a moment to come
+    // up" becomes a list of numbers rather than a guess about which stage.
+    var stage: Stage = .{ .ctx = ctx, .on = timing, .clock = .start(ctx.io) };
+    session.stage = &stage;
+
     // Mímir, if this build and this machine have one. A shot is a script
     // writing a file and not a person reading, so it neither reads the
     // remembered position nor records having been there.
     session.library = library.openWith(ctx, gpa, db_path);
+    stage.mark("library");
     session.remembers_place = shot == null;
     if (session.library) |l| {
         if (l.accent() catch null) |c| session.accent = c;
@@ -407,6 +417,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
             return ctx.fail("cannot open {s}: {t}", .{ file, err });
         };
     }
+    stage.mark("documents");
 
     // The first window, looking at the first document.
     const first = &session.buffers.items[0];
@@ -430,6 +441,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     // you were: a script asking for a picture must get the same picture
     // whatever is in your configuration directory.
     if (shot == null and !clean) session.startPlugins(config_dir);
+    stage.mark("plugins");
 
     if (shot) |dest| {
         if (backend == .cpu and !on_device) {
@@ -463,6 +475,54 @@ const Settings = struct {
     page_given: bool,
     splits: []const u8 = &.{},
     device: lyngvi.Device.Options,
+};
+
+/// `--time`'s startup stopwatch.
+///
+/// The reader's start is a sequence of one-off costs -- the library, the
+/// documents, a Vulkan device, a swapchain, two pipelines, and then the first
+/// page actually rendered -- and until one of them is named with a number,
+/// "startup feels slow" cannot be acted on. Every stage prints how long it
+/// took and how long the run has been going, so both the individual cost and
+/// the point the window appears are readable off one list.
+///
+/// Off unless `--time` was given, and then it is a handful of `note` calls on
+/// a path that runs once.
+const Stage = struct {
+    ctx: *Context,
+    on: bool,
+    clock: Lap,
+    total: u64 = 0,
+
+    fn mark(s: *Stage, comptime what: []const u8) void {
+        const ns = s.clock.lap();
+        if (!s.on) return;
+        s.total += ns;
+        s.ctx.note("start  {s:<12} {d:>8.2}ms  ({d:.2} in)", .{
+            what,
+            @as(f64, @floatFromInt(ns)) / 1_000_000.0,
+            @as(f64, @floatFromInt(s.total)) / 1_000_000.0,
+        });
+    }
+};
+
+/// A stopwatch over `Io`'s monotonic clock. Zig 0.16 has no `std.time.Timer`,
+/// and `lyngvi.Clock` answers in seconds of `f32`, which cannot resolve a
+/// stage that takes two milliseconds.
+const Lap = struct {
+    io: Io,
+    last: Io.Timestamp,
+
+    fn start(io: Io) Lap {
+        return .{ .io = io, .last = Io.Clock.awake.now(io) };
+    }
+
+    fn lap(l: *Lap) u64 {
+        const now = Io.Clock.awake.now(l.io);
+        const ns = l.last.durationTo(now).nanoseconds;
+        l.last = now;
+        return if (ns <= 0) 0 else @intCast(ns);
+    }
 };
 
 /// One rendered page, on the device and in the display list's numbering.
@@ -819,6 +879,9 @@ const Session = struct {
     status: []const u8 = "",
     /// The process's `Io`, for timestamps. Null in tests.
     io: ?Io = null,
+    /// `--time`'s startup stopwatch, borrowed from `run`. Null everywhere
+    /// else, which is every test and every session that did not ask for it.
+    stage: ?*Stage = null,
 
     /// Galdr, when this build has Lua and plugins were not turned off.
     plugins: ?*galdr.Runtime = null,
@@ -2956,6 +3019,67 @@ const Session = struct {
             .visible = settings.shot == null,
         }) catch |err| return ctx.fail("could not open a window: {s}", .{@errorName(err)});
         defer window.destroy();
+        if (s.stage) |g| g.mark("window");
+
+        const size = window.size();
+
+        // Where every window starts, settled here rather than after the
+        // device, because none of it needs one: the display's scale and the
+        // window's size are known as soon as the window is, and the zoom
+        // decides where every page begins.
+        //
+        // Now there is a display to be a percentage of, and a window to fit
+        // to. Both have to happen before the first `scrollToPage`.
+        const scale = window.scale();
+        s.layout.arrange(.fromRect(0, 0, @floatFromInt(size.width), @floatFromInt(size.height)));
+        {
+            const v = s.view();
+            v.dpi_scale = scale;
+            if (v.fit_on_open) v.fitWidth();
+        }
+        s.applySplits(settings.splits);
+        {
+            // After the splits, because a split refits the zoom and a zoom
+            // moves where every page starts: scrolling to `--page` first
+            // would land above it by however much the refit moved things.
+            var it = s.layout.iterator();
+            while (it.next()) |v| {
+                v.dpi_scale = scale;
+                if (settings.page_given) v.scrollToPage(settings.start_page);
+            }
+        }
+        s.remember(s.view());
+        // The window exists and every window is where it will start, so a
+        // plugin reacting to `start` can split, scroll or zoom and see it.
+        if (s.plugins) |rt| {
+            rt.emit(.start);
+            s.reportChanges();
+        }
+
+        var worker: Rasteriser = .{ .session = s, .io = ctx.io };
+        worker.start() catch |err| {
+            return ctx.fail("could not start the rasterising thread: {s}", .{@errorName(err)});
+        };
+        defer worker.stop();
+
+        // Page one, asked for before the device exists.
+        //
+        // Rasterising it is CPU work and creating a Vulkan device and a
+        // swapchain is the driver's; on this machine the second takes three
+        // quarters of a second and the first a fifth of one, and doing them
+        // one after the other meant the window appeared and then sat on blank
+        // paper. Started here, the page is finished and waiting by the time
+        // there is anything to upload it to. The worker fills one job and
+        // blocks, so this costs one page of memory and no more.
+        //
+        // Only when the backend is already settled. A GPU session can still
+        // fall back to the CPU if the path pipeline will not compile, and
+        // `produce` reads `backend` on the worker thread -- starting before
+        // that decision would be a race on it, and could rasterise the page
+        // in the form the session turns out not to want.
+        if (s.backend == .cpu) {
+            if (s.nextJob()) |job| worker.post(job);
+        }
 
         var device = lyngvi.Device.init(gpa, window, settings.device) catch |err| {
             return switch (err) {
@@ -2971,8 +3095,8 @@ const Session = struct {
             };
         };
         defer device.deinit();
+        if (s.stage) |g| g.mark("device");
 
-        const size = window.size();
         var swapchain = lyngvi.Swapchain.init(gpa, &device, .{
             .width = size.width,
             .height = size.height,
@@ -2980,6 +3104,7 @@ const Session = struct {
             return ctx.fail("could not create a swapchain: {s}", .{@errorName(err)});
         };
         defer swapchain.deinit();
+        if (s.stage) |g| g.mark("swapchain");
         if (settings.shot != null) {
             swapchain.readable = true;
             swapchain.recreate(.{ .width = size.width, .height = size.height }) catch |err| {
@@ -2997,6 +3122,7 @@ const Session = struct {
             };
         };
         defer renderer.deinit();
+        if (s.stage) |g| g.mark("renderer");
 
         ctx.note("{s}, {d}x{d}, {s}, shaders from {s}", .{
             device.name(),
@@ -3025,6 +3151,7 @@ const Session = struct {
         else
             null;
         defer if (paths_renderer) |*p| p.deinit();
+        if (s.stage) |g| g.mark("paths");
 
         if (paths_renderer) |p| {
             if (p.shaders_missing) {
@@ -3041,43 +3168,8 @@ const Session = struct {
         var over: DrawList = .init(gpa, .fromRect(0, 0, 1, 1));
         defer over.deinit();
 
-        // Now there is a display to be a percentage of, and a window to fit
-        // to. Both have to happen before the first `scrollToPage`, because
-        // the zoom decides where every page starts.
-        const scale = window.scale();
-        s.layout.arrange(.fromRect(0, 0, @floatFromInt(size.width), @floatFromInt(size.height)));
-        {
-            const v = s.view();
-            v.dpi_scale = scale;
-            if (v.fit_on_open) v.fitWidth();
-        }
-        s.applySplits(settings.splits);
-        {
-            // After the splits, because a split refits the zoom and a zoom
-            // moves where every page starts: scrolling to `--page` first
-            // would land above it by however much the refit moved things.
-            var it = s.layout.iterator();
-            while (it.next()) |v| {
-                v.dpi_scale = scale;
-                if (settings.page_given) v.scrollToPage(settings.start_page);
-            }
-        }
-        s.remember(s.view());
-        // The window exists and every window is where it will start, so a
-        // plugin reacting to `start` can split, scroll or zoom and see it.
-        if (s.plugins) |rt| {
-            rt.emit(.start);
-            s.reportChanges();
-        }
-
         var uploads: std.ArrayList(lyngvi.Renderer.Upload) = .empty;
         defer uploads.deinit(gpa);
-
-        var worker: Rasteriser = .{ .session = s, .io = ctx.io };
-        worker.start() catch |err| {
-            return ctx.fail("could not start the rasterising thread: {s}", .{@errorName(err)});
-        };
-        defer worker.stop();
 
         var clock: lyngvi.Clock = .start(ctx.io);
         var drawn: u32 = 0;
@@ -3167,6 +3259,20 @@ const Session = struct {
 
             switch (try renderer.frameWith(&list, uploads.items, page_backdrop, paths, &over)) {
                 .drawn => {
+                    // The first frame and the first frame with the page on
+                    // it are different moments, and the second is the one a
+                    // reader calls "started". The window is up before the
+                    // worker has finished page one, so the two are reported
+                    // separately rather than as one number.
+                    if (drawn == 0) {
+                        if (s.stage) |g| g.mark("first frame");
+                    }
+                    if (s.pages_rendered != 0) {
+                        if (s.stage) |g| {
+                            g.mark("first page");
+                            s.stage = null;
+                        }
+                    }
                     drawn += 1;
                     if (shooting) {
                         if (renderer.captured) |c| try s.writeShot(settings.shot.?, c);
