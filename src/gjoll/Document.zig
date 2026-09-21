@@ -45,6 +45,14 @@ table: xref.Table,
 cache: std.AutoHashMapUnmanaged(u32, Object) = .empty,
 /// Decoded object streams, keyed by their container object number.
 streams: std.AutoHashMapUnmanaged(u32, ObjectStream) = .empty,
+/// Decoded stream bytes, keyed by the address of the `Stream` they came from.
+///
+/// The address is the identity. A stream is parsed once and cached in `cache`
+/// by object number, and the arena never reuses an address, so two calls with
+/// the same pointer are the same stream and two streams never share one.
+/// Keying on the pointer rather than on an object number also covers the
+/// streams that have no number of their own.
+decoded: std.AutoHashMapUnmanaged(usize, filter.Result) = .empty,
 /// Object numbers currently being parsed, to break reference cycles.
 in_progress: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// True when the cross-reference table had to be rebuilt by scanning.
@@ -107,6 +115,7 @@ fn tableLeadsToPages(doc: *Document) bool {
 fn clearDerived(doc: *Document) void {
     doc.cache.clearRetainingCapacity();
     doc.streams.clearRetainingCapacity();
+    doc.decoded.clearRetainingCapacity();
     doc.in_progress.clearRetainingCapacity();
 }
 
@@ -121,6 +130,7 @@ pub fn arenaAllocator(doc: *Document) Allocator {
 pub fn deinit(doc: *Document) void {
     doc.cache.deinit(doc.gpa);
     doc.streams.deinit(doc.gpa);
+    doc.decoded.deinit(doc.gpa);
     doc.in_progress.deinit(doc.gpa);
     doc.arena_state.deinit();
     doc.gpa.free(doc.bytes);
@@ -335,21 +345,41 @@ fn intField(doc: *Document, dict: Dict, key: []const u8, default: i64) Error!i64
 
 // -- stream data ------------------------------------------------------------
 
-/// Decodes a stream's bytes. The result is arena-allocated and lives as long
-/// as the document, so callers must not free it.
+/// Decodes a stream's bytes, once. The result is arena-allocated and lives as
+/// long as the document, so callers must not free it, and a second call for
+/// the same stream returns the same bytes instead of inflating them again.
+///
+/// The decode runs on `gpa` and only its result is duplicated into the arena.
+/// A filter chain is a pipeline: each stage allocates its output and frees its
+/// input, and on an arena those frees do nothing -- so an ASCII85 stage in
+/// front of a Flate one used to leave three copies of the stream behind, and a
+/// long scanned document paid that on every page. On a real allocator the
+/// intermediates are actually reclaimed and only the answer is kept.
 ///
 /// `result.stopped_at` is set when the chain ended at an image codec; the data
 /// is then that codec's encoded bytes, which is what an extractor wants.
 pub fn streamData(doc: *Document, stream: *const Stream) Error!filter.Result {
+    const key = @intFromPtr(stream);
+    if (doc.decoded.get(key)) |cached| return cached;
+
     const arena = doc.arena_state.allocator();
     const chain = try doc.filterChain(stream.dict);
 
-    return filter.decode(arena, stream.raw, chain) catch |err| switch (err) {
+    const result: filter.Result = if (filter.decode(doc.gpa, stream.raw, chain)) |scratch| r: {
+        defer scratch.deinit(doc.gpa);
+        break :r .{
+            .data = try arena.dupe(u8, scratch.data),
+            .stopped_at = scratch.stopped_at,
+        };
+    } else |err| switch (err) {
         // A stream that will not decode is still worth showing raw: it is
         // often encrypted, or truncated with a usable prefix.
         error.CorruptFlateStream => .{ .data = try arena.dupe(u8, stream.raw) },
-        else => err,
+        else => return err,
     };
+
+    try doc.decoded.put(doc.gpa, key, result);
+    return result;
 }
 
 /// Builds a filter chain, resolving indirect `/Filter` and `/DecodeParms`.

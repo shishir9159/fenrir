@@ -226,18 +226,6 @@ base_ctm: Matrix = .identity,
 fonts: std.ArrayList(Font) = .empty,
 font_cache: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 space_cache: std.AutoHashMapUnmanaged(u32, ColorSpace) = .empty,
-/// Decoded content of form XObjects and Type 3 glyph procedures, by object
-/// number.
-///
-/// `Document.streamData` decodes afresh every time it is asked, which is the
-/// right default for a command that reads one stream. Here it is the wrong
-/// one: a page that stamps the same appearance stream two hundred times --
-/// a table rule, a bullet, an annotation border -- would inflate the same
-/// Flate stream two hundred times into an arena that is never freed until
-/// the document closes. Type 3 text is the worst case, because there the
-/// repeated stream is a single letter.
-stream_cache: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
-
 /// Object numbers of the form XObjects and patterns currently being run, to
 /// refuse a stream that draws itself.
 active: std.ArrayList(u32) = .empty,
@@ -351,7 +339,6 @@ fn deinit(it: *Interpreter) void {
     it.fonts.deinit(it.gpa);
     it.font_cache.deinit(it.gpa);
     it.space_cache.deinit(it.gpa);
-    it.stream_cache.deinit(it.gpa);
     it.active.deinit(it.gpa);
     it.glyph_buf.deinit(it.gpa);
     it.text_clip.deinit(it.gpa);
@@ -1202,7 +1189,7 @@ fn drawType3Glyph(
     }
 
     const glyph_stream = (try it.doc.resolve(raw)).asStream() orelse return;
-    const data = try it.contentOf(glyph_stream, ref);
+    const data = (try it.doc.streamData(glyph_stream)).data;
 
     const saved = it.state;
     const saved_clip = it.builder.clip_depth;
@@ -1240,18 +1227,6 @@ fn drawType3Glyph(
 }
 
 // -- XObjects ---------------------------------------------------------------
-
-/// Decoded stream bytes, memoised by object number. A direct stream (one with
-/// no object of its own) is not cacheable and is decoded each time, which is
-/// fine because it cannot be shared.
-fn contentOf(it: *Interpreter, s: *const object.Stream, ref: u32) Error![]const u8 {
-    if (ref != 0) {
-        if (it.stream_cache.get(ref)) |cached| return cached;
-    }
-    const data = (try it.doc.streamData(s)).data;
-    if (ref != 0) try it.stream_cache.put(it.gpa, ref, data);
-    return data;
-}
 
 fn isActive(it: *const Interpreter, ref: u32) bool {
     for (it.active.items) |n| {
@@ -1394,7 +1369,7 @@ fn drawForm(
     const resources = own orelse parent_resources;
 
     if (ref != 0) try it.active.append(it.gpa, ref);
-    const data = try it.contentOf(form, ref);
+    const data = (try it.doc.streamData(form)).data;
     it.diag.forms_drawn += 1;
 
     try it.execute(data, resources, depth + 1);
