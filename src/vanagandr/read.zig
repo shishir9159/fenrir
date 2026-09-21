@@ -774,6 +774,15 @@ const Session = struct {
 
     /// The open documents, and the tree of windows onto them.
     buffers: std.ArrayList(Buffer) = .empty,
+    /// One font cache per open buffer, same index. Every page of a document
+    /// draws in the same few faces, and parsing each font program again for
+    /// every page was a tenth of the time a page took to appear.
+    ///
+    /// Here rather than on `Buffer` because a buffer is Hliðskjálf's and the
+    /// binding of a PDF font to a Týr face is Vánagandr's, and the
+    /// dependencies run one way. Touched only from `produce`, which is to say
+    /// only on the rasterising thread, for the same reason `Document` is.
+    faces: std.ArrayList(glyphmod.Cache) = .empty,
     layout: Layout = .{},
     keymap: keys.State = .{},
 
@@ -868,6 +877,8 @@ const Session = struct {
         s.note.deinit(s.gpa);
         s.recorded.deinit(s.gpa);
         s.layout.deinit(s.gpa);
+        for (s.faces.items) |*c| c.deinit();
+        s.faces.deinit(s.gpa);
         for (s.buffers.items) |*b| {
             b.doc.deinit();
             s.gpa.destroy(b.doc);
@@ -901,6 +912,12 @@ const Session = struct {
 
         const path = absolutePath(s.ctx, gpa, file) orelse return error.OutOfMemory;
         errdefer gpa.free(path);
+
+        // Appended together and in this order, because `faces` is indexed by
+        // buffer id and a buffer with no cache beside it would be looked up
+        // out of bounds on its first page.
+        try s.faces.append(gpa, .init(gpa));
+        errdefer _ = s.faces.pop();
 
         try s.buffers.append(gpa, .{
             .path = path,
@@ -1096,7 +1113,7 @@ const Session = struct {
         defer canvas.deinit(gpa);
         canvas.fb.clear(.white);
 
-        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io);
+        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, &s.faces.items[job.buffer]);
         defer glyphs.deinit();
 
         var images: Images = .init(gpa, b.doc, b.pages[job.page].resources);
@@ -1129,7 +1146,7 @@ const Session = struct {
         const size = replay.canvasSize(list.page, 1.0);
         scene.reset(.{ @floatFromInt(size[0]), @floatFromInt(size[1]) });
 
-        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io);
+        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, &s.faces.items[job.buffer]);
         defer glyphs.deinit();
 
         var images: Images = .init(gpa, b.doc, b.pages[job.page].resources);

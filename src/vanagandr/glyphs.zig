@@ -82,17 +82,33 @@ const Binding = struct {
     }
 };
 
-/// A font program and who is responsible for it. See `Fonts.programs`.
+/// A font program and who is responsible for it. See `Cache.programs`.
 const Program = struct { bytes: []u8, owned: bool };
 
-/// Resolves and caches every font a display list mentions.
-pub const Fonts = struct {
+/// Every font of one document, parsed once and kept.
+///
+/// A `Fonts` is built from a display list and a display list is one page, but
+/// a *font* is not a page's: a book sets its body text in one face, and a
+/// reader that binds per page parses the same `glyf` or CFF program again for
+/// every page it shows. On a typeset paper that was nine milliseconds a page
+/// -- eleven per cent of the whole render -- spent producing a face byte for
+/// byte identical to the one the previous page threw away.
+///
+/// Keyed on the font dictionary's object number, which is what makes two
+/// pages' `/F1` the same font rather than two fonts with the same name. A
+/// cache belongs to exactly one document, because that is what the keys mean.
+///
+/// This is not the outline cache in the graveyard. That one memoised the
+/// *result* of decoding a glyph, which was one per cent of the run and lost.
+/// This memoises opening the font program, which is a different quantity --
+/// see `OPTIMIZING.md`.
+pub const Cache = struct {
     gpa: Allocator,
-    doc: *Document,
-    /// Needed only to read a substitute font off this machine. Without it, a
-    /// document that embeds nothing simply has no glyphs.
-    io: ?std.Io = null,
-    bindings: []Binding,
+    by_object: std.AutoHashMapUnmanaged(u32, *Binding) = .empty,
+    /// Bindings for fonts with no object number of their own. There is
+    /// nothing to key those on, so each is built again and simply owned here
+    /// until the cache goes.
+    loose: std.ArrayList(*Binding) = .empty,
     /// Font programs, kept alive because a `Face` borrows its bytes.
     ///
     /// Two owners, and the difference matters. A program read out of the
@@ -106,6 +122,49 @@ pub const Fonts = struct {
     /// allocator now, and the same line is an invalid free on the first page
     /// with an embedded font in it.
     programs: std.ArrayList(Program) = .empty,
+
+    pub fn init(gpa: Allocator) Cache {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(c: *Cache) void {
+        var it = c.by_object.valueIterator();
+        while (it.next()) |slot| {
+            slot.*.deinit(c.gpa);
+            c.gpa.destroy(slot.*);
+        }
+        c.by_object.deinit(c.gpa);
+        for (c.loose.items) |b| {
+            b.deinit(c.gpa);
+            c.gpa.destroy(b);
+        }
+        c.loose.deinit(c.gpa);
+        for (c.programs.items) |p| {
+            if (p.owned) c.gpa.free(p.bytes);
+        }
+        c.programs.deinit(c.gpa);
+        c.* = undefined;
+    }
+};
+
+/// Resolves every font a display list mentions, through a document-wide cache.
+pub const Fonts = struct {
+    /// For what lives exactly as long as this does: the binding table and the
+    /// outline scratch. Everything a `Binding` owns -- the face, its program,
+    /// its `/Differences` -- is allocated from `cache.gpa` instead, because
+    /// the cache outlives this and is what will free them. Mixing the two is
+    /// a cross-allocator free, which is the bug the reader's real heap turns
+    /// from a silent no-op into a crash.
+    gpa: Allocator,
+    doc: *Document,
+    /// Needed only to read a substitute font off this machine. Without it, a
+    /// document that embeds nothing simply has no glyphs.
+    io: ?std.Io = null,
+    /// One per entry in the display list's font table, pointing into `cache`.
+    /// Borrowed: this owns the slice and not what it points at.
+    bindings: []*Binding,
+    /// Where the bindings live. Outlives this; see `Cache`.
+    cache: *Cache,
     /// The outline handed back by the last `lookup`. One buffer, reused: the
     /// interface promises the slices only until the next call, which is
     /// exactly what a page-at-a-time replay needs.
@@ -119,28 +178,72 @@ pub const Fonts = struct {
     /// How many fonts came off this machine rather than out of the document.
     substituted: u32 = 0,
 
-    pub fn init(gpa: Allocator, doc: *Document, list: DisplayList, io: ?std.Io) Allocator.Error!Fonts {
-        const bindings = try gpa.alloc(Binding, list.fonts.len);
-        @memset(bindings, .{});
+    pub fn init(
+        gpa: Allocator,
+        doc: *Document,
+        list: DisplayList,
+        io: ?std.Io,
+        cache: *Cache,
+    ) Allocator.Error!Fonts {
+        const bindings = try gpa.alloc(*Binding, list.fonts.len);
+        errdefer gpa.free(bindings);
 
-        var f: Fonts = .{ .gpa = gpa, .doc = doc, .io = io, .bindings = bindings };
+        var f: Fonts = .{
+            .gpa = gpa,
+            .doc = doc,
+            .io = io,
+            .bindings = bindings,
+            .cache = cache,
+        };
         for (list.fonts, 0..) |info, i| {
             f.base_font = list.stringOf(info.base_font);
-            // A font that will not load is a blank in the page, not a failed
-            // render: a document with one broken font and forty good ones
-            // should show the forty.
-            f.bind(&f.bindings[i], info) catch continue;
+            f.bindings[i] = try f.resolve(info);
+            // Counted from the binding rather than in `bind`, because a
+            // binding that came out of the cache did its substituting on some
+            // earlier page and would otherwise go unreported here.
+            if (f.bindings[i].substituted) f.substituted += 1;
         }
         return f;
     }
 
-    pub fn deinit(f: *Fonts) void {
-        for (f.bindings) |*b| b.deinit(f.gpa);
-        f.gpa.free(f.bindings);
-        for (f.programs.items) |p| {
-            if (p.owned) f.gpa.free(p.bytes);
+    /// The binding for one font of the display list: out of the cache if this
+    /// document has bound it before, freshly built and put there if not.
+    fn resolve(f: *Fonts, info: DisplayList.FontInfo) Allocator.Error!*Binding {
+        const c = f.cache;
+        const cacheable = info.object != 0;
+        if (cacheable) {
+            if (c.by_object.get(info.object)) |b| return b;
         }
-        f.programs.deinit(f.gpa);
+
+        const b = try c.gpa.create(Binding);
+        b.* = .{};
+        // A font that will not load is a blank in the page, not a failed
+        // render: a document with one broken font and forty good ones should
+        // show the forty. The empty binding is cached too, so the next page
+        // does not try the same broken font again.
+        f.bind(b, info) catch {};
+
+        if (cacheable) {
+            c.by_object.put(c.gpa, info.object, b) catch {
+                // Out of memory for the index only. The binding still works;
+                // it is just kept in the list that is never looked up, and
+                // the next page rebuilds it.
+                c.loose.append(c.gpa, b) catch {
+                    b.deinit(c.gpa);
+                    c.gpa.destroy(b);
+                    return error.OutOfMemory;
+                };
+            };
+        } else {
+            try c.loose.append(c.gpa, b);
+        }
+        return b;
+    }
+
+    pub fn deinit(f: *Fonts) void {
+        // Not the bindings themselves: the cache owns those, and freeing one
+        // here would leave every later page holding a dangling face.
+        f.gpa.free(f.bindings);
         f.scratch.deinit(f.gpa);
     }
 
@@ -160,7 +263,7 @@ pub const Fonts = struct {
     fn lookup(ptr: *anyopaque, font: DisplayList.FontId, glyph: DisplayList.Glyph) ?GlyphOutline {
         const f: *Fonts = @ptrCast(@alignCast(ptr));
         if (font >= f.bindings.len) return null;
-        const b = &f.bindings[font];
+        const b = f.bindings[font];
         const face = b.face orelse return null;
 
         const gid = f.glyphFor(b, face, glyph.code) orelse return null;
@@ -310,24 +413,23 @@ pub const Fonts = struct {
             }
             const sub = readSubstitute(f, f.base_font, flags) orelse return;
             b.substituted = true;
-            f.substituted += 1;
             // A stand-in is never the symbolic font the descriptor described,
             // so its own cmap must not be consulted with raw codes: the name
             // chain is the only thing that means anything now.
             b.symbolic = false;
             break :blk .{ .bytes = sub, .owned = true };
         };
-        try f.programs.append(f.gpa, entry);
+        try f.cache.programs.append(f.cache.gpa, entry);
         const program = entry.bytes;
 
-        b.face = tyr.open(f.gpa, program, .{}) catch null;
+        b.face = tyr.open(f.cache.gpa, program, .{}) catch null;
         // The fallback backend opens anything and draws boxes. A box is worse
         // than a gap here: it is not what the document says and it looks like
         // a rendering bug rather than a missing feature.
         if (b.face) |face| {
             if (std.mem.eql(u8, face.backend, "fallback")) {
                 var x = face;
-                x.deinit(f.gpa);
+                x.deinit(f.cache.gpa);
                 b.face = null;
             }
         }
@@ -367,8 +469,8 @@ pub const Fonts = struct {
         const dr = try f.doc.resolve(diff);
         const arr = dr.asArray() orelse return;
 
-        var names = try f.gpa.alloc([]u8, 256);
-        errdefer f.gpa.free(names);
+        var names = try f.cache.gpa.alloc([]u8, 256);
+        errdefer f.cache.gpa.free(names);
         @memset(names, &.{});
 
         // The array alternates a starting code with a run of names, and a new
@@ -383,7 +485,7 @@ pub const Fonts = struct {
             }
             if (it.asName()) |n| {
                 if (at < 256) {
-                    names[at] = f.gpa.dupe(u8, n) catch continue;
+                    names[at] = f.cache.gpa.dupe(u8, n) catch continue;
                     at += 1;
                 }
             }
@@ -541,7 +643,7 @@ fn readSubstitute(f: *Fonts, base_font: []const u8, flags: i64) ?[]u8 {
         for (font_dirs) |dir| {
             var buf: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
-            const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, f.gpa, .limited(32 << 20)) catch continue;
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, f.cache.gpa, .limited(32 << 20)) catch continue;
             return bytes;
         }
     }

@@ -206,12 +206,24 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
 
     var clocked: Timing = .{};
     const time: ?*Timing = if (timing) &clocked else null;
+
+    // The fonts outlive the page, unlike everything else `one` allocates.
+    // See `glyphs.Cache`: a document sets its text in the same few faces, and
+    // parsing each font program again for every page is work that was never
+    // needed. The heap under it spans the run for the same reason, and still
+    // catches the bug the per-page one is there for -- that check is about
+    // which allocator freed a thing, not about how long the thing lived.
+    var font_heap: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = font_heap.deinit();
+    var faces: glyphmod.Cache = .init(font_heap.allocator());
+    defer faces.deinit();
+
     if (all) {
         var total: replay.Stats = .{};
         for (pages, 0..) |p, index| {
             const out = try numbered(ctx, dest, index + 1);
             defer ctx.gpa.free(out);
-            const s = try one(ctx, &doc, p, out, job, time);
+            const s = try one(ctx, &doc, p, out, job, time, &faces);
             accumulate(&total, s);
         }
         ctx.note("{d} pages", .{pages.len});
@@ -226,7 +238,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const out = dest orelse try numbered(ctx, null, page_number);
     defer if (dest == null) ctx.gpa.free(out);
 
-    const s = try one(ctx, &doc, pages[page_number - 1], out, job, time);
+    const s = try one(ctx, &doc, pages[page_number - 1], out, job, time, &faces);
     reportTime(ctx, time);
     report(ctx, s);
 }
@@ -305,6 +317,7 @@ fn one(
     dest: []const u8,
     job: Job,
     time: ?*Timing,
+    faces: *glyphmod.Cache,
 ) !replay.Stats {
     // Started even when `--time` was not asked for: one `Timer.start` per
     // page is nothing beside interpreting it, and branching on the flag in
@@ -354,7 +367,7 @@ fn one(
     var heap: std.heap.DebugAllocator(.{}) = .init;
     defer _ = heap.deinit();
 
-    var glyphs: Glyphs = try .init(heap.allocator(), doc, result.list, ctx.io);
+    var glyphs: Glyphs = try .init(heap.allocator(), doc, result.list, ctx.io, faces);
     defer glyphs.deinit();
 
     var images: Images = .init(heap.allocator(), doc, p.resources);
