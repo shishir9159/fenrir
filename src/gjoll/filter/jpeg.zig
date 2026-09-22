@@ -588,6 +588,28 @@ const idct_table = blk: {
 /// than the fixed-point version every codec ships, because the difference is
 /// under a level of output and this one can be read.
 fn idct(block: *const [64]i32, plane: []u8, stride: u32, px: u32, py: u32) void {
+    // A block with nothing but a DC term is a flat 8x8 patch, and both passes
+    // collapse to two multiplies for the whole block instead of a thousand.
+    // Smooth areas -- paper, sky, the background of a figure -- are mostly
+    // these, and a scan of printed text is almost all of them.
+    //
+    // Written as the same two multiplies in the same order as the loops below
+    // rather than as one folded constant. Adding zero to a finite float is
+    // exact and `idct_table[u][0]` does not depend on `u`, so this is the same
+    // arithmetic, not an approximation of it, and the framebuffer hash agrees.
+    if (std.mem.allEqual(i32, block[1..], 0)) {
+        if (px >= stride) return;
+        const dc = idct_table[0][0] * @as(f32, @floatFromInt(block[0])) * 0.5;
+        const value = clamp8(idct_table[0][0] * dc * 0.5 + 128.0);
+        for (0..8) |y| {
+            const row = (@as(usize, py) + y) * stride + px;
+            if (row >= plane.len) break;
+            const width = @min(@as(usize, 8), @min(stride - px, plane.len - row));
+            @memset(plane[row..][0..width], value);
+        }
+        return;
+    }
+
     var tmp: [64]f32 = undefined;
 
     // Rows.
