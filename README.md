@@ -508,6 +508,81 @@ runtime decision, so a build with two of them can render the same page each
 way and diff the results — which is the main reason to have two. `fenrir
 fonts` prints what the binary you have can actually do.
 
+## Profiling
+
+Performance is the first priority here, and the rule that goes with it is that
+nothing is optimised on the strength of how the code reads. `OPTIMIZING.md` has
+the full method, the worklist and the ledger of what has already been measured;
+this is which tool to reach for.
+
+### The clock in the binary
+
+`--time` on `raster` and on `read` is the first stop, and for most questions
+the last one. It is not a profiler, but it splits the run four ways and hashes
+the pixels in the same pass, so one command answers both "where did the time
+go" and "did the picture change".
+
+```
+fenrir raster <file> --all --stats --time
+```
+
+```
+time 2237.43ms over 26 pages  interpret 13.90  canvas 154.10  fonts 6.41  render 2063.02  hash bf68db5063ccf734
+```
+
+`--stats` keeps it from writing PNGs, so the numbers are the renderer and not
+the disk. Two runs whose `hash` agrees drew the same pixels; a change that
+moves it is a rendering change, not an optimisation. Build both binaries, keep
+both, and run them *interleaved* — this machine's clock drifts several per cent
+over a few minutes, which is larger than most wins.
+
+`fenrir read --time` does the same for startup, naming each stage from the
+library through the Vulkan device to the first page on screen.
+
+### Sampling the CPU
+
+Ninety per cent of a page is Gleipnir, on the CPU, and that is where a real
+profiler is needed. Build `-Doptimize=ReleaseSafe` — full speed, and it keeps
+the frame pointers and safety checks that make a stack readable — and sample
+`fenrir raster <file> --all --stats` under Superluminal, VTune, or the Windows
+Performance Recorder. There is no GPU work in that command at all, which is
+what makes it the standard workload.
+
+### RenderDoc
+
+**Not for the current worklist.** RenderDoc is a frame debugger: it captures
+one frame's Vulkan calls, their state and their timings. The CPU rasteriser it
+cannot see at all, so on a profile that is nine parts Gleipnir it would answer
+a question nobody is asking.
+
+It earns its place on the other side of the split, where nothing else can look:
+
+- **The analytic path pipeline.** `fenrir read --path gpu` draws the same
+  geometry as `--path cpu` through two passes on the device. A capture shows
+  the draw calls, the instance buffers and the intermediate targets, which is
+  how a shader that disagrees with the CPU oracle gets localised.
+- **Confirming the frame loop does what `src/lyngvi/` claims.** One draw call
+  per layer, the quad from `gl_VertexIndex`, the clip in the instance rather
+  than in `vkCmdSetScissor`, and no per-frame allocation. A capture is the
+  evidence for those sentences.
+- **GPU-side timings.** Whether a frame is bound on the path pass, the
+  composite, or the presentation wait.
+
+To take a capture: launch `fenrir read <file> --path gpu` from RenderDoc's
+*Launch Application* tab, press F12 (or PrtScn) on the window to grab a frame,
+and open the capture. Turn the validation layers on for the same run with
+`--validate`, which is the cheaper check and usually the one that finds the
+bug:
+
+```
+fenrir read <file> --path gpu --validate
+```
+
+Two caveats. RenderDoc needs the swapchain, so it cannot see `fenrir raster` or
+`fenrir read --shot --path cpu`, neither of which creates a device. And a
+capture perturbs the frame it captures — read the shape of the frame off it,
+and the timings off `--time`.
+
 ## The CLI
 
 Vánagandr exists to make the rest of the project debuggable. It is the tool
@@ -720,10 +795,8 @@ differently -- is the reader's plugin system, and it is Neovim's model: Lua,
 an `init.lua`, a directory of plugins, and one table of functions for talking
 to the program.
 
-Neovim's *model*, not Neovim's interpreter. Neovim is LuaJIT and its permanent
-interface is Lua 5.1; this is PUC-Rio Lua 5.4, which is neither source
-compatible with it nor as fast. Why, and what the difference costs, is
-[below](#why-lua-54-and-not-luajit).
+Neovim is LuaJIT and its permanent interface is Lua 5.1; we implemented PUC-Rio Lua 5.4,
+which is neither source compatible with it nor as fast.
 
 ### Where they live
 
