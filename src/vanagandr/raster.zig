@@ -218,12 +218,17 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var faces: glyphmod.Cache = .init(font_heap.allocator());
     defer faces.deinit();
 
+    // One page's working memory, reused for every page. See the note in `one`
+    // for why it is an arena that is reset rather than one that is freed.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+
     if (all) {
         var total: replay.Stats = .{};
         for (pages, 0..) |p, index| {
             const out = try numbered(ctx, dest, index + 1);
             defer ctx.gpa.free(out);
-            const s = try one(ctx, &doc, p, out, job, time, &faces);
+            const s = try one(ctx, &doc, p, out, job, time, &faces, &scratch);
             accumulate(&total, s);
         }
         ctx.note("{d} pages", .{pages.len});
@@ -238,7 +243,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const out = dest orelse try numbered(ctx, null, page_number);
     defer if (dest == null) ctx.gpa.free(out);
 
-    const s = try one(ctx, &doc, pages[page_number - 1], out, job, time, &faces);
+    const s = try one(ctx, &doc, pages[page_number - 1], out, job, time, &faces, &scratch);
     reportTime(ctx, time);
     report(ctx, s);
 }
@@ -318,15 +323,34 @@ fn one(
     job: Job,
     time: ?*Timing,
     faces: *glyphmod.Cache,
+    scratch: *std.heap.ArenaAllocator,
 ) !replay.Stats {
     // Started even when `--time` was not asked for: one `Timer.start` per
     // page is nothing beside interpreting it, and branching on the flag in
     // four places to save it would only make the code harder to read.
     var clock: Lap = .start(ctx.io);
 
-    var result = content.page(ctx.gpa, doc, p, job.options) catch |err|
+    // The page arena, reused across pages and reset behind us. Everything
+    // below is one page's working memory -- a display list, a canvas of
+    // fourteen megabytes of `f32`, the rasteriser's scratch -- and `--all`
+    // needs one page's worth at a time, not every page's. It used to come from
+    // `ctx.gpa`, the CLI's arena, where `deinit` is a no-op: a 519-page scan
+    // climbed to eight gigabytes resident before it finished.
+    //
+    // Retaining the capacity rather than freeing it is the whole point. A
+    // fresh arena per page hands back cold pages and pays the fault on all
+    // fourteen megabytes again every time, which measured two per cent slower
+    // than never freeing at all. Reusing one arena keeps the memory warm and
+    // bounds it at the largest page instead of the sum of them.
+    //
+    // First `defer` in the function, so it runs last -- after every `deinit`
+    // below has had its turn at memory this arena owns.
+    defer _ = scratch.reset(.retain_capacity);
+    const gpa = scratch.allocator();
+
+    var result = content.page(gpa, doc, p, job.options) catch |err|
         return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
-    defer result.deinit(ctx.gpa);
+    defer result.deinit(gpa);
 
     const interpret_ns = clock.lap();
 
@@ -339,9 +363,9 @@ fn one(
         );
     }
 
-    var canvas = gleipnir.raster.Canvas.init(ctx.gpa, size[0], size[1], .{ .samples = job.samples }) catch |err|
+    var canvas = gleipnir.raster.Canvas.init(gpa, size[0], size[1], .{ .samples = job.samples }) catch |err|
         return ctx.fail("cannot allocate a {d}x{d} canvas: {t}", .{ size[0], size[1], err });
-    defer canvas.deinit(ctx.gpa);
+    defer canvas.deinit(gpa);
 
     // Opaque white, because that is what paper is and what every other reader
     // shows. A transparent page would composite correctly and look, in most
@@ -354,16 +378,11 @@ fn one(
     // column look like the expensive one.
     const canvas_ns = clock.lap();
 
-    // A real allocator and not `ctx.gpa`, which is the CLI's arena. A decoded
-    // page image is tens of megabytes, `--all` decodes them a page at a time,
-    // and on an arena `deinit` is a no-op -- so a scanned book would climb
-    // into the gigabytes before it finished.
-    //
-    // The glyph layer uses it too, and not for memory. The reader runs both
-    // on a real heap, where freeing something the document's arena owns is a
-    // crash; under the arena it is a silent no-op. Two of those have shipped
-    // -- an embedded font program, then a `/CIDToGIDMap` -- and each was found
-    // by a person opening a document. On this heap a corpus run finds them.
+    // A checking heap, and not the page arena, for these two alone. The reader
+    // runs them on a real heap, where freeing something the document's arena
+    // owns is a crash; under an arena it is a silent no-op. Two of those have
+    // shipped -- an embedded font program, then a `/CIDToGIDMap` -- and each
+    // was found by a person opening a document. Here a corpus run finds them.
     var heap: std.heap.DebugAllocator(.{}) = .init;
     defer _ = heap.deinit();
 
@@ -381,7 +400,7 @@ fn one(
     options.path_backend = if (job.path == .slug) .slug else .stencil;
 
     const stats = replay.render(
-        ctx.gpa,
+        gpa,
         &canvas,
         result.list,
         replay.pageTransform(result.list.page, job.factor),
