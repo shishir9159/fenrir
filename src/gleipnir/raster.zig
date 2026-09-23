@@ -450,6 +450,7 @@ pub const Canvas = struct {
         if (area.isEmpty()) return;
 
         const scale: slug.Scale = .of(f.xform);
+        const src = c.encodeColor(color);
 
         var y: u32 = area.y0;
         while (y < area.y1) : (y += 1) {
@@ -464,9 +465,9 @@ pub const Canvas = struct {
                 });
                 const cov = slug.coverageAt(store.*, f.header, p.x, p.y, scale);
                 if (cov <= 0) continue;
-                c.blend(
+                c.blendEncoded(
                     @as(usize, y) * c.width() + x,
-                    color,
+                    src,
                     cov * (@as(f32, @floatFromInt(clip)) / 255.0) * alpha,
                 );
             }
@@ -636,30 +637,65 @@ pub const Canvas = struct {
     fn resolve(c: *Canvas, area: Box, color: ?Color, alpha: f32, out: ?Mask) void {
         const inv_n = 1.0 / @as(f32, @floatFromInt(c.samples.count()));
 
+        // The colour is the same for every pixel of the sweep, so its clamp
+        // and its transfer function are the same answer every pixel. Encoded
+        // once here rather than once per covered pixel.
+        const src: Encoded = if (color) |k| c.encodeColor(k) else undefined;
+
+        // `area` is the cover quad's box already intersected with the clip
+        // box, so the bounds test in `clipAt` is known to pass and the row
+        // base below replaces it.
+        const clip_box = c.clip_box;
+        const clip_w = clip_box.widthOf();
+        const w = c.width();
+
         var y: u32 = area.y0;
         while (y < area.y1) : (y += 1) {
+            const pixel_row = @as(usize, y) * w;
+            const clip_row = @as(usize, y - clip_box.y0) * clip_w - clip_box.x0;
+
+            // Most of a cover quad is empty -- a glyph fills a third of its
+            // own box and a comma a twentieth -- so the row is swept a vector
+            // at a time looking for anything at all, and only the blocks that
+            // hold something are walked pixel by pixel.
             var x: u32 = area.x0;
-            while (x < area.x1) : (x += 1) {
-                const pixel = @as(usize, y) * c.width() + x;
-                const n = c.cover[pixel];
-                if (n == 0) continue;
-                c.cover[pixel] = 0;
+            while (x < area.x1) {
+                const run = @min(skip_width, area.x1 - x);
+                if (run == skip_width) {
+                    const block: @Vector(skip_width, u8) = c.cover[pixel_row + x ..][0..skip_width].*;
+                    if (@reduce(.Or, block) == 0) {
+                        x += skip_width;
+                        continue;
+                    }
+                }
 
-                const frac = @as(f32, @floatFromInt(n)) * inv_n *
-                    (@as(f32, @floatFromInt(c.clipAt(x, y))) / 255.0);
+                const stop = x + run;
+                while (x < stop) : (x += 1) {
+                    const pixel = pixel_row + x;
+                    const n = c.cover[pixel];
+                    if (n == 0) continue;
+                    c.cover[pixel] = 0;
 
-                if (out) |mask| {
-                    if (!mask.box.contains(x, y)) continue;
-                    const i = @as(usize, y - mask.box.y0) * mask.box.widthOf() +
-                        (x - mask.box.x0);
-                    const v: u8 = @intFromFloat(@round(std.math.clamp(frac, 0, 1) * 255.0));
-                    mask.data[i] = @max(mask.data[i], v);
-                } else {
-                    c.blend(pixel, color.?, frac * alpha);
+                    const frac = @as(f32, @floatFromInt(n)) * inv_n *
+                        (@as(f32, @floatFromInt(c.clip[clip_row + x])) / 255.0);
+
+                    if (out) |mask| {
+                        if (!mask.box.contains(x, y)) continue;
+                        const i = @as(usize, y - mask.box.y0) * mask.box.widthOf() +
+                            (x - mask.box.x0);
+                        const v: u8 = @intFromFloat(@round(std.math.clamp(frac, 0, 1) * 255.0));
+                        mask.data[i] = @max(mask.data[i], v);
+                    } else {
+                        c.blendEncoded(pixel, src, frac * alpha);
+                    }
                 }
             }
         }
     }
+
+    /// How many pixels of `cover` are tested for emptiness at once. Sixteen
+    /// is one SSE register and divides every page width this draws on.
+    const skip_width = 16;
 
     const CoverState = struct {
         rule: FillRule,
@@ -828,16 +864,32 @@ pub const Canvas = struct {
     /// general form costs one unpremultiply and buys every blend mode,
     /// including over the transparent regions a page can have.
     fn blend(c: *Canvas, pixel: usize, color: Color, cov: f32) void {
-        const a = std.math.clamp(color.a, 0, 1) * std.math.clamp(cov, 0, 1);
+        c.blendEncoded(pixel, c.encodeColor(color), cov);
+    }
+
+    /// A colour clamped and put through the framebuffer's transfer function,
+    /// which is the half of `blend` that does not depend on the pixel. A sweep
+    /// over one path does it once instead of once per covered pixel.
+    const Encoded = struct { rgb: [3]f32, a: f32 };
+
+    fn encodeColor(c: *const Canvas, color: Color) Encoded {
+        return .{
+            .rgb = .{
+                c.fb.encode(std.math.clamp(color.r, 0, 1)),
+                c.fb.encode(std.math.clamp(color.g, 0, 1)),
+                c.fb.encode(std.math.clamp(color.b, 0, 1)),
+            },
+            .a = std.math.clamp(color.a, 0, 1),
+        };
+    }
+
+    fn blendEncoded(c: *Canvas, pixel: usize, color: Encoded, cov: f32) void {
+        const a = color.a * std.math.clamp(cov, 0, 1);
         if (a <= 0) return;
         const o = pixel * 4;
         const ab = c.fb.pixels[o + 3];
 
-        var cs = [3]f32{
-            c.fb.encode(std.math.clamp(color.r, 0, 1)),
-            c.fb.encode(std.math.clamp(color.g, 0, 1)),
-            c.fb.encode(std.math.clamp(color.b, 0, 1)),
-        };
+        var cs = color.rgb;
         if (c.blend_mode != .normal and ab > 0) {
             const cb = [3]f32{
                 c.fb.pixels[o + 0] / ab,
