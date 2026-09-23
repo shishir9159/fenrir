@@ -667,15 +667,43 @@ pub const Canvas = struct {
 
     const Pass = enum { stencil, cover };
 
-    /// One triangle, one scanline at a time, with the edge functions carried
-    /// incrementally across x.
+
+    /// One triangle, one scanline at a time.
     ///
     /// The cover quad is two triangles that share a diagonal, so a sample on
     /// that diagonal must land in exactly one of them or it is either zeroed
     /// twice -- harmless -- or blended twice, which shows as a bright seam
     /// down the middle of every filled shape. `edgeInside` is the top-left
     /// rule that prevents it, and it is the same rule the hardware uses.
+    ///
+    /// The sample count, the pass and the fill rule are constant for the whole
+    /// of the loop and were read inside it. Switching on all three here
+    /// instantiates the body once per combination, which makes `positions` a
+    /// comptime array the sample loop unrolls over and takes two branches out
+    /// of the innermost scope.
     fn rasterTriangle(c: *Canvas, a: Vertex, b: Vertex, t: Vertex, pass: Pass, state: ?*CoverState) void {
+        switch (c.samples) {
+            inline else => |s| switch (pass) {
+                .stencil => c.triangle(s, .stencil, .nonzero, a, b, t),
+                .cover => switch (state.?.rule) {
+                    inline else => |r| c.triangle(s, .cover, r, a, b, t),
+                },
+            },
+        }
+    }
+
+    fn triangle(
+        c: *Canvas,
+        comptime s: Samples,
+        comptime pass: Pass,
+        comptime rule: FillRule,
+        a: Vertex,
+        b: Vertex,
+        t: Vertex,
+    ) void {
+        const n = comptime s.count();
+        const positions: [n][2]f32 = comptime s.positions()[0..n].*;
+
         const area = signedArea(a, b, t);
         if (area == 0 or !std.math.isFinite(area)) return;
 
@@ -695,9 +723,6 @@ pub const Canvas = struct {
         const area_px = Box.fromBounds(box, c.clip_box);
         if (area_px.isEmpty()) return;
 
-        const positions = c.samples.positions();
-        const n = c.samples.count();
-
         // The three edge tests, bracketed over a pixel. See `Edge`.
         const edges: [3]Edge = .{
             .of(p0, p1, area_px),
@@ -705,14 +730,32 @@ pub const Canvas = struct {
             .of(p2, p0, area_px),
         };
 
+        // `area_px` is already intersected with the clip box, so every pixel
+        // below is inside it and the bounds test `clipAt` makes is known to
+        // pass. A row base computed once replaces it.
+        const clip_box = c.clip_box;
+        const clip_w = clip_box.widthOf();
+        const w = c.width();
+
         var y: u32 = area_px.y0;
         while (y < area_px.y1) : (y += 1) {
             const fy: f32 = @floatFromInt(y);
+            const clip_row = @as(usize, y - clip_box.y0) * clip_w - clip_box.x0;
+            const pixel_row = @as(usize, y) * w;
+
+            // The edge function is affine, so along a row it is `base - dy*x`.
+            // Hoisting the y half out of the pixel loop leaves one fused
+            // multiply-add per edge per pixel where there were two multiplies
+            // and two subtractions, and unlike carrying `d` incrementally it
+            // accumulates no error across the row.
+            var base: [3]f32 = undefined;
+            for (&base, edges) |*v, e| v.* = e.dx * (fy - e.ay) + e.dy * e.ax;
+
             var x: u32 = area_px.x0;
             while (x < area_px.x1) : (x += 1) {
-                const pixel = @as(usize, y) * c.width() + x;
+                const pixel = pixel_row + x;
 
-                if (c.clipAt(x, y) == 0) continue;
+                if (c.clip[clip_row + x] == 0) continue;
 
                 // Which side of each edge the pixel's corner is on, and
                 // whether its samples can straddle the edge at all. A pixel
@@ -723,52 +766,43 @@ pub const Canvas = struct {
                 const fx: f32 = @floatFromInt(x);
                 var whole = true;
                 var outside = false;
-                for (edges) |e| {
-                    const d = e.dx * (fy - e.ay) - e.dy * (fx - e.ax);
-                    if (d + e.hi < -e.margin) {
-                        outside = true;
-                        break;
-                    }
+                inline for (edges, base) |e, b0| {
+                    const d = b0 - e.dy * fx;
+                    if (d + e.hi < -e.margin) outside = true;
                     if (d + e.lo <= e.margin) whole = false;
                 }
                 if (outside) continue;
+
+                const cell: *[n]u8 = c.stencil[pixel * n ..][0..n];
 
                 // A cover triangle over a pixel no stencil triangle reached
                 // has nothing to test and nothing to clear. Worth checking
                 // because the cover quad is the whole path's box while the
                 // path is usually a small part of it -- an `o` fills about a
                 // third of its own box, and a comma a twentieth.
-                if (pass == .cover and allClear(c.stencil[pixel * n ..][0..n])) continue;
+                if (pass == .cover and allClear(n, cell)) continue;
 
                 var covered: u32 = 0;
-                for (positions, 0..) |off, si| {
-                    if (!whole) {
-                        const px = fx + off[0];
-                        const py = fy + off[1];
-                        if (!inside(p0, p1, p2, px, py)) continue;
-                    }
-
-                    const slot = pixel * n + si;
-                    switch (pass) {
+                inline for (positions, 0..) |off, si| {
+                    var hit = true;
+                    if (!whole) hit = inside(p0, p1, p2, fx + off[0], fy + off[1]);
+                    if (hit) switch (pass) {
                         .stencil => {
                             // INCREMENT_AND_WRAP / DECREMENT_AND_WRAP.
-                            c.stencil[slot] = if (front)
-                                c.stencil[slot] +% 1
-                            else
-                                c.stencil[slot] -% 1;
+                            cell[si] = if (front) cell[si] +% 1 else cell[si] -% 1;
                         },
                         .cover => {
-                            const s = c.stencil[slot];
-                            // Both failOp and passOp are ZERO, so the sample is
-                            // cleared whether it passed or not.
-                            c.stencil[slot] = 0;
-                            const in = switch (state.?.rule) {
-                                .nonzero => s != 0,
-                                .even_odd => (s & 1) != 0,
+                            const v = cell[si];
+                            // Both failOp and passOp are ZERO, so the sample
+                            // is cleared whether it passed or not.
+                            cell[si] = 0;
+                            const on = switch (rule) {
+                                .nonzero => v != 0,
+                                .even_odd => (v & 1) != 0,
                             };
-                            if (in) covered += 1;
+                            if (on) covered += 1;
                         },
-                    }
+                    };
                 }
 
                 if (pass == .stencil or covered == 0) continue;
@@ -845,11 +879,10 @@ fn apply(t: Transform, v: Vertex) Vertex {
 }
 
 /// Whether every sample of one pixel is clear. Folded rather than compared so
-/// that the whole pixel is one or two machine words either way.
-fn allClear(samples: []const u8) bool {
-    var acc: u8 = 0;
-    for (samples) |s| acc |= s;
-    return acc == 0;
+/// that the whole pixel is one or two machine words either way, and folded as
+/// a vector because `n` is a comptime power of two at every call site.
+inline fn allClear(comptime n: u8, cell: *const [n]u8) bool {
+    return @reduce(.Or, @as(@Vector(n, u8), cell.*)) == 0;
 }
 
 fn signedArea(a: Vertex, b: Vertex, c: Vertex) f32 {
