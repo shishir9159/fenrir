@@ -652,7 +652,7 @@ pub const Canvas = struct {
         var y: u32 = area.y0;
         while (y < area.y1) : (y += 1) {
             const pixel_row = @as(usize, y) * w;
-            const clip_row = @as(usize, y - clip_box.y0) * clip_w - clip_box.x0;
+            const clip_row = @as(usize, y - clip_box.y0) * clip_w;
 
             // Most of a cover quad is empty -- a glyph fills a third of its
             // own box and a comma a twentieth -- so the row is swept a vector
@@ -677,7 +677,7 @@ pub const Canvas = struct {
                     c.cover[pixel] = 0;
 
                     const frac = @as(f32, @floatFromInt(n)) * inv_n *
-                        (@as(f32, @floatFromInt(c.clip[clip_row + x])) / 255.0);
+                        (@as(f32, @floatFromInt(c.clip[clip_row + (x - clip_box.x0)])) / 255.0);
 
                     if (out) |mask| {
                         if (!mask.box.contains(x, y)) continue;
@@ -776,7 +776,7 @@ pub const Canvas = struct {
         var y: u32 = area_px.y0;
         while (y < area_px.y1) : (y += 1) {
             const fy: f32 = @floatFromInt(y);
-            const clip_row = @as(usize, y - clip_box.y0) * clip_w - clip_box.x0;
+            const clip_row = @as(usize, y - clip_box.y0) * clip_w;
             const pixel_row = @as(usize, y) * w;
 
             // The edge function is affine, so along a row it is `base - dy*x`.
@@ -791,7 +791,7 @@ pub const Canvas = struct {
             while (x < area_px.x1) : (x += 1) {
                 const pixel = pixel_row + x;
 
-                if (c.clip[clip_row + x] == 0) continue;
+                if (c.clip[clip_row + (x - clip_box.x0)] == 0) continue;
 
                 // Which side of each edge the pixel's corner is on, and
                 // whether its samples can straddle the edge at all. A pixel
