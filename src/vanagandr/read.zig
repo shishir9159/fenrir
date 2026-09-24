@@ -1570,7 +1570,7 @@ const Session = struct {
         const at = v.userSpaceAt(page, p) orelse return null;
         const map = s.buffer(v.buffer).textMap(page) orelse return null;
         if (map.isEmpty()) return null;
-        const line = map.lineAt(at.y);
+        const line = map.lineAt(at.x, at.y);
         return .{ .page = page, .line = line, .column = map.columnAt(line, at.x) };
     }
 
@@ -1772,7 +1772,7 @@ const Session = struct {
         v.scrollToBox(mark.page, mark.box);
         if (b.textMap(mark.page)) |map| {
             if (!map.isEmpty()) {
-                const line = map.lineAt((mark.box.min_y + mark.box.max_y) * 0.5);
+                const line = map.lineAt(mark.box.min_x, (mark.box.min_y + mark.box.max_y) * 0.5);
                 v.cursorTo(.{
                     .page = mark.page,
                     .line = line,
