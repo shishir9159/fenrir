@@ -373,6 +373,17 @@ pub fn userSpaceAt(v: View, index: usize, p: Point) ?Point {
     };
 }
 
+/// A point in the user space of `page`, in the window, or null if it is not
+/// on screen. The inverse of `userSpaceAt`.
+pub fn windowPoint(v: View, index: usize, p: Point) ?Point {
+    const rect = v.pageRect(index);
+    const at: Point = .{
+        .x = rect.min_x + p.x * v.zoom,
+        .y = rect.min_y + (v.pageBox(index).max_y - p.y) * v.zoom,
+    };
+    return if (rect.contains(at)) at else null;
+}
+
 /// The page under a window point, if any.
 pub fn pageAt(v: View, p: Point) ?u32 {
     const range = v.visiblePages();

@@ -2537,7 +2537,10 @@ const Session = struct {
 
         if (s.drag) |*d| {
             if (d.buffer == v.buffer) {
-                if (s.positionAt(v, in.mouse)) |p| d.to = p;
+                if (s.positionAt(v, in.mouse)) |p| {
+                    d.to = p;
+                    s.carryCursor(v, p);
+                }
             }
             return;
         }
@@ -2564,6 +2567,21 @@ const Session = struct {
 
         const p = s.positionAt(v, in.mouse) orelse return;
         s.drag = .{ .buffer = v.buffer, .from = p, .to = p };
+        s.carryCursor(v, p);
+    }
+
+    /// Moves the caret to where the pointer is, which is what a click in text
+    /// means everywhere else and is how the keyboard picks up a selection the
+    /// mouse began: `v` after a drag extends from the end of it, and `w` or
+    /// `j` after a click carries on from where the reader was looking.
+    ///
+    /// Not scrolled to, unlike a cursor move from the keyboard -- the pointer
+    /// is already somewhere the reader can see, and a page that jumped under
+    /// a drag would be unusable.
+    fn carryCursor(s: *Session, v: *View, at: View.Position) void {
+        const map = s.buffer(v.buffer).textMap(at.page) orelse return;
+        if (map.isEmpty()) return;
+        v.cursorTo(at, map);
     }
 
     fn splitWindow(s: *Session, dir: Layout.Direction) void {
@@ -4003,4 +4021,36 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
     const bad = keys.commandWith(&s.keymap, .{ .events = &.{.{ .text = "x" }} }, rt.lookup());
     try testing.expect(!s.apply(bad.items()[0]));
     try testing.expect(std.mem.indexOf(u8, s.status, "boom") != null);
+}
+
+test "a press in text moves the caret there and a drag carries it along" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    try putText(&s, 0, 3, 4);
+
+    const v = s.view();
+    try testing.expect(!v.cursor.visible);
+
+    // The window point of the second glyph of the second line.
+    const map = s.buffer(0).textMap(0).?;
+    const target = map.lines[1].glyphs(map)[1];
+    const at = v.windowPoint(0, .{ .x = target.middle(), .y = target.base }) orelse
+        return error.SkipZigTest;
+
+    s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    try testing.expect(v.cursor.visible);
+    try testing.expectEqual(@as(u32, 1), v.cursor.line);
+    try testing.expectEqual(@as(u32, 1), v.cursor.column);
+    try testing.expect(s.drag != null);
+
+    // The drag carries the caret with it rather than leaving it where the
+    // press was: releasing and pressing `v` has to extend from the end.
+    const later = map.lines[2].glyphs(map)[3];
+    const to = v.windowPoint(0, .{ .x = later.middle(), .y = later.base }) orelse
+        return error.SkipZigTest;
+    s.pointer(.{ .mouse = to, .buttons = .{ .left = true } });
+    try testing.expectEqual(@as(u32, 2), v.cursor.line);
+    try testing.expectEqual(@as(u32, 3), v.cursor.column);
 }
