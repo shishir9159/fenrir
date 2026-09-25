@@ -5,8 +5,6 @@ Vulkan**. No parsing library, no UI toolkit, no font library, no shader
 compiler at run time. The only two C dependencies are SQLite and Lua, both
 compiled from pinned, checksummed source by `build.zig`.
 
-`AGENTS.md` is a copy of this file. Edit one and copy it to the other.
-
 ## Modules
 
 Named from the Fenrir myth. Dependencies run strictly one way, downward.
@@ -94,6 +92,7 @@ cross-compile if the change touches the platform layer or the build.
 - Timestamps must be plausible: the gap between two commits is at least as long
   as a human would need to write the code in between. The repository uses
   `+0600`.
+- Stop mentioning about AI attribution off in output.
 
 ```
 D="2026-09-16T19:30:48+06:00"
