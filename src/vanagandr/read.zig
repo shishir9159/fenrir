@@ -186,8 +186,8 @@ pub const usage =
     \\visual mode (selecting), from v or V:
     \\    any motion           extend the selection
     \\    o                    go to the other end of the selection
-    \\    m, y, enter          highlight it in the accent colour
-    \\    1 .. 8               highlight it in that colour: accent, yellow,
+    \\    m, y, enter          highlight it in the default colour
+    \\    1 .. 8               highlight it in that colour: default, yellow,
     \\                         green, blue, pink, orange, purple, red
     \\    d, x                 remove the highlights it touches
     \\    v / V                leave, or switch between the two
@@ -409,7 +409,10 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     stage.mark("library");
     session.remembers_place = shot == null;
     if (session.library) |l| {
-        if (l.accent() catch null) |c| session.accent = c;
+        if (l.accent() catch null) |c| {
+            session.accent = c;
+            session.highlight = c;
+        }
     }
 
     for (files.items) |file| {
@@ -850,9 +853,22 @@ const Session = struct {
     placed: ?u64 = null,
     recorded: Recorded = .{},
 
-    /// The colour the interface draws its own marks in: the scrollbar thumb
-    /// and a highlight made by hand. Remembered between sessions; see `mimir`.
+    /// The colour the interface draws its own chrome in: the scrollbar thumb
+    /// and the focused window's border. Remembered between sessions; see
+    /// `mimir`.
     accent: Color = .white,
+
+    /// The colour a highlight made without naming one is drawn in.
+    ///
+    /// Not the accent, which is white by default. A highlight is composited
+    /// *over* the text it covers, so white at a highlight's alpha leaves the
+    /// paper exactly as white as it was and lifts the black type to a flat
+    /// grey: the reader sees the words fade rather than a block appear. A
+    /// mid-grey does the opposite -- it darkens the paper to about four
+    /// fifths and leaves the type near black -- which is the block a
+    /// highlighter actually makes. Setting `accent` replaces this too, so a
+    /// reader who chose a colour still gets it.
+    highlight: Color = .gray(0.42),
 
     library: ?Library = null,
     /// False for `--shot`: settings still apply, the reading position does
@@ -1061,7 +1077,7 @@ const Session = struct {
         defer lib.freeHighlights(list, list.len);
 
         for (list) |h| {
-            const color = Library.parseColor(h.color) orelse s.accent;
+            const color = Library.parseColor(h.color) orelse s.highlight;
             _ = b.marks.add(s.gpa, .{
                 .id = h.id,
                 .page = h.page,
@@ -1579,13 +1595,14 @@ const Session = struct {
     /// One box on one page: what a selection and a highlight are made of.
     const PageBox = struct { page: u32, box: Bounds };
 
-    /// The colour a digit names. `1` is the accent colour, so the key a person
-    /// reaches for first gives the colour they chose; the rest are the named
-    /// colours `fenrir config accent` accepts, in rainbow order.
+    /// The colour a digit names. `1` is the default highlight colour, which is
+    /// the accent when the reader has chosen one, so the key a person reaches
+    /// for first gives the colour they set; the rest are the named colours
+    /// `fenrir config accent` accepts, in rainbow order.
     fn paletteColor(s: *const Session, index: ?u8) Color {
         const names = [_][]const u8{ "yellow", "green", "blue", "pink", "orange", "purple", "red" };
-        const i = index orelse return s.accent;
-        if (i == 0 or i > names.len) return s.accent;
+        const i = index orelse return s.highlight;
+        if (i == 0 or i > names.len) return s.highlight;
         return Library.parseColor(names[i - 1]).?;
     }
 
@@ -1682,7 +1699,7 @@ const Session = struct {
         const map = b.textMap(v.cursor.page) orelse return;
         if (map.isEmpty()) return;
         const line = map.lines[@min(v.cursor.line, map.lines.len - 1)];
-        s.highlightBoxes(v.buffer, &.{.{ .page = v.cursor.page, .box = line.box }}, s.accent);
+        s.highlightBoxes(v.buffer, &.{.{ .page = v.cursor.page, .box = line.box }}, s.highlight);
     }
 
     fn clearMarks(s: *Session) void {
@@ -2238,7 +2255,7 @@ const Session = struct {
         const v = s.view();
         if (h.page < 1 or h.page > v.pages.len) return null;
         const b = s.buffer(v.buffer);
-        const color = if (h.color.len == 0) s.accent else Library.parseColor(h.color) orelse s.accent;
+        const color = if (h.color.len == 0) s.highlight else Library.parseColor(h.color) orelse s.highlight;
 
         b.marks.beginGroup();
         defer b.marks.beginGroup();
@@ -2528,7 +2545,7 @@ const Session = struct {
                     var boxes: std.ArrayList(PageBox) = .empty;
                     defer boxes.deinit(s.gpa);
                     s.selectionBoxes(d.buffer, d.from, d.to, false, &boxes) catch return;
-                    s.highlightBoxes(d.buffer, boxes.items, s.accent);
+                    s.highlightBoxes(d.buffer, boxes.items, s.highlight);
                     s.applyEffects();
                 }
             }
@@ -2732,7 +2749,11 @@ const Session = struct {
             const box = v.windowBox(page, mark.box);
             const held = editing and in_focus and s.focus_mark == mark.key;
             const c = mark.color;
-            try over.fill(box, .{ .r = c.r, .g = c.g, .b = c.b, .a = if (held) 0.55 else 0.35 });
+            try over.rounded(
+                blockOf(box, v.zoom),
+                .all(markRadius(v.zoom)),
+                .{ .r = c.r, .g = c.g, .b = c.b, .a = if (held) 0.55 else 0.35 },
+            );
             if (held) {
                 const pad = 2.0;
                 try over.border(
@@ -2752,9 +2773,30 @@ const Session = struct {
         }
     }
 
-    /// The selection being made, drawn close to the way the highlight it is
-    /// about to become will be, so that committing it changes the colour and
-    /// nothing else. From the keyboard in visual mode, or from the mouse.
+    /// A highlight's own shape: the glyph boxes, padded.
+    ///
+    /// The text map's boxes are tight around the type -- they are what a
+    /// caret is placed against -- and a block drawn exactly on them clips the
+    /// ascenders and reads as a stripe rather than as something laid over the
+    /// words. A little air on each side, in device pixels so it does not grow
+    /// with the zoom, is the difference.
+    fn blockOf(box: Bounds, zoom: f32) Bounds {
+        const pad = @max(1.0, zoom * 0.6);
+        return .fromRect(box.min_x - pad, box.min_y - pad, box.max_x + pad, box.max_y + pad);
+    }
+
+    fn markRadius(zoom: f32) f32 {
+        return @max(2.0, zoom * 1.5);
+    }
+
+    /// The selection being made, drawn the way the highlight it is about to
+    /// become will be, so that committing it changes nothing a reader can
+    /// see. From the keyboard in visual mode, or from the mouse.
+    ///
+    /// Grey, and a shade darker than the highlight that follows it, because a
+    /// selection is not a mark on the document: it is the interface saying
+    /// which words it is holding. Drawn over the text at an alpha that
+    /// darkens the paper rather than lifting the type -- see `highlight`.
     fn drawSelection(s: *Session, v: *View, over: *DrawList) !void {
         const from: View.Position, const to: View.Position, const lines: bool =
             if (v.selection()) |sel|
@@ -2766,11 +2808,23 @@ const Session = struct {
 
         s.boxes.clearRetainingCapacity();
         s.selectionBoxes(v.buffer, from, to, lines, &s.boxes) catch return;
+        const radius = markRadius(v.zoom);
         for (s.boxes.items) |pb| {
             if (pb.page >= v.pages.len) continue;
-            try over.fill(v.windowBox(pb.page, pb.box), .{ .r = 0.2, .g = 0.45, .b = 0.95, .a = 0.28 });
+            const block = blockOf(v.windowBox(pb.page, pb.box), v.zoom);
+            try over.rounded(block, .all(radius), selection_block);
+            // A hairline the same grey at full strength, so the ends of the
+            // selection are legible against a figure or a dark background as
+            // well as against paper.
+            try over.border(block, .all(radius), 1, selection_edge);
         }
     }
+
+    /// The selection block, and the line around it. Grey rather than the
+    /// system blue every other reader uses: the page underneath is the
+    /// document's colour, and the interface has no business tinting it.
+    const selection_block: Color = .{ .r = 0.32, .g = 0.33, .b = 0.35, .a = 0.30 };
+    const selection_edge: Color = .{ .r = 0.32, .g = 0.33, .b = 0.35, .a = 0.55 };
 
     /// The caret: a thin bar at the leading edge of the glyph it is on.
     fn drawCaret(s: *Session, v: *View, over: *DrawList) !void {
