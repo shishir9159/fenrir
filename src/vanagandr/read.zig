@@ -171,9 +171,9 @@ pub const usage =
     \\    page up / page down  a screen at a time
     \\    home / end           the first and last page
     \\    n / p                the next and previous page
-    \\    drag over text       highlight it; press a highlight to remove it
-    \\    m                    highlight the cursor's line, or remove the one
-    \\                         under the cursor
+    \\    drag over text       select it; a click puts the selection away
+    \\    m                    highlight the selection, or the cursor's line,
+    \\                         or remove the highlight under the cursor
     \\    M                    remove every highlight in this document
     \\    u / ctrl+r           undo / redo a highlight change
     \\    + / -                zoom in and out
@@ -878,8 +878,7 @@ const Session = struct {
     /// Set when the loop should end, by `q` on the last window or by `Q`.
     quit: bool = false,
 
-    /// A drag over text with the mouse, as its two ends. Becomes a highlight
-    /// when the button is let go.
+    /// The selection made with the mouse, or null when there is none.
     drag: ?Drag = null,
 
     /// The highlight in hand in edit mode, by its session key.
@@ -940,10 +939,19 @@ const Session = struct {
     borders: std.ArrayList(Bounds) = .empty,
     boxes: std.ArrayList(PageBox) = .empty,
 
+    /// A selection made with the mouse: which buffer, and its two ends.
+    ///
+    /// It outlives the button. Letting go of a drag leaves the words selected,
+    /// the way letting go in a browser does, and the next press anywhere puts
+    /// the selection away. A selection is not a mark on the document: nothing
+    /// of it is written to the database and nothing of it survives the
+    /// session. `m` is what turns one into a highlight.
     const Drag = struct {
         buffer: u32,
         from: View.Position,
         to: View.Position,
+        /// The button is still down, so the far end follows the pointer.
+        held: bool = true,
     };
 
     pub const Image = struct { pixels: []u8, width: u32, height: u32 };
@@ -1684,6 +1692,13 @@ const Session = struct {
     fn toggleMark(s: *Session) void {
         const v = s.view();
         const b = s.buffer(v.buffer);
+
+        // A selection dragged with the mouse leaves normal mode holding
+        // words, not a line, and `m` means those words -- otherwise the only
+        // way to highlight a mouse selection would be to make it again with
+        // the keyboard.
+        if (s.drag != null) return s.highlightSelection(null);
+
         if (!v.cursor.visible or v.cursor.caret.isEmpty()) return;
 
         const at: Point = .{
@@ -1708,11 +1723,31 @@ const Session = struct {
         s.status = if (b.marks.canUndo()) "highlights cleared -- u to bring them back" else "";
     }
 
-    /// Visual mode's `m`, `y`, enter or a digit.
+    /// What is selected right now, from the keyboard or from the mouse.
+    ///
+    /// Visual mode wins when both are somehow live, because the reader asked
+    /// for that one last. The mouse's counts only in the window it was made
+    /// in: a selection in a split is that split's, as visual mode's is.
+    fn activeSelection(s: *Session, v: *View) ?[2]View.Position {
+        if (v.selection()) |sel| return sel;
+        const d = s.drag orelse return null;
+        if (d.buffer != v.buffer or v != s.layout.current()) return null;
+        return View.Position.ordered(d.from, d.to);
+    }
+
+    /// Nothing is selected any more, whichever of the two made it.
+    fn clearSelection(s: *Session) void {
+        s.view().endSelection();
+        s.drag = null;
+    }
+
+    /// Visual mode's `m`, `y`, enter or a digit -- and the same keys over a
+    /// selection the mouse made, which is how a drag becomes a highlight now
+    /// that letting go of one no longer does it by itself.
     fn highlightSelection(s: *Session, colour: ?u8) void {
         const v = s.view();
-        const sel = v.selection() orelse return;
-        defer v.endSelection();
+        const sel = s.activeSelection(v) orelse return;
+        defer s.clearSelection();
 
         var boxes: std.ArrayList(PageBox) = .empty;
         defer boxes.deinit(s.gpa);
@@ -1723,8 +1758,8 @@ const Session = struct {
     /// Visual mode's `d`: every highlight the selection touches goes.
     fn unhighlightSelection(s: *Session) void {
         const v = s.view();
-        const sel = v.selection() orelse return;
-        defer v.endSelection();
+        const sel = s.activeSelection(v) orelse return;
+        defer s.clearSelection();
         const b = s.buffer(v.buffer);
 
         var boxes: std.ArrayList(PageBox) = .empty;
@@ -2222,7 +2257,10 @@ const Session = struct {
     }
 
     fn hostSelection(ptr: *anyopaque) ?[2]galdr.Host.Position {
-        const sel = hostSession(ptr).view().selection() orelse return null;
+        // Either kind: a plugin asking what is selected means what the reader
+        // can see selected, and does not care which hand made it.
+        const s = hostSession(ptr);
+        const sel = s.activeSelection(s.view()) orelse return null;
         return .{ fromOne(sel[0]), fromOne(sel[1]) };
     }
 
@@ -2435,10 +2473,14 @@ const Session = struct {
 
             .move_cursor => |step| s.moveCursor(step),
             .hide_cursor => {
-                // Escape puts the caret away first and closes second, so that
-                // leaving cursor mode is not the same key as leaving.
-                if (!v.cursor.visible) return true;
-                v.cursor.visible = false;
+                // Escape puts the selection away, then the caret, and closes
+                // last -- each step is something the reader can see undone,
+                // so leaving is never the same key as leaving cursor mode.
+                if (s.drag != null) {
+                    s.drag = null;
+                } else if (v.cursor.visible) {
+                    v.cursor.visible = false;
+                } else return true;
             },
 
             .enter_visual, .enter_visual_line => {
@@ -2449,7 +2491,7 @@ const Session = struct {
             .enter_edit => s.enterEdit(),
             .enter_note => s.beginNote(),
             .leave_mode => {
-                v.endSelection();
+                s.clearSelection();
                 s.note.clearRetainingCapacity();
                 s.cmdline.clearRetainingCapacity();
                 if (s.keymap.mode == .normal) s.focus_mark = null;
@@ -2512,15 +2554,22 @@ const Session = struct {
 
     /// The pointer: which window it is in, the scrollbar, and the page.
     ///
-    /// Dragging over text is a visual selection made with the mouse, and it
-    /// becomes a highlight when the button is let go -- the same boxes, the
-    /// same replace-don't-stack rule, the same undo step. In edit mode a press
-    /// on a highlight takes hold of it instead.
+    /// Dragging over text selects it, and the selection stays put when the
+    /// button is let go until the next press anywhere puts it away -- text
+    /// selection the way a browser does it. `m` is what turns one into a
+    /// highlight. In edit mode a press on a highlight takes hold of it
+    /// instead.
     fn pointer(s: *Session, in: lyngvi.Input) void {
         const down = in.buttons.left;
         const pressed = down and !s.view().was_down;
 
-        if (pressed) _ = s.layout.focusAt(in.mouse);
+        // A press begins a new gesture, so whatever was selected stops being
+        // selected -- and it happens here, before anything below can read
+        // `s.drag` and take the last gesture's selection for this one's.
+        if (pressed) {
+            s.drag = null;
+            _ = s.layout.focusAt(in.mouse);
+        }
 
         // Every window's scrollbar is live, not only the focused one's: a
         // thumb you can see and cannot drag is worse than no thumb.
@@ -2539,15 +2588,10 @@ const Session = struct {
 
         const v = s.view();
         if (!down) {
-            if (s.drag) |d| {
-                s.drag = null;
-                if (!std.meta.eql(d.from, d.to)) {
-                    var boxes: std.ArrayList(PageBox) = .empty;
-                    defer boxes.deinit(s.gpa);
-                    s.selectionBoxes(d.buffer, d.from, d.to, false, &boxes) catch return;
-                    s.highlightBoxes(d.buffer, boxes.items, s.highlight);
-                    s.applyEffects();
-                }
+            // Letting go keeps the words selected. A drag that never left the
+            // glyph it started on is a click, and a click selects nothing.
+            if (s.drag) |*d| {
+                if (std.meta.eql(d.from, d.to)) s.drag = null else d.held = false;
             }
             return;
         }
@@ -2604,7 +2648,7 @@ const Session = struct {
     fn splitWindow(s: *Session, dir: Layout.Direction) void {
         // A split copies the window, and a copied selection would be two
         // windows each claiming to be selecting.
-        s.view().endSelection();
+        s.clearSelection();
         if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
 
         const made = s.layout.split(s.gpa, dir) catch null;
@@ -2789,25 +2833,22 @@ const Session = struct {
         return @max(2.0, zoom * 1.5);
     }
 
-    /// The selection being made, drawn the way the highlight it is about to
-    /// become will be, so that committing it changes nothing a reader can
-    /// see. From the keyboard in visual mode, or from the mouse.
+    /// What is selected, drawn the way the highlight `m` would make of it, so
+    /// that committing one changes nothing a reader can see. From the
+    /// keyboard in visual mode, or from the mouse.
     ///
     /// Grey, and a shade darker than the highlight that follows it, because a
     /// selection is not a mark on the document: it is the interface saying
     /// which words it is holding. Drawn over the text at an alpha that
     /// darkens the paper rather than lifting the type -- see `highlight`.
     fn drawSelection(s: *Session, v: *View, over: *DrawList) !void {
-        const from: View.Position, const to: View.Position, const lines: bool =
-            if (v.selection()) |sel|
-                .{ sel[0], sel[1], s.lineSelection() }
-            else if (s.drag != null and v == s.layout.current() and s.drag.?.buffer == v.buffer)
-                .{ s.drag.?.from, s.drag.?.to, false }
-            else
-                return;
+        const sel = s.activeSelection(v) orelse return;
+        // Whole lines only when visual line mode made it; a mouse drag is
+        // always the glyphs it went over.
+        const lines = v.selection() != null and s.lineSelection();
 
         s.boxes.clearRetainingCapacity();
-        s.selectionBoxes(v.buffer, from, to, lines, &s.boxes) catch return;
+        s.selectionBoxes(v.buffer, sel[0], sel[1], lines, &s.boxes) catch return;
         const radius = markRadius(v.zoom);
         for (s.boxes.items) |pb| {
             if (pb.page >= v.pages.len) continue;
@@ -4107,4 +4148,47 @@ test "a press in text moves the caret there and a drag carries it along" {
     s.pointer(.{ .mouse = to, .buttons = .{ .left = true } });
     try testing.expectEqual(@as(u32, 2), v.cursor.line);
     try testing.expectEqual(@as(u32, 3), v.cursor.column);
+}
+
+test "letting go of a drag leaves a selection, not a highlight" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    try putText(&s, 0, 3, 4);
+
+    const v = s.view();
+    const map = s.buffer(0).textMap(0).?;
+    const first = map.lines[1].glyphs(map)[0];
+    const last = map.lines[2].glyphs(map)[2];
+    const at = v.windowPoint(0, .{ .x = first.middle(), .y = first.base }) orelse
+        return error.SkipZigTest;
+    const to = v.windowPoint(0, .{ .x = last.middle(), .y = last.base }) orelse
+        return error.SkipZigTest;
+
+    s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = to, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = to, .buttons = .{} });
+
+    // The words stay selected and nothing was written to the document: a
+    // selection belongs to the interface, a highlight to the reader.
+    try testing.expect(s.drag != null);
+    try testing.expect(!s.drag.?.held);
+    try testing.expect(s.activeSelection(v) != null);
+    try testing.expectEqual(@as(usize, 0), s.buffer(0).marks.count());
+
+    // A press puts the selection away, the way a click in a browser does,
+    // and a press that goes nowhere is a click and selects nothing.
+    s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    try testing.expect(std.meta.eql(s.drag.?.from, s.drag.?.to));
+    s.pointer(.{ .mouse = at, .buttons = .{} });
+    try testing.expect(s.drag == null);
+
+    // `m` is what makes a highlight of it, and puts the selection away.
+    s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = to, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = to, .buttons = .{} });
+    _ = s.apply(.toggle_highlight);
+    try testing.expect(s.drag == null);
+    try testing.expect(s.buffer(0).marks.count() > 0);
 }
