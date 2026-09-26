@@ -57,6 +57,9 @@ decoded: std.AutoHashMapUnmanaged(usize, filter.Result) = .empty,
 in_progress: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// True when the cross-reference table had to be rebuilt by scanning.
 recovered: bool,
+/// Whether `deinit` frees `bytes`. False for a document opened over bytes
+/// somebody else owns; see `openBorrowed`.
+owns_bytes: bool = true,
 
 /// An `/Type /ObjStm` container: many small objects concatenated and
 /// compressed together (§7.5.7). Its header is a list of
@@ -72,12 +75,17 @@ const ObjectStream = struct {
 /// by `deinit`. Falls back to rebuilding the cross-reference table by scanning
 /// whenever the file's own table does not yield a usable catalog.
 pub fn open(gpa: Allocator, bytes: []const u8) Error!Document {
+    return openOwning(gpa, bytes, true);
+}
+
+fn openOwning(gpa: Allocator, bytes: []const u8, owns: bool) Error!Document {
     var doc: Document = .{
         .gpa = gpa,
         .arena_state = .init(gpa),
         .bytes = bytes,
         .table = .{},
         .recovered = false,
+        .owns_bytes = owns,
     };
     errdefer doc.deinit();
 
@@ -127,13 +135,27 @@ pub fn arenaAllocator(doc: *Document) Allocator {
     return doc.arena_state.allocator();
 }
 
+/// Opens a second view of bytes somebody else owns and will outlive it.
+///
+/// A `Document` is not thread-safe -- it memoises parsed objects, decoded
+/// object streams and decoded stream data as it is asked for them -- so a
+/// program that wants to read one file on several threads gives each thread
+/// its own. The file itself is megabytes and is only ever read, so it is
+/// shared; everything derived from it is not.
+///
+/// Nothing else differs: each view parses its own cross-reference table and
+/// fills its own caches, and the pages it hands back are its own.
+pub fn openBorrowed(gpa: Allocator, bytes: []const u8) Error!Document {
+    return openOwning(gpa, bytes, false);
+}
+
 pub fn deinit(doc: *Document) void {
     doc.cache.deinit(doc.gpa);
     doc.streams.deinit(doc.gpa);
     doc.decoded.deinit(doc.gpa);
     doc.in_progress.deinit(doc.gpa);
     doc.arena_state.deinit();
-    doc.gpa.free(doc.bytes);
+    if (doc.owns_bytes) doc.gpa.free(doc.bytes);
     doc.* = undefined;
 }
 

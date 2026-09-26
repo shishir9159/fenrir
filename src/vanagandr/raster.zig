@@ -63,6 +63,9 @@ pub const usage =
     \\    --path P       Which rasteriser fills an outline: stencil (the
     \\                   default), slug, or both -- which renders the page
     \\                   twice and reports how far the two disagree.
+    \\    --jobs N       With --all, render N pages at once, on N threads.
+    \\                   0 means one per core. Defaults to 1, because this
+    \\                   command is also the benchmark: see OPTIMIZING.md.
     \\
     \\    Text and images are drawn: Tyr reads TrueType, CFF and Type 1
     \\    outlines, and Gjoll decodes Flate and baseline JPEG images through
@@ -91,6 +94,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var replay_options: replay.Options = .{};
     var ascii: ?[4]u32 = null;
     var list_fonts = false;
+    var jobs: u32 = 1;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -147,6 +151,11 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             timing = true;
         } else if (std.mem.eql(u8, arg, "--fonts")) {
             list_fonts = true;
+        } else if (std.mem.eql(u8, arg, "--jobs")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--jobs needs a number of threads", .{});
+            jobs = std.fmt.parseInt(u32, argv[i], 10) catch
+                return ctx.fail("not a thread count: {s}", .{argv[i]});
         } else if (std.mem.eql(u8, arg, "--path")) {
             i += 1;
             if (i == argv.len) return ctx.fail("--path needs stencil, slug or both", .{});
@@ -224,15 +233,22 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     defer scratch.deinit();
 
     if (all) {
+        const threads = if (jobs == 0) cpuCount(ctx) else jobs;
+        var wall: Lap = .start(ctx.io);
         var total: replay.Stats = .{};
-        for (pages, 0..) |p, index| {
-            const out = try numbered(ctx, dest, index + 1);
-            defer ctx.gpa.free(out);
-            const s = try one(ctx, &doc, p, out, job, time, &faces, &scratch);
-            accumulate(&total, s);
+        if (threads > 1 and pages.len > 1) {
+            total = try fleet(ctx, bytes, pages.len, dest, job, time, @min(threads, pages.len));
+        } else {
+            for (pages, 0..) |p, index| {
+                const out = try numbered(ctx, dest, index + 1);
+                defer ctx.gpa.free(out);
+                const s = try one(ctx, &doc, p, out, job, time, &faces, &scratch);
+                accumulate(&total, s);
+            }
         }
+        const elapsed = wall.lap();
         ctx.note("{d} pages", .{pages.len});
-        reportTime(ctx, time);
+        reportTime(ctx, time, elapsed);
         report(ctx, total);
         return;
     }
@@ -244,7 +260,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     defer if (dest == null) ctx.gpa.free(out);
 
     const s = try one(ctx, &doc, pages[page_number - 1], out, job, time, &faces, &scratch);
-    reportTime(ctx, time);
+    reportTime(ctx, time, 0);
     report(ctx, s);
 }
 
@@ -281,6 +297,11 @@ const Timing = struct {
     /// Every page's framebuffer hash, folded together in page order. Two runs
     /// that agree here rendered the same pixels; see `CLAUDE.md`.
     hash: u64 = 0,
+    /// The last page's own hash, before it was folded in. Kept so that pages
+    /// rendered on several threads can be folded into one run's hash in page
+    /// order afterwards and come out with the number one thread would have
+    /// printed.
+    last: u64 = 0,
 
     fn total(t: Timing) u64 {
         return t.interpret + t.canvas + t.fonts + t.render;
@@ -314,6 +335,214 @@ const Lap = struct {
         return if (ns <= 0) 0 else @intCast(ns);
     }
 };
+
+// -- rendering pages at once --------------------------------------------------
+
+/// How many threads `--jobs 0` means. One per core, and one if the count
+/// cannot be had.
+fn cpuCount(ctx: *Context) u32 {
+    const n = std.Thread.getCpuCount() catch {
+        ctx.note("cannot tell how many cores this machine has; rendering on one", .{});
+        return 1;
+    };
+    return @intCast(@max(1, @min(n, 256)));
+}
+
+/// One page's turn at the two writers, kept until the page before it has had
+/// its turn.
+///
+/// Rendering out of order is the point; *reporting* out of order is not.
+/// `--stats` output has to stay byte-diffable across builds and `--time`'s
+/// hash is folded in page order on purpose, so a worker writes into its own
+/// pair of buffers and the main thread plays them back once every page is in.
+const Rendered = struct {
+    out: std.Io.Writer.Allocating,
+    err: std.Io.Writer.Allocating,
+    stats: replay.Stats = .{},
+    timing: Timing = .{},
+    /// The page could not be rendered. Its `err` says why.
+    failed: bool = false,
+
+    fn init(gpa: std.mem.Allocator) Rendered {
+        return .{ .out = .init(gpa), .err = .init(gpa) };
+    }
+
+    fn deinit(r: *Rendered) void {
+        r.out.deinit();
+        r.err.deinit();
+    }
+};
+
+/// What every worker shares: the file, the job, and the next page to take.
+const Fleet = struct {
+    ctx: *Context,
+    bytes: []const u8,
+    dest: ?[]const u8,
+    job: Job,
+    timing: bool,
+    /// Handed out by `fetchAdd`, so a thread that draws a page of line art
+    /// does not hold up five threads with a page of prose each. Pages on one
+    /// document differ by a factor of ten, which is far too much for a
+    /// fixed split.
+    next: std.atomic.Value(usize) = .init(0),
+    results: []Rendered,
+    /// Why a thread never rendered anything, if one did not.
+    ///
+    /// The first thread to fail claims the field and the rest leave it alone,
+    /// so the one thing a worker has to say that belongs to no page is still
+    /// said by the main thread after the join, rather than written to the
+    /// terminal from underneath another thread's page.
+    start_error: anyerror = error.Unexpected,
+    claimed: std.atomic.Value(bool) = .init(false),
+    failed_to_start: std.atomic.Value(bool) = .init(false),
+
+    fn couldNotStart(f: *Fleet, err: anyerror) void {
+        if (f.claimed.swap(true, .acq_rel)) return;
+        f.start_error = err;
+        f.failed_to_start.store(true, .release);
+    }
+
+    fn startError(f: *Fleet) ?anyerror {
+        return if (f.failed_to_start.load(.acquire)) f.start_error else null;
+    }
+};
+
+/// Renders every page on `threads` threads and reports them in page order.
+///
+/// Each thread opens its own view of the file. A `Document` memoises as it
+/// reads -- parsed objects, decoded object streams, decoded stream data --
+/// and sharing one behind a lock would put the decode of every image on the
+/// critical path of every thread. Opening it again costs one cross-reference
+/// table per thread and nothing else: the pages split between the views, so
+/// between them they decode what one document would have decoded, and the
+/// file's megabytes are read by all of them and owned by none.
+///
+/// Every page is rendered exactly as it is on one thread -- same canvas, same
+/// transform, same order of operations -- so the framebuffer hashes are the
+/// ones `--jobs 1` prints. That is the whole reason this is the shape it is.
+fn fleet(
+    ctx: *Context,
+    bytes: []const u8,
+    n_pages: usize,
+    dest: ?[]const u8,
+    job: Job,
+    time: ?*Timing,
+    threads: u32,
+) !replay.Stats {
+    const gpa = std.heap.smp_allocator;
+
+    const results = try gpa.alloc(Rendered, n_pages);
+    defer gpa.free(results);
+    for (results) |*r| r.* = .init(gpa);
+    defer for (results) |*r| r.deinit();
+
+    var shared: Fleet = .{
+        .ctx = ctx,
+        .bytes = bytes,
+        .dest = dest,
+        .job = job,
+        .timing = time != null,
+        .results = results,
+    };
+
+    var pool: [256]std.Thread = undefined;
+    var started: usize = 0;
+    while (started < threads) : (started += 1) {
+        pool[started] = std.Thread.spawn(.{}, render, .{&shared}) catch break;
+    }
+    // Whatever would not start is this thread's work, so a machine that
+    // refuses a thread renders the document rather than half of it.
+    if (started == 0) render(&shared);
+    for (pool[0..started]) |t| t.join();
+
+    // Every page was at least claimed, or some thread died before it could
+    // take one and pages are missing rather than merely unwritten.
+    const claimed = shared.next.load(.monotonic) >= n_pages;
+    if (shared.startError()) |err| {
+        ctx.note("a render thread could not read the document: {t}", .{err});
+        if (!claimed) return ctx.fail("cannot render {d} pages on {d} threads", .{ n_pages, threads });
+    }
+
+    var total: replay.Stats = .{};
+    var failed = false;
+    for (results) |*r| {
+        ctx.out.writeAll(r.out.written()) catch {};
+        ctx.err.writeAll(r.err.written()) catch {};
+        if (r.failed) {
+            failed = true;
+            continue;
+        }
+        accumulate(&total, r.stats);
+        if (time) |t| foldTiming(t, r.timing);
+    }
+    ctx.err.flush() catch {};
+    if (failed) return error.CommandFailed;
+    return total;
+}
+
+/// One worker: its own document, its own faces, its own page arena, and
+/// whichever pages are left when it asks.
+fn render(f: *Fleet) void {
+    const gpa = std.heap.smp_allocator;
+
+    var doc = fenrir.openBorrowed(gpa, f.bytes) catch |err| {
+        f.couldNotStart(err);
+        return;
+    };
+    defer doc.deinit();
+
+    const pages = fenrir.pages.all(&doc) catch |err| {
+        f.couldNotStart(err);
+        return;
+    };
+
+    var font_heap: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = font_heap.deinit();
+    var faces: glyphmod.Cache = .init(font_heap.allocator());
+    defer faces.deinit();
+
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+
+    while (true) {
+        const index = f.next.fetchAdd(1, .monotonic);
+        if (index >= f.results.len or index >= pages.len) return;
+        const r = &f.results[index];
+
+        // A context of this page's own: the same `Io` and the same job, with
+        // the two writers pointed at this page's buffers rather than at the
+        // terminal, and an allocator of its own for the few strings `one`
+        // makes. Everything `one` does is then unchanged.
+        var local: Context = .{
+            .gpa = scratch.allocator(),
+            .io = f.ctx.io,
+            .out = &r.out.writer,
+            .err = &r.err.writer,
+            .environ = null,
+        };
+
+        const out = numbered(&local, f.dest, index + 1) catch {
+            r.failed = true;
+            continue;
+        };
+
+        const time: ?*Timing = if (f.timing) &r.timing else null;
+        r.stats = one(&local, &doc, pages[index], out, f.job, time, &faces, &scratch) catch {
+            r.failed = true;
+            continue;
+        };
+    }
+}
+
+/// Adds one page's laps and hash into the run's, in page order.
+fn foldTiming(t: *Timing, page: Timing) void {
+    t.pages += page.pages;
+    t.interpret += page.interpret;
+    t.canvas += page.canvas;
+    t.fonts += page.fonts;
+    t.render += page.render;
+    if (page.pages != 0) t.hash = std.hash.Wyhash.hash(t.hash, std.mem.asBytes(&page.last));
+}
 
 fn one(
     ctx: *Context,
@@ -424,6 +653,7 @@ fn one(
         // Order-dependent on purpose: two runs that render the same pages in
         // a different order are not the same run.
         t.hash = std.hash.Wyhash.hash(t.hash, std.mem.asBytes(&page_hash));
+        t.last = page_hash;
 
         ctx.note(
             "page {d}  {d:.2}ms  interpret {d:.2}  canvas {d:.2}  fonts {d:.2}  render {d:.2}  {x:0>16}",
@@ -621,7 +851,7 @@ fn writePng(ctx: *Context, dest: []const u8, fb: gleipnir.Framebuffer) !void {
 
 /// The one line a benchmark reads: the total, its three parts, and the hash
 /// that says the pixels behind it are the same ones as last time.
-fn reportTime(ctx: *Context, time: ?*Timing) void {
+fn reportTime(ctx: *Context, time: ?*Timing, wall: u64) void {
     const t = (time orelse return).*;
     if (t.pages == 0) return;
     ctx.note(
@@ -637,6 +867,10 @@ fn reportTime(ctx: *Context, time: ?*Timing) void {
             t.hash,
         },
     );
+    // The columns above are laps summed over pages, which on more than one
+    // thread is the work done and not the time waited. The wall clock is the
+    // number a person sitting in front of it has.
+    if (wall != 0) ctx.note("wall {d:.2}ms", .{ms(wall)});
 }
 
 fn accumulate(total: *replay.Stats, s: replay.Stats) void {

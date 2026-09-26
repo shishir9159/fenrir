@@ -92,6 +92,13 @@ pub fn open(gpa: std.mem.Allocator, bytes: []const u8) Document.Error!Document {
     return Document.open(gpa, bytes);
 }
 
+/// Opens a second view of bytes that somebody else owns and will outlive the
+/// document. See `Document.openBorrowed`: this is how one file is read on
+/// more than one thread.
+pub fn openBorrowed(gpa: std.mem.Allocator, bytes: []const u8) Document.Error!Document {
+    return Document.openBorrowed(gpa, bytes);
+}
+
 test {
     // A file's tests run only if the file is referenced from the test root,
     // so name every one of them explicitly rather than relying on the public
