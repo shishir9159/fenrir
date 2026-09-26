@@ -330,6 +330,11 @@ fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
     var lines: std.ArrayList(Line) = .empty;
     errdefer lines.deinit(gpa);
 
+    // How far off a baseline a fragment may sit and still belong to the line
+    // above it. See `fold` below for what this is for and why it is this
+    // number.
+    const fold_gap = medianHeight(boxes) * 0.35;
+
     var start: usize = 0;
     var i: usize = 1;
     while (i <= boxes.len) : (i += 1) {
@@ -340,11 +345,7 @@ fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
 
         // Along the line, which the sort above only did within one y.
         const on_line = boxes[start..i];
-        std.mem.sort(Box, on_line, {}, struct {
-            fn less(_: void, a: Box, b: Box) bool {
-                return a.box.min_x < b.box.min_x;
-            }
-        }.less);
+        std.mem.sort(Box, on_line, {}, byX);
 
         var box: Bounds = .empty;
         var baseline: f32 = 0;
@@ -352,16 +353,74 @@ fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
             box = box.unionWith(g.box);
             baseline += g.base;
         }
-        try lines.append(gpa, .{
+        const line: Line = .{
             .first = @intCast(start),
             .count = @intCast(on_line.len),
             .baseline = baseline / @as(f32, @floatFromInt(on_line.len)),
             .box = box,
             .column = columnOf(gutters, on_line[0]),
-        });
+        };
+
+        if (lines.items.len != 0 and fold(&lines.items[lines.items.len - 1], line, boxes, fold_gap)) {
+            start = i;
+            continue;
+        }
+        try lines.append(gpa, line);
         start = i;
     }
     return lines.toOwnedSlice(gpa);
+}
+
+fn byX(_: void, a: Box, b: Box) bool {
+    return a.box.min_x < b.box.min_x;
+}
+
+/// Puts the pieces of one typeset line back together, and says whether it
+/// did.
+///
+/// A line with mathematics in it does not arrive as one line. A subscript
+/// sits a point and a half below the words around it and a superscript the
+/// same above, which is not enough box overlap for `sameLine`, so the walk
+/// cuts the line in two: the words, and then a one-glyph line holding the
+/// `i` of an `x_i`. On a page of a paper there are a dozen of these. The
+/// consequences are all the reader's: the caret steps down onto a row with
+/// one glyph on it, and a selection dragged across the paragraph draws the
+/// words and leaves their subscripts unselected in the middle of it.
+///
+/// So a line that sits within `gap` of the one before it, in the same column
+/// and overlapping it in x, is folded into it. The gap is a third of the
+/// page's median glyph height -- about three and a half points on a paper set
+/// in ten. That is wide enough for every sub- and superscript, which are one
+/// to three points off, and narrow enough to leave the rows of a *displayed*
+/// equation alone: those are five points and more apart, and they really are
+/// separate lines, on paper as well as in here.
+///
+/// Only the line immediately before, and only when its glyphs end exactly
+/// where these begin -- a `Line` is a span of one shared array, so two lines
+/// can only become one when they are already next to each other in it. They
+/// are, because the walk emits them in the order the array holds them.
+fn fold(prev: *Line, line: Line, boxes: []Box, gap: f32) bool {
+    if (prev.column != line.column) return false;
+    if (prev.first + prev.count != line.first) return false;
+    if (@abs(prev.baseline - line.baseline) > gap) return false;
+    // Side by side is two things, not one: a marginal note beside a line is
+    // at its height and nowhere near it.
+    if (prev.box.min_x > line.box.max_x or line.box.min_x > prev.box.max_x) return false;
+
+    prev.count += line.count;
+    prev.box = prev.box.unionWith(line.box);
+
+    // The glyphs of both, in reading order along the line: a caret moving
+    // through `x_i + y` has to meet the `i` between the `x` and the `+`.
+    const merged = boxes[prev.first..][0..prev.count];
+    std.mem.sort(Box, merged, {}, byX);
+
+    // Weighted, so the baseline stays the words' and is not dragged down by
+    // a subscript. `lineAt` picks the nearest baseline to a click.
+    var sum: f32 = 0;
+    for (merged) |g| sum += g.base;
+    prev.baseline = sum / @as(f32, @floatFromInt(merged.len));
+    return true;
 }
 
 // -- columns ------------------------------------------------------------------
@@ -653,6 +712,56 @@ test "a superscript joins the line it sits in rather than starting one" {
     defer page.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), page.lines.len);
     try testing.expectEqual(@as(u32, 2), page.lines[0].count);
+}
+
+test "a dropped subscript is folded back into its line, a stacked one is not" {
+    const gpa = testing.allocator;
+
+    // A line of five glyphs at size ten with a subscript under the third:
+    // set at seven points and dropped two, which is what `x_i` looks like in
+    // a paper and is too little box overlap for the line test on its own.
+    const glyphs = try gpa.alloc(DisplayList.Glyph, 6);
+    defer gpa.free(glyphs);
+    for (glyphs[0..5], 0..) |*g, i| g.* = .{
+        .code = 'a' + @as(u32, @intCast(i)),
+        .offset = .{ .x = 6 * @as(f32, @floatFromInt(i)), .y = 0 },
+    };
+    glyphs[5] = .{ .code = 'i', .offset = .origin };
+
+    var cmds = try gpa.alloc(DisplayList.DrawCmd, 2);
+    defer gpa.free(cmds);
+    cmds[0] = .{ .text = .{
+        .size = 10,
+        .transform = .translation(100, 700),
+        .glyphs = .{ .start = 0, .count = 5 },
+    } };
+    cmds[1] = .{ .text = .{
+        .size = 7,
+        .transform = .translation(113, 698),
+        .glyphs = .{ .start = 5, .count = 1 },
+    } };
+
+    var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer page.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), page.lines.len);
+    try testing.expectEqual(@as(u32, 6), page.lines[0].count);
+    // And in reading order along the line, between the glyph it belongs to
+    // and the one after it.
+    try testing.expectEqual(@as(u32, 'i'), page.lines[0].glyphs(page)[3].code);
+    // The baseline stays the words', not the subscript's.
+    try testing.expectApproxEqAbs(@as(f32, 700), page.lines[0].baseline, 0.5);
+
+    // The row of a displayed equation is far enough below to stay its own
+    // line: this is the case the fold must not swallow.
+    cmds[1] = .{ .text = .{
+        .size = 10,
+        .transform = .translation(113, 692),
+        .glyphs = .{ .start = 5, .count = 1 },
+    } };
+    var stacked = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer stacked.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), stacked.lines.len);
 }
 
 test "the column nearest an x is found, and past the last glyph is the end" {
