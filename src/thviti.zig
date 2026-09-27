@@ -43,6 +43,7 @@
 const std = @import("std");
 
 pub const Box = @import("thviti/Box.zig");
+pub const Theme = @import("thviti/Theme.zig");
 pub const UI = @import("thviti/UI.zig");
 pub const draw = @import("thviti/draw.zig");
 pub const input = @import("thviti/input.zig");
@@ -65,6 +66,7 @@ pub const StylePatch = Box.StylePatch;
 
 test {
     _ = Box;
+    _ = Theme;
     _ = UI;
     _ = draw;
     _ = input;

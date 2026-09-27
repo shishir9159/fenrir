@@ -35,6 +35,7 @@ const sdf = @import("../gleipnir/sdf.zig");
 const Fonts = @import("../tyr/Fonts.zig");
 
 const key_mod = @import("key.zig");
+const Theme = @import("Theme.zig");
 
 const Bounds = geom.Bounds;
 const Color = paint.Color;
@@ -188,10 +189,10 @@ pub const Flags = packed struct(u32) {
 /// `ui.pushStyle(.{ .fg = dim })` merges one field onto the top of the stack
 /// and leaves the rest alone, which is the same thing with one stack.
 pub const Style = struct {
-    bg: Color = .{ .r = 0.16, .g = 0.17, .b = 0.20 },
-    fg: Color = .{ .r = 0.88, .g = 0.89, .b = 0.92 },
-    border_color: Color = .{ .r = 0.30, .g = 0.32, .b = 0.38 },
-    shadow_color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0.45 },
+    bg: Color = Theme.dark.panel,
+    fg: Color = Theme.dark.text,
+    border_color: Color = Theme.dark.border,
+    shadow_color: Color = Theme.dark.shadow,
 
     radius: Radius = .none,
     /// Ring thickness for `draw_border`, inside the edge.
@@ -507,4 +508,15 @@ test "a new frame keeps state and drops structure" {
     try testing.expectEqual(@as(f32, 0.75), b.hot_t);
     try testing.expectEqual(Bounds.fromRect(10, 10, 50, 50), b.rect);
     try testing.expect(!b.isNew());
+}
+
+test "a default style is the dark theme, to the last thousandth" {
+    // The defaults used to be four literals here. They are the theme's now,
+    // and this is the test that says moving them changed nothing: every
+    // screenshot taken before Theme.zig existed still matches.
+    const s: Style = .{};
+    try testing.expectEqual(Color{ .r = 0.16, .g = 0.17, .b = 0.20 }, s.bg);
+    try testing.expectEqual(Color{ .r = 0.88, .g = 0.89, .b = 0.92 }, s.fg);
+    try testing.expectEqual(Color{ .r = 0.30, .g = 0.32, .b = 0.38 }, s.border_color);
+    try testing.expectEqual(Color{ .r = 0, .g = 0, .b = 0, .a = 0.45 }, s.shadow_color);
 }
