@@ -101,6 +101,14 @@ Report best-of-five, not the mean: the minimum is the run least disturbed by
 everything else on the machine, and the mean of a noisy sample mostly measures
 the noise.
 
+**Leave `--jobs` alone when you are measuring the rasteriser.** `raster --all`
+renders pages on several threads if you ask it to, and it defaults to one
+thread precisely so that the standard workload keeps measuring what it always
+measured. Six threads turn a change worth two per cent into noise, and the
+`interpret`, `canvas`, `fonts` and `render` columns become work done rather
+than time waited. Use `--jobs` to measure `--jobs`, and the `wall` line it
+prints — not the `time` line, which is the sum of the laps.
+
 **Prove the pixels did not move.** Until `--time` can hash, this needs a
 second run with the PNGs written:
 
@@ -406,10 +414,13 @@ bother with against what is left.
 8. ~~**Hoist the loop-invariants.**~~ The colour encode is out of `blend`:
    `resolve` and `fillSlug` encode once per path into an `Encoded` rather than
    once per covered pixel. The `1/n` in the cubic flatteners is still there.
-9. **Replace the small wastes**: `disc`'s per-vertex `@cos`/`@sin` with
+9. ~~**Replace the small wastes**: `disc`'s per-vertex `@cos`/`@sin` with
    incremental rotation, `signedArea`'s `%` with a rotated walk, `pushClip`'s
    divide by 255 with the reciprocal form, and TrueType's 90 KB of stack arrays
-   with a scratch buffer on the face.
+   with a scratch buffer on the face.~~ **Dropped, not done.** The ledger's
+   last section says why: none of the four is in a per-pixel loop, and the two
+   changes of this kind that *were* made came to 1.9% together. Take one only
+   if a profile names it.
 
 **The one hazard to name out loud.** Any change to the per-sample test must
 reproduce `edgeInside`'s top-left rule *exactly*. The cover quad is two
@@ -439,12 +450,26 @@ for the safe build the finishing section asks for.
     resource sub-dictionary lookups out of the operator handlers.
 11. Packing `(reach, index)` into the slug bands so the early exit needs no
     gather and the sort needs no comparator indirection.
-12. **Threads.** Rows are documented as independent
-    (`src/tyr/raster.zig:194`), and `fenrir raster --all` is embarrassingly
-    parallel across pages. This is the largest available win and also the one
-    most likely to turn a deterministic renderer into a flaky one — the
-    stencil-clean assertion, the shared `Document` arena and the glyph caches
-    all assume one thread today.
+12. **Threads.** ~~Pages.~~ Landed as `raster --all --jobs N`: **4.4× to 5.0×
+    on six cores**, every framebuffer hash unchanged on all 28 documents.
+    Numbers in the ledger. What made it safe is that no page is rendered any
+    differently — a page still gets one canvas, one transform and one thread —
+    so there was nothing to get subtly wrong about the top-left rule or the
+    stencil. The sharing was the whole problem and the answer was not to
+    share: each thread opens its own `Document` over the same bytes, because a
+    `Document` memoises as it reads and a lock around it would have put every
+    image decode on every thread's critical path.
+
+    **Rows are still to do, and they are the half a reader would feel.**
+    `src/tyr/raster.zig:194` says rows are independent, and a person waiting
+    through a zoom is waiting on one page. But splitting a page into bands
+    moves the page transform by an integer number of device pixels, and
+    `a*x + b*y + (f - y0)` is not `(a*x + b*y + f) - y0` in floating point: the
+    hashes move. By this project's own rule that makes it a rendering change
+    and not an optimisation, so it needs the argument Tier 3 item 13 needs.
+    Splitting the *display list* by band instead, and giving each thread the
+    unmodified transform and a clip to its own rows, is the version that keeps
+    the arithmetic and is worth trying first.
 13. **Narrowing the `f32` framebuffer.** Sixteen bytes a pixel is what makes
     the sweeps bandwidth-bound, and eight or four would halve or quarter that.
     It also changes pixels, so by this project's own rule it is a rewrite and
@@ -665,15 +690,74 @@ branches and a runtime slice from a loop that runs eight times per pixel per
 triangle, which the compiler could then unroll. On this renderer the thing that
 pays is giving the optimiser a loop whose shape it knows.
 
+**Tier 3 item 12, pages on threads: 4.4× to 5.0× on six cores, and every
+hash identical.** `raster --all --jobs N`. The machine has six cores; `--jobs
+0` asks for one thread per core. Wall clock, best of three in each ordering,
+both binaries kept and interleaved:
+
+| | 1 thread | 6 threads | |
+|---|---|---|---|
+| *Pretrained Transformers* (26 pages, text) | 1,829 ms | 415 ms | **4.4×** |
+| *Nanite_2021* (155 pages, 333 images) | 29,169 ms | 5,737 ms | **5.0×** |
+| *kolmbook-eng-scan* (519 pages, a scan) | 35,345 ms | 6,999 ms | **4.9×** |
+
+**All 28 documents were hashed at one thread and at six, and all 28 agree** —
+and the PNGs of a fourteen-page paper are byte-identical file for file, not
+merely equal in the framebuffer. That is by construction rather than by luck:
+a page is rendered by exactly one thread, through the same `one`, with the
+same canvas, transform and order of operations it has always had. Only *which*
+thread and *when* changed. The per-page hashes are folded into the run's hash
+in page order afterwards, and each page's report is buffered and played back
+in page order, so `--stats` output stays byte-diffable across builds.
+
+Memory is the cost, and it is not the one the arithmetic suggests. Peak RSS:
+
+| | 1 thread | 6 threads |
+|---|---|---|
+| *Nanite_2021* | 105 MB | 332 MB |
+| *kolmbook-eng-scan* | 3,443 MB | 3,571 MB |
+
+Six page arenas instead of one is six framebuffers, which is the whole of the
+Nanite figure. The scan barely moves, and the reason is the one that made
+per-thread documents affordable: the gigabytes there are decoded pages held in
+the document arena, and six documents rendering a sixth of the pages each
+retain between them what one document rendering all of them did.
+
+Two things were considered and not built. *One shared `Document` behind a
+mutex* looked cheaper — interpreting is 0.6% of a page — until you notice that
+images are decoded lazily *during* the render, through the document, so the
+lock would have serialised the expensive half of the image-heavy case. *One
+document per thread, opened over duplicated bytes* was the same design with a
+copy of a hundred-megabyte file per thread in it; `Document.openBorrowed` is
+four lines and removes the copy.
+
 **What is left, in the order the clock now argues for.** Everything worth doing
 is in Gleipnir, and the non-Gleipnir items that looked promising are measured
-and small. Tier 2 is spent: item 9 is a handful of scalar wastes that could not
-add up to a per cent of what item 5 just took. Tier 3 item 12 — threads — is now
-clearly the largest thing left, since after Tier 2 the render column is still
-90% of the run and pages are independent. Item 13's framebuffer width has a
-number against it too: the canvas column is 8% of a run, and it is 8% because
-sixteen bytes a pixel have to be allocated, faulted and cleared. Tier 1 items 1
-and 3 remain memory fixes rather than speed ones and should be argued as such.
+and small.
+
+**Tier 2 is spent, and item 9 is not worth doing.** It was never large, and
+the ledger now says how large by analogy. Items 7 and 8 — real, correct, and
+exactly the same *kind* of change, made while the loop they were in was
+already open — came to **1.9% between them**, and the note under them says
+nobody should go looking for another one like it. Item 9's four are all
+further from the hot loop than those two were. `disc`'s `@cos`/`@sin` run per
+round join, not per pixel. `signedArea`'s `%` runs on a slice of three or
+four. `pushClip`'s divide by 255 is per clipped pixel, and a clip covers a
+small part of a page. TrueType's 90 KB stack frame is one subtraction of a
+stack pointer, inside the glyph decode the graveyard already measured at 1% of
+the run — the same 1% that made an outline cache with a 95% hit rate a 6%
+*loss*. Four edits of that size, each needing its own interleaved benchmark
+and its own hash diff, against a render column that is still 90% of the whole
+run: the machine's own drift between two sessions is wider than the answer.
+
+What costs now is that a page is one thread's work, and after Tier 2 the
+render column is still 90% of the run. Threading pages took 4.4× to 5.0× off a
+batch run without touching a line of Gleipnir. Rows are the same argument
+pointed at the thing a reader actually waits for, and Tier 3 item 12 says what
+stands in the way of them. Item 13's framebuffer width has a number against it
+too: the canvas column is 8% of a run, and it is 8% because sixteen bytes a
+pixel have to be allocated, faulted and cleared. Tier 1 items 1 and 3 remain
+memory fixes rather than speed ones and should be argued as such.
 
 ## The graveyard
 
