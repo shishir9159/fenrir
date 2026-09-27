@@ -31,6 +31,29 @@
 //! different answer. The last glyph of a run has no next, and gets half its
 //! size -- an estimate, and visibly one on a caret parked after a full stop,
 //! but the alternative is loading a face here to measure one glyph.
+//!
+//! ## Displayed equations are still wrong, and are the next thing here
+//!
+//! Inline mathematics is handled: `fold` puts a dropped subscript back on the
+//! line it belongs to, so dragging over a paragraph of a paper takes its
+//! `x_i`s with it. A *displayed* equation is not, and cannot be by the method
+//! this file uses.
+//!
+//! Its rows are genuinely several points apart -- a numerator, a bar, a
+//! denominator, a limit under a sum -- so they arrive here as four or five
+//! lines, which by geometry is exactly what they are. But they are one
+//! expression, and reading order through them is not "left to right, then
+//! down": it is the order the mathematics is spoken in, which no arrangement
+//! of boxes on a page carries. So a selection dragged across a display picks
+//! up a staggered set of blocks, a caret walks along a row of exponents on
+//! its own, and both are behaving correctly and looking wrong.
+//!
+//! The fix is not another threshold. It is to recognise a display as a unit
+//! -- a run of lines, well inside the text column, with no line of body text
+//! between them, in a document that has body text either side -- and to let a
+//! selection that touches any part of it take the whole thing, the way a
+//! browser takes a whole image rather than part of one. That is a structure
+//! this file does not have yet, and it is what to build here next.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
