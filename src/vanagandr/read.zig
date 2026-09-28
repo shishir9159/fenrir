@@ -64,6 +64,7 @@ const Io = std.Io;
 const fenrir = @import("fenrir");
 
 const Context = @import("Context.zig");
+const chrome_mod = @import("chrome.zig");
 const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const library = @import("library.zig");
@@ -75,6 +76,7 @@ const gleipnir = fenrir.gleipnir;
 const galdr = fenrir.galdr;
 const hlidskjalf = fenrir.hlidskjalf;
 const lyngvi = fenrir.lyngvi;
+const thviti = fenrir.thviti;
 const replay = gleipnir.replay;
 
 const Bounds = gelgja.Bounds;
@@ -849,6 +851,11 @@ const Session = struct {
     layout: Layout = .{},
     keymap: keys.State = .{},
 
+    /// The interface drawn over the page: Þviti, a face off this machine, and
+    /// the glyph atlas. Null until there is a window to draw it in, which is
+    /// every test and every `--shot --path cpu`.
+    chrome: ?*chrome_mod.Chrome = null,
+
     backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu,
     placed: ?u64 = null,
     recorded: Recorded = .{},
@@ -957,6 +964,7 @@ const Session = struct {
     pub const Image = struct { pixels: []u8, width: u32, height: u32 };
 
     fn deinit(s: *Session) void {
+        if (s.chrome) |c| c.destroy();
         // Before the buffers: a plugin's last handlers may still read them.
         if (s.plugins) |p| p.destroy();
         if (s.config_dir) |d| s.gpa.free(d);
@@ -2959,6 +2967,35 @@ const Session = struct {
         }
     }
 
+    /// The rectangle the windows get, which is the client area less whatever
+    /// the interface has taken off it.
+    ///
+    /// The status bar is *reserved*, not drawn over: a bar that floated on
+    /// top would cover the last line of the page, and a reader whose last
+    /// line is hidden is worse than one with a shorter page. Every window's
+    /// fit-width refits to this without being told, because `Layout.arrange`
+    /// calls `refit` on each rectangle it hands out.
+    fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
+        const taken: f32 = if (s.chrome != null) chrome_mod.status_height else 0;
+        return .fromRect(0, 0, width, @max(height - taken, 1));
+    }
+
+    /// What the bar says, gathered from wherever the reader keeps it.
+    ///
+    /// Every slice handed out lives on the session, so the bar holds nothing
+    /// it has to be given back.
+    fn statusLine(s: *Session) chrome_mod.Status {
+        const v = s.view();
+        return .{
+            .title = s.buffer(v.buffer).title,
+            .page = v.currentPage() + 1,
+            .pages = @intCast(v.pages.len),
+            .percent = v.percent(),
+            .fit_width = v.fit_width,
+            .windows = s.layout.count(),
+        };
+    }
+
     fn updateTitle(s: *Session, window: lyngvi.Window) void {
         const v = s.view();
         const page = v.currentPage();
@@ -3134,6 +3171,23 @@ const Session = struct {
         defer window.destroy();
         if (s.stage) |g| g.mark("window");
 
+        // The interface, before the device: the face comes off the disk and
+        // the first frame's glyphs are rasterised on the CPU, so none of it
+        // waits on a Vulkan device that takes three quarters of a second to
+        // create. A reader that cannot find a face still opens -- Týr's
+        // fallback draws boxes -- so this is a note, not a failure.
+        s.chrome = chrome_mod.Chrome.create(gpa, ctx.io) catch |err| blk: {
+            ctx.note("no interface font ({s}); the status bar will draw as boxes", .{
+                @errorName(err),
+            });
+            break :blk null;
+        };
+        if (s.chrome) |c| {
+            if (!c.hasFace()) {
+                ctx.note("no face for the interface on this machine; drawing Tyr's boxes", .{});
+            }
+        }
+
         const size = window.size();
 
         // Where every window starts, settled here rather than after the
@@ -3144,7 +3198,7 @@ const Session = struct {
         // Now there is a display to be a percentage of, and a window to fit
         // to. Both have to happen before the first `scrollToPage`.
         const scale = window.scale();
-        s.layout.arrange(.fromRect(0, 0, @floatFromInt(size.width), @floatFromInt(size.height)));
+        s.layout.arrange(s.windowRect(@floatFromInt(size.width), @floatFromInt(size.height)));
         {
             const v = s.view();
             v.dpi_scale = scale;
@@ -3281,6 +3335,17 @@ const Session = struct {
         var over: DrawList = .init(gpa, .fromRect(0, 0, 1, 1));
         defer over.deinit();
 
+        // The atlas takes texture one on the device and on both lists,
+        // before any page slot does. See `Chrome.attach` for why all three.
+        if (s.chrome) |c| {
+            c.attach(&renderer, &list, &over) catch |err| {
+                ctx.note("no atlas for the interface ({s}); its text will draw as blocks", .{
+                    @errorName(err),
+                });
+            };
+            if (s.accent.a != 0) c.theme = c.theme.withAccent(s.accent);
+        }
+
         var uploads: std.ArrayList(lyngvi.Renderer.Upload) = .empty;
         defer uploads.deinit(gpa);
 
@@ -3308,9 +3373,7 @@ const Session = struct {
                 continue;
             }
 
-            s.layout.arrange(.fromRect(
-                0,
-                0,
+            s.layout.arrange(s.windowRect(
                 @floatFromInt(swapchain.extent.width),
                 @floatFromInt(swapchain.extent.height),
             ));
@@ -3341,6 +3404,17 @@ const Session = struct {
             over.reset(extent);
             try s.compose(&list, &over);
             s.updateTitle(window);
+
+            // The interface, on top of the page and the marks on it. The
+            // same frame's input the keymap already read: Þviti derives
+            // presses by comparing with last frame and consumes nothing, so
+            // both may have it.
+            if (s.chrome) |c| {
+                try c.begin(extent, input);
+                try c.status(s.statusLine());
+                c.end();
+                try c.flush(&over, &list, &renderer, &uploads);
+            }
 
             // The path pass, between the two rect lists. Placing is a matrix
             // per instance and nothing else, so this runs every frame even
