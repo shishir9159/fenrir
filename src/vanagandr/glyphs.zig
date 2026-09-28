@@ -47,6 +47,8 @@ const Document = fenrir.Document;
 const Object = fenrir.Object;
 const replay = gleipnir.replay;
 
+const sysfont = @import("sysfont.zig");
+
 const Dict = fenrir.Dict;
 const GlyphOutline = replay.GlyphOutline;
 
@@ -411,7 +413,7 @@ pub const Fonts = struct {
                 // The document's arena owns this one.
                 if (try f.readProgram(fd)) |p| break :blk .{ .bytes = p, .owned = false };
             }
-            const sub = readSubstitute(f, f.base_font, flags) orelse return;
+            const sub = sysfont.forBaseFont(f.io, f.cache.gpa, f.base_font, flags) orelse return;
             b.substituted = true;
             // A stand-in is never the symbolic font the descriptor described,
             // so its own cmap must not be consulted with raw codes: the name
@@ -521,131 +523,3 @@ pub fn describe(f: *Fonts, list: DisplayList, w: *std.Io.Writer) std.Io.Writer.E
     }
 }
 
-// -- substituting a font the document did not embed --------------------------
-
-/// A PDF may name a font and embed nothing, on the theory that the reader has
-/// it: `/BaseFont /Helvetica` with no `/FontDescriptor` at all is legal and
-/// common, and so is `/BaseFont /Arial` from a Word export. There is no
-/// outline anywhere in the file for those, so either something on this machine
-/// stands in or the page comes out blank.
-///
-/// What this does is deliberately crude. It classifies the name into one of
-/// four families and a weight and a slope, and looks for a file with a
-/// matching name in the platform's font directory. It does not read font
-/// metadata, does not consult a fontconfig, and does not try to match metrics
-/// -- a substituted face has the wrong widths, so the *positions* still come
-/// from the PDF's own `/Widths` and only the shapes are borrowed.
-///
-/// The result is legible and not typographically faithful, which is the right
-/// trade: the alternative on those documents is a blank page.
-const Substitute = struct {
-    /// Roughly what the name is asking for. Everything unrecognised becomes
-    /// `sans`, which is what a reader wants when it cannot tell.
-    const Family = enum { serif, sans, mono, symbol };
-
-    family: Family = .sans,
-    bold: bool = false,
-    italic: bool = false,
-
-    fn classify(base_font: []const u8, flags: i64) Substitute {
-        // `ABCDEF+Helvetica-Bold` -- the subset tag is six letters and a plus,
-        // and carries no information about the typeface.
-        var name = base_font;
-        if (std.mem.indexOfScalar(u8, name, '+')) |plus| {
-            if (plus == 6) name = name[plus + 1 ..];
-        }
-
-        var s: Substitute = .{};
-        // Bit 1 is FixedPitch, bit 2 Serif, bit 7 Italic (numbered from 1).
-        if (flags & 1 != 0) s.family = .mono;
-        if (flags & 2 != 0) s.family = .serif;
-        if (flags & 64 != 0) s.italic = true;
-
-        if (containsAny(name, &.{ "Courier", "Mono", "Consol", "Typewriter", "CMTT" })) {
-            s.family = .mono;
-        } else if (containsAny(name, &.{ "Times", "Serif", "Georgia", "Book", "Roman", "Garamond", "Minion", "CMR", "Nimbus" })) {
-            s.family = .serif;
-        } else if (containsAny(name, &.{ "Helvetica", "Arial", "Sans", "Verdana", "Calibri", "Segoe", "Tahoma" })) {
-            s.family = .sans;
-        }
-        if (containsAny(name, &.{ "Symbol", "Dingbat", "Wingding" })) s.family = .symbol;
-
-        if (containsAny(name, &.{ "Bold", "Black", "Heavy", "Semibold", "-BX", "CMBX" })) s.bold = true;
-        if (containsAny(name, &.{ "Italic", "Oblique", "-IT", "CMTI", "CMMI" })) s.italic = true;
-
-        return s;
-    }
-
-    fn containsAny(hay: []const u8, needles: []const []const u8) bool {
-        for (needles) |n| {
-            if (std.mem.indexOf(u8, hay, n) != null) return true;
-        }
-        return false;
-    }
-
-    /// File names to try, best first. Windows names come first because that is
-    /// where this runs today; the rest cost one failed open each.
-    fn candidates(s: Substitute) []const []const u8 {
-        return switch (s.family) {
-            .symbol => &.{ "symbol.ttf", "seguisym.ttf", "DejaVuSans.ttf" },
-            .mono => if (s.bold and s.italic)
-                &.{ "courbi.ttf", "DejaVuSansMono-BoldOblique.ttf", "LiberationMono-BoldItalic.ttf" }
-            else if (s.bold)
-                &.{ "courbd.ttf", "DejaVuSansMono-Bold.ttf", "LiberationMono-Bold.ttf" }
-            else if (s.italic)
-                &.{ "couri.ttf", "DejaVuSansMono-Oblique.ttf", "LiberationMono-Italic.ttf" }
-            else
-                &.{ "cour.ttf", "DejaVuSansMono.ttf", "LiberationMono-Regular.ttf" },
-            .serif => if (s.bold and s.italic)
-                &.{ "timesbi.ttf", "DejaVuSerif-BoldItalic.ttf", "LiberationSerif-BoldItalic.ttf" }
-            else if (s.bold)
-                &.{ "timesbd.ttf", "DejaVuSerif-Bold.ttf", "LiberationSerif-Bold.ttf" }
-            else if (s.italic)
-                &.{ "timesi.ttf", "DejaVuSerif-Italic.ttf", "LiberationSerif-Italic.ttf" }
-            else
-                &.{ "times.ttf", "DejaVuSerif.ttf", "LiberationSerif-Regular.ttf" },
-            .sans => if (s.bold and s.italic)
-                &.{ "arialbi.ttf", "DejaVuSans-BoldOblique.ttf", "LiberationSans-BoldItalic.ttf" }
-            else if (s.bold)
-                &.{ "arialbd.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf" }
-            else if (s.italic)
-                &.{ "ariali.ttf", "DejaVuSans-Oblique.ttf", "LiberationSans-Italic.ttf" }
-            else
-                &.{ "arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf" },
-        };
-    }
-};
-
-/// Where a platform keeps its fonts. Searched in order.
-const font_dirs = switch (@import("builtin").os.tag) {
-    .windows => [_][]const u8{
-        "C:/Windows/Fonts",
-        "C:/WINDOWS/Fonts",
-    },
-    .macos => [_][]const u8{
-        "/System/Library/Fonts",
-        "/Library/Fonts",
-    },
-    else => [_][]const u8{
-        "/usr/share/fonts/truetype/dejavu",
-        "/usr/share/fonts/truetype/liberation",
-        "/usr/share/fonts/TTF",
-        "/usr/share/fonts",
-    },
-};
-
-/// Reads a stand-in font program off this machine. The caller owns the bytes.
-fn readSubstitute(f: *Fonts, base_font: []const u8, flags: i64) ?[]u8 {
-    const io = f.io orelse return null;
-    const s = Substitute.classify(base_font, flags);
-
-    for (s.candidates()) |name| {
-        for (font_dirs) |dir| {
-            var buf: [512]u8 = undefined;
-            const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
-            const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, f.cache.gpa, .limited(32 << 20)) catch continue;
-            return bytes;
-        }
-    }
-    return null;
-}
