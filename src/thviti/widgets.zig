@@ -35,6 +35,15 @@ const Size = Box.Size;
 
 pub const Error = UI.Error;
 
+/// The editing model behind a text field. Its own file because all of it is
+/// arithmetic over bytes and none of it needs a UI to test.
+pub const field = @import("widgets/field.zig");
+pub const Field = field.Field;
+
+test {
+    _ = field;
+}
+
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with
 /// state would be a bug waiting to be found.
 pub fn spacer(ui: *UI, size: Size) Error!void {
