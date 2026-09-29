@@ -914,6 +914,8 @@ const Session = struct {
     /// Where `status` points when the message is not a literal: a plugin's
     /// `fenrir.notify`, or a command's answer.
     status_buf: [512]u8 = undefined,
+    /// The mode and the count beside it, for the frame being built.
+    mode_buf: [96]u8 = undefined,
     /// A highlight's colour as text, for the one `highlightAt` being answered.
     hex_buf: [7]u8 = undefined,
     /// What events were last reported with, so that `page` and `mode` fire on
@@ -2973,27 +2975,67 @@ const Session = struct {
     /// The status bar is *reserved*, not drawn over: a bar that floated on
     /// top would cover the last line of the page, and a reader whose last
     /// line is hidden is worse than one with a shorter page. Every window's
-    /// fit-width refits to this without being told, because `Layout.arrange`
-    /// calls `refit` on each rectangle it hands out.
+    /// fit-width refits to this, because `Layout.arrange` calls `refit` on
+    /// each rectangle it hands out.
     fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
         const taken: f32 = if (s.chrome != null) chrome_mod.status_height else 0;
         return .fromRect(0, 0, width, @max(height - taken, 1));
     }
 
-    /// What the bar says, gathered from wherever the reader keeps it.
+    /// What the mode line says, gathered from wherever the reader keeps it.
     ///
-    /// Every slice handed out lives on the session, so the bar holds nothing
-    /// it has to be given back.
+    /// Every slice handed out either lives on the session or is a literal, so
+    /// the bar holds nothing it has to be given back: the note and the `:`
+    /// line are the session's own buffers, and the one thing that has to be
+    /// formatted -- which highlight is in hand, of how many -- goes into
+    /// `mode_buf` and is built afresh each frame rather than cached, because
+    /// it is under a hundred bytes and caching it would mean invalidating it.
     fn statusLine(s: *Session) chrome_mod.Status {
         const v = s.view();
-        return .{
-            .title = s.buffer(v.buffer).title,
+        const b = s.buffer(v.buffer);
+        const mode = s.keymap.mode;
+
+        var st: chrome_mod.Status = .{
+            .mode = mode.label(),
+            .message = s.status,
+            .title = b.title,
             .page = v.currentPage() + 1,
             .pages = @intCast(v.pages.len),
             .percent = v.percent(),
             .fit_width = v.fit_width,
             .windows = s.layout.count(),
         };
+
+        switch (mode) {
+            .note => st.typing = s.note.items,
+            // The colon belongs to the line being typed and not beside it:
+            // `:zoom 150` is one thing a person is writing, and a gap in the
+            // middle of it would read as two.
+            .command => {
+                st.mode = "";
+                var wr: std.Io.Writer = .fixed(&s.mode_buf);
+                wr.print(":{s}", .{s.cmdline.items[0..@min(s.cmdline.items.len, 80)]}) catch {};
+                st.typing = s.mode_buf[0..wr.end];
+            },
+            else => {},
+        }
+
+        // Edit and note mode say which highlight is in hand, in the order `n`
+        // walks them, and edit mode shows what is written on it -- note mode
+        // does not, because what is being typed is about to replace it.
+        if ((mode == .edit or mode == .note) and s.focusedMarkIndex() != null) {
+            const held = b.marks.items()[s.focusedMarkIndex().?];
+            var place: usize = 1;
+            for (b.marks.items()) |m| {
+                if (Marks.readsBefore(m, held)) place += 1;
+            }
+            var wr: std.Io.Writer = .fixed(&s.mode_buf);
+            wr.print("{s} {d}/{d}", .{ mode.label(), place, b.marks.count() }) catch {};
+            st.mode = s.mode_buf[0..wr.end];
+            if (mode == .edit) st.note = held.note;
+        }
+
+        return st;
     }
 
     fn updateTitle(s: *Session, window: lyngvi.Window) void {
@@ -3010,12 +3052,16 @@ const Session = struct {
         window.setTitle(s.titleText(&buf, page, windows));
     }
 
-    /// What the title bar says: the document and where you are in it, then
-    /// the mode, then whatever the mode has to show.
+    /// What the operating system's title bar says: the document, and where
+    /// you are in it.
     ///
-    /// The title is the only text this window draws, so it carries the mode
-    /// line as well -- the note being typed, which highlight is in hand, the
-    /// reason a key did nothing.
+    /// It used to say a great deal more, because it was the only text this
+    /// window drew: the mode, the note being typed, which highlight was in
+    /// hand, the reason a key did nothing. All of that is in the status bar
+    /// now, where a person reading the page is already looking. What is left
+    /// here is what a title is actually for -- telling one window from
+    /// another in a task switcher, where the page you are on is useful and
+    /// the mode you are in is not.
     fn titleText(s: *Session, buf: []u8, page: u32, windows: u32) []const u8 {
         const v = s.view();
         const base = s.buffer(v.buffer).title;
@@ -3025,32 +3071,6 @@ const Session = struct {
             base[0..@min(base.len, 160)], page + 1, v.pages.len, v.percent(),
         }) catch return buf[0..w.end];
         if (windows > 1) w.print(" -- {d} windows", .{windows}) catch return buf[0..w.end];
-
-        const mode = s.keymap.mode;
-        if (mode != .normal) w.print("   {s}", .{mode.label()}) catch return buf[0..w.end];
-
-        const marks = &s.buffer(v.buffer).marks;
-        switch (mode) {
-            .edit, .note => if (s.focusedMarkIndex()) |i| {
-                // Its place in reading order, which is the order `n` walks.
-                var place: usize = 1;
-                const held = marks.items()[i];
-                for (marks.items()) |m| {
-                    if (Marks.readsBefore(m, held)) place += 1;
-                }
-                w.print(" {d}/{d}", .{ place, marks.count() }) catch return buf[0..w.end];
-                if (mode == .note) {
-                    w.print(" {s}_", .{s.note.items[0..@min(s.note.items.len, 400)]}) catch return buf[0..w.end];
-                } else if (held.note.len != 0) {
-                    w.print(" \"{s}\"", .{held.note[0..@min(held.note.len, 400)]}) catch return buf[0..w.end];
-                }
-            },
-            else => {},
-        }
-        if (mode == .command) {
-            w.print("{s}_", .{s.cmdline.items[0..@min(s.cmdline.items.len, 400)]}) catch return buf[0..w.end];
-        }
-        if (s.status.len != 0) w.print("   {s}", .{s.status}) catch return buf[0..w.end];
         return buf[0..w.end];
     }
 
@@ -3571,6 +3591,7 @@ fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !S
 
 /// `Session.deinit` frees documents, and a test session has none.
 fn closeSession(s: *Session) void {
+    s.cmdline.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.layout.deinit(s.gpa);
@@ -3930,23 +3951,45 @@ test "backspace in a note removes a character, not a byte" {
     try testing.expectEqualStrings("a", s.note.items);
 }
 
-test "the title bar carries the mode and what it is showing" {
+test "the status line carries the mode and what the mode has to show" {
     const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
     defer closeSession(&s);
 
-    var title: [1024]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, s.titleText(&title, 0, 1), "VISUAL") == null);
+    try testing.expectEqualStrings("", s.statusLine().mode);
 
     s.keymap.mode = .visual;
-    try testing.expect(std.mem.indexOf(u8, s.titleText(&title, 0, 1), "-- VISUAL --") != null);
+    try testing.expectEqualStrings("-- VISUAL --", s.statusLine().mode);
 
     s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
     s.keymap.mode = .note;
     s.focus_mark = s.buffer(0).marks.items()[0].key;
     for ("hello") |c| s.noteChar(c);
-    try testing.expect(std.mem.indexOf(u8, s.titleText(&title, 0, 1), "-- NOTE -- 1/1 hello_") != null);
+
+    const noting = s.statusLine();
+    try testing.expectEqualStrings("-- NOTE -- 1/1", noting.mode);
+    try testing.expectEqualStrings("hello", noting.typing.?);
+
+    // A `:` line belongs to the colon, not beside it.
+    s.keymap.mode = .command;
+    for ("zoom 150") |c| s.cmdline.append(gpa, c) catch unreachable;
+    const typing = s.statusLine();
+    try testing.expectEqualStrings("", typing.mode);
+    try testing.expectEqualStrings(":zoom 150", typing.typing.?);
+}
+
+test "the title bar keeps the document and drops the mode line" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.keymap.mode = .visual;
+    var title: [1024]u8 = undefined;
+    const text_of = s.titleText(&title, 0, 1);
+    try testing.expect(std.mem.indexOf(u8, text_of, "page 1 of 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text_of, "VISUAL") == null);
 }
 
 test "the cursor's line can be highlighted and cleared again" {

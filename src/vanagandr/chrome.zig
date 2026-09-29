@@ -224,6 +224,16 @@ pub const Chrome = struct {
 /// so that what the bar looks like for a given state is a question with an
 /// answer, asked in a test.
 pub const Status = struct {
+    /// `-- VISUAL --`, or empty in normal mode.
+    mode: []const u8 = "",
+    /// The `:` line or the note being typed, drawn with a block after it.
+    /// Null when nothing is being typed.
+    typing: ?[]const u8 = null,
+    /// What is written on the highlight in hand, in edit mode.
+    note: []const u8 = "",
+    /// What just happened, or why a key did nothing.
+    message: []const u8 = "",
+
     title: []const u8 = "",
     /// Numbered from 1, as a person numbers them.
     page: u32 = 1,
@@ -235,19 +245,21 @@ pub const Status = struct {
     windows: u32 = 1,
 };
 
-/// The bar along the bottom of the window.
+/// The mode line, along the bottom of the window.
 ///
 /// Two groups, and which is which is the whole layout. On the left, what you
-/// are doing. On the right, where you are: the zoom, the page, the document.
+/// are doing: the mode, what is being typed in it, and what the reader last
+/// had to say. On the right, where you are: the zoom, the page, the document.
 /// The left half changes with every key and the right half changes when you
 /// move, and a person watching one is not watching the other.
 ///
 /// The left group is the one that yields. It asks for the whole bar at a
 /// strictness of zero and the right group asks for exactly its children at a
 /// strictness of one, so a shortfall comes out of the left entirely -- and
-/// because the left group clips, whatever it holds is cut off at the page
-/// number rather than pushing it out of the window. That is one rule, in the
-/// sizes, instead of measuring a string and eliding it every frame.
+/// because the left group clips, a message longer than the window is cut off
+/// at the page number rather than pushing it out of the window. That is one
+/// rule, in the sizes, instead of measuring a string and eliding it every
+/// frame.
 pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status) !void {
     ui.pushStyle(.{ .font = face, .font_size = status_text, .fg = t.text_dim });
     defer ui.popStyle();
@@ -265,11 +277,6 @@ pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status) !void {
     defer ui.close(bar);
 
     {
-        // Empty for now, and still the thing that pushes the right group to
-        // the far end. What a person is *doing* goes in here -- the mode, the
-        // line being typed, the last thing the reader had to say -- and that
-        // is the next commit; the group is here already because the sizes
-        // below are the whole of how the two halves get along.
         ui.next(.{
             .w = .fill,
             .h = .fill,
@@ -283,6 +290,31 @@ pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status) !void {
         defer ui.close(left);
 
         try w.spacer(ui, .px(gutter));
+
+        if (st.mode.len != 0) {
+            // The one thing in the bar drawn in the foreground: which mode
+            // you are in is the question the bar exists to answer.
+            ui.next(.{ .fg = t.text });
+            _ = try w.labelf(ui, "{s}###mode", .{clamp(st.mode, 32)});
+            try w.spacer(ui, .px(gutter));
+        }
+
+        if (st.typing) |line| {
+            // A block rather than a caret: there is no blink here, and a thin
+            // line that does not blink reads as part of the text.
+            ui.next(.{ .fg = t.text });
+            _ = try w.labelf(ui, "{s}_###typing", .{clamp(line, 400)});
+            try w.spacer(ui, .px(gutter));
+        }
+
+        if (st.note.len != 0) {
+            _ = try w.labelf(ui, "\"{s}\"###note", .{clamp(st.note, 400)});
+            try w.spacer(ui, .px(gutter));
+        }
+
+        if (st.message.len != 0) {
+            _ = try w.labelf(ui, "{s}###message", .{clamp(st.message, 400)});
+        }
     }
 
     {
@@ -333,25 +365,44 @@ fn group(ui: *UI, name: []const u8) *thviti.Box {
     return ui.find(key.make(key.make(ui.root.key, "status"), name)).?;
 }
 
-test "the bar sits along the bottom, with where you are at the far end" {
+test "the bar sits along the bottom of the window, whatever is in it" {
     var ui: UI = .init(testing.allocator, UI.fixed_metrics);
     defer ui.deinit();
 
-    try solve(&ui, .{ .title = "paper.pdf", .page = 7, .pages = 48, .percent = 138 });
+    try solve(&ui, .{ .title = "paper.pdf", .page = 7, .pages = 48 });
 
     const bar = ui.root.first.?;
     try testing.expectEqual(@as(f32, 600 - status_height), bar.rect.min_y);
     try testing.expectEqual(@as(f32, 600), bar.rect.max_y);
     try testing.expectEqual(@as(f32, 900), bar.rect.width());
+}
+
+test "what you are doing is at the near end and where you are at the far one" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+
+    try solve(&ui, .{
+        .mode = "-- VISUAL --",
+        .title = "paper.pdf",
+        .page = 7,
+        .pages = 48,
+        .percent = 138,
+    });
+
+    const left = group(&ui, "left");
+    const mode = left.first.?.next.?;
+    try testing.expectEqualStrings("-- VISUAL --", mode.text);
+    try testing.expectEqual(@as(f32, gutter), mode.rect.min_x);
 
     // The title is the last thing before the closing gutter, and ends a
     // gutter short of the window's edge.
-    const title = group(&ui, "right").last.?.prev.?;
+    const right = group(&ui, "right");
+    const title = right.last.?.prev.?;
     try testing.expectEqualStrings("paper.pdf", title.text);
     try testing.expectApproxEqAbs(@as(f32, 900 - gutter), title.rect.max_x, 0.5);
 }
 
-test "an empty left group still pushes the right one to the far end" {
+test "a bar in normal mode with nothing to say says only where you are" {
     var ui: UI = .init(testing.allocator, UI.fixed_metrics);
     defer ui.deinit();
 
@@ -392,3 +443,20 @@ test "a label that counts keeps its identity when only the number moves" {
     try testing.expectEqualStrings("8 / 48", second.text);
 }
 
+test "a message longer than the window cannot push the page number off it" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+
+    const long = "x" ** 600;
+    try solve(&ui, .{ .message = long, .title = "a.pdf", .page = 3, .pages = 9 });
+
+    const left = group(&ui, "left");
+    const right = group(&ui, "right");
+
+    // The left group gave up every pixel the right group needed, and what it
+    // could not fit is clipped inside it rather than drawn over the top.
+    try testing.expect(left.rect.max_x <= right.rect.min_x + 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 900), right.rect.max_x, 0.5);
+    try testing.expect(right.rect.width() > 0);
+    try testing.expect(left.flags.clip);
+}
