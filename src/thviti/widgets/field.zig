@@ -37,8 +37,17 @@ pub const Field = struct {
 
     /// Byte offsets into `bytes[0..len]`, always on a character boundary.
     caret: u32 = 0,
+
     /// The other end of the selection; equal to `caret` when there is none.
     anchor: u32 = 0,
+
+    /// How far the text is scrolled left under the caret, in pixels. Here
+    /// rather than on the box because it has to survive the field losing
+    /// focus and getting it back.
+    offset: f32 = 0,
+    /// When the caret last moved, so that the blink restarts on a keystroke
+    /// rather than keeping its own phase.
+    blink_from: f64 = 0,
 
     pub fn init(storage: []u8) Field {
         return .{ .bytes = storage };
@@ -75,6 +84,7 @@ pub const Field = struct {
         @memcpy(f.bytes[0..take], text[0..take]);
         f.len = take;
         f.caret = take;
+        f.offset = 0;
         f.anchor = take;
     }
 
@@ -82,6 +92,7 @@ pub const Field = struct {
         f.len = 0;
         f.caret = 0;
         f.anchor = 0;
+        f.offset = 0;
     }
 
     pub fn selectAll(f: *Field) void {
@@ -193,6 +204,226 @@ pub fn after(text: []const u8, at: u32) u32 {
     return @min(at + n, @as(u32, @intCast(text.len)));
 }
 
+
+// -- the widget ---------------------------------------------------------------
+
+const Box = @import("../Box.zig");
+const UI = @import("../UI.zig");
+const paint = @import("../../gelgja/paint.zig");
+
+const Color = paint.Color;
+const Signal = UI.Signal;
+const Size = Box.Size;
+const Style = Box.Style;
+
+pub const Error = UI.Error;
+
+/// Room either side of the text. The caret sits inside it, so a caret at the
+/// start of the text is not flush against the border.
+pub const pad: f32 = 6;
+/// Caret width. One pixel reads as a hair at any size; two is a cursor.
+pub const caret_width: f32 = 2;
+/// A whole blink, and how much of it the caret is visible for.
+pub const blink_period: f64 = 1.06;
+pub const blink_on: f64 = 0.62;
+
+pub const Options = struct {
+    w: ?Size = null,
+    h: ?Size = null,
+    /// Drawn dimmed while the field is empty and unfocused.
+    placeholder: []const u8 = "",
+    /// The selection band. Defaults to a mix of the style's own two colours,
+    /// which lands the right way up on a dark theme and on a light one --
+    /// the same argument `hot_lift` makes.
+    selection: ?Color = null,
+};
+
+pub const Result = struct {
+    signal: Signal,
+    /// The text changed this frame.
+    edited: bool = false,
+    /// Enter was pressed while focused.
+    submitted: bool = false,
+    /// Escape was pressed while focused.
+    cancelled: bool = false,
+};
+
+/// A one-line text field.
+///
+/// Three measures of a prefix per frame -- to the caret, and to each end of
+/// the selection -- plus one of the whole string. Týr caches shaped runs, so
+/// each is a hash lookup and a sum over the run; a field holds a few dozen
+/// characters and this is not where a frame goes.
+pub fn textField(ui: *UI, name: []const u8, f: *Field, opts: Options) Error!Result {
+    const outer = ui.style();
+    const line = ui.metrics.lineHeight(outer.font, outer.font_size);
+
+    ui.nextDefaults(.{
+        .w = opts.w orelse .fill,
+        .h = opts.h orelse .px(@round(line + pad * 2)),
+        .axis = .x,
+        .child_align = .center,
+        .flags = .{
+            .clickable = true,
+            .focusable = true,
+            .draw_background = true,
+            .draw_border = true,
+            .clip = true,
+        },
+    });
+    const b = try ui.open(name);
+    defer ui.close(b);
+
+    var out: Result = .{ .signal = ui.signal(b) };
+    if (out.signal.focused) keys(ui, f, &out);
+
+    const st = b.style;
+    const text = f.slice();
+
+    const total = if (text.len == 0) 0 else (try ui.metrics.measure(text, st.font, st.font_size)).x;
+    const caret_x = try widthTo(ui, f, st, f.caret);
+
+    // Keep the caret in view, against last frame's width -- like everything
+    // else a call site needs geometry for. A field that has just appeared
+    // scrolls right on its second frame, and a field being typed into has
+    // been on screen a while.
+    const inner = b.rect.width() - pad * 2;
+    if (inner > 0) {
+        if (caret_x - f.offset > inner) f.offset = caret_x - inner;
+        if (caret_x - f.offset < 0) f.offset = caret_x;
+        f.offset = std.math.clamp(f.offset, 0, @max(total - inner, 0));
+    }
+
+    if (f.hasSelection()) {
+        const sel = f.selection();
+        const x0 = try widthTo(ui, f, st, sel[0]);
+        const x1 = try widthTo(ui, f, st, sel[1]);
+        ui.next(.{
+            .w = .px(x1 - x0),
+            .h = .px(line),
+            .fixed_x = pad - f.offset + x0,
+            .flags = .{ .floating_x = true, .draw_background = true },
+            .bg = opts.selection orelse mix(st.bg, st.fg, 0.28),
+        });
+        _ = try ui.box("selection");
+    }
+
+    const empty = f.isEmpty();
+    const showing = if (empty and !out.signal.focused) opts.placeholder else text;
+    ui.next(.{
+        .w = .px(@max(total, 1)),
+        .h = .px(line),
+        .fixed_x = pad - f.offset,
+        .text_align = .start,
+        .fg = if (empty) mix(st.bg, st.fg, 0.55) else st.fg,
+        .flags = .{ .floating_x = true, .draw_text = true },
+    });
+    _ = try ui.boxText("text", showing);
+
+    // Solid while the caret is moving and blinking once it settles: a caret
+    // that keeps its own phase is invisible for half of every keystroke,
+    // which reads as dropped input.
+    if (out.signal.focused and @mod(ui.time - f.blink_from, blink_period) < blink_on) {
+        ui.next(.{
+            .w = .px(caret_width),
+            .h = .px(line),
+            .fixed_x = pad - f.offset + caret_x,
+            .flags = .{ .floating_x = true, .draw_background = true },
+            .bg = st.fg,
+        });
+        _ = try ui.box("caret");
+    }
+
+    return out;
+}
+
+/// One frame's keys, in the order the platform saw them.
+///
+/// `Signal.text` is every character typed this frame, flattened, which is
+/// enough for a box that only appends and wrong for one that edits: typing
+/// `a`, backspace, `a` leaves the text unchanged, and a field that saw the
+/// three out of order would disagree.
+///
+/// Tab is deliberately not read. `UI.end` moves focus along the ring with it
+/// after the tree is built, and a field that swallowed tab would trap the
+/// keyboard inside itself.
+fn keys(ui: *UI, f: *Field, out: *Result) void {
+    for (ui.in.events) |e| switch (e) {
+        .text => |t| {
+            if (typeInto(f, t)) {
+                out.edited = true;
+                f.blink_from = ui.time;
+            }
+        },
+        .key_down => |k| {
+            if (k.modifiers.ctrl) {
+                if ((k.char | 0x20) == 'a') f.selectAll();
+                continue;
+            }
+            const extend = k.modifiers.shift;
+            switch (k.code) {
+                .left => f.moveLeft(extend),
+                .right => f.moveRight(extend),
+                .home => f.moveHome(extend),
+                .end => f.moveEnd(extend),
+                .backspace => {
+                    f.backspace();
+                    out.edited = true;
+                },
+                .delete => {
+                    f.deleteForward();
+                    out.edited = true;
+                },
+                .enter => out.submitted = true,
+                .escape => out.cancelled = true,
+                else => continue,
+            }
+            f.blink_from = ui.time;
+        },
+        else => {},
+    };
+}
+
+/// Inserts a text event, minus anything that is not text.
+///
+/// Enter, tab and escape arrive as keys, and several platforms put them in
+/// the text stream as well, as `\r`, `\t` and `\x1b`. A field that took them
+/// would hold a control character it can neither draw nor measure.
+fn typeInto(f: *Field, t: []const u8) bool {
+    var changed = false;
+    var i: usize = 0;
+    while (i < t.len) {
+        if (isControl(t[i])) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < t.len and !isControl(t[j])) j += 1;
+        if (f.insert(t[i..j])) changed = true;
+        i = j;
+    }
+    return changed;
+}
+
+fn isControl(c: u8) bool {
+    return c < 0x20 or c == 0x7f;
+}
+
+/// How wide the text is up to a byte offset.
+fn widthTo(ui: *UI, f: *Field, st: Style, at: u32) Error!f32 {
+    if (at == 0) return 0;
+    return (try ui.metrics.measure(f.bytes[0..at], st.font, st.font_size)).x;
+}
+
+fn mix(a: Color, b: Color, k: f32) Color {
+    const t = std.math.clamp(k, 0, 1);
+    return .{
+        .r = a.r + (b.r - a.r) * t,
+        .g = a.g + (b.g - a.g) * t,
+        .b = a.b + (b.b - a.b) * t,
+        .a = a.a + (b.a - a.a) * t,
+    };
+}
 // -- tests --------------------------------------------------------------------
 
 const testing = std.testing;
@@ -333,4 +564,171 @@ test "a cut that lands inside a character is walked back to its start" {
     // And the invariant holds afterwards: backspace takes a character.
     f.backspace();
     try testing.expectEqualStrings("ab", f.slice());
+}
+
+// -- the widget, with a UI but no font and no window --------------------------
+
+const input = @import("../input.zig");
+
+/// One frame with the field in it. `UI.fixed_metrics` advances half an em per
+/// byte, so at the default fourteen pixels every character is seven wide and
+/// the geometry below is arithmetic rather than a typeface's opinion.
+fn oneFrame(ui: *UI, f: *Field, in: input.Input) !Result {
+    try ui.begin(.fromRect(0, 0, 300, 60), in);
+    const r = try textField(ui, "q", f, .{});
+    ui.end();
+    return r;
+}
+
+fn focusIt(ui: *UI) void {
+    ui.setFocus(@import("../key.zig").make(ui.root.key, "q"));
+}
+
+fn typing(text: []const u8) [1]input.Event {
+    return .{.{ .text = text }};
+}
+
+fn pressing(code: input.KeyCode) [1]input.Event {
+    return .{.{ .key_down = .{ .code = code } }};
+}
+
+test "an unfocused field ignores typing and a focused one takes it" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+
+    var hi = typing("hi");
+    _ = try oneFrame(&ui, &f, .{ .events = &hi });
+    try testing.expect(f.isEmpty());
+
+    focusIt(&ui);
+    const r = try oneFrame(&ui, &f, .{ .events = &hi });
+    try testing.expectEqualStrings("hi", f.slice());
+    try testing.expect(r.edited);
+}
+
+test "a backspace between two keystrokes is applied between them" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+
+    _ = try oneFrame(&ui, &f, .{});
+    focusIt(&ui);
+
+    // The whole reason this walks `ui.in.events` instead of `Signal.text`:
+    // flattened, these three are "aa" and the answer would be wrong.
+    var mixed = [_]input.Event{
+        .{ .text = "a" },
+        .{ .key_down = .{ .code = .backspace } },
+        .{ .text = "b" },
+    };
+    _ = try oneFrame(&ui, &f, .{ .events = &mixed });
+    try testing.expectEqualStrings("b", f.slice());
+}
+
+test "enter submits and escape cancels, and neither changes the text" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+    f.set("48");
+
+    _ = try oneFrame(&ui, &f, .{});
+    focusIt(&ui);
+
+    var enter = pressing(.enter);
+    const submitted = try oneFrame(&ui, &f, .{ .events = &enter });
+    try testing.expect(submitted.submitted and !submitted.cancelled);
+
+    var escape = pressing(.escape);
+    const cancelled = try oneFrame(&ui, &f, .{ .events = &escape });
+    try testing.expect(cancelled.cancelled and !cancelled.submitted);
+
+    try testing.expectEqualStrings("48", f.slice());
+}
+
+test "a carriage return in the text stream is not text" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+
+    _ = try oneFrame(&ui, &f, .{});
+    focusIt(&ui);
+
+    // Windows sends enter as a key *and* as `\r`; a field that took it would
+    // hold a character it can neither draw nor measure.
+    var stream = typing("a\r\tb\x1b");
+    _ = try oneFrame(&ui, &f, .{ .events = &stream });
+    try testing.expectEqualStrings("ab", f.slice());
+}
+
+test "shift with a motion extends the selection through the widget" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+    f.set("hello");
+
+    _ = try oneFrame(&ui, &f, .{});
+    focusIt(&ui);
+
+    var shift_left = [_]input.Event{
+        .{ .key_down = .{ .code = .left, .modifiers = .{ .shift = true } } },
+        .{ .key_down = .{ .code = .left, .modifiers = .{ .shift = true } } },
+    };
+    _ = try oneFrame(&ui, &f, .{ .events = &shift_left });
+    try testing.expectEqualSlices(u32, &.{ 3, 5 }, &f.selection());
+}
+
+
+test "the caret scrolls into view when the text is longer than the field" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [256]u8 = undefined;
+    var f: Field = .init(&store);
+
+    // Sixty characters at seven pixels is far wider than three hundred.
+    f.set("x" ** 60);
+    _ = try oneFrame(&ui, &f, .{});
+    _ = try oneFrame(&ui, &f, .{});
+    try testing.expect(f.offset > 0);
+
+    // Home brings it back to the start, and the offset follows the caret
+    // rather than being reset by hand anywhere.
+    focusIt(&ui);
+    var home = pressing(.home);
+    _ = try oneFrame(&ui, &f, .{ .events = &home });
+    _ = try oneFrame(&ui, &f, .{});
+    try testing.expectEqual(@as(f32, 0), f.offset);
+}
+
+test "a focused field with a selection draws a band, the text and a caret" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+    f.set("hello");
+
+    _ = try oneFrame(&ui, &f, .{});
+    focusIt(&ui);
+    f.selectAll();
+    _ = try oneFrame(&ui, &f, .{});
+
+    const box_of = @import("../key.zig").make;
+    const field_key = box_of(ui.root.key, "q");
+
+    const band = ui.find(box_of(field_key, "selection")).?;
+    const shown = ui.find(box_of(field_key, "text")).?;
+    const caret = ui.find(box_of(field_key, "caret")).?;
+
+    // Five characters at seven pixels, starting a pad in.
+    try testing.expectEqualStrings("hello", shown.text);
+    try testing.expectApproxEqAbs(@as(f32, 35), band.rect.width(), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, pad), band.rect.min_x, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, caret_width), caret.rect.width(), 0.01);
+    // The caret is at the end, which is where `selectAll` leaves it.
+    try testing.expectApproxEqAbs(@as(f32, pad + 35), caret.rect.min_x, 0.01);
 }
