@@ -280,6 +280,17 @@ pub fn textField(ui: *UI, name: []const u8, f: *Field, opts: Options) Error!Resu
     const st = b.style;
     const text = f.slice();
 
+    // A press puts the caret where it was pressed and a drag from there
+    // selects. Both read last frame's rectangle, which is the one that was
+    // under the pointer when it was pressed.
+    const left = b.rect.min_x + pad - f.offset;
+    if (out.signal.pressed) {
+        f.moveTo(try indexAt(ui, f, st, left, ui.in.mouse.x), false);
+        f.blink_from = ui.time;
+    } else if (out.signal.dragging) {
+        f.moveTo(try indexAt(ui, f, st, left, ui.in.mouse.x), true);
+    }
+
     const total = if (text.len == 0) 0 else (try ui.metrics.measure(text, st.font, st.font_size)).x;
     const caret_x = try widthTo(ui, f, st, f.caret);
 
@@ -415,6 +426,28 @@ fn widthTo(ui: *UI, f: *Field, st: Style, at: u32) Error!f32 {
     return (try ui.metrics.measure(f.bytes[0..at], st.font, st.font_size)).x;
 }
 
+
+/// The offset a pointer at `x` is nearest to, `left` being where the text
+/// starts on screen.
+///
+/// Past the *middle* of a character means the caret belongs after it, which
+/// is what makes clicking between two letters land where the eye expects
+/// rather than always to the left of it. Walks forward and stops at the
+/// answer, so a click near the start of a long line costs a couple of
+/// measures rather than one per character.
+fn indexAt(ui: *UI, f: *Field, st: Style, left: f32, x: f32) Error!u32 {
+    const text = f.slice();
+    var i: u32 = 0;
+    var behind: f32 = 0;
+    while (i < f.len) {
+        const next = after(text, i);
+        const ahead = (try ui.metrics.measure(text[0..next], st.font, st.font_size)).x;
+        if (left + (behind + ahead) * 0.5 > x) return i;
+        behind = ahead;
+        i = next;
+    }
+    return f.len;
+}
 fn mix(a: Color, b: Color, k: f32) Color {
     const t = std.math.clamp(k, 0, 1);
     return .{
@@ -731,4 +764,48 @@ test "a focused field with a selection draws a band, the text and a caret" {
     try testing.expectApproxEqAbs(@as(f32, caret_width), caret.rect.width(), 0.01);
     // The caret is at the end, which is where `selectAll` leaves it.
     try testing.expectApproxEqAbs(@as(f32, pad + 35), caret.rect.min_x, 0.01);
+}
+
+test "a press puts the caret at the character it landed nearest" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+    f.set("hello");
+
+    // The text starts at `pad` and every character is seven wide, so sixteen
+    // is past the middle of the second one: the caret belongs after the
+    // first, not before it, which is what a field that rounded down does.
+    const at: @import("../../gelgja/geom.zig").Point = .{ .x = 16, .y = 20 };
+
+    // Over it first. A press only reaches a box the pointer was already on,
+    // which is true of a real mouse and is where the frame of latency in
+    // hover resolution shows.
+    _ = try oneFrame(&ui, &f, .{ .mouse = at });
+    _ = try oneFrame(&ui, &f, .{ .mouse = at, .buttons = .{ .left = true } });
+
+    try testing.expectEqual(@as(u32, 1), f.caret);
+    try testing.expect(!f.hasSelection());
+}
+
+test "dragging from a press selects between the two" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var store: [64]u8 = undefined;
+    var f: Field = .init(&store);
+    f.set("hello");
+
+    // Just past the middle of the first character, which sits at 9.5.
+    const start: @import("../../gelgja/geom.zig").Point = .{ .x = 12, .y = 20 };
+    _ = try oneFrame(&ui, &f, .{ .mouse = start });
+    _ = try oneFrame(&ui, &f, .{ .mouse = start, .buttons = .{ .left = true } });
+    try testing.expectEqual(@as(u32, 1), f.anchor);
+
+    // Still held, three characters along.
+    const along: @import("../../gelgja/geom.zig").Point = .{ .x = 30, .y = 20 };
+    _ = try oneFrame(&ui, &f, .{ .mouse = along, .buttons = .{ .left = true } });
+
+    try testing.expectEqual(@as(u32, 1), f.anchor);
+    try testing.expect(f.caret > 1);
+    try testing.expect(f.hasSelection());
 }
