@@ -447,6 +447,17 @@ pub fn boxf(ui: *UI, comptime fmt: []const u8, args: anytype) Error!*Box {
     return ui.makeBox(parsed.key, parsed.display);
 }
 
+/// A box whose display text and key are given separately.
+///
+/// `box` and `boxf` take one string and split it on `###`, which is right for
+/// a label the caller wrote and wrong for text the caller did not write: a
+/// search field holding `a###b` would split on the user's own hashes, key on
+/// `b`, and draw half the query. Anything that shows text from outside the
+/// program -- a field, a search result, a document's title -- uses this.
+pub fn boxText(ui: *UI, name: []const u8, text: []const u8) Error!*Box {
+    return ui.makeBox(key.make(ui.parent().key, name), text);
+}
+
 /// A box that becomes the parent for everything up to the matching `close`.
 pub fn open(ui: *UI, label: []const u8) Error!*Box {
     const b = try ui.box(label);
@@ -1608,4 +1619,26 @@ test "a disabled box takes no input at all" {
     const s = try build(&ui);
     ui.end();
     try testing.expect(!s.hovering and !s.pressed);
+}
+
+test "boxText keys on its name and not on the text it is showing" {
+    var ui: UI = .init(testing.allocator, fixed_metrics);
+    defer ui.deinit();
+
+    // A query with hashes in it. Through `box` this would split on the user's
+    // own `###`, key on `b`, and draw `a` -- which is why fields use this.
+    try ui.begin(.fromRect(0, 0, 200, 100), .{});
+    const first = try ui.boxText("query", "a###b");
+    ui.end();
+
+    try testing.expectEqualStrings("a###b", first.text);
+
+    try ui.begin(.fromRect(0, 0, 200, 100), .{});
+    const second = try ui.boxText("query", "something else");
+    ui.end();
+
+    // The same box across a complete change of text, which is what a field
+    // being typed into needs: its focus and its animation survive.
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(key.make(ui.root.key, "query"), second.key);
 }
