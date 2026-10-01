@@ -108,16 +108,25 @@ privileged access to anything a caller could not reach.
 
 | | Commit | ~ |
 |---|---|---|
-| 🚧 | a text field with a caret and a selection | 280 |
-| | a list widget that only builds its visible rows | 200 |
+| ✅ | the editing model behind a text field | 345 |
+| ✅ | a box whose text and key are given separately | 30 |
+| ✅ | a text field widget | 398 |
+| ✅ | clicking and dragging in a text field | 77 |
+| 🚧 | a list widget that only builds its visible rows | 200 |
 | | floating popups, and menus built on them | 200 |
 | | a tab bar | 180 |
 | | icon buttons, tooltips and a draggable splitter | 200 |
 
-The field owns no string: the caller's buffer is passed in, the way
-`checkbox` takes a `*bool`. IME is deferred — `input.zig` already delivers
-composed text, so the field will not need reworking when a platform grows
-one.
+`src/thviti/widgets/field.zig` holds both halves: `Field`, which is pure
+arithmetic over bytes and testable with nothing at all, and `textField`, which
+draws it. The field owns no string — `Field.bytes` is the caller's storage and
+nothing in it allocates, the way `checkbox` takes a `*bool`. Every field in
+this program is bounded (a page number, a query, a `:` line), so `insert`
+returning false when full is the whole overflow policy.
+
+`UI.boxText` was added for it: `box` and `boxf` split their label on `###`,
+which is right for a label the program wrote and wrong for text a person
+typed. Anything showing text from outside the program uses `boxText`.
 
 The list takes a row count, a row height and a callback, and builds only the
 rows the scroll view can see. `vanagandr/ui.zig` builds all of them and lets
@@ -393,10 +402,14 @@ Things that cost time once and should not cost it again.
   at strictness 1. A message longer than the window is cut at the page number
   instead of pushing it out. That is one rule in the sizing, not a string
   measured and truncated every frame.
-- **A commit here runs 60–280 lines.** `the reader draws its own text` is 472
-  and is the outlier, because it introduced a whole subsystem; do not treat it
-  as licence. The clean seam if it ever needs splitting is `Chrome` (device
-  plumbing) apart from `statusBar` (the widget).
+- **Commits here have been running large, and should not.** `CLAUDE.md` asks
+  for under about three hundred lines, and the repository's own code commits
+  before this work ran 60–272. The interface commits have landed between 30
+  and 472, because a widget arrives with its documentation and its tests and
+  the three do not divide neatly. Two seams that did work, and are worth
+  reaching for first: split a *model* from the *widget that draws it* (the
+  text field), and split the *keyboard* from the *mouse* (the same). Splitting
+  so that one commit draws nothing is not a seam, it is bookkeeping.
 
 ## Verifying a change
 
