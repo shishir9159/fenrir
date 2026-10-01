@@ -40,8 +40,15 @@ pub const Error = UI.Error;
 pub const field = @import("widgets/field.zig");
 pub const Field = field.Field;
 
+/// A scrolling list that builds only the rows it can see. Its own file for
+/// the same reason: the range it builds is arithmetic and is tested with no
+/// UI at all.
+pub const list = @import("widgets/list.zig");
+pub const List = list.List;
+
 test {
     _ = field;
+    _ = list;
 }
 
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with

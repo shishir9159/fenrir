@@ -112,8 +112,8 @@ privileged access to anything a caller could not reach.
 | ✅ | a box whose text and key are given separately | 30 |
 | ✅ | a text field widget | 398 |
 | ✅ | clicking and dragging in a text field | 77 |
-| 🚧 | a list widget that only builds its visible rows | 200 |
-| | floating popups, and menus built on them | 200 |
+| ✅ | a list widget that only builds its visible rows | 254 |
+| 🚧 | floating popups, and menus built on them | 200 |
 | | a tab bar | 180 |
 | | icon buttons, tooltips and a draggable splitter | 200 |
 
@@ -128,10 +128,21 @@ returning false when full is the whole overflow policy.
 which is right for a label the program wrote and wrong for text a person
 typed. Anything showing text from outside the program uses `boxText`.
 
-The list takes a row count, a row height and a callback, and builds only the
-rows the scroll view can see. `vanagandr/ui.zig` builds all of them and lets
-the draw list cull, which is fine for 200 rows and wrong for a 600-page
-outline; the `culled` counter in `fenrir ui` is what will say so.
+`src/thviti/widgets/list.zig` takes a row count and a row height and builds
+only the rows the scroll view can see, cutting the same seam again: `range`
+is four numbers in and two row indices out, so every awkward case is asked
+about with no UI at all. An iterator rather than the callback first sketched
+here, because `openPanel` already makes that argument — the call site keeps
+its own control flow, which is where a list wants to `continue` or to break
+out early. Rows stay in the flow behind a nil-keyed spacer rather than being
+floated at `index * row_height`, since `UI.positions` deliberately does not
+scroll floating children.
+
+`vanagandr/ui.zig` built all of them and let the draw list cull, which is
+fine for 200 rows and wrong for a 600-page outline. Its sidebar now uses the
+widget, and the `culled` counter is what says so: **163 boxes solved and
+1599 instances culled became 71 and 27**, with the frame unchanged but for
+the indent, which is a spacer now instead of three spaces in the label.
 
 The splitter commit also gives `Layout` draggable dividers, closing the
 README's *"Windows are resized only by the layout, not by dragging the

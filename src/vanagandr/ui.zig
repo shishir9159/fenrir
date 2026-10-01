@@ -288,52 +288,44 @@ fn sidebar(ui: *UI, state: *State) !void {
     _ = try w.label(ui, "OUTLINE");
     ui.close(head);
 
-    const content = @as(f32, @floatFromInt(state.pages)) * row_height;
-
     ui.next(.{ .w = .fill, .h = .fill, .axis = .x });
     const split = try ui.open("outline split");
     defer ui.close(split);
 
+    // Only the rows the view can see are built. At a hundred and twenty-eight
+    // sections that is a few hundred boxes saved; at a six-hundred-page
+    // outline it is the difference between a frame and a stall, and the
+    // `culled` counter this command prints is what says so either way.
     ui.next(.{ .w = .fill, .h = .fill });
-    const view = try w.openScroll(ui, "outline", content);
+    const rows = try w.list.open(ui, "outline", .{
+        .count = state.pages,
+        .row_height = row_height,
+    });
     {
-        defer ui.close(view.box);
+        defer w.list.close(ui, rows);
 
-        // The whole list is built, and the boxes outside the view are culled
-        // by the draw list rather than by this loop. Two hundred rows is
-        // cheap; two hundred thousand would want a visible range, and the
-        // `culled` counter is what would say so.
-        var n: u32 = 0;
-        while (n < state.pages) : (n += 1) {
+        ui.pushStyle(.{ .font_size = 12, .fg = .{ .r = 0.70, .g = 0.72, .b = 0.78 } });
+        defer ui.popStyle();
+
+        var it = rows.rows();
+        while (it.next()) |n| {
             const current = n + 1 == state.page;
-            ui.next(.{
-                .w = .fill,
-                .h = .px(row_height),
-                .child_align = .center,
-                .axis = .x,
-                .flags = .{
-                    .clickable = true,
-                    .draw_background = true,
-                    .draw_text = true,
-                    .hot_animation = true,
-                },
-                .bg = if (current)
-                    .{ .r = 0.20, .g = 0.36, .b = 0.62 }
-                else
-                    .{ .r = 0.15, .g = 0.16, .b = 0.19, .a = 0 },
-                .fg = if (current)
-                    .{ .r = 1, .g = 1, .b = 1 }
-                else
-                    .{ .r = 0.70, .g = 0.72, .b = 0.78 },
-                .font_size = 12,
+            if (current) ui.pushStyle(.{ .fg = .{ .r = 1, .g = 1, .b = 1 } });
+            defer if (current) ui.popStyle();
+
+            var buf: [32]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "Section {d}", .{n + 1});
+            const sig = try w.list.row(ui, rows, n, text, .{
+                .selected = current,
+                .indent = 12,
+                .selection = .{ .r = 0.20, .g = 0.36, .b = 0.62 },
             });
-            const b = try ui.boxf("   Section {d}###row{d}", .{ n + 1, n });
-            if (ui.signal(b).clicked) state.page = n + 1;
+            if (sig.clicked) state.page = n + 1;
         }
     }
 
     ui.next(.{ .bg = .{ .r = 0.12, .g = 0.13, .b = 0.15 } });
-    try w.scrollBar(ui, "outline bar", view, content);
+    try w.list.scrollBar(ui, "outline bar", rows);
 }
 
 fn pageView(ui: *UI, state: *State) !void {
