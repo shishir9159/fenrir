@@ -113,7 +113,8 @@ privileged access to anything a caller could not reach.
 | ✅ | a text field widget | 398 |
 | ✅ | clicking and dragging in a text field | 77 |
 | ✅ | a list widget that only builds its visible rows | 254 |
-| 🚧 | floating popups, and menus built on them | 200 |
+| ✅ | a panel that floats over everything else | 258 |
+| 🚧 | menus built on the popup | 200 |
 | | a tab bar | 180 |
 | | icon buttons, tooltips and a draggable splitter | 200 |
 
@@ -143,6 +144,19 @@ fine for 200 rows and wrong for a 600-page outline. Its sidebar now uses the
 widget, and the `culled` counter is what says so: **163 boxes solved and
 1599 instances culled became 71 and 27**, with the frame unchanged but for
 the indent, which is a spacer now instead of three spaces in the label.
+
+`src/thviti/widgets/popup.zig` is one box floated against the root, and it
+is on top because it is **built last** — the same order `UI` already draws
+and hit-tests in, so nothing sorts and there is no second layer. Menus,
+tooltips and the command palette are all that box with different contents.
+Dismissal is a clickable backdrop behind it, and the press that *opened* a
+popup cannot be the press that closes it: hover is resolved by walking the
+tree, so a backdrop absent when hover was last resolved is not hot, and a
+press only reaches a box the pointer was already over. That frame of latency
+is usually the price of immediate call sites; here it is the mechanism.
+
+The popup and the menu are separate commits, the way the text field's model
+and its widget were. The popup is the one with the argument in it.
 
 The splitter commit also gives `Layout` draggable dividers, closing the
 README's *"Windows are resized only by the layout, not by dragging the

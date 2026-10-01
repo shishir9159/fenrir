@@ -46,9 +46,15 @@ pub const Field = field.Field;
 pub const list = @import("widgets/list.zig");
 pub const List = list.List;
 
+/// A panel floating over everything else. An ordinary box floated against
+/// the root, on top because it is built last.
+pub const popup = @import("widgets/popup.zig");
+pub const Popup = popup.Popup;
+
 test {
     _ = field;
     _ = list;
+    _ = popup;
 }
 
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with
