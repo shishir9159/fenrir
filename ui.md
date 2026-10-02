@@ -115,8 +115,8 @@ privileged access to anything a caller could not reach.
 | ✅ | a list widget that only builds its visible rows | 254 |
 | ✅ | a panel that floats over everything else | 258 |
 | ✅ | menus built on the popup | 391 |
-| 🚧 | a tab bar | 180 |
-| | icon buttons, tooltips and a draggable splitter | 200 |
+| ✅ | a tab bar | 367 |
+| 🚧 | icon buttons, tooltips and a draggable splitter | 200 |
 
 `src/thviti/widgets/field.zig` holds both halves: `Field`, which is pure
 arithmetic over bytes and testable with nothing at all, and `textField`, which
@@ -165,6 +165,15 @@ before any item exists — so it records the index it chose and `item` reports
 it as it is built. A row activated from the keyboard comes back through the
 same return value as one that was clicked, and the caller cannot tell them
 apart, which is the point.
+
+`tabs.zig` is the accent bar the design language asks for and nothing else —
+no raised shape, no notch. A tab asks for 180 pixels at a strictness of 0.55
+rather than sizing to its title: a bar whose tabs move when a document is
+opened is a bar nobody can aim at, and when there are more tabs than room
+the solver shares the shortfall between all of them, so the *minimum width
+is the strictness* and there is no second number to get wrong. The close
+cross is a clickable box inside a clickable tab, and the inner one wins for
+nothing — hover is depth-first in build order, last match taking it.
 
 The splitter commit also gives `Layout` draggable dividers, closing the
 README's *"Windows are resized only by the layout, not by dragging the

@@ -175,7 +175,10 @@ pub const State = struct {
     zoom: u32 = 125,
     outline_open: bool = true,
     continuous: bool = true,
+    tab: u32 = 0,
 };
+
+const open_documents = [_][]const u8{ "gylfaginning.pdf", "skaldskaparmal.pdf" };
 
 /// A reader's chrome, written the way it would be written for real.
 pub fn scene(ui: *UI, state: *State) !void {
@@ -187,9 +190,16 @@ pub fn scene(ui: *UI, state: *State) !void {
     defer ui.close(window);
 
     try titleBar(ui, state);
+    try tabPages(ui, state);
     try toolBar(ui, state);
     try body(ui, state);
     try statusBar(ui, state);
+}
+
+fn tabPages(ui: *UI, state: *State) !void {
+    ui.next(.{ .bg = .{ .r = 0.13, .g = 0.14, .b = 0.17 } });
+    const r = try w.tabBar(ui, "tabs", &open_documents, state.tab, .{ .add = true });
+    if (r.activated) |n| state.tab = n;
 }
 
 fn titleBar(ui: *UI, state: *State) !void {

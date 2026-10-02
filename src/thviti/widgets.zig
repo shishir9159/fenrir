@@ -55,11 +55,16 @@ pub const Popup = popup.Popup;
 pub const menu = @import("widgets/menu.zig");
 pub const Menu = menu.Menu;
 
+/// One row of documents, with an accent bar on the active one.
+pub const tabs = @import("widgets/tabs.zig");
+pub const tabBar = tabs.tabBar;
+
 test {
     _ = field;
     _ = list;
     _ = popup;
     _ = menu;
+    _ = tabs;
 }
 
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with
