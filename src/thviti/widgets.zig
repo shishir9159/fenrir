@@ -51,10 +51,15 @@ pub const List = list.List;
 pub const popup = @import("widgets/popup.zig");
 pub const Popup = popup.Popup;
 
+/// A menu: a popup full of rows, each a command and the key that runs it.
+pub const menu = @import("widgets/menu.zig");
+pub const Menu = menu.Menu;
+
 test {
     _ = field;
     _ = list;
     _ = popup;
+    _ = menu;
 }
 
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with

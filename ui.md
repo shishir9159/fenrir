@@ -114,8 +114,8 @@ privileged access to anything a caller could not reach.
 | ✅ | clicking and dragging in a text field | 77 |
 | ✅ | a list widget that only builds its visible rows | 254 |
 | ✅ | a panel that floats over everything else | 258 |
-| 🚧 | menus built on the popup | 200 |
-| | a tab bar | 180 |
+| ✅ | menus built on the popup | 391 |
+| 🚧 | a tab bar | 180 |
 | | icon buttons, tooltips and a draggable splitter | 200 |
 
 `src/thviti/widgets/field.zig` holds both halves: `Field`, which is pure
@@ -157,6 +157,14 @@ is usually the price of immediate call sites; here it is the mechanism.
 
 The popup and the menu are separate commits, the way the text field's model
 and its widget were. The popup is the one with the argument in it.
+
+`menu.zig` draws each command's binding dim at the right, because the design
+language asks for it and a menu that hides which key runs a command has
+broken the promise. Enter cannot act where it is read — the keys are read
+before any item exists — so it records the index it chose and `item` reports
+it as it is built. A row activated from the keyboard comes back through the
+same return value as one that was clicked, and the caller cannot tell them
+apart, which is the point.
 
 The splitter commit also gives `Layout` draggable dividers, closing the
 README's *"Windows are resized only by the layout, not by dragging the
