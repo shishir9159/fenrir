@@ -64,8 +64,8 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     var atlas_dest: ?[]const u8 = null;
     var width: u32 = 1000;
     var height: u32 = 640;
-    var mouse: Point = .{ .x = 140, .y = 58 };
-    var frames: u32 = 24;
+    var mouse: Point = .{ .x = 82, .y = 84 };
+    var frames: u32 = 40;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -176,6 +176,9 @@ pub const State = struct {
     outline_open: bool = true,
     continuous: bool = true,
     tab: u32 = 0,
+    /// The one tooltip the window can have. Interface state that is not the
+    /// UI's, because it is about the pointer and not about a box.
+    tips: w.Tips = .{},
 };
 
 const open_documents = [_][]const u8{ "gylfaginning.pdf", "skaldskaparmal.pdf" };
@@ -194,6 +197,10 @@ pub fn scene(ui: *UI, state: *State) !void {
     try toolBar(ui, state);
     try body(ui, state);
     try statusBar(ui, state);
+
+    // Last, and that is the contract rather than a habit: a popup is on top
+    // because it is built after everything it is on top of.
+    try w.tool.tooltips(ui, &state.tips);
 }
 
 fn tabPages(ui: *UI, state: *State) !void {
@@ -240,7 +247,13 @@ fn toolBar(ui: *UI, state: *State) !void {
 
     try w.spacer(ui, .px(12));
     _ = try w.button(ui, "Open");
-    try w.spacer(ui, .px(6));
+    try w.spacer(ui, .px(10));
+
+    // A letter stands in for the icon until there is a registry to ask. The
+    // widget is the same either way; only what it is handed changes.
+    const rail = try w.iconToggle(ui, "outline", "O", &state.outline_open, .{});
+    w.tool.hint(ui, &state.tips, rail, "Outline");
+    try w.spacer(ui, .px(10));
 
     if ((try w.buttonWith(ui, "Prev", .{ .disabled = state.page == 1 })).clicked) {
         state.page -|= 1;

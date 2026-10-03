@@ -116,7 +116,8 @@ privileged access to anything a caller could not reach.
 | ✅ | a panel that floats over everything else | 258 |
 | ✅ | menus built on the popup | 391 |
 | ✅ | a tab bar | 367 |
-| 🚧 | icon buttons, tooltips and a draggable splitter | 200 |
+| ✅ | icon buttons, and the tooltips that name them | 373 |
+| 🚧 | a splitter, and windows resized by dragging one | 300 |
 
 `src/thviti/widgets/field.zig` holds both halves: `Field`, which is pure
 arithmetic over bytes and testable with nothing at all, and `textField`, which
@@ -174,6 +175,20 @@ the solver shares the shortfall between all of them, so the *minimum width
 is the strictness* and there is no second number to get wrong. The close
 cross is a clickable box inside a clickable tab, and the inner one wins for
 nothing — hover is depth-first in build order, last match taking it.
+
+`tool.zig` takes a *string* for its glyph, which is a bookmark and not a
+design — phase two hands it an icon id instead and nothing else about the
+widget changes. Its tooltip is two calls, not one: `hint` records what the
+pointer is resting on where the control is built, and `tooltips` draws it
+at the end of the frame, because a popup is on top only by being built last.
+It waits 0.45s, and the clock restarts on a different box, so a pointer
+crossing a rail does not drag a tooltip across the screen with it.
+
+One trap paid for here and worth not paying twice: **a spacer inside a box
+that sizes to its children is the whole window wide.** `spacer` is `.fill`,
+a percentage looks past a `children_sum` ancestor for something with a size,
+and the next one up is the root. Padding inside a popup goes in the text
+size's own `pad`, not in spacers.
 
 The splitter commit also gives `Layout` draggable dividers, closing the
 README's *"Windows are resized only by the layout, not by dragging the

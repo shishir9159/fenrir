@@ -63,6 +63,9 @@ pub const Options = struct {
     /// which is shown *because* the pointer is somewhere and would be
     /// dismissed by its own existence.
     backdrop: bool = true,
+    /// Shadow spread. Here rather than left to `ui.next`, because the
+    /// backdrop is built first and clears whatever the caller set pending.
+    shadow: f32 = 12,
 };
 
 pub const Popup = struct {
@@ -101,6 +104,7 @@ pub fn open(ui: *UI, name: []const u8, opts: Options) Error!Popup {
         .fixed_x = at.x,
         .fixed_y = at.y,
         .radius = .all(6),
+        .shadow = opts.shadow,
         .flags = .{
             .floating_x = true,
             .floating_y = true,
@@ -121,17 +125,21 @@ pub fn close(ui: *UI, p: Popup) void {
 
 /// Pushes a popup back inside the viewport.
 ///
-/// The width is known -- the caller gave it -- and the height usually is not,
-/// because a menu is as tall as its items. Last frame's rectangle answers
-/// that, the way every other geometry a call site reads here does, so a popup
-/// opening near the bottom edge hangs over it for one frame and then sits
-/// against it.
+/// A width given in pixels is known at once; a height is almost never, since
+/// a menu is as tall as its items and a tooltip is as wide as its words.
+/// Last frame's rectangle answers what the options do not, the way every
+/// other geometry a call site reads here does -- so a popup opening near an
+/// edge hangs over it for one frame and then sits against it.
 fn clampInto(ui: *UI, name: []const u8, opts: Options) Point {
     const view = ui.viewport;
-    const k = key.make(ui.parent().key, name);
+    const last = ui.find(key.make(ui.parent().key, name));
 
-    const width = if (opts.w.kind == .pixels) opts.w.value else 0;
-    const height = if (ui.find(k)) |b| b.rect.height() else 0;
+    const width = if (opts.w.kind == .pixels)
+        opts.w.value
+    else if (last) |b| b.rect.width() else 0;
+    const height = if (opts.h.kind == .pixels)
+        opts.h.value
+    else if (last) |b| b.rect.height() else 0;
 
     return .{
         .x = @max(view.min_x, @min(opts.at.x, view.max_x - width)),

@@ -59,12 +59,19 @@ pub const Menu = menu.Menu;
 pub const tabs = @import("widgets/tabs.zig");
 pub const tabBar = tabs.tabBar;
 
+/// Icon buttons, and the tooltips that say what they are.
+pub const tool = @import("widgets/tool.zig");
+pub const iconButton = tool.iconButton;
+pub const iconToggle = tool.iconToggle;
+pub const Tips = tool.Tips;
+
 test {
     _ = field;
     _ = list;
     _ = popup;
     _ = menu;
     _ = tabs;
+    _ = tool;
 }
 
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with
