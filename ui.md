@@ -16,7 +16,8 @@ shaped the way it is.
 else. Its mode line was the **operating system's title bar**, because a window
 that cannot write in itself has nowhere else to put one. Þviti — the UI layer
 — was finished as a core and exercised only by `fenrir ui` and `fenrir view`,
-neither of which opens a document. The README says so outright:
+neither of which opens a document. The README said so outright, until phase
+one was finished and it stopped being true:
 
 > Still missing, and deliberately: a real widget set. Text fields with
 > selection and an IME, menus, tab bars, trees, splitters, drag-and-drop.
@@ -112,12 +113,12 @@ privileged access to anything a caller could not reach.
 | ✅ | a box whose text and key are given separately | 30 |
 | ✅ | a text field widget | 398 |
 | ✅ | clicking and dragging in a text field | 77 |
-| ✅ | a list widget that only builds its visible rows | 254 |
-| ✅ | a panel that floats over everything else | 258 |
-| ✅ | menus built on the popup | 391 |
-| ✅ | a tab bar | 367 |
-| ✅ | icon buttons, and the tooltips that name them | 373 |
-| ✅ | a splitter, and windows resized by dragging one | 380 |
+| ✅ | a list widget that only builds its visible rows | 444 |
+| ✅ | a panel that floats over everything else | 271 |
+| ✅ | menus built on the popup | 399 |
+| ✅ | a tab bar | 369 |
+| ✅ | icon buttons, and the tooltips that name them | 387 |
+| ✅ | a splitter, and windows resized by dragging one | 487 |
 
 `src/thviti/widgets/field.zig` holds both halves: `Field`, which is pure
 arithmetic over bytes and testable with nothing at all, and `textField`, which
@@ -212,11 +213,25 @@ exactly where they were.
 ### What phase 1 cost, against what it was budgeted
 
 Four rows of the table became six commits: the popup split from the menu,
-and the splitter from the icon buttons. Both were the seams `CLAUDE.md`
-asks for and both landed near 300 lines rather than the 500 the unsplit
-versions would have been. The estimates were 200 and the commits ran 271 to
-399 — a widget still arrives with its documentation and its tests, and the
-three still do not divide neatly.
+and the splitter from the icon buttons. Both were seams `CLAUDE.md` asks
+for, and the unsplit versions would have been 670 and 874 lines.
+
+It was still not enough. The estimates were 200 a commit and the six ran
+271 to 487, averaging 393. A widget arrives with its documentation and its
+tests and the three do not divide neatly — the tests are a third of every
+one of these files, and the argument for why a widget is shaped as it is is
+another third. The only commit that came in near the budget is the one with
+no tests in it at all, `a box whose text and key are given separately`, at
+thirty lines.
+
+The seam that would actually have worked on the biggest of them is the one
+the text field used and these did not: **keyboard from mouse.** The menu's
+arrow keys are a hundred lines that arrive after a menu that already works
+with the pointer; the splitter's `Layout` half is a hundred and fifty that
+arrive after a splitter that already works on panels. Both were written in
+one go because they were being written for the first time and the shape was
+not settled until the end. Next phase, split them in the plan rather than
+noticing afterwards.
 
 ### Phase 2 — icons
 
