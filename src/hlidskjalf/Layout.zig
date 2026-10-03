@@ -548,6 +548,94 @@ pub fn borders(l: *Layout, out: *std.ArrayList(Bounds), gpa: Allocator) Allocato
     }
 }
 
+/// One line between two windows: which node owns it, which pair it divides,
+/// and where it is.
+///
+/// Named by the node and the index rather than by the rectangle, because a
+/// drag re-lays the tree on every frame. A divider that knew only where it
+/// had been would have to be found again after each move, and would be lost
+/// the moment it reached a window's minimum and stopped moving under the
+/// pointer.
+pub const Divider = struct {
+    node: u32,
+    /// The gap between children `after - 1` and `after`.
+    after: u32,
+    /// `vertical` between two side-by-side windows, matching the direction
+    /// the split that made it was asked for in.
+    dir: Direction,
+    rect: Bounds,
+};
+
+/// The divider under a point, or null.
+///
+/// `slack` widens each line across its thickness. A two-pixel line is a
+/// two-pixel target and nobody can hit one; widening it here rather than
+/// drawing it thicker keeps what is grabbed and what is seen independent,
+/// which is the only way to have a hairline you can still take hold of.
+pub fn dividerAt(l: *Layout, p: Point, slack: f32) ?Divider {
+    for (l.nodes.items, 0..) |n, node| {
+        if (n.kind != .row and n.kind != .column) continue;
+
+        var i: usize = 1;
+        while (i < n.children.items.len) : (i += 1) {
+            const before = l.nodes.items[n.children.items[i - 1]].rect;
+            const after = l.nodes.items[n.children.items[i]].rect;
+            const stacked = n.kind == .column;
+
+            const rect: Bounds = if (stacked)
+                .fromRect(n.rect.min_x, before.max_y, n.rect.max_x, after.min_y)
+            else
+                .fromRect(before.max_x, n.rect.min_y, after.min_x, n.rect.max_y);
+
+            const grab: Bounds = if (stacked)
+                .fromRect(rect.min_x, rect.min_y - slack, rect.max_x, rect.max_y + slack)
+            else
+                .fromRect(rect.min_x - slack, rect.min_y, rect.max_x + slack, rect.max_y);
+
+            if (grab.contains(p)) return .{
+                .node = @intCast(node),
+                .after = @intCast(i),
+                .dir = if (stacked) .horizontal else .vertical,
+                .rect = rect,
+            };
+        }
+    }
+    return null;
+}
+
+/// Moves a divider so its line lands at `at` -- device pixels along the axis
+/// the pair is stacked on -- and re-lays the tree, as `split` and `close` do.
+///
+/// Only the two windows either side move: their shares sum to the same number
+/// afterwards, so dragging one line in a row of four leaves the other two
+/// exactly where they were. Neither side goes below `min_side`, which is the
+/// same floor a split refuses to go under, so a window can never be dragged
+/// smaller than one that could have been made.
+pub fn moveDivider(l: *Layout, d: Divider, at: f32) void {
+    if (l.root == none or d.node >= l.nodes.items.len) return;
+    const n = &l.nodes.items[d.node];
+    if (d.after == 0 or d.after >= n.children.items.len) return;
+
+    const i = d.after;
+    const stacked = n.kind == .column;
+    const total = if (stacked) n.rect.height() else n.rect.width();
+    const kids: f32 = @floatFromInt(n.children.items.len);
+    const usable = @max(1, total - border * (kids - 1));
+
+    const pair = n.shares.items[i - 1] + n.shares.items[i];
+    const room = usable * pair;
+    if (room < min_side * 2) return;
+
+    const first = l.nodes.items[n.children.items[i - 1]].rect;
+    const start = if (stacked) first.min_y else first.min_x;
+
+    const want = std.math.clamp(at - start, min_side, room - min_side);
+    n.shares.items[i - 1] = want / usable;
+    n.shares.items[i] = pair - n.shares.items[i - 1];
+
+    l.arrange(l.nodes.items[l.root].rect);
+}
+
 fn indexOf(items: []const u32, want: u32) ?usize {
     for (items, 0..) |it, i| {
         if (it == want) return i;
@@ -830,4 +918,68 @@ test "a window at a chosen zoom keeps it through a split" {
     _ = try l.split(gpa, .vertical);
     var it = l.iterator();
     while (it.next()) |v| try testing.expectApproxEqAbs(@as(f32, 2), v.zoom, 0.001);
+}
+
+test "the line between two windows is found by a point near it" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var l = try started(gpa, fakePages(&buf, 3));
+    defer l.deinit(gpa);
+
+    _ = try l.split(gpa, .vertical);
+    const d = l.dividerAt(.{ .x = 500, .y = 400 }, 4).?;
+    try testing.expectEqual(Direction.vertical, d.dir);
+    try testing.expectEqual(@as(u32, 1), d.after);
+    // Two pixels wide, in the middle, and the full height.
+    try testing.expectApproxEqAbs(@as(f32, border), d.rect.width(), 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 800), d.rect.height(), 1e-3);
+
+    // The slack is what makes it hittable; without it a two-pixel line is a
+    // two-pixel target.
+    try testing.expect(l.dividerAt(.{ .x = 504, .y = 400 }, 4) != null);
+    try testing.expect(l.dividerAt(.{ .x = 504, .y = 400 }, 0) == null);
+    try testing.expect(l.dividerAt(.{ .x = 200, .y = 400 }, 4) == null);
+}
+
+test "dragging the line resizes both windows and nothing else" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var l = try started(gpa, fakePages(&buf, 3));
+    defer l.deinit(gpa);
+
+    // Three columns: a third each.
+    const a = l.currentIndex();
+    const b = (try l.split(gpa, .vertical)).?;
+    const c = (try l.split(gpa, .vertical)).?;
+    const third = l.viewAt(c).rect;
+
+    const d = l.dividerAt(.{ .x = l.viewAt(a).rect.max_x + 1, .y = 400 }, 4).?;
+    l.moveDivider(d, 200);
+
+    try testing.expectApproxEqAbs(@as(f32, 200), l.viewAt(a).rect.max_x, 1e-3);
+    // The third window did not move: a drag takes from one neighbour, not
+    // from every window in the row.
+    try testing.expectApproxEqAbs(third.min_x, l.viewAt(c).rect.min_x, 1e-3);
+    try testing.expectApproxEqAbs(third.max_x, l.viewAt(c).rect.max_x, 1e-3);
+    // And the pair still fills what it filled before.
+    try testing.expectApproxEqAbs(third.min_x - border, l.viewAt(b).rect.max_x, 1e-3);
+}
+
+test "neither window can be dragged below the width a split needs" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var l = try started(gpa, fakePages(&buf, 3));
+    defer l.deinit(gpa);
+
+    const a = l.currentIndex();
+    const b = (try l.split(gpa, .horizontal)).?;
+
+    const d = l.dividerAt(.{ .x = 500, .y = l.viewAt(a).rect.max_y + 1 }, 4).?;
+    try testing.expectEqual(Direction.horizontal, d.dir);
+
+    l.moveDivider(d, -400);
+    try testing.expectApproxEqAbs(@as(f32, min_side), l.viewAt(a).rect.height(), 1e-3);
+
+    l.moveDivider(l.dividerAt(.{ .x = 500, .y = l.viewAt(a).rect.max_y + 1 }, 4).?, 5000);
+    try testing.expectApproxEqAbs(@as(f32, min_side), l.viewAt(b).rect.height(), 1e-3);
 }

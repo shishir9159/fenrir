@@ -888,6 +888,9 @@ const Session = struct {
     /// The selection made with the mouse, or null when there is none.
     drag: ?Drag = null,
 
+    /// The line between two windows, while it is being dragged.
+    split_drag: ?Layout.Divider = null,
+
     /// The highlight in hand in edit mode, by its session key.
     focus_mark: ?u64 = null,
     /// The note being typed in note mode. Written to the highlight on enter.
@@ -2573,6 +2576,10 @@ const Session = struct {
         const down = in.buttons.left;
         const pressed = down and !s.view().was_down;
 
+        // Before anything else: a gesture that began on the line between two
+        // windows belongs to that line until it is let go.
+        if (s.dragSplit(in, down, pressed)) return;
+
         // A press begins a new gesture, so whatever was selected stops being
         // selected -- and it happens here, before anything below can read
         // `s.drag` and take the last gesture's selection for this one's.
@@ -2639,6 +2646,37 @@ const Session = struct {
         const p = s.positionAt(v, in.mouse) orelse return;
         s.drag = .{ .buffer = v.buffer, .from = p, .to = p };
         s.carryCursor(v, p);
+    }
+
+    /// How far either side of the line a press still counts as taking hold
+    /// of it. The line is two pixels; nobody can hit two pixels.
+    const divider_slack: f32 = 4;
+
+    /// The line between two windows, taken hold of and moved. True when the
+    /// gesture belongs to a divider, and nothing below should see it.
+    ///
+    /// The divider is remembered for the whole drag rather than looked up
+    /// each frame, because the pointer runs ahead of the line the moment it
+    /// reaches a window's minimum -- and a lookup would then find nothing and
+    /// drop the gesture just as someone leans into it.
+    fn dragSplit(s: *Session, in: lyngvi.Input, down: bool, pressed: bool) bool {
+        if (down and pressed and s.split_drag == null) {
+            s.split_drag = s.layout.dividerAt(in.mouse, divider_slack);
+        }
+        const d = s.split_drag orelse return false;
+
+        if (down) {
+            s.layout.moveDivider(d, if (d.dir == .vertical) in.mouse.x else in.mouse.y);
+        } else {
+            s.split_drag = null;
+        }
+
+        // Everything below the early return is skipped, and that includes the
+        // button bookkeeping `dragScrollbar` does. Without this the release
+        // that ends a drag still looks like a press on the frame after it,
+        // and the next press anywhere is swallowed.
+        s.view().was_down = down;
+        return true;
     }
 
     /// Moves the caret to where the pointer is, which is what a click in text
@@ -4308,4 +4346,32 @@ test "letting go of a drag leaves a selection, not a highlight" {
     _ = s.apply(.toggle_highlight);
     try testing.expect(s.drag == null);
     try testing.expect(s.buffer(0).marks.count() > 0);
+}
+
+test "dragging the line between two windows resizes both of them" {
+    const gpa = testing.allocator;
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.splitWindow(.vertical);
+    const left = s.layout.viewAt(0);
+    const line = left.rect.max_x;
+
+    // A press on the line, then a drag well to the left of it.
+    s.pointer(.{ .mouse = .{ .x = line + 1, .y = 400 }, .buttons = .{ .left = true } });
+    try testing.expect(s.split_drag != null);
+    s.pointer(.{ .mouse = .{ .x = 300, .y = 400 }, .buttons = .{ .left = true } });
+    try testing.expectApproxEqAbs(@as(f32, 300), left.rect.max_x, 1e-3);
+
+    // Letting go ends it, and the gesture never became a text selection.
+    s.pointer(.{ .mouse = .{ .x = 300, .y = 400 } });
+    try testing.expect(s.split_drag == null);
+    try testing.expect(s.drag == null);
+
+    // A press away from the line is not a drag on it, and the next press
+    // after a divider drag still registers.
+    s.pointer(.{ .mouse = .{ .x = 150, .y = 400 }, .buttons = .{ .left = true } });
+    try testing.expect(s.split_drag == null);
+    try testing.expectApproxEqAbs(@as(f32, 300), left.rect.max_x, 1e-3);
 }

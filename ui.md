@@ -100,7 +100,7 @@ windows stop above it rather than being covered by it.
 atlas; the headless shot path is unchanged rather than broken. Closing it is
 ~35 lines — an atlas branch in that sampler, and a `Chrome` in `shoot`.
 
-### Phase 1 — the widget set 🚧
+### Phase 1 — the widget set ✅
 
 New files under `src/thviti/widgets/`, with `widgets.zig` re-exporting them.
 Each is written the way the existing ones are: `next`, `box`, `signal`, no
@@ -117,7 +117,7 @@ privileged access to anything a caller could not reach.
 | ✅ | menus built on the popup | 391 |
 | ✅ | a tab bar | 367 |
 | ✅ | icon buttons, and the tooltips that name them | 373 |
-| 🚧 | a splitter, and windows resized by dragging one | 300 |
+| ✅ | a splitter, and windows resized by dragging one | 380 |
 
 `src/thviti/widgets/field.zig` holds both halves: `Field`, which is pure
 arithmetic over bytes and testable with nothing at all, and `textField`, which
@@ -190,9 +190,33 @@ a percentage looks past a `children_sum` ancestor for something with a size,
 and the next one up is the root. Padding inside a popup goes in the text
 size's own `pad`, not in spacers.
 
-The splitter commit also gives `Layout` draggable dividers, closing the
-README's *"Windows are resized only by the layout, not by dragging the
-divider."*
+`splitter.zig` owns one number and nothing else: the caller sizes the first
+pane `.percentStrict(fraction)` and the second `.fill`. **Strict, and that
+is not a detail** — `Size.percent` is loose, and if both panes will give way
+the violation pass shares the overflow between them and the line lands
+somewhere neither the caller nor the pointer asked for. This cost an hour.
+
+`Layout` gets the same gesture for real windows: `dividerAt` finds the line
+under a point with slack (two pixels is not a target), `moveDivider` moves
+it and re-lays the tree as `split` and `close` do. A divider is named by its
+node and the index of the pair it splits, never by its rectangle, because
+the pointer runs ahead of the line the moment it reaches `min_side` and a
+lookup would drop the gesture just as someone leans into it. `read.zig`
+holds the divider for the whole drag, and closes the README's *"Windows are
+resized only by the layout, not by dragging the divider."*
+
+Only the two windows either side move: their shares sum to the same number
+afterwards, so dragging one line in a row of four leaves the other two
+exactly where they were.
+
+### What phase 1 cost, against what it was budgeted
+
+Four rows of the table became six commits: the popup split from the menu,
+and the splitter from the icon buttons. Both were the seams `CLAUDE.md`
+asks for and both landed near 300 lines rather than the 500 the unsplit
+versions would have been. The estimates were 200 and the commits ran 271 to
+399 — a widget still arrives with its documentation and its tests, and the
+three still do not divide neatly.
 
 ### Phase 2 — icons
 

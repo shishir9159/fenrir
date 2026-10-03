@@ -65,6 +65,10 @@ pub const iconButton = tool.iconButton;
 pub const iconToggle = tool.iconToggle;
 pub const Tips = tool.Tips;
 
+/// A draggable line between two panes, which owns one number and nothing
+/// else. `Layout` has the same gesture for the windows of the split tree.
+pub const splitter = @import("widgets/splitter.zig").splitter;
+
 test {
     _ = field;
     _ = list;
@@ -72,6 +76,7 @@ test {
     _ = menu;
     _ = tabs;
     _ = tool;
+    _ = @import("widgets/splitter.zig");
 }
 
 /// A gap. Nil-keyed, so it never enters the persistent table -- a spacer with

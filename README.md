@@ -1320,8 +1320,8 @@ in it — still reads completely.
   it has an appearance and is never clickable.
 - **The standard-14 metrics.** A simple font with no `/Widths` still advances
   half an em per glyph; the AFM files are not in the tree.
-- A real widget set on top of Þviti — text fields with selection and an IME,
-  menus, tab bars, trees, splitters.
+- An IME, a tree widget and drag-and-drop. The rest of the widget set is
+  written: fields, lists, popups, menus, tabs, icon buttons and a splitter.
 - Lyngvi's X11 backend, and everything platform-shaped a reader eventually
   needs: file dialogs, menus, the clipboard. The Wayland backend compiles and
   its protocol tables and key handling are tested, but it has not yet been run
@@ -1331,7 +1331,8 @@ in it — still reads completely.
 - Word motions find word boundaries from the spacing of the glyphs, because
   most PDFs draw no space characters; a tightly kerned or letter-spaced line
   can put a boundary in the wrong place.
-- Windows are resized only by the layout, not by dragging the divider.
+- Splits are made equal by the layout unless the divider is dragged; there is
+  no `<C-w>` resize command yet.
 
 ## Porting to Android
 
@@ -1901,23 +1902,30 @@ cache is one, so that stays available.
 
 ```
 $ fenrir ui --out ui.png
-163 boxes solved, 158 drawn, 2142 glyph quads
-690 instances, 1599 culled, 18 draw calls without descriptor indexing
-atlas 1024x256, 8 glyphs, 0% full, 8 rasterised
+82 boxes solved, 79 drawn, 664 glyph quads
+685 instances, 29 culled, 28 draw calls without descriptor indexing
+atlas 1024x256, 9 glyphs, 0% full, 9 rasterised
 ```
 
-The eighteen is the honest number and worth keeping in view: with descriptor
-indexing the frame is one call, and eighteen is what the fallback path would
-cost because text and panels are interleaved. Drawing all the text in a pass
-would make it two. The sixteen hundred culled are outline rows scrolled
-outside the sidebar's clip, dropped before they reach the buffer.
+The draw calls are the honest number and worth keeping in view: with
+descriptor indexing the frame is one call, and this is what the fallback path
+costs because text and panels are interleaved. Drawing all the text in a pass
+would make it two.
 
-Still missing, and deliberately: a real widget set. Text fields with selection
-and an IME, menus, tab bars, trees, splitters, drag-and-drop. That is a layer
-written *on* this one, and writing it before there was a window to put it in
-would have meant designing against an interface nobody had used. There is a
-window now, which is the argument for writing it next rather than the argument
-that it was wrong to wait.
+The box count used to be a hundred and sixty-three, and sixteen hundred
+instances used to be culled — outline rows scrolled outside the sidebar's
+clip, built in full and then dropped before they reached the buffer. The list
+widget builds only the rows the view can see, so they are not built at all.
+Culling is the right answer for a row that has scrolled half out of sight and
+the wrong one for a row six hundred pages down.
+
+The widget set is that layer, written on this one now that there is a window
+to put it in — `src/thviti/widgets/`: a text field with selection and mouse
+editing, a list that builds only its visible rows, a floating popup, menus
+built on it, a tab bar, icon buttons, tooltips and a splitter. Writing it
+earlier would have meant designing against an interface nobody had used.
+
+Still missing: an IME, a tree, and drag-and-drop.
 
 ## Reference
 
