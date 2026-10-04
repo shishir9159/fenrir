@@ -37,6 +37,7 @@ pub const encoding = @import("tyr/encoding.zig");
 pub const format = @import("tyr/format.zig");
 pub const raster = @import("tyr/raster.zig");
 pub const registry = @import("tyr/registry.zig");
+pub const icons = @import("tyr/backend/icons.zig");
 pub const svgpath = @import("tyr/svgpath.zig");
 pub const cff = @import("tyr/backend/cff.zig");
 pub const truetype = @import("tyr/backend/truetype.zig");
@@ -69,6 +70,7 @@ test {
     _ = raster;
     _ = registry;
     _ = svgpath;
+    _ = icons;
     _ = cff;
     _ = truetype;
     _ = type1;
