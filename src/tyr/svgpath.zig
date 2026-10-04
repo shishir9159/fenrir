@@ -11,8 +11,10 @@
 //! cubic, close -- which is not a coincidence. Both descend from PostScript,
 //! and it is why an icon costs no new machinery downstream: a path becomes an
 //! outline, an outline becomes a glyph, and the atlas, the rasteriser and the
-//! draw list never learn that icons exist. Elliptical arcs are the one
-//! operator with no counterpart, and they are the next commit.
+//! draw list never learn that icons exist.
+//!
+//! Elliptical arcs are the one operator with no counterpart, and they are
+//! converted rather than represented: see `arcTo`.
 //!
 //! ## Two coordinate systems, one matrix
 //!
@@ -152,6 +154,14 @@ const Parser = struct {
                 try p.quadTo(q, try p.point(rel));
             },
             'T' => try p.quadTo(p.reflect(p.quad_ctrl), try p.point(rel)),
+            'A' => {
+                const rx = try p.number();
+                const ry = try p.number();
+                const degrees = try p.number();
+                const large = try p.flag();
+                const sweep = try p.flag();
+                try p.arcTo(rx, ry, degrees, large, sweep, try p.point(rel));
+            },
             'Z' => try p.close(),
             else => return error.BadPathData,
         }
@@ -188,6 +198,126 @@ const Parser = struct {
         try p.out.quadTo(p.gpa, p.t.apply(q), p.t.apply(to));
         p.cur = to;
         p.quad_ctrl = q;
+        p.cubic_ctrl = null;
+    }
+
+    /// An elliptical arc, as up to four cubics.
+    ///
+    /// This is the one operator `Outline` has no verb for, and adding one
+    /// would push an arc all the way down through the rasteriser and the
+    /// stroker to reach a shape no content stream can produce. So it is
+    /// converted here, once, in the one file that knows what an arc is.
+    ///
+    /// The conversion is the specification's own (F.6.5): an arc is given by
+    /// its endpoints, its radii and two flags, and the ellipse it lies on has
+    /// to be recovered from them before anything can be drawn. Then the
+    /// sweep is cut into quarter turns, each approximated by a cubic whose
+    /// controls run `4/3 tan(t/4)` along the tangents. That approximation is
+    /// exact at both ends and off by about one part in ten thousand of the
+    /// radius in the middle of a quarter turn, which at a 24-pixel icon is
+    /// four thousandths of a pixel.
+    fn arcTo(
+        p: *Parser,
+        rx_in: f32,
+        ry_in: f32,
+        degrees: f32,
+        large: bool,
+        sweep: bool,
+        to: Point,
+    ) Error!void {
+        const from = p.cur;
+        // An arc that goes nowhere is dropped entirely (F.6.2). It is not a
+        // closed loop, which is what treating the two endpoints as distinct
+        // would eventually produce.
+        if (from.x == to.x and from.y == to.y) return;
+
+        var rx = @abs(rx_in);
+        var ry = @abs(ry_in);
+        // A zero radius is a straight line, and it is the form a rounded
+        // corner degrades into when an icon set is generated with the corner
+        // radius set to nothing.
+        if (rx == 0 or ry == 0) return p.lineTo(to);
+
+        const phi = degrees * std.math.pi / 180.0;
+        const cos_phi = @cos(phi);
+        const sin_phi = @sin(phi);
+
+        // F.6.5.1: half the endpoint difference, rotated into the ellipse's
+        // own frame, where it is an axis-aligned ellipse again.
+        const dx = (from.x - to.x) * 0.5;
+        const dy = (from.y - to.y) * 0.5;
+        const x1 = cos_phi * dx + sin_phi * dy;
+        const y1 = -sin_phi * dx + cos_phi * dy;
+
+        // F.6.6: radii too small to reach across the gap are scaled up until
+        // they just do, rather than rejected.
+        const lambda = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
+        if (lambda > 1) {
+            const s = @sqrt(lambda);
+            rx *= s;
+            ry *= s;
+        }
+
+        // F.6.5.2: the centre. Two ellipses pass through both endpoints and
+        // the flags choose between them, which is what the sign is doing.
+        const denom = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+        if (denom == 0) return p.lineTo(to);
+        // Clamped because the radii were only just made big enough above, and
+        // the rounding can leave this a few ulps below zero.
+        const num = @max(rx * rx * ry * ry - denom, 0);
+        var coef = @sqrt(num / denom);
+        if (large == sweep) coef = -coef;
+
+        const cx1 = coef * rx * y1 / ry;
+        const cy1 = -coef * ry * x1 / rx;
+        const e: Ellipse = .{
+            .c = .{
+                .x = cos_phi * cx1 - sin_phi * cy1 + (from.x + to.x) * 0.5,
+                .y = sin_phi * cx1 + cos_phi * cy1 + (from.y + to.y) * 0.5,
+            },
+            .rx = rx,
+            .ry = ry,
+            .cos_phi = cos_phi,
+            .sin_phi = sin_phi,
+        };
+
+        // F.6.5.5 and F.6.5.6: where on that ellipse the endpoints sit, and
+        // how far round it the arc runs. The flags decide the direction.
+        const ux = (x1 - cx1) / rx;
+        const uy = (y1 - cy1) / ry;
+        const vx = (-x1 - cx1) / rx;
+        const vy = (-y1 - cy1) / ry;
+        const start = std.math.atan2(uy, ux);
+        var span = std.math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+        if (!sweep and span > 0) span -= std.math.tau;
+        if (sweep and span < 0) span += std.math.tau;
+
+        const quarters = @ceil(@abs(span) / (std.math.pi * 0.5) - 1e-4);
+        const pieces: u32 = @intFromFloat(@max(quarters, 1));
+        const step = span / @as(f32, @floatFromInt(pieces));
+        const k = (4.0 / 3.0) * @tan(step * 0.25);
+
+        var n: u32 = 0;
+        while (n < pieces) : (n += 1) {
+            const a0 = start + step * @as(f32, @floatFromInt(n));
+            const a1 = a0 + step;
+            const p0 = e.at(a0);
+            // The last piece ends on the point the file named, not on the one
+            // the trigonometry arrived at. A chain of arcs drifts otherwise,
+            // and a contour that should close ends a fraction short.
+            const p3 = if (n + 1 == pieces) to else e.at(a1);
+            const t0 = e.tangentAt(a0);
+            const t1 = e.tangentAt(a1);
+            try p.cubicTo(
+                .{ .x = p0.x + k * t0.x, .y = p0.y + k * t0.y },
+                .{ .x = p3.x - k * t1.x, .y = p3.y - k * t1.y },
+                p3,
+            );
+        }
+
+        // An `S` after an arc has nothing to reflect. The spec restricts the
+        // reflection to a previous cubic, and an arc is not one however it is
+        // drawn here.
         p.cubic_ctrl = null;
     }
 
@@ -239,6 +369,21 @@ const Parser = struct {
         return std.fmt.parseFloat(f32, p.d[start..p.i]) catch error.BadPathData;
     }
 
+    /// An arc flag: one character, `0` or `1`, and not a number.
+    ///
+    /// That distinction is the whole reason this is not `number`. The flags
+    /// need no separator after them, so `a1 1 0 011 0` is a valid arc with
+    /// both flags and an x of 1 packed into `011` -- and every minified icon
+    /// set writes them that way.
+    fn flag(p: *Parser) Error!bool {
+        p.skipSeparators();
+        if (p.i == p.d.len) return error.BadPathData;
+        const c = p.d[p.i];
+        if (c != '0' and c != '1') return error.BadPathData;
+        p.i += 1;
+        return c == '1';
+    }
+
     fn digits(p: *Parser) bool {
         const start = p.i;
         while (p.i < p.d.len and std.ascii.isDigit(p.d[p.i])) p.i += 1;
@@ -258,9 +403,41 @@ const Parser = struct {
     }
 };
 
+/// The ellipse an arc lies on, once it has been recovered from the endpoints.
+/// Rotated, so the two accessors carry the rotation rather than the caller
+/// rotating every point it gets back.
+const Ellipse = struct {
+    c: Point,
+    rx: f32,
+    ry: f32,
+    cos_phi: f32,
+    sin_phi: f32,
+
+    fn at(e: Ellipse, a: f32) Point {
+        const ca = @cos(a);
+        const sa = @sin(a);
+        return .{
+            .x = e.c.x + e.rx * ca * e.cos_phi - e.ry * sa * e.sin_phi,
+            .y = e.c.y + e.rx * ca * e.sin_phi + e.ry * sa * e.cos_phi,
+        };
+    }
+
+    /// The derivative with respect to the angle, which is what the cubic's
+    /// control points run along. Not normalised: its length is part of the
+    /// `4/3 tan(t/4)` scaling.
+    fn tangentAt(e: Ellipse, a: f32) Point {
+        const ca = @cos(a);
+        const sa = @sin(a);
+        return .{
+            .x = -e.rx * sa * e.cos_phi - e.ry * ca * e.sin_phi,
+            .y = -e.rx * sa * e.sin_phi + e.ry * ca * e.cos_phi,
+        };
+    }
+};
+
 fn isCommand(c: u8) bool {
     return switch (std.ascii.toUpper(c)) {
-        'M', 'L', 'H', 'V', 'C', 'S', 'Q', 'T', 'Z' => true,
+        'M', 'L', 'H', 'V', 'C', 'S', 'Q', 'T', 'A', 'Z' => true,
         else => false,
     };
 }
@@ -395,14 +572,89 @@ test "a stray byte fails the whole string" {
     try testing.expectError(error.BadPathData, parse(gpa, &o, "M0 0 L10 10 X", .{}));
     try testing.expectError(error.BadPathData, parse(gpa, &o, "M0 0 L10", .{}));
     try testing.expectError(error.BadPathData, parse(gpa, &o, "10 10", .{}));
-    // Arcs parse as soon as they are written, and not before.
-    try testing.expectError(error.BadPathData, parse(gpa, &o, "M0 0 A1 1 0 0 1 2 2", .{}));
+    // An arc flag is one character and only ever `0` or `1`.
+    try testing.expectError(error.BadPathData, parse(gpa, &o, "M0 0 A5 5 0 2 1 10 0", .{}));
 
     // Empty data is a glyph with no ink, which is a space and not an error.
     var empty: Outline = .{};
     defer empty.deinit(gpa);
     try parse(gpa, &empty, "   ", .{});
     try testing.expect(empty.isEmpty());
+}
+
+test "an arc's flags choose which way round it goes" {
+    // A half circle from (0,0) to (10,0). The sweep flag is the whole
+    // difference between the two, and it mirrors the arc about the chord.
+    var up = try parsed("M0 0 A5 5 0 1 1 10 0", .{});
+    defer up.deinit(testing.allocator);
+    var down = try parsed("M0 0 A5 5 0 1 0 10 0", .{});
+    defer down.deinit(testing.allocator);
+
+    const a = up.bounds();
+    try testing.expectApproxEqAbs(@as(f32, -5), a.min_y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0), a.max_y, 1e-3);
+
+    const b = down.bounds();
+    try testing.expectApproxEqAbs(@as(f32, 0), b.min_y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 5), b.max_y, 1e-3);
+
+    // Half a turn is two quarters, and each is one cubic.
+    try testing.expectEqualSlices(Verb, &.{ .move, .cubic, .cubic }, up.verbs.items);
+}
+
+test "an arc lands exactly on the point it was given" {
+    // Two arcs and a close: the contour has to meet itself, which it will not
+    // if the endpoint comes from the trigonometry rather than from the file.
+    var o = try parsed("M2 12 a10 10 0 1 1 20 0 a10 10 0 1 1 -20 0 z", .{});
+    defer o.deinit(testing.allocator);
+
+    const p = o.points.items;
+    const last = p[p.len - 1];
+    try testing.expectEqual(@as(f32, 2), last.x);
+    try testing.expectEqual(@as(f32, 12), last.y);
+
+    const b = o.bounds();
+    try testing.expectApproxEqAbs(@as(f32, 2), b.min_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 22), b.max_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 2), b.min_y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 22), b.max_y, 1e-3);
+}
+
+test "radii too small are grown, and a radius of zero is a line" {
+    // The gap is twenty and the radii are one: F.6.6 scales them until the
+    // ellipse reaches, rather than refusing the path.
+    var grown = try parsed("M0 0 A1 1 0 0 1 20 0", .{});
+    defer grown.deinit(testing.allocator);
+    const b = grown.bounds();
+    try testing.expectApproxEqAbs(@as(f32, 20), b.max_x, 1e-2);
+    try testing.expectApproxEqAbs(@as(f32, -10), b.min_y, 1e-2);
+
+    var flat = try parsed("M0 0 A0 5 0 0 1 20 0", .{});
+    defer flat.deinit(testing.allocator);
+    try testing.expectEqualSlices(Verb, &.{ .move, .line }, flat.verbs.items);
+}
+
+test "the arc flags need no separator after them" {
+    // `011 0` is large=0, sweep=1, then the point (1,0). A number parser
+    // would read `011` as eleven and the path would be a different shape.
+    var packed_flags = try parsed("M0 0a1 1 0 011 0", .{});
+    defer packed_flags.deinit(testing.allocator);
+    var spaced = try parsed("M0 0 a1 1 0 0 1 1 0", .{});
+    defer spaced.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(Point, spaced.points.items, packed_flags.points.items);
+}
+
+test "an S after an arc has nothing to reflect" {
+    var o = try parsed("M0 0 A5 5 0 0 1 10 0 S15 5 20 0", .{});
+    defer o.deinit(testing.allocator);
+
+    // The first control of the S is the pen itself, not a reflection of the
+    // last control the arc's cubics happened to leave behind.
+    const p = o.points.items;
+    const s_first = p[p.len - 3];
+    try testing.expectApproxEqAbs(@as(f32, 10), s_first.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), s_first.y, 1e-4);
 }
 
 test "a real icon, as an icon set publishes it" {
