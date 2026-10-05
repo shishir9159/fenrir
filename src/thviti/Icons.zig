@@ -218,12 +218,22 @@ pub fn nameOf(i: *const Icons, id: Id) []const u8 {
     return i.entries.items[id].name;
 }
 
-/// True when something has actually said how this icon is drawn. What
-/// `fenrir icons` prints a column for, and what a health check looks at.
-pub fn isDrawn(i: *const Icons, id: Id, slot: Slot) bool {
-    if (id >= i.entries.items.len) return false;
+/// Which layer a slot's icon is actually coming from. What `fenrir icons`
+/// prints a column for: a theme that silently fails to take effect is
+/// otherwise indistinguishable from one that had nothing to say.
+pub const Origin = enum { theme, registered, none };
+
+pub fn originOf(i: *const Icons, id: Id, slot: Slot) Origin {
+    if (id >= i.entries.items.len) return .none;
     const e = i.entries.items[id];
-    return e.theme.at(slot) != null or e.default.at(slot) != null;
+    if (e.theme.at(slot) != null) return .theme;
+    if (e.default.at(slot) != null) return .registered;
+    return .none;
+}
+
+/// True when something has actually said how this icon is drawn.
+pub fn isDrawn(i: *const Icons, id: Id, slot: Slot) bool {
+    return i.originOf(id, slot) != .none;
 }
 
 /// The id for a name, made if this is the first time it has been seen.

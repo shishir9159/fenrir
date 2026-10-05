@@ -473,10 +473,13 @@ fn statusBar(ui: *UI, state: *State) !void {
 /// source rectangles are whole texels, so every tap falls on a texel centre.
 /// It stops agreeing the moment anything is scaled, which is when the
 /// difference would otherwise be blamed on the shader.
-const AtlasSampler = struct {
+/// Reads the glyph atlas as coverage, for the software rasteriser. Public
+/// because `fenrir icons` renders its sheet through exactly this path and a
+/// second copy would be a second thing to keep in step.
+pub const AtlasSampler = struct {
     fonts: *Fonts,
 
-    fn sampler(a: *AtlasSampler) gleipnir.software.Sampler {
+    pub fn sampler(a: *AtlasSampler) gleipnir.software.Sampler {
         return .{ .ptr = a, .sample = sample };
     }
 
@@ -528,7 +531,7 @@ fn parsePair(ctx: *Context, s: []const u8, sep: u8) !Point {
     return .{ .x = a, .y = b };
 }
 
-fn writePng(ctx: *Context, dest: []const u8, fb: gleipnir.Framebuffer) !void {
+pub fn writePng(ctx: *Context, dest: []const u8, fb: gleipnir.Framebuffer) !void {
     var file = Io.Dir.cwd().createFile(ctx.io, dest, .{}) catch |err|
         return ctx.fail("cannot create {s}: {t}", .{ dest, err });
     defer file.close(ctx.io);

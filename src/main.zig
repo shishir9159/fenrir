@@ -11,6 +11,7 @@ const Context = @import("vanagandr/Context.zig");
 const dump = @import("vanagandr/dump.zig");
 const extract = @import("vanagandr/extract.zig");
 const fonts = @import("vanagandr/fonts.zig");
+const icons = @import("vanagandr/icons.zig");
 const info = @import("vanagandr/info.zig");
 const pages = @import("vanagandr/pages.zig");
 const rects = @import("vanagandr/rects.zig");
@@ -44,6 +45,7 @@ const commands = [_]Command{
     .{ .name = "plugins", .summary = "load init.lua and the plugins, and report", .usage = plugins.usage, .run = plugins.run },
     .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
+    .{ .name = "icons", .summary = "list the icon registry, and draw a sheet of it", .usage = icons.usage, .run = icons.run },
     .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run },
     .{ .name = "ui", .summary = "render a frame of interface, layout and text included", .usage = ui.usage, .run = ui.run },
     .{ .name = "view", .summary = "open a window and draw on the GPU", .usage = view.usage, .run = view.run },
