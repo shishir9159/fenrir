@@ -37,6 +37,7 @@ const Color = fenrir.gelgja.Color;
 const DrawList = gleipnir.DrawList;
 const Fonts = tyr.Fonts;
 const Point = fenrir.gelgja.Point;
+const Icons = thviti.Icons;
 const UI = thviti.UI;
 const w = thviti.widgets;
 
@@ -106,6 +107,11 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     var ui: UI = .init(ctx.gpa, thviti.text.metricsOf(&fonts));
     defer ui.deinit();
 
+    // The icon face is opened on the same `Fonts` as the text, so an icon is
+    // one more glyph in the same atlas and the frame is still one draw call.
+    var icons: Icons = try .init(ctx.gpa, &fonts);
+    defer icons.deinit();
+
     var d: DrawList = .init(ctx.gpa, .fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
     defer d.deinit();
 
@@ -122,7 +128,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     while (n < frames) : (n += 1) {
         fonts.beginFrame();
         try ui.begin(viewport, .{ .mouse = mouse, .dt = 1.0 / 60.0 });
-        try scene(&ui, &state);
+        try scene(&ui, &state, &icons);
         ui.end();
     }
 
@@ -184,7 +190,7 @@ pub const State = struct {
 const open_documents = [_][]const u8{ "gylfaginning.pdf", "skaldskaparmal.pdf" };
 
 /// A reader's chrome, written the way it would be written for real.
-pub fn scene(ui: *UI, state: *State) !void {
+pub fn scene(ui: *UI, state: *State, icons: *const Icons) !void {
     ui.pushStyle(.{ .bg = .{ .r = 0.13, .g = 0.14, .b = 0.17 } });
     defer ui.popStyle();
 
@@ -194,7 +200,7 @@ pub fn scene(ui: *UI, state: *State) !void {
 
     try titleBar(ui, state);
     try tabPages(ui, state);
-    try toolBar(ui, state);
+    try toolBar(ui, state, icons);
     try body(ui, state);
     try statusBar(ui, state);
 
@@ -230,7 +236,7 @@ fn titleBar(ui: *UI, state: *State) !void {
     try w.fill(ui);
 }
 
-fn toolBar(ui: *UI, state: *State) !void {
+fn toolBar(ui: *UI, state: *State, icons: *const Icons) !void {
     ui.next(.{
         .w = .fill,
         .h = .px(44),
@@ -249,10 +255,31 @@ fn toolBar(ui: *UI, state: *State) !void {
     _ = try w.button(ui, "Open");
     try w.spacer(ui, .px(10));
 
-    // A letter stands in for the icon until there is a registry to ask. The
-    // widget is the same either way; only what it is handed changes.
-    const rail = try w.iconToggle(ui, "outline", "O", &state.outline_open, .{});
+    // Icons by id, resolved through the registry at the slot the toolbar
+    // uses. Nothing here knows whether the answer is built in or themed.
+    const rail = try w.iconToggle(
+        ui,
+        "outline",
+        icons.byName("fenrir.outline", .toolbar_large),
+        &state.outline_open,
+        .{},
+    );
     w.tool.hint(ui, &state.tips, rail, "Outline");
+    try w.spacer(ui, .px(4));
+
+    w.tool.hint(
+        ui,
+        &state.tips,
+        try w.iconButton(ui, "search", icons.byName("fenrir.search", .toolbar_large), .{}),
+        "Search",
+    );
+    try w.spacer(ui, .px(4));
+    w.tool.hint(
+        ui,
+        &state.tips,
+        try w.iconButton(ui, "bookmark", icons.byName("fenrir.bookmark", .toolbar_large), .{}),
+        "Bookmark this page",
+    );
     try w.spacer(ui, .px(10));
 
     if ((try w.buttonWith(ui, "Prev", .{ .disabled = state.page == 1 })).clicked) {

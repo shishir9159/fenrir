@@ -4,13 +4,17 @@
 //! of square glyphs with no words on it is a rail nobody can read, and a
 //! tooltip with nothing to hang off is not a thing at all.
 //!
-//! ## The glyph is a string, for now
+//! ## The glyph comes from the registry, and never from a path
 //!
-//! `iconButton` takes text and centres it, which is a bookmark and not a
-//! design: phase two replaces it with an icon *id* resolved through a
-//! registry, and nothing else about the widget changes. Taking a string
-//! today keeps the rails buildable before the registry exists, and taking a
-//! path -- ever -- would be the mistake the plan is written to avoid.
+//! `iconButton` takes an `Icons.Drawn` -- a face, the bytes that select a
+//! glyph in it, and the size its slot asks for -- which is what
+//! `Icons.resolve` returns and nothing else produces. So a button cannot
+//! name a file, cannot name a colour, and cannot be given an icon that has
+//! not been registered under an id somebody can theme.
+//!
+//! It is still only text in a box underneath, which is the point: the icon
+//! is centred, tinted by `Style.fg` and animated by the same lift as every
+//! other control, because the renderer has no idea it is an icon.
 //!
 //! ## A tooltip is recorded here and drawn at the end of the frame
 //!
@@ -33,6 +37,7 @@ const geom = @import("../../gelgja/geom.zig");
 const paint = @import("../../gelgja/paint.zig");
 
 const Box = @import("../Box.zig");
+const Icons = @import("../Icons.zig");
 const Theme = @import("../Theme.zig");
 const UI = @import("../UI.zig");
 const key = @import("../key.zig");
@@ -45,8 +50,9 @@ const Signal = UI.Signal;
 
 pub const Error = UI.Error;
 
-/// Square, at the sizes the icon slots will use: 24 on a toolbar, 20 on a
-/// rail, 16 in a menu.
+/// The button, not the icon in it. The icon's own size is its slot's, and
+/// the difference between the two is the padding around it -- a 20-pixel
+/// sidebar icon in a 24-pixel button has two pixels of room a side.
 pub const size: f32 = 24;
 
 pub const Options = struct {
@@ -63,7 +69,7 @@ pub const Options = struct {
 /// No border because a rail of bordered squares is a grid of boxes rather
 /// than a row of controls; the hover lift is what says it can be pressed,
 /// which is the same gesture every other control here uses.
-pub fn iconButton(ui: *UI, name: []const u8, glyph: []const u8, opts: Options) Error!Signal {
+pub fn iconButton(ui: *UI, name: []const u8, icon: Icons.Drawn, opts: Options) Error!Signal {
     const st = ui.style();
     const accent = opts.accent orelse Theme.dark.accent;
 
@@ -72,6 +78,8 @@ pub fn iconButton(ui: *UI, name: []const u8, glyph: []const u8, opts: Options) E
         .h = .px(opts.size),
         .text_align = .center,
         .radius = .all(4),
+        .font = icon.font,
+        .font_size = icon.px,
         .fg = if (opts.on) accent else mix(st.bg, st.fg, 0.78),
         .bg = if (opts.on) mix(st.bg, accent, 0.20) else st.bg.withAlpha(0),
         .flags = .{
@@ -84,15 +92,15 @@ pub fn iconButton(ui: *UI, name: []const u8, glyph: []const u8, opts: Options) E
             .disabled = opts.disabled,
         },
     });
-    return ui.signal(try ui.boxText(name, glyph));
+    return ui.signal(try ui.boxText(name, icon.text));
 }
 
 /// A latch, with the state the caller's -- a rail button for a panel that is
 /// open, or for the mode the keymap is in.
-pub fn iconToggle(ui: *UI, name: []const u8, glyph: []const u8, on: *bool, opts: Options) Error!Signal {
+pub fn iconToggle(ui: *UI, name: []const u8, icon: Icons.Drawn, on: *bool, opts: Options) Error!Signal {
     var o = opts;
     o.on = on.*;
-    const sig = try iconButton(ui, name, glyph, o);
+    const sig = try iconButton(ui, name, icon, o);
     if (sig.clicked) on.* = !on.*;
     return sig;
 }
@@ -205,6 +213,12 @@ fn scratch() UI {
     return .init(testing.allocator, UI.fixed_metrics);
 }
 
+/// What the registry would have returned. A `Drawn` is three plain fields,
+/// so these tests need no registry, no face and no atlas -- they are about
+/// the button and the tooltip, and a real icon would only make them slower
+/// and harder to read.
+const stand_in: Icons.Drawn = .{ .font = 0, .text = "B", .px = 16 };
+
 /// A rail of two buttons, with the tooltip layer after it.
 fn oneFrame(ui: *UI, t: *Tips, open: *bool, in: input.Input) !void {
     try ui.begin(.fromRect(0, 0, 400, 300), in);
@@ -213,8 +227,8 @@ fn oneFrame(ui: *UI, t: *Tips, open: *bool, in: input.Input) !void {
     const rail = try ui.open("rail");
     {
         defer ui.close(rail);
-        hint(ui, t, try iconButton(ui, "bookmark", "B", .{}), "Bookmarks");
-        hint(ui, t, try iconToggle(ui, "notes", "N", open, .{}), "Annotations");
+        hint(ui, t, try iconButton(ui, "bookmark", stand_in, .{}), "Bookmarks");
+        hint(ui, t, try iconToggle(ui, "notes", stand_in, open, .{}), "Annotations");
     }
 
     try tooltips(ui, t);
@@ -316,7 +330,7 @@ test "a tooltip near an edge is pushed back inside" {
         fn go(u: *UI, tips: *Tips) !void {
             try u.begin(.fromRect(0, 0, 400, 300), .{ .mouse = .{ .x = 384, .y = 290 } });
             u.next(.{ .w = .px(size), .h = .px(size), .fixed_x = 372, .fixed_y = 282, .flags = .{ .floating_x = true, .floating_y = true } });
-            hint(u, tips, try iconButton(u, "b", "B", .{}), "Bookmarks");
+            hint(u, tips, try iconButton(u, "b", stand_in, .{}), "Bookmarks");
             try tooltips(u, tips);
             u.end();
         }

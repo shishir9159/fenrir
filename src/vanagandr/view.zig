@@ -228,6 +228,11 @@ fn render(ctx: *Context, settings: Settings) !void {
     std.debug.assert(gpu_atlas == list_atlas);
 
     var atlas_height = fonts.atlasHeight();
+    // Opens the icon face on `fonts` and registers every built-in icon, so
+    // the chrome below can ask for `fenrir.outline` by name.
+    var icons: thviti.Icons = try .init(gpa, &fonts);
+    defer icons.deinit();
+
     var state: ui_demo.State = .{};
     var clock: lyngvi.Clock = .start(ctx.io);
     var drawn: u32 = 0;
@@ -273,7 +278,7 @@ fn render(ctx: *Context, settings: Settings) !void {
 
         fonts.beginFrame();
         try ui.begin(viewport, input);
-        try ui_demo.scene(&ui, &state);
+        try ui_demo.scene(&ui, &state, &icons);
         ui.end();
 
         // Þviti's tree becomes instances, and the glyphs Týr rasterised this
