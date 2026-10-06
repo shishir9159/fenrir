@@ -141,8 +141,17 @@ pub fn read(
     try collect(L, a, &entries);
     if (nested) lua.pop(L, 1);
 
+    // A Lua table has no order, so two runs over the same file walk it
+    // differently and a caller that numbers what it applies -- the icon face
+    // does, one glyph per path -- would produce a different listing each
+    // time. Sorting by name is what makes `fenrir icons --theme` a diff.
+    std.mem.sort(Entry, entries.items, {}, byName);
     theme.entries = try entries.toOwnedSlice(a);
     return theme;
+}
+
+fn byName(_: void, a: Entry, b: Entry) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
 }
 
 /// Reads every key of the table on top of the stack.
@@ -284,6 +293,24 @@ test "a flat table of ids and path data" {
         try testing.expect(e.source == .path);
         try testing.expect(e.source.path.len > 0);
     }
+}
+
+test "entries come back in name order, whatever order Lua walked them in" {
+    if (!lua.available) return error.SkipZigTest;
+
+    var theme = try themed(
+        \\return {
+        \\  ["z.one"] = "M0 0h1v1H0z",
+        \\  ["a.two"] = "M0 0h2v2H0z",
+        \\  ["m.three"] = "M0 0h3v3H0z",
+        \\}
+    );
+    defer theme.deinit();
+
+    try testing.expectEqual(@as(usize, 3), theme.entries.len);
+    try testing.expectEqualStrings("a.two", theme.entries[0].name);
+    try testing.expectEqualStrings("m.three", theme.entries[1].name);
+    try testing.expectEqualStrings("z.one", theme.entries[2].name);
 }
 
 test "a font theme names its font and its code points" {
