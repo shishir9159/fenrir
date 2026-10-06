@@ -39,6 +39,7 @@ const Allocator = std.mem.Allocator;
 const mimir = @import("mimir.zig");
 
 pub const Host = @import("galdr/Host.zig");
+pub const icons = @import("galdr/icons.zig");
 pub const Runtime = @import("galdr/Runtime.zig");
 pub const keyspec = @import("galdr/keyspec.zig");
 pub const lua = @import("galdr/lua.zig");
@@ -81,6 +82,7 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
 
 test {
     _ = Host;
+    _ = icons;
     _ = Runtime;
     _ = keyspec;
     _ = lua;
