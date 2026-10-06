@@ -233,18 +233,98 @@ one go because they were being written for the first time and the shape was
 not settled until the end. Next phase, split them in the plan rather than
 noticing afterwards.
 
-### Phase 2 — icons
+### Phase 2 — icons ✅
 
 Icons are **declared, never embedded**. A plugin registers
 `plugin_id.icon_name`; every toolbar, menu, tab and palette entry references
 that ID. Nothing outside the registry knows how an icon is drawn.
 
-| Commit | Files | ~ |
-|---|---|---|
-| an icon face whose glyphs are built in | `src/tyr/backend/icons.zig` | 280 |
-| the icon registry: namespaced ids and slots | `src/thviti/Icons.zig` | 250 |
-| svg path data, parsed into an outline | `src/tyr/svgpath.zig` | 260 |
-| icon themes, and `fenrir icons` to check them | `vanagandr/icons.zig` | 200 |
+Four commits were budgeted and eight were written. Two of the splits were
+planned here in advance and two were not; see the accounting below.
+
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | svg path data, parsed into an outline | `src/tyr/svgpath.zig` | 429 |
+| ✅ | elliptical arcs in path data | `svgpath.zig` | 257 |
+| ✅ | an icon face whose glyphs are built in | `src/tyr/backend/icons.zig` | 440 |
+| ✅ | the icon registry: namespaced ids and slots | `src/thviti/Icons.zig` | 508 |
+| ✅ | icon buttons take an icon from the registry | `widgets/tool.zig`, `vanagandr/ui.zig` | 69 |
+| ✅ | `fenrir icons`, and a sheet of what it draws | `src/vanagandr/icons.zig` | 317 |
+| ✅ | icon themes, read out of a lua table | `src/galdr/icons.zig` | 391 |
+| ✅ | `fenrir icons` applies and checks a theme | `vanagandr/icons.zig` | 121 |
+
+**The claim that this needs almost no new machinery held.** `Face` is a
+vtable whose only required output is an `Outline`, and SVG path data is the
+same operator set, so `tyr/backend/icons.zig` is a `Face` that reads a table
+of `d` strings. Below it, nothing changed at all: the atlas keys on
+`(face, glyph, size, subpixel)` and caches an icon per size beside the
+letters, `tyr/raster.zig` fills it, and `draw.zig` emits one tinted quad. The
+tint is `currentColor` for nothing, as predicted — an icon follows
+`Style.fg`, so the light theme in phase three needs no second asset.
+
+**The one design decision that was not in the plan: icons are reached by code
+point, not by glyph index.** The plan's source union said `.glyph` was a face
+id and a glyph index. It is a face id and a *code point*, at `U+E000` upwards
+for the built-in face, because `Fonts.layout` takes a string and a `Box`
+holds one. Placing a glyph by index would have meant a second path through
+`Fonts`, a field on `Box` and a branch in the renderer, to arrive at what a
+private-use code point already does. It is also what a theme author has: a
+Nerd Fonts cheat sheet lists code points and nobody knows their indices.
+
+**`Icons.resolve` does no work.** A `Source` is turned into a font id and the
+bytes that select the glyph *at registration*, and path data reaches the icon
+face at the same moment, so a themed icon and a compiled-in one are
+indistinguishable from the atlas down. Resolving on a frame path is two array
+indexes. That is the rule about doing nothing per frame that can be done on
+change, applied where the change is a registration.
+
+**The theme is Lua with no Lua in it.** `galdr/icons.zig` opens a state with
+no libraries at all -- not the plugin sandbox, which is for code, and this is
+a table -- loads one chunk in text mode only, and reads what it returns. A
+theme cannot call anything, cannot reach the filesystem, is capped at four
+megabytes, and is stopped by a count hook if it turns out to be a program.
+The entries come back as strings and numbers: the font is a *file*, and the
+library layer does not open files, so `vanagandr/icons.zig` is what opens it
+and what turns `slot = "menu"` into a `Slot`.
+
+Entries are sorted by name before they are returned, which is not tidiness:
+a Lua table has no order, the icon face numbers glyphs in the order they
+arrive, and an unsorted theme gives a different listing on every run of a
+command whose whole purpose is to be diffed.
+
+### What phase 2 cost, against what it was budgeted
+
+Four commits at 250 became eight at 317 average, and 2532 lines against a
+budget of 990. The estimates were wrong in the same direction as phase one's
+and for the same reason -- a file arrives with its documentation and its
+tests -- but two things are worth separating out.
+
+The splits that were *planned* worked. Arcs split from the rest of the path
+grammar exactly as intended: the parser landed with eight operators and a
+test that says an arc is refused, and arcs replaced that test two hours
+later. Applying a theme split from reading one the same way.
+
+The splits that were *not* planned are the interesting ones, and both are the
+same shape: **a table is not a feature.** `fenrir icons` was budgeted as part
+of "icon themes, and `fenrir icons` to check them", and it is not — printing
+the registry is what proves the registry, and it had to exist before there
+was a theme to check with it. The same for the widget: handing `iconButton`
+an id rather than a string is three lines of widget and a call site, and it
+belongs with neither the registry before it nor the command after it.
+
+The commit that came closest to its budget is the only one that is purely a
+change to existing code, at 69 lines. Every new *file* ran between 317 and
+508. That is now the honest number to plan phases three and four with: a new
+file in this program costs about four hundred lines, of which a third is
+tests and a third is the argument for why it is shaped as it is.
+
+**What did not move.** Nothing on the page path was touched -- the diff for
+this phase is four new files, two module roots, one widget and three
+commands -- so `fenrir raster --all --stats` reports the same fills, strokes,
+segments and glyphs it did before, and there is no frame-time claim to make
+because no per-frame code changed. The icon face adds glyphs to the atlas
+that was already there: the sheet of all twenty-eight icons at all six slots
+is 113 cells and one draw call.
 
 **Why this needs almost no new machinery.** `Face` is a vtable whose only
 required output is an `Outline` — moveTo/lineTo/quadTo/cubicTo/close, which
@@ -498,6 +578,22 @@ Things that cost time once and should not cost it again.
   at strictness 1. A message longer than the window is cut at the page number
   instead of pushing it out. That is one rule in the sizing, not a string
   measured and truncated every frame.
+- **A registry is not usable until something prints it.** `fenrir icons`
+  found three wrong paths and two icons that drew nothing, in the minute
+  after it first ran, and none of them would have been found by reading the
+  table. Every registry in this program gets its command in the same commit
+  it gets its table, not in a later one.
+- **Draw the thing before committing the thing.** Twenty-eight icons all
+  parsed, stayed inside the em, and had the right number of contours, and
+  the tests said so. Two of them were still unreadable at sixteen pixels. A
+  throwaway test that rasterises to ASCII art in the terminal took five
+  minutes to write and is the only reason this phase did not ship a pen that
+  looked like a smear.
+- **A face copied by value cannot report a count that grows.** `Fonts` holds
+  `Face` structs by value, so `info.num_glyphs` is a snapshot; the icon face
+  gains glyphs whenever a theme adds path data. It reports zero, as Týr's
+  fallback does and for the fallback's stated reason, and the live number is
+  on the `Set` behind it.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
