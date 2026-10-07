@@ -1946,3 +1946,11 @@ up in the making.
 # final goal: remove glslc dependency https://github.com/khronosGroup/glslang#ast---spir-v-back-end
 consume: https://codeberg.org/andrewrk/async-io-examples/src/branch/main/example8.zig
 inline iamge
+
+
+# Why Not?
+
+## Why Not XInput
+https://www.youtube.com/watch?v=ONMSW1XvuVU
+
+XInput misses samples when framerate is low. XInput needs to be handled with a separate thread according to Casey Muratori.
