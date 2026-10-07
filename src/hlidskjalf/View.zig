@@ -64,18 +64,18 @@ scroll: f32 = 0,
 pan: f32 = 0,
 zoom: f32 = 1,
 
-/// Fit the page width as soon as there is a rectangle to fit to. Set when
-/// neither `--zoom` nor a remembered zoom said otherwise.
+/// Fit the page as soon as there is a rectangle to fit to. Set when neither
+/// `--zoom` nor a remembered zoom said otherwise.
 fit_on_open: bool = false,
 
-/// The zoom follows the width of this view, rather than being a number.
+/// The zoom follows the shape of this view, rather than being a number.
 ///
-/// A *mode*, not an action, because that is what "fit width" means in every
-/// reader anyone has used: split the window and each half refits; drag the
-/// edge and the page follows. Set by `fitWidth`, cleared by any zoom that
-/// names a number. Without it a split of a fitted window leaves two halves
-/// each showing the middle of a page twice as wide as they are.
-fit_width: bool = false,
+/// A *mode*, not an action, because that is what a fit means in every reader
+/// anyone has used: split the window and each half refits; drag the edge and
+/// the page follows. Set by `fitTo`, cleared by any zoom that names a number.
+/// Without it a split of a fitted window leaves two halves each showing the
+/// middle of a page twice as wide as they are.
+fit: Fit = .free,
 
 /// Device pixels per logical pixel, from the platform, so that a percentage
 /// means the page's true physical size.
@@ -127,6 +127,44 @@ pub const Cursor = struct {
 
     pub fn position(c: Cursor) Position {
         return .{ .page = c.page, .line = c.line, .column = c.column };
+    }
+};
+
+/// What the zoom is tied to, when it is tied to anything.
+///
+/// `free` is a number somebody chose and nothing may move it. The other three
+/// are the three shapes a page can be asked to match, and they are one enum
+/// rather than three flags because they are exclusive: a page fitted to the
+/// width and to the height at once is a page at two zooms.
+///
+/// `page` is the smaller of the other two and not an average of them -- the
+/// page has to fit *inside* the window, and taking the larger would fit one
+/// dimension by pushing the other out of sight.
+pub const Fit = enum {
+    free,
+    width,
+    height,
+    page,
+
+    /// What the status bar calls it. Empty for `free`, which is the absence
+    /// of a fit and has nothing to say.
+    pub fn label(f: Fit) []const u8 {
+        return switch (f) {
+            .free => "",
+            .width => "fit width",
+            .height => "fit height",
+            .page => "fit page",
+        };
+    }
+
+    /// What `:fit width` and a setting take. `actual` is spelled out because
+    /// "fit free" is not something anybody would type.
+    pub fn byName(name: []const u8) ?Fit {
+        if (std.mem.eql(u8, name, "actual") or std.mem.eql(u8, name, "free")) return .free;
+        if (std.mem.eql(u8, name, "width")) return .width;
+        if (std.mem.eql(u8, name, "height")) return .height;
+        if (std.mem.eql(u8, name, "page")) return .page;
+        return null;
     }
 };
 
@@ -265,7 +303,7 @@ pub fn scrollToPage(v: *View, index: usize) void {
 /// A zoom to a number ends fit-width mode: someone who pressed `+` wants that
 /// size, and a window resize snapping it back would be fighting them.
 pub fn setZoom(v: *View, want: f32) void {
-    v.fit_width = false;
+    v.fit = .free;
     v.zoomAbout(want);
 }
 
@@ -281,20 +319,41 @@ fn zoomAbout(v: *View, want: f32) void {
     v.clampScroll();
 }
 
-/// Fits the page width to the view, and stays fitted: see `fit_width`.
-pub fn fitWidth(v: *View) void {
-    v.fit_width = true;
+/// Fits the page to the view and stays fitted: see `fit`.
+///
+/// A whole page is *scrolled to* as well as zoomed to, which `refit` does
+/// not do. Asking for fit-page means asking to see a page, so the one you
+/// are on comes to the top; but the same thing on every window resize would
+/// throw away where you had scrolled to, and a resize is not a request.
+pub fn fitTo(v: *View, want: Fit) void {
+    const page = v.currentPage();
+    v.fit = want;
     v.refit();
+    if (want == .page) v.scrollToPage(page);
 }
 
-/// Re-applies fit-width to the view's current rectangle. Called by `Layout`
+/// Re-applies the fit to the view's current rectangle. Called by `Layout`
 /// whenever it gives this view a new one.
 pub fn refit(v: *View) void {
-    if (!v.fit_width or v.pages.len == 0) return;
-    const page = v.currentPage();
-    const points: f32 = @floatCast(v.pages[page].displayWidth());
-    if (points > 0) v.zoomAbout((v.width() - gap * 2) / points);
-    v.pan = 0;
+    if (v.fit == .free or v.pages.len == 0) return;
+    const p = v.pages[v.currentPage()];
+    const across: f32 = @floatCast(p.displayWidth());
+    const down: f32 = @floatCast(p.displayHeight());
+
+    const by_width = if (across > 0) (v.width() - gap * 2) / across else 0;
+    const by_height = if (down > 0) (v.height() - gap * 2) / down else 0;
+
+    const want = switch (v.fit) {
+        .free => unreachable,
+        .width => by_width,
+        .height => by_height,
+        .page => @min(by_width, by_height),
+    };
+    if (want > 0) v.zoomAbout(want);
+    // A page fitted across the view has no sideways slack left to hold, and
+    // a pan held from before the fit would slide it off centre. Fit-height
+    // keeps its pan, because the page may still be wider than the window.
+    if (v.fit != .height) v.pan = 0;
 }
 
 /// The `zoom` at which the page is its true physical size. A PDF point is
@@ -845,6 +904,90 @@ test "a view's arithmetic is in its own rectangle, not the window's" {
 
     // And the scrollbar is on the right edge of the *view*.
     try testing.expectApproxEqAbs(@as(f32, 1400 - 12), right.scrollbarAt().?.x0, 0.001);
+}
+
+test "each fit matches the dimension it names, and a page fits inside both" {
+    var buf: [4]fenrir.Page = undefined;
+    const pages = fakePages(&buf, 3); // 600 by 800 points.
+
+    // Wider than it is tall, so the two single-axis fits land on obviously
+    // different zooms and fit-page can only be the smaller of them.
+    var v = viewOf(pages, 1, 1000, 600);
+
+    v.fitTo(.width);
+    try testing.expectApproxEqAbs(@as(f32, 1000 - 2 * gap), v.pageSize(0)[0], 1.5);
+
+    v.fitTo(.height);
+    try testing.expectApproxEqAbs(@as(f32, 600 - 2 * gap), v.pageSize(0)[1], 1.5);
+
+    v.fitTo(.page);
+    const size = v.pageSize(0);
+    try testing.expect(size[0] <= 1000 - 2 * gap + 1.5);
+    try testing.expectApproxEqAbs(@as(f32, 600 - 2 * gap), size[1], 1.5);
+}
+
+test "a fit is a mode: it follows the window until a number ends it" {
+    var buf: [4]fenrir.Page = undefined;
+    var v = viewOf(fakePages(&buf, 3), 1, 1000, 600);
+
+    v.fitTo(.page);
+    // Taller window, so it is now the height that binds and the page follows
+    // without anybody asking it to again.
+    v.rect = .fromRect(0, 0, 1000, 1200);
+    v.refit();
+    try testing.expectEqual(View.Fit.page, v.fit);
+    try testing.expectApproxEqAbs(@as(f32, 1200 - 2 * gap), v.pageSize(0)[1], 1.5);
+
+    // A zoom that names a number is somebody deciding, and the window stops
+    // having an opinion.
+    v.setZoom(2);
+    try testing.expectEqual(View.Fit.free, v.fit);
+    v.rect = .fromRect(0, 0, 500, 1200);
+    v.refit();
+    try testing.expectApproxEqAbs(@as(f32, 2), v.zoom, 0.001);
+}
+
+test "asking for a whole page brings one to the top; a resize does not" {
+    var buf: [8]fenrir.Page = undefined;
+    var v = viewOf(fakePages(&buf, 6), 1, 1000, 600);
+    v.scrollToPage(2);
+    v.scroll += 40;
+
+    v.fitTo(.page);
+    try testing.expectApproxEqAbs(v.pageTop(2) - gap, v.scroll, 0.5);
+
+    // A window resize refits without moving the reader: the scroll follows
+    // the zoom about the middle of the view, and nothing snaps.
+    v.scroll += 25;
+    const before = v.place();
+    v.rect = .fromRect(0, 0, 900, 600);
+    v.refit();
+    const after = v.place();
+    try testing.expectEqual(before.page, after.page);
+    try testing.expect(@abs(before.offset - after.offset) > 0.0 or v.scroll != v.pageTop(2) - gap);
+}
+
+test "a fit with no pages, or a page of no size, changes nothing" {
+    var empty: View = .{ .fit = .page, .rect = .fromRect(0, 0, 1000, 600) };
+    empty.refit();
+    try testing.expectApproxEqAbs(@as(f32, 1), empty.zoom, 0.001);
+
+    var buf: [2]fenrir.Page = undefined;
+    const pages = fakePages(&buf, 1);
+    pages[0].crop_box = .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+    pages[0].media_box = pages[0].crop_box;
+    var v = viewOf(pages, 1, 1000, 600);
+    v.fitTo(.page);
+    try testing.expectApproxEqAbs(@as(f32, 1), v.zoom, 0.001);
+}
+
+test "the names a setting and a command line use round-trip" {
+    try testing.expectEqual(View.Fit.width, View.Fit.byName("width").?);
+    try testing.expectEqual(View.Fit.page, View.Fit.byName("page").?);
+    try testing.expectEqual(View.Fit.free, View.Fit.byName("actual").?);
+    try testing.expect(View.Fit.byName("fit") == null);
+    try testing.expectEqualStrings("", View.Fit.free.label());
+    try testing.expectEqualStrings("fit height", View.Fit.height.label());
 }
 
 test "a place is remembered in points, so reopening at another zoom lands there" {

@@ -489,11 +489,13 @@ fn place(l: *Layout, node: u32, rect: Bounds) void {
         .free => {},
         .leaf => {
             const v = &l.views.items[n.view];
-            const resized = v.rect.width() != rect.width();
+            const resized = v.rect.width() != rect.width() or v.rect.height() != rect.height();
             v.rect = rect;
-            // Only on a change of width: `arrange` runs every frame, and a
+            // Only on a change of size: `arrange` runs every frame, and a
             // refit is a zoom about the middle of the view, which with a
             // scroll in flight would nudge the page a sub-pixel per frame.
+            // The height counts as well as the width now that a page can be
+            // fitted down the window.
             if (resized) v.refit();
             v.clampScroll();
         },
@@ -886,7 +888,7 @@ test "splitting a fitted window refits both halves to their own width" {
     var l = try started(gpa, fakePages(&buf, 3));
     defer l.deinit(gpa);
 
-    l.current().fitWidth();
+    l.current().fitTo(.width);
     const whole = l.current().pageSize(0)[0];
     try testing.expectApproxEqAbs(@as(f32, 1000 - 2 * View.gap), whole, 1.5);
 
@@ -911,9 +913,9 @@ test "a window at a chosen zoom keeps it through a split" {
     var l = try started(gpa, fakePages(&buf, 3));
     defer l.deinit(gpa);
 
-    l.current().fitWidth();
+    l.current().fitTo(.width);
     l.current().setZoom(2);
-    try testing.expect(!l.current().fit_width);
+    try testing.expect(l.current().fit == .free);
 
     _ = try l.split(gpa, .vertical);
     var it = l.iterator();

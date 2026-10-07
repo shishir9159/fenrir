@@ -239,8 +239,11 @@ pub const Status = struct {
     page: u32 = 1,
     pages: u32 = 1,
     percent: f32 = 100,
-    /// The zoom follows the window's width rather than being a number.
-    fit_width: bool = false,
+    /// What the zoom is tied to -- "fit width", "fit page" -- or empty when
+    /// it is a number nobody is moving. A string rather than `View.Fit`
+    /// because `Status` is strings and numbers, and the bar has no business
+    /// knowing what a view is.
+    fit: []const u8 = "",
     /// Shown only when there is more than one.
     windows: u32 = 1,
 };
@@ -327,8 +330,8 @@ pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status) !void {
             try w.spacer(ui, .px(gutter));
         }
 
-        if (st.fit_width) {
-            _ = try w.labelf(ui, "fit width###fit", .{});
+        if (st.fit.len != 0) {
+            _ = try w.labelf(ui, "{s}###fit", .{clamp(st.fit, 32)});
             try w.spacer(ui, .px(gutter));
         }
 

@@ -115,7 +115,8 @@ pub const Command = union(enum) {
     // -- zoom
     zoom_by: f32,
     zoom_to: f32,
-    fit_width,
+    /// Tie the zoom to the shape of the window, or let it go free again.
+    fit: View.Fit,
 
     // -- the cursor
     move_cursor: View.Step,
@@ -402,7 +403,7 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
         'u' => .undo,
         '+', '=' => .{ .zoom_by = 1.25 },
         '-', '_' => .{ .zoom_by = 1.0 / 1.25 },
-        '0' => .fit_width,
+        '0' => .{ .fit = .width },
         '1' => .{ .zoom_to = 1 },
         'v' => blk: {
             state.mode = .visual;

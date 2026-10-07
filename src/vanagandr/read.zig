@@ -143,7 +143,7 @@ pub const usage =
     \\commands, after : in normal mode:
     \\    :12                  page 12
     \\    :page +2, :page -1   pages forward and back
-    \\    :zoom 150, :fit      a zoom, or fit the width
+    \\    :zoom 150, :fit page a zoom, or the width, the height or a page
     \\    :sp, :vs, :close     split below, split beside, close the window
     \\    :only, :bn, :bp      close the others, next / previous document
     \\    :q, :qa              close the window, close the reader
@@ -2126,7 +2126,15 @@ const Session = struct {
                 if (!(percent > 0) or !std.math.isFinite(percent)) return false;
                 v.setZoom(v.hundredPercent() * percent / 100);
             },
-            .fit => v.fitWidth(),
+            .fit => {
+                // Bare `:fit` is the width, which is what it has always
+                // meant and what it means in every other reader.
+                const want: View.Fit = if (args.len == 0) .width else View.Fit.byName(args) orelse {
+                    s.say(":fit takes width, height, page or actual", .{});
+                    return false;
+                };
+                v.fitTo(want);
+            },
             .undo => s.undoMarks(false),
             .redo => s.undoMarks(true),
             .marks => {
@@ -2482,7 +2490,7 @@ const Session = struct {
 
             .zoom_by => |f| v.setZoom(v.zoom * f),
             .zoom_to => |f| v.setZoom(v.hundredPercent() * f),
-            .fit_width => v.fitWidth(),
+            .fit => |want| v.fitTo(want),
 
             .move_cursor => |step| s.moveCursor(step),
             .hide_cursor => {
@@ -3013,8 +3021,9 @@ const Session = struct {
     /// The status bar is *reserved*, not drawn over: a bar that floated on
     /// top would cover the last line of the page, and a reader whose last
     /// line is hidden is worse than one with a shorter page. Every window's
-    /// fit-width refits to this, because `Layout.arrange` calls `refit` on
-    /// each rectangle it hands out.
+    /// fit refits to this, because `Layout.arrange` calls `refit` on each
+    /// rectangle it hands out -- which is also why a page fitted down the
+    /// window fits above the bar rather than behind it.
     fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
         const taken: f32 = if (s.chrome != null) chrome_mod.status_height else 0;
         return .fromRect(0, 0, width, @max(height - taken, 1));
@@ -3040,7 +3049,7 @@ const Session = struct {
             .page = v.currentPage() + 1,
             .pages = @intCast(v.pages.len),
             .percent = v.percent(),
-            .fit_width = v.fit_width,
+            .fit = v.fit.label(),
             .windows = s.layout.count(),
         };
 
@@ -3134,7 +3143,7 @@ const Session = struct {
 
         var it = s.layout.iterator();
         while (it.next()) |v| {
-            if (v.fit_on_open) v.fitWidth();
+            if (v.fit_on_open) v.fitTo(.width);
             if (v.scroll == 0) v.scrollToPage(start_page);
         }
 
@@ -3260,7 +3269,7 @@ const Session = struct {
         {
             const v = s.view();
             v.dpi_scale = scale;
-            if (v.fit_on_open) v.fitWidth();
+            if (v.fit_on_open) v.fitTo(.width);
         }
         s.applySplits(settings.splits);
         {
