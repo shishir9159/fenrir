@@ -28,9 +28,13 @@
 //! A glyph's width is taken from the *next* glyph's offset rather than from
 //! the font, because the run already contains the advance the producer chose,
 //! kerning and `TJ` adjustments included, and asking the font would get a
-//! different answer. The last glyph of a run has no next, and gets half its
-//! size -- an estimate, and visibly one on a caret parked after a full stop,
-//! but the alternative is loading a face here to measure one glyph.
+//! different answer. The last glyph of a run has no next, and is measured
+//! against `TextRun.advance` -- where the pen finished -- which the
+//! interpreter carries for exactly this. It used to get half its size
+//! instead, and that guess is why the right-hand edge of a selection over a
+//! justified paragraph was ragged: every line ends at the same place on the
+//! paper, and half an em past the *start* of the last letter is a different
+//! place for an `l` than for an `m`.
 //!
 //! ## Displayed equations are still wrong, and are the next thing here
 //!
@@ -252,7 +256,7 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
             const advance = if (i + 1 < glyphs.len)
                 glyphs[i + 1].offset.x - g.offset.x
             else
-                run.size * 0.5;
+                run.advance - g.offset.x;
             // A negative advance is a run that moves backwards -- a `TJ` with
             // a large positive adjustment, or right-to-left text emitted in
             // visual order. Give it a forward box anyway; a zero-width one
@@ -644,6 +648,7 @@ fn runOf(
         .size = size,
         .transform = .translation(x, y),
         .glyphs = .{ .start = 0, .count = n },
+        .advance = advance * @as(f32, @floatFromInt(n)),
     } };
     return .{ .glyphs = glyphs, .cmds = cmds };
 }
@@ -670,8 +675,66 @@ test "a run becomes one line of boxes in reading order" {
     try testing.expectApproxEqAbs(@as(f32, 106), page.boxes[1].box.min_x, 0.01);
     try testing.expectEqual(@as(u32, 'a'), page.boxes[0].code);
 
-    // The last glyph has no next to measure against and gets half a size.
-    try testing.expectApproxEqAbs(@as(f32, 5), page.boxes[3].box.width(), 0.01);
+    // The last glyph has no next to measure against, and is measured against
+    // where the pen finished instead -- the same advance as the rest.
+    try testing.expectApproxEqAbs(@as(f32, 6), page.boxes[3].box.width(), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 124), page.lines[0].box.max_x, 0.01);
+}
+
+test "the line ends where the pen did, not half an em past its last letter" {
+    const gpa = testing.allocator;
+
+    // Two lines of one run each, justified to the same right margin at 200:
+    // the first ends in a narrow letter and the second in a wide one, which
+    // in a real document means the last glyph *starts* in different places.
+    const glyphs = try gpa.alloc(DisplayList.Glyph, 4);
+    defer gpa.free(glyphs);
+    glyphs[0] = .{ .code = 'x', .offset = .{ .x = 0, .y = 0 } };
+    glyphs[1] = .{ .code = 'l', .offset = .{ .x = 97, .y = 0 } };
+    glyphs[2] = .{ .code = 'x', .offset = .{ .x = 0, .y = 0 } };
+    glyphs[3] = .{ .code = 'm', .offset = .{ .x = 92, .y = 0 } };
+
+    const cmds = try gpa.alloc(DisplayList.DrawCmd, 2);
+    defer gpa.free(cmds);
+    for (cmds, 0..) |*c, i| c.* = .{ .text = .{
+        .size = 10,
+        .transform = .translation(100, 700 - 12 * @as(f32, @floatFromInt(i))),
+        .glyphs = .{ .start = @intCast(i * 2), .count = 2 },
+        .advance = 100,
+    } };
+
+    var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer page.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 2), page.lines.len);
+    // Both end at the margin. Half a size each would have put them at 202
+    // and 197, which is the ragged selection edge this is here to stop.
+    try testing.expectApproxEqAbs(@as(f32, 200), page.lines[0].box.max_x, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 200), page.lines[1].box.max_x, 0.01);
+}
+
+test "a run that never said where its pen finished still gets a box" {
+    const gpa = testing.allocator;
+
+    // `advance` is zero on a display list built by hand rather than by the
+    // interpreter, and a zero-width last glyph would be a caret position
+    // nobody could click on.
+    const glyphs = try gpa.alloc(DisplayList.Glyph, 1);
+    defer gpa.free(glyphs);
+    glyphs[0] = .{ .code = 'a', .offset = .origin };
+
+    var cmds = try gpa.alloc(DisplayList.DrawCmd, 1);
+    defer gpa.free(cmds);
+    cmds[0] = .{ .text = .{
+        .size = 10,
+        .transform = .translation(100, 700),
+        .glyphs = .{ .start = 0, .count = 1 },
+    } };
+
+    var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer page.deinit(gpa);
+
+    try testing.expectApproxEqAbs(@as(f32, 5), page.boxes[0].box.width(), 0.01);
 }
 
 test "glyphs on different baselines are different lines, down the page" {

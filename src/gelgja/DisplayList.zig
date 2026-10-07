@@ -125,6 +125,19 @@ pub const TextRun = struct {
     /// Present only when `mode` strokes.
     stroke: ?Stroke = null,
     glyphs: Range = .empty,
+    /// Where the pen finished, in the space `Glyph.offset` is measured in:
+    /// the run's whole advance, the spacing after its last glyph included.
+    ///
+    /// Here because the last glyph of a run has no next glyph to be measured
+    /// against, and it is the one a selection ends on. Guessing a width for
+    /// it -- which is what `hlidskjalf.text` did -- makes the right-hand edge
+    /// of a selection over a justified paragraph ragged by however much each
+    /// line's final letter differs from the guess. The interpreter already
+    /// has the number, since it is what advanced the text matrix, so this is
+    /// one float per run rather than a measurement.
+    ///
+    /// Zero means nobody said, and the guess is what happens.
+    advance: f32 = 0,
 };
 
 pub const Image = struct {

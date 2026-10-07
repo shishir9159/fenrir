@@ -271,6 +271,8 @@ pub const RunStyle = struct {
     mode: paint.TextRenderMode = .fill,
     fill: Paint = .{ .solid = .black },
     stroke: ?Stroke = null,
+    /// See `DisplayList.TextRun.advance`.
+    advance: f32 = 0,
 };
 
 /// Records one `Tj`/`TJ` worth of glyphs.
@@ -292,6 +294,7 @@ pub fn textRun(b: *Builder, style: RunStyle, glyphs: []const Glyph) Error!void {
         .fill = style.fill,
         .stroke = style.stroke,
         .glyphs = .{ .start = start, .count = @intCast(glyphs.len) },
+        .advance = style.advance,
     } });
 }
 

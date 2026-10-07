@@ -1110,6 +1110,10 @@ fn showText(it: *Interpreter, bytes: []const u8, resources: Dict, depth: u8) Err
             .mode = it.state.render_mode,
             .fill = withAlpha(it.state.fill, it.state.fill_alpha),
             .stroke = if (it.state.render_mode.strokes()) it.state.line else null,
+            // Before `Tz`, like the glyph offsets beside it: this is where
+            // the pen stands after the last glyph, which is the only width
+            // that glyph can be given.
+            .advance = @floatCast(offset),
         }, it.glyph_buf.items);
     }
 
