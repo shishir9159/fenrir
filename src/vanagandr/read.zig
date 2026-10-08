@@ -69,6 +69,7 @@ const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const library = @import("library.zig");
 const Library = library.Library;
+const settings_page = @import("settings.zig");
 
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
@@ -146,6 +147,7 @@ pub const usage =
     \\    :page +2, :page -1   pages forward and back
     \\    :zoom 150, :fit page a zoom, or the width, the height or a page
     \\    :set theme=light     the colours the interface is drawn in
+    \\    :settings            all of them, as a page over the document
     \\    :sp, :vs, :close     split below, split beside, close the window
     \\    :only, :bn, :bp      close the others, next / previous document
     \\    :q, :qa              close the window, close the reader
@@ -875,6 +877,10 @@ const Session = struct {
     /// draws them with no `Chrome` at all.
     theme: Theme = .dark,
 
+    /// The settings page, and the values it is showing. Filled when it opens
+    /// and after every change, never per frame: see `settings.zig`.
+    settings: settings_page.State = .{},
+
     /// The accent a person configured, or null for the theme's own.
     ///
     /// Kept apart from the theme so that `useTheme` can put it back on top of
@@ -1105,6 +1111,63 @@ const Session = struct {
         const name = (lib.theme() catch null) orelse return s.theme;
         defer s.gpa.free(name);
         return Theme.byName(name) orelse s.theme;
+    }
+
+    /// Fills the settings page with what the library holds now.
+    ///
+    /// Called when the page opens and after every change, and nowhere near a
+    /// frame: `Library.get` asks SQLite and allocates, and this reader does
+    /// not allocate on a frame path. With no library every row is unset,
+    /// which is the truth -- there is nowhere for a setting to have been
+    /// written.
+    fn readSettings(s: *Session) void {
+        for (settings_page.options, 0..) |opt, i| {
+            const lib = s.library orelse {
+                s.settings.put(i, null);
+                continue;
+            };
+            const got = lib.get(opt.key) catch null;
+            defer if (got) |g| s.gpa.free(g);
+            s.settings.put(i, got);
+        }
+    }
+
+    /// One row of the settings page, written down and acted on.
+    ///
+    /// Through the same doors as everything else: a theme goes through
+    /// `useTheme`, so the page and `:set theme=` cannot diverge, and a colour
+    /// is parsed before it is stored, so a row nobody could read is refused
+    /// where it was typed rather than on the next start.
+    fn changeSetting(s: *Session, c: settings_page.Change) void {
+        if (std.mem.eql(u8, c.key, "theme")) {
+            const t = Theme.byName(c.value) orelse {
+                s.say("no theme called {s}", .{c.value[0..@min(c.value.len, 48)]});
+                return;
+            };
+            s.useTheme(t);
+        } else if (std.mem.eql(u8, c.key, "accent")) {
+            if (c.value.len != 0) {
+                const colour = Library.parseColor(c.value) orelse {
+                    s.say("{s} is not a colour: try a name or #rrggbb", .{
+                        c.value[0..@min(c.value.len, 48)],
+                    });
+                    return;
+                };
+                s.chosen_accent = colour;
+                s.highlight = colour;
+            } else {
+                s.chosen_accent = null;
+            }
+            s.useTheme(s.theme);
+        }
+
+        const lib = s.library orelse {
+            s.say("nowhere to keep {s}: this reader has no library", .{c.key});
+            return;
+        };
+        if (c.value.len == 0) lib.remove(c.key) catch {} else lib.set(c.key, c.value) catch {};
+        s.readSettings();
+        s.say("{s} = {s}", .{ c.key, if (c.value.len == 0) "unset" else c.value });
     }
 
     /// Takes from the library where this document was left, and puts the view
@@ -2131,7 +2194,7 @@ const Session = struct {
         const args = std.mem.trim(u8, line[space..], " \t");
         const v = s.view();
 
-        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, bn, bnext, bp, bprevious, page, zoom, fit, set, undo, redo, marks, lua, messages, plugins, echo };
+        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, bn, bnext, bp, bprevious, page, zoom, fit, set, settings, undo, redo, marks, lua, messages, plugins, echo };
         const which = std.meta.stringToEnum(Builtin, name) orelse {
             if (s.plugins) |rt| {
                 if (rt.runCommand(name, args)) |ran| return ran;
@@ -2180,6 +2243,10 @@ const Session = struct {
                 v.fitTo(want);
             },
             .set => return s.setOption(args),
+            .settings => {
+                s.settings.toggle();
+                if (s.settings.open) s.readSettings();
+            },
             .undo => s.undoMarks(false),
             .redo => s.undoMarks(true),
             .marks => {
@@ -2518,12 +2585,10 @@ const Session = struct {
     /// the chrome keeps for exactly this reason, and not of a box tree that
     /// does not exist yet.
     fn handle(s: *Session, in: lyngvi.Input) bool {
-        if (s.chrome) |c| {
-            if (c.grabbing()) {
-                var it = s.layout.iterator();
-                while (it.next()) |v| v.clampScroll();
-                return s.quit;
-            }
+        if (s.interfaceHasInput()) {
+            var it = s.layout.iterator();
+            while (it.next()) |v| v.clampScroll();
+            return s.quit;
         }
         s.pointer(in);
 
@@ -2542,6 +2607,18 @@ const Session = struct {
         while (it.next()) |v| v.clampScroll();
         s.reportChanges();
         return s.quit;
+    }
+
+    /// Whether the interface is holding this frame's keyboard and pointer.
+    ///
+    /// True while a menu or the settings page is open. Both are built after
+    /// `handle` runs, so the question is asked of their *state* rather than
+    /// of a box tree that does not exist yet -- which is why that state is
+    /// the caller's in both files rather than living in the tree.
+    fn interfaceHasInput(s: *const Session) bool {
+        if (s.settings.open) return true;
+        const c = s.chrome orelse return false;
+        return c.grabbing();
     }
 
     /// Fires `page` and `mode` when either has changed since last reported.
@@ -3596,8 +3673,12 @@ const Session = struct {
             if (s.chrome) |c| {
                 try c.begin(extent, input);
                 const want = try c.status(s.statusLine());
+                // After the bar, so it is over it: a popup is on top by
+                // being built last, and nothing here sorts.
+                const changed = try settings_page.page(&c.ui, c.face, c.theme, &s.settings);
                 c.end();
                 if (want) |wanted| s.applyZoom(wanted);
+                if (changed) |c2| s.changeSetting(c2);
                 try c.flush(&over, &list, &renderer, &uploads);
             }
 
@@ -4558,4 +4639,57 @@ test "an unknown setting or theme is refused, and changes nothing" {
     // Asking rather than setting, both spellings.
     try testing.expect(s.exec("set theme"));
     try testing.expect(s.exec("set"));
+}
+
+test "the settings page holds the keyboard while it is open" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(!s.interfaceHasInput());
+    try testing.expect(s.exec("settings"));
+    try testing.expect(s.settings.open);
+    // Otherwise escape would leave a mode and the arrows would scroll the
+    // document out from under the page.
+    try testing.expect(s.interfaceHasInput());
+
+    try testing.expect(s.exec("settings"));
+    try testing.expect(!s.settings.open);
+    try testing.expect(!s.interfaceHasInput());
+}
+
+test "a setting changed on the page goes through the same door as the command" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.changeSetting(.{ .key = "theme", .value = "light" });
+    try testing.expectEqualStrings("light", s.theme.name);
+
+    // A colour is parsed where it is typed, so a row nobody could read is
+    // refused rather than found wrong on the next start.
+    s.changeSetting(.{ .key = "accent", .value = "not a colour" });
+    try testing.expect(s.chosen_accent == null);
+
+    s.changeSetting(.{ .key = "accent", .value = "orange" });
+    try testing.expect(s.chosen_accent != null);
+    try testing.expectEqual(s.chosen_accent.?, s.accent);
+    try testing.expectEqual(s.chosen_accent.?, s.highlight);
+}
+
+test "with no library every setting is unset, and saying so is not a crash" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.readSettings();
+    for (settings_page.options, 0..) |_, i| {
+        try testing.expectEqual(@as(usize, 0), s.settings.valueOf(i).len);
+    }
+    // The theme still changes; there is simply nowhere to keep it.
+    s.changeSetting(.{ .key = "theme", .value = "light" });
+    try testing.expectEqualStrings("light", s.theme.name);
 }
