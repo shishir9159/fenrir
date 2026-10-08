@@ -295,11 +295,13 @@ pub const config_usage =
     \\    fenrir config author           print one
     \\    fenrir config author "Name"    set one
     \\    fenrir config accent yellow    a colour by name, or #rrggbb
+    \\    fenrir config theme light      dark or light
     \\    fenrir config --unset accent   back to the default
     \\
     \\    Known keys:
     \\      author   the name annotations are signed with
     \\      accent   the colour the interface draws its own marks in
+    \\      theme    which set of colours the interface is drawn in
     \\      zoom     the zoom a document opens at, or `fit`
 ;
 
@@ -352,6 +354,22 @@ pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
                     return ctx.fail("{s} is not a colour: try a name or #rrggbb", .{v});
                 lib.setAccent(c) catch |err| return ctx.fail("cannot set accent: {t}", .{err});
                 ctx.out.print("accent = {s}\n", .{v}) catch {};
+                return;
+            }
+            // The same argument as a colour: a theme nobody has is found
+            // here, while whoever typed it is still watching, rather than on
+            // the next start by quietly staying dark.
+            if (std.mem.eql(u8, k, "theme")) {
+                if (fenrir.thviti.Theme.byName(v) == null) {
+                    var names: std.Io.Writer.Allocating = .init(ctx.gpa);
+                    defer names.deinit();
+                    for (fenrir.thviti.Theme.all, 0..) |t, n| {
+                        names.writer.print("{s}{s}", .{ if (n == 0) "" else ", ", t.name }) catch {};
+                    }
+                    return ctx.fail("no theme called {s}: there is {s}", .{ v, names.written() });
+                }
+                lib.setTheme(v) catch |err| return ctx.fail("cannot set theme: {t}", .{err});
+                ctx.out.print("theme = {s}\n", .{v}) catch {};
                 return;
             }
             lib.set(k, v) catch |err| return ctx.fail("cannot set {s}: {t}", .{ k, err });

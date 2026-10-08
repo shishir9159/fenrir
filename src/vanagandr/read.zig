@@ -92,6 +92,7 @@ const Marks = hlidskjalf.Marks;
 const View = hlidskjalf.View;
 const keys = hlidskjalf.keys;
 const text = hlidskjalf.text;
+const Theme = thviti.Theme;
 
 /// Which path rasteriser this binary has, from `-Dpath`.
 const have_cpu = fenrir.build_options.path_cpu;
@@ -144,6 +145,7 @@ pub const usage =
     \\    :12                  page 12
     \\    :page +2, :page -1   pages forward and back
     \\    :zoom 150, :fit page a zoom, or the width, the height or a page
+    \\    :set theme=light     the colours the interface is drawn in
     \\    :sp, :vs, :close     split below, split beside, close the window
     \\    :only, :bn, :bp      close the others, next / previous document
     \\    :q, :qa              close the window, close the reader
@@ -412,10 +414,13 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     session.remembers_place = shot == null;
     if (session.library) |l| {
         if (l.accent() catch null) |c| {
-            session.accent = c;
+            session.chosen_accent = c;
             session.highlight = c;
         }
     }
+    // After the accent, because the theme carries it: `useTheme` puts the
+    // chosen colour back on top of whichever theme was named.
+    session.useTheme(session.rememberedTheme());
 
     for (files.items) |file| {
         _ = session.openBuffer(file) catch |err| {
@@ -860,10 +865,27 @@ const Session = struct {
     placed: ?u64 = null,
     recorded: Recorded = .{},
 
-    /// The colour the interface draws its own chrome in: the scrollbar thumb
-    /// and the focused window's border. Remembered between sessions; see
+    /// The colours everything the reader draws is taken from, the chrome's
+    /// and the page's backdrop alike. Remembered between sessions; see
     /// `mimir`.
-    accent: Color = .white,
+    ///
+    /// On the session and not only on the `Chrome`, because the backdrop, the
+    /// lines between windows and the paper under a page that has not arrived
+    /// yet are all drawn whether or not there is an interface -- `--shot`
+    /// draws them with no `Chrome` at all.
+    theme: Theme = .dark,
+
+    /// The accent a person configured, or null for the theme's own.
+    ///
+    /// Kept apart from the theme so that `useTheme` can put it back on top of
+    /// whichever theme is chosen next: a reader who picked orange and then
+    /// switched to the light theme wants orange, not the light theme's blue.
+    chosen_accent: ?Color = null,
+
+    /// The colour the interface draws its own chrome in: the scrollbar thumb
+    /// and the focused window's border. The theme's accent, or the one that
+    /// was configured.
+    accent: Color = Theme.dark.accent,
 
     /// The colour a highlight made without naming one is drawn in.
     ///
@@ -1062,6 +1084,28 @@ const Session = struct {
     }
 
     // -- what the library remembers ------------------------------------------
+
+    /// Draws everything after this in `t`, with whatever accent is in force.
+    ///
+    /// One place, so that a theme chosen at startup and one chosen with
+    /// `:set` take exactly the same path -- the failure otherwise is the one
+    /// where switching in the reader looks right and reopening does not.
+    fn useTheme(s: *Session, t: Theme) void {
+        s.theme = if (s.chosen_accent) |c| t.withAccent(c) else t;
+        s.accent = s.theme.accent;
+        if (s.chrome) |c| c.theme = s.theme;
+    }
+
+    /// The theme the library remembers, or the one already in force. A name
+    /// nobody recognises is left alone rather than reported: `fenrir config`
+    /// refuses one at the moment it is typed, so a bad name in the database
+    /// was put there by hand and the reader still has to open.
+    fn rememberedTheme(s: *Session) Theme {
+        const lib = s.library orelse return s.theme;
+        const name = (lib.theme() catch null) orelse return s.theme;
+        defer s.gpa.free(name);
+        return Theme.byName(name) orelse s.theme;
+    }
 
     /// Takes from the library where this document was left, and puts the view
     /// there. Returns the place if there was one.
@@ -2087,7 +2131,7 @@ const Session = struct {
         const args = std.mem.trim(u8, line[space..], " \t");
         const v = s.view();
 
-        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, bn, bnext, bp, bprevious, page, zoom, fit, undo, redo, marks, lua, messages, plugins, echo };
+        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, bn, bnext, bp, bprevious, page, zoom, fit, set, undo, redo, marks, lua, messages, plugins, echo };
         const which = std.meta.stringToEnum(Builtin, name) orelse {
             if (s.plugins) |rt| {
                 if (rt.runCommand(name, args)) |ran| return ran;
@@ -2135,6 +2179,7 @@ const Session = struct {
                 };
                 v.fitTo(want);
             },
+            .set => return s.setOption(args),
             .undo => s.undoMarks(false),
             .redo => s.undoMarks(true),
             .marks => {
@@ -2183,6 +2228,48 @@ const Session = struct {
             },
             .echo => s.say("{s}", .{args[0..@min(args.len, 400)]}),
         }
+        return true;
+    }
+
+    /// `:set theme=light`, and `:set theme` to be told what it is.
+    ///
+    /// Vim's spelling, and Vim's division: a setting is a name and a value,
+    /// not a command per setting. There is one of them today and the shape is
+    /// here for the next; `fenrir config` is the same table from outside the
+    /// reader, and both go through `Theme.byName` so a name that works in one
+    /// works in the other.
+    ///
+    /// What is set is written down. A theme chosen in the reader and lost on
+    /// the way out would be a theme nobody chooses twice.
+    fn setOption(s: *Session, args: []const u8) bool {
+        if (args.len == 0) {
+            s.say("theme = {s}", .{s.theme.name});
+            return true;
+        }
+
+        const eq = std.mem.indexOfScalar(u8, args, '=') orelse {
+            if (!std.mem.eql(u8, args, "theme")) {
+                s.say("no setting called {s}", .{args[0..@min(args.len, 48)]});
+                return false;
+            }
+            s.say("theme = {s}", .{s.theme.name});
+            return true;
+        };
+
+        const name = std.mem.trim(u8, args[0..eq], " \t");
+        const value = std.mem.trim(u8, args[eq + 1 ..], " \t");
+        if (!std.mem.eql(u8, name, "theme")) {
+            s.say("no setting called {s}", .{name[0..@min(name.len, 48)]});
+            return false;
+        }
+
+        const t = Theme.byName(value) orelse {
+            s.say("no theme called {s}: there is dark and light", .{value[0..@min(value.len, 48)]});
+            return false;
+        };
+        s.useTheme(t);
+        if (s.library) |l| l.setTheme(t.name) catch {};
+        s.say("theme = {s}", .{t.name});
         return true;
     }
 
@@ -2756,15 +2843,16 @@ const Session = struct {
 
     // -- the frame -----------------------------------------------------------
 
-    /// The backdrop a page sits on. Dark enough that white paper is obviously
-    /// paper and not the whole window, and neutral so it does not tint what is
-    /// next to it.
-    const page_backdrop: Color = .gray(0.16);
-    const paper: Color = .white;
-    const shadow: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0.45 };
+    /// The backdrop a page sits on, the paper under one that has not arrived,
+    /// the shadow it sits on, and the line between two windows.
+    ///
+    /// Four literals until the theme reached this far down. They were
+    /// `gray(0.16)`, white, black at 0.45 and `gray(0.08)`, which are the
+    /// dark theme's `ground`, `paper`, `shadow` and `divider` to within a
+    /// hundredth -- the light theme needed all four to move together, and a
+    /// backdrop that stayed near black under a light interface is exactly
+    /// the sort of half-applied theme this file was meant not to have.
     const white: Color = .white;
-    /// The line between two windows, and the one round the focused one.
-    const divider: Color = .gray(0.08);
 
     fn compose(s: *Session, list: *DrawList, over: *DrawList) !void {
         s.stamp += 1;
@@ -2789,7 +2877,7 @@ const Session = struct {
         // everything so neither is covered by a page.
         s.borders.clearRetainingCapacity();
         try s.layout.borders(&s.borders, s.gpa);
-        for (s.borders.items) |b| try over.fill(b, divider);
+        for (s.borders.items) |b| try over.fill(b, s.theme.divider);
 
         if (s.layout.count() > 1) {
             const focused = s.layout.nodes.items[s.layout.focus].rect;
@@ -2815,14 +2903,14 @@ const Session = struct {
                 .fromRect(rect.min_x, rect.min_y + 3, rect.max_x, rect.max_y + 3),
                 .{},
                 8,
-                shadow,
+                s.theme.shadow,
             );
 
             if (s.backend == .gpu) {
                 // Blank paper. The path pipeline draws on it, in its own pass
                 // between this list and `over`.
                 s.recorded.touch(v.buffer, i);
-                try list.fill(rect, paper);
+                try list.fill(rect, s.theme.paper);
             } else if (s.slotFor(v.buffer, i, v.zoom)) |slot| {
                 slot.used = s.stamp;
                 try list.image(
@@ -2834,7 +2922,7 @@ const Session = struct {
             } else {
                 // Paper with nothing on it yet. Better than a hole, and it
                 // tells you the page exists and is coming.
-                try list.fill(rect, paper);
+                try list.fill(rect, s.theme.paper);
             }
 
         }
@@ -3218,7 +3306,7 @@ const Session = struct {
 
         var fb = try gleipnir.Framebuffer.init(gpa, width, height, .linear);
         defer fb.deinit(gpa);
-        fb.clear(page_backdrop);
+        fb.clear(s.theme.ground);
         gleipnir.software.render(fb, list.instances.items, images.sampler());
 
         var file = Io.Dir.cwd().createFile(ctx.io, dest, .{}) catch |err|
@@ -3439,7 +3527,7 @@ const Session = struct {
                     @errorName(err),
                 });
             };
-            if (s.accent.a != 0) c.theme = c.theme.withAccent(s.accent);
+            c.theme = s.theme;
         }
 
         var uploads: std.ArrayList(lyngvi.Renderer.Upload) = .empty;
@@ -3541,7 +3629,7 @@ const Session = struct {
                 (s.firstMissing() == null or drawn >= shot_patience);
             renderer.capture_next = shooting;
 
-            switch (try renderer.frameWith(&list, uploads.items, page_backdrop, paths, &over)) {
+            switch (try renderer.frameWith(&list, uploads.items, s.theme.ground, paths, &over)) {
                 .drawn => {
                     // The first frame and the first frame with the page on
                     // it are different moments, and the second is the one a
@@ -4413,4 +4501,61 @@ test "dragging the line between two windows resizes both of them" {
     s.pointer(.{ .mouse = .{ .x = 150, .y = 400 }, .buttons = .{ .left = true } });
     try testing.expect(s.split_drag == null);
     try testing.expectApproxEqAbs(@as(f32, 300), left.rect.max_x, 1e-3);
+}
+
+test "a theme reaches the page's backdrop and not only the chrome" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // Two of the three literals were already the dark theme's, to the
+    // hundredth. The backdrop was not: it was `gray(0.16)`, which is the
+    // *panel*, so the bar was the same grey as the ground it sat on. It is
+    // `ground` now and a step darker, which is what the design language asks
+    // for and what makes a bar read as a surface.
+    try testing.expectApproxEqAbs(@as(f32, 0.08), s.theme.divider.r, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.45), s.theme.shadow.a, 0.01);
+    try testing.expect(s.theme.ground.r < s.theme.panel.r);
+
+    try testing.expect(s.exec("set theme=light"));
+    try testing.expect(!s.theme.isDark());
+    // The ground moves with it: a light interface over a near-black backdrop
+    // is the half-applied theme this is here to catch.
+    try testing.expect(s.theme.ground.r > 0.5);
+    try testing.expect(s.theme.paper.r > 0.9);
+}
+
+test "the accent follows the theme, and a chosen one follows the reader" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.useTheme(.dark);
+    try testing.expectEqual(Theme.dark.accent, s.accent);
+
+    // Somebody picked orange. It survives the change of theme, because a
+    // person choosing a colour has not also chosen to lose it.
+    const orange: Color = .{ .r = 0.96, .g = 0.6, .b = 0.15 };
+    s.chosen_accent = orange;
+    s.useTheme(.light);
+    try testing.expectEqual(orange, s.accent);
+    try testing.expectEqual(orange, s.theme.accent);
+}
+
+test "an unknown setting or theme is refused, and changes nothing" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(!s.exec("set theme=solarised"));
+    try testing.expectEqualStrings("dark", s.theme.name);
+    try testing.expect(!s.exec("set wrap=on"));
+    try testing.expectEqualStrings("dark", s.theme.name);
+
+    // Asking rather than setting, both spellings.
+    try testing.expect(s.exec("set theme"));
+    try testing.expect(s.exec("set"));
 }

@@ -216,6 +216,20 @@ pub fn setAuthor(lib: Library, name: []const u8) Error!void {
     try lib.set("author", name);
 }
 
+/// Which set of colours the interface is drawn in, by name.
+///
+/// A name and not a table: the themes are compiled into Þviti, and a library
+/// that stored eleven colours would be a second place for them to be wrong.
+/// Whether the name is one that exists is asked where the themes are, which
+/// is not here.
+pub fn theme(lib: Library) Error!?[]u8 {
+    return lib.get("theme");
+}
+
+pub fn setTheme(lib: Library, name: []const u8) Error!void {
+    try lib.set("theme", name);
+}
+
 /// The colour the interface draws its own marks in: the scrollbar thumb, and
 /// what a highlight made by hand would be.
 pub fn accent(lib: Library) Error!?Color {
