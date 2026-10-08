@@ -2422,7 +2422,22 @@ const Session = struct {
     // -- input ---------------------------------------------------------------
 
     /// Returns true when the reader should close.
+    ///
+    /// The interface gets first refusal on the frame. While a menu is open it
+    /// owns the pointer and the arrows, escape and enter, and the page must
+    /// not also act on them -- escape would leave visual mode and the arrows
+    /// would scroll the document out from under the menu. The chrome is built
+    /// after this runs, so the question is asked of the menu's *state*, which
+    /// the chrome keeps for exactly this reason, and not of a box tree that
+    /// does not exist yet.
     fn handle(s: *Session, in: lyngvi.Input) bool {
+        if (s.chrome) |c| {
+            if (c.grabbing()) {
+                var it = s.layout.iterator();
+                while (it.next()) |v| v.clampScroll();
+                return s.quit;
+            }
+        }
         s.pointer(in);
 
         const bindings = if (s.plugins) |rt| rt.lookup() else null;
@@ -2571,6 +2586,20 @@ const Session = struct {
             .redo => s.undoMarks(true),
         }
         return false;
+    }
+
+    /// What the status bar's zoom control asked for, carried out.
+    ///
+    /// The bar names a fit with the same word `:fit` takes, so the two ways
+    /// in parse it in one place and a menu row cannot drift from the command
+    /// that does the same thing.
+    fn applyZoom(s: *Session, want: chrome_mod.ZoomWant) void {
+        const v = s.view();
+        switch (want) {
+            .fit => |name| v.fitTo(View.Fit.byName(name) orelse return),
+            .percent => |p| v.setZoom(v.hundredPercent() * p / 100),
+        }
+        s.dirty_title = true;
     }
 
     /// The pointer: which window it is in, the scrollbar, and the page.
@@ -3478,8 +3507,9 @@ const Session = struct {
             // both may have it.
             if (s.chrome) |c| {
                 try c.begin(extent, input);
-                try c.status(s.statusLine());
+                const want = try c.status(s.statusLine());
                 c.end();
+                if (want) |wanted| s.applyZoom(wanted);
                 try c.flush(&over, &list, &renderer, &uploads);
             }
 

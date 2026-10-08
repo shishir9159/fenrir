@@ -76,6 +76,11 @@ pub const Chrome = struct {
 
     theme: Theme = .dark,
 
+    /// The zoom control's own state. On the chrome and not in the box tree,
+    /// for the reason a checkbox's bool is the caller's: the reader has to
+    /// be able to ask whether a menu is open before it reads a key.
+    zoom: Zoom = .{},
+
     /// On the heap, and not by value, because `UI` reaches text through a
     /// vtable whose pointer is `&c.fonts`. A `Chrome` returned by value is
     /// copied to its caller and that pointer is left aiming at the frame it
@@ -164,9 +169,15 @@ pub const Chrome = struct {
     }
 
     /// The mode line, for a reader that does not want to know how one is
-    /// built.
-    pub fn status(c: *Chrome, st: Status) !void {
-        return statusBar(&c.ui, c.face, c.theme, st);
+    /// built. Returns what the zoom control was asked for, if anything.
+    pub fn status(c: *Chrome, st: Status) !?ZoomWant {
+        return statusBar(&c.ui, c.face, c.theme, st, &c.zoom);
+    }
+
+    /// Whether the interface is holding the keyboard and the pointer this
+    /// frame, which it is while a menu is open.
+    pub fn grabbing(c: *const Chrome) bool {
+        return c.zoom.menu.open;
     }
 
     /// The solved tree, as instances on `over`, plus whatever rows Týr
@@ -248,6 +259,112 @@ pub const Status = struct {
     windows: u32 = 1,
 };
 
+/// What the zoom control was asked for.
+///
+/// A request, not an action: the bar has no view to act on and no idea what
+/// one is, so it names what it was asked for and the reader carries it out.
+/// The fit is the *word* `:fit` takes rather than a `View.Fit`, which keeps
+/// this file's promise that a `Status` is strings and numbers -- and costs
+/// nothing, since `View.Fit.byName` is the parser either way.
+pub const ZoomWant = union(enum) {
+    fit: []const u8,
+    /// A percentage of the page's true physical size, as the bar shows it.
+    percent: f32,
+};
+
+/// The zoom control's state, which is one menu.
+pub const Zoom = struct {
+    menu: w.Menu = .{},
+};
+
+/// What the menu offers, in the order it offers it. The rule above the line
+/// is the fits, below it the sizes somebody might name.
+const zoom_menu = struct {
+    const Row = struct { []const u8, []const u8, ZoomWant };
+    const fits = [_]Row{
+        .{ "Fit width", "0", .{ .fit = "width" } },
+        .{ "Fit height", "", .{ .fit = "height" } },
+        .{ "Fit page", "", .{ .fit = "page" } },
+        .{ "Actual size", "1", .{ .fit = "actual" } },
+    };
+    const sizes = [_]Row{
+        .{ "50%", "", .{ .percent = 50 } },
+        .{ "75%", "", .{ .percent = 75 } },
+        .{ "100%", "", .{ .percent = 100 } },
+        .{ "150%", "", .{ .percent = 150 } },
+        .{ "200%", "", .{ .percent = 200 } },
+        .{ "400%", "", .{ .percent = 400 } },
+    };
+
+    /// Known before the menu is built, so it can be placed *above* the bar
+    /// rather than hanging off the bottom of the window for one frame while
+    /// `popup.clampInto` works out how tall it turned out to be.
+    const height: f32 = w.menu.padding * 2 +
+        @as(f32, fits.len + sizes.len) * w.menu.item_height +
+        w.menu.separator_height;
+    const width: f32 = 180;
+};
+
+/// The zoom, as a control rather than a reading.
+///
+/// Built inside the bar; the menu it opens is built *after* the bar closes,
+/// because a popup is on top by being built last and nothing here sorts.
+fn zoomControl(ui: *UI, t: Theme, st: Status, z: *Zoom) !void {
+    ui.next(.{
+        .w = .children,
+        .h = .fill,
+        .axis = .x,
+        .child_align = .center,
+        .bg = t.panel,
+        .flags = .{
+            .clickable = true,
+            .draw_background = true,
+            .hot_animation = true,
+            .active_animation = true,
+        },
+    });
+    // Keyed and not labelled: it draws nothing of its own, and a container
+    // carrying its key as text would be a label nobody wrote.
+    const b = try ui.open("###zoom");
+    const sig = ui.signal(b);
+    {
+        defer ui.close(b);
+        try w.spacer(ui, .px(gutter * 0.6));
+        if (st.fit.len != 0) {
+            _ = try w.labelf(ui, "{s}###fit", .{clamp(st.fit, 32)});
+            try w.spacer(ui, .px(gutter * 0.6));
+        }
+        ui.next(.{ .fg = t.text });
+        _ = try w.labelf(ui, "{d:.0}%###percent", .{st.percent});
+        try w.spacer(ui, .px(gutter * 0.6));
+    }
+
+    // Above the bar and aligned with the control's left edge. `b.rect` is
+    // last frame's, which is the frame the person was looking at when they
+    // clicked -- the same rectangle the signal is about.
+    if (sig.clicked) z.menu.toggle(.{
+        .x = b.rect.min_x,
+        .y = ui.viewport.height() - status_height - zoom_menu.height,
+    });
+}
+
+/// The menu, and what it was asked for. Built after everything else.
+fn zoomMenu(ui: *UI, z: *Zoom) !?ZoomWant {
+    const p = try w.menu.begin(ui, "zoom menu", &z.menu, .{ .w = .px(zoom_menu.width) }) orelse
+        return null;
+    defer w.menu.end(ui, &z.menu, p);
+
+    var want: ?ZoomWant = null;
+    for (zoom_menu.fits) |row| {
+        if (try w.menu.item(ui, &z.menu, row[0], .{ .binding = row[1] })) want = row[2];
+    }
+    try w.menu.separator(ui);
+    for (zoom_menu.sizes) |row| {
+        if (try w.menu.item(ui, &z.menu, row[0], .{ .binding = row[1] })) want = row[2];
+    }
+    return want;
+}
+
 /// The mode line, along the bottom of the window.
 ///
 /// Two groups, and which is which is the whole layout. On the left, what you
@@ -263,10 +380,15 @@ pub const Status = struct {
 /// at the page number rather than pushing it out of the window. That is one
 /// rule, in the sizes, instead of measuring a string and eliding it every
 /// frame.
-pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status) !void {
+pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status, z: *Zoom) !?ZoomWant {
     ui.pushStyle(.{ .font = face, .font_size = status_text, .fg = t.text_dim });
     defer ui.popStyle();
 
+    try modeLine(ui, t, st, z);
+    return zoomMenu(ui, z);
+}
+
+fn modeLine(ui: *UI, t: Theme, st: Status, z: *Zoom) !void {
     ui.next(.{
         .w = .fill,
         .h = .px(status_height),
@@ -330,13 +452,9 @@ pub fn statusBar(ui: *UI, face: Fonts.FontId, t: Theme, st: Status) !void {
             try w.spacer(ui, .px(gutter));
         }
 
-        if (st.fit.len != 0) {
-            _ = try w.labelf(ui, "{s}###fit", .{clamp(st.fit, 32)});
-            try w.spacer(ui, .px(gutter));
-        }
+        try zoomControl(ui, t, st, z);
+        try w.spacer(ui, .px(gutter * 0.4));
 
-        _ = try w.labelf(ui, "{d:.0}%###zoom", .{st.percent});
-        try w.spacer(ui, .px(gutter));
         _ = try w.labelf(ui, "{d} / {d}###page", .{ st.page, st.pages });
         try w.spacer(ui, .px(gutter));
 
@@ -359,9 +477,17 @@ const key = thviti.key;
 /// a half-em advance, so every width below is arithmetic rather than a
 /// typeface's opinion.
 fn solve(ui: *UI, st: Status) !void {
-    try ui.begin(.fromRect(0, 0, 900, 600), .{});
-    try statusBar(ui, Fonts.fallback_font, .dark, st);
+    var z: Zoom = .{};
+    _ = try solveWith(ui, st, &z, .{});
+}
+
+/// The same, with the zoom control's state and this frame's input in hand:
+/// what a test about the menu needs and what the rest does not.
+fn solveWith(ui: *UI, st: Status, z: *Zoom, in: thviti.Input) !?ZoomWant {
+    try ui.begin(.fromRect(0, 0, 900, 600), in);
+    const want = try statusBar(ui, Fonts.fallback_font, .dark, st, z);
     ui.end();
+    return want;
 }
 
 fn group(ui: *UI, name: []const u8) *thviti.Box {
@@ -422,9 +548,19 @@ test "a bar in normal mode with nothing to say says only where you are" {
     while (it.next()) |child| {
         if (child.text.len != 0) labels += 1;
     }
-    // Zoom, page, title. No window count and no fit, because there is one
-    // window and the zoom is a number.
-    try testing.expectEqual(@as(u32, 3), labels);
+    // The page and the title. No window count, because there is one window;
+    // the zoom is inside its own control and is counted below.
+    try testing.expectEqual(@as(u32, 2), labels);
+
+    // And inside the control, the percentage alone -- no fit, because the
+    // zoom is a number nobody is holding to a shape.
+    const zoom = ui.find(key.make(group(&ui, "right").key, "zoom")).?;
+    var inner: u32 = 0;
+    var kids = zoom.children();
+    while (kids.next()) |child| {
+        if (child.text.len != 0) inner += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), inner);
 }
 
 test "a label that counts keeps its identity when only the number moves" {
@@ -462,4 +598,94 @@ test "a message longer than the window cannot push the page number off it" {
     try testing.expectApproxEqAbs(@as(f32, 900), right.rect.max_x, 0.5);
     try testing.expect(right.rect.width() > 0);
     try testing.expect(left.flags.clip);
+}
+
+test "the zoom reads as a control and opens its menu above the bar" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var z: Zoom = .{};
+
+    const st: Status = .{ .title = "a.pdf", .page = 1, .pages = 9, .percent = 138 };
+    _ = try solveWith(&ui, st, &z, .{});
+
+    const zoom = ui.find(key.make(group(&ui, "right").key, "zoom")).?;
+    try testing.expect(zoom.flags.clickable);
+
+    // Onto it, then press: a press only reaches a box the pointer was
+    // already over, here as in a real mouse.
+    const at: fenrir.gelgja.Point = .{
+        .x = (zoom.rect.min_x + zoom.rect.max_x) * 0.5,
+        .y = (zoom.rect.min_y + zoom.rect.max_y) * 0.5,
+    };
+    _ = try solveWith(&ui, st, &z, .{ .mouse = at });
+    _ = try solveWith(&ui, st, &z, .{ .mouse = at, .buttons = .{ .left = true } });
+    _ = try solveWith(&ui, st, &z, .{ .mouse = at });
+    try testing.expect(z.menu.open);
+
+    // Above the bar and not behind it, which is what knowing the height in
+    // advance buys: the menu is placed rather than pushed.
+    const menu = ui.find(key.make(ui.root.key, "zoom menu")).?;
+    try testing.expectApproxEqAbs(600 - status_height, menu.rect.max_y, 0.5);
+
+    // Sideways it starts at the control and is pushed back inside the window
+    // -- which here it is, because the zoom sits near the right-hand end.
+    try testing.expect(menu.rect.min_x <= zoom.rect.min_x + 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 900), menu.rect.max_x, 0.5);
+}
+
+test "a menu row names a fit in the words the command line takes" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var z: Zoom = .{};
+
+    const st: Status = .{ .title = "a.pdf", .page = 1, .pages = 9, .percent = 100 };
+    _ = try solveWith(&ui, st, &z, .{});
+    z.menu.show(.{ .x = 40, .y = 600 - status_height - zoom_menu.height });
+    _ = try solveWith(&ui, st, &z, .{});
+
+    // The third fit, chosen with the keyboard: down three times and enter.
+    // `Menu.fired` is what the arrows leave behind, and `item` reports it as
+    // the row is built -- the same return a click comes back through.
+    z.menu.highlight = 2;
+    z.menu.fired = 2;
+    const want = (try solveWith(&ui, st, &z, .{})).?;
+    try testing.expectEqualStrings("page", want.fit);
+    // And it closed itself on the way out.
+    try testing.expect(!z.menu.open);
+}
+
+test "a percentage row asks for the number it is written with" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+    var z: Zoom = .{};
+
+    const st: Status = .{ .title = "a.pdf", .page = 1, .pages = 9, .percent = 100 };
+    _ = try solveWith(&ui, st, &z, .{});
+    z.menu.show(.{ .x = 40, .y = 0 });
+    _ = try solveWith(&ui, st, &z, .{});
+
+    const first_size: i32 = @intCast(zoom_menu.fits.len);
+    z.menu.highlight = first_size;
+    z.menu.fired = first_size;
+    const want = (try solveWith(&ui, st, &z, .{})).?;
+    try testing.expectApproxEqAbs(@as(f32, 50), want.percent, 0.001);
+}
+
+test "a fit shows its name beside the percentage, and a free zoom shows none" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+
+    try solve(&ui, .{ .title = "a.pdf", .page = 1, .pages = 9, .fit = "fit page" });
+    const zoom_key = key.make(group(&ui, "right").key, "zoom");
+    try testing.expectEqualStrings("fit page", ui.find(key.make(zoom_key, "fit")).?.text);
+
+    // A second UI rather than a second frame on this one: a box survives a
+    // few frames after it stops being built, so asking this one whether the
+    // label is gone would be asking whether `prune` has caught up yet.
+    var plain: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer plain.deinit();
+    try solve(&plain, .{ .title = "a.pdf", .page = 1, .pages = 9 });
+    const plain_zoom = key.make(group(&plain, "right").key, "zoom");
+    try testing.expect(plain.find(key.make(plain_zoom, "fit")) == null);
+    try testing.expectEqualStrings("100%", plain.find(key.make(plain_zoom, "percent")).?.text);
 }
