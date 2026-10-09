@@ -64,7 +64,7 @@ the same source. These are the rules every widget is written to:
 │  │                                                       │ │  7 │  page field
 │  │                                                       │ │ /48│  (editable)
 ├──┴───────────────────────────────────────────────────────┴─┴────┤
-│ -- VISUAL --              fit width   138%            paper.pdf  │  status
+│ -- VISUAL --            [ fit width 138% ]  7 / 48    paper.pdf  │  status
 └──────────────────────────────────────────────────────────────────┘
    ^left rail                                    ^scrollbar ^right rail
 ```
@@ -74,9 +74,14 @@ These **are** the existing keymap modes (`keys.Mode`), not a parallel concept
 — a rail button sends the same `Command` the key does. Right rail: panel
 toggles at the top, the page counter at the bottom.
 
+The zoom is a **control**, not a reading: it says what the zoom is tied to and
+what it is, and opens a menu of the four fits and six sizes. That is the one
+place in the bar anything can be clicked, and the page counter beside it is
+where the right rail's own counter will go in phase four.
+
 Panels open as an **overlay docked to the right rail**, over the page — not as
-a third column that reflows it. Reflowing would refit every `fit_width` view
-on every toggle.
+a third column that reflows it. Reflowing would refit every fitted view on
+every toggle.
 
 ---
 
@@ -353,17 +358,92 @@ the theme foreground falls out for free, in both themes, with no second asset.
   `<config>/icons/<name>.lua`. A Nerd Fonts or Material theme is `.glyph`
   sources against a face opened from disk, and costs nothing new.
 
-### Phase 3 — zoom, dark mode, settings
+### Phase 3 — zoom, dark mode, settings ✅
 
-| Commit | ~ |
-|---|---|
-| fit page and fit height, beside fit width — `View.fit_width: bool` → `Fit { free, width, height, page }` | 150 |
-| the zoom control in the status bar — a menu, plus `:fit width\|page\|height\|actual` | 180 |
-| a light theme, and the setting that picks it — `theme` in Mímir, `:set theme=…` | 150 |
-| a settings page — a panel over `Library.settings()` | 280 |
+Four commits were budgeted and five were written, one of them a bug found
+while reading a paper rather than anything on this list.
 
-`refit` is already called by `Layout.arrange` on every rectangle change, so
-all four fit modes survive splits and resizes for nothing.
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | a selection ends where the pen did | `gelgja/DisplayList.zig`, `content/Interpreter.zig`, `hlidskjalf/text.zig` | 95 |
+| ✅ | fit the height and the page, beside the width | `hlidskjalf/View.zig`, `Layout.zig`, `keys.zig` | 234 |
+| ✅ | the zoom becomes a control with a menu | `vanagandr/chrome.zig` | 288 |
+| ✅ | a theme setting, and the light theme it picks | `mimir/Library.zig`, `vanagandr/read.zig` | 217 |
+| ✅ | a settings page over what the library keeps | `src/vanagandr/settings.zig` | 679 |
+
+`refit` is called by `Layout.arrange` on every rectangle change, so all four
+fit modes survive splits and resizes for nothing — with one line changed:
+the refit ran on a change of *width* only, which was right while the only fit
+was the width's and wrong the moment a page could be fitted down the window.
+
+**The light theme was already written.** `Theme.light` landed with the theme
+file in phase 0 and had never been reachable. What this phase added was the
+setting, and what it cost was not the theme at all: it was the four colour
+literals still in `read.zig` — the backdrop, the paper, the page's shadow and
+the line between two windows — which are drawn whether or not there is a
+`Chrome` and so had never been anybody's theme. Three of them turned out to
+be the dark theme's `paper`, `shadow` and `divider` to the hundredth. The
+fourth, the backdrop, was `gray(0.16)`, which is the theme's **panel** — so
+the status bar had been exactly the same grey as the ground it sat on since
+the day it was written, and nobody noticed until a light theme made it
+obvious. It is `ground` now, a step darker, as the design language always
+said it should be.
+
+**The interface gets first refusal on a frame, and asks its own state.**
+`read.zig` handles input *before* the chrome is built, which is the right
+order for everything else and impossible for a menu: escape would leave
+visual mode and the arrows would scroll the page out from under the popup.
+So `Session.interfaceHasInput` asks whether a menu or the settings page is
+**open**, not whether a box is hot — the box tree for this frame does not
+exist yet. That is the second time keeping widget state on the caller has
+paid for itself, and it is the reason to keep doing it.
+
+**A fit is named by a word in both directions.** The status bar's menu hands
+back `.{ .fit = "page" }` — a string, not a `View.Fit` — because `Status` is
+strings and numbers and the bar has no business knowing what a view is. It
+costs nothing: `View.Fit.byName` is the parser for `:fit page` anyway, so a
+menu row and a command line cannot drift.
+
+### What phase 3 cost, against what it was budgeted
+
+Four commits at 760 became five at 1513, and the average commit was 303 —
+the first phase to land on `CLAUDE.md`'s number rather than twice it. Both
+halves of that are worth separating.
+
+**The three commits that changed existing code came in at 95, 234 and 217,**
+against budgets of 150, 180 and 150. That is the first time the estimates
+have been close, and the reason is that phases one and two had already built
+what these needed: the menu was a widget, the popup was a widget, the theme
+was a table, and the fit modes were a bool that wanted to be an enum. A phase
+spent using the last two phases is a cheap phase.
+
+**The one new file ran to 679 lines and the budget said 280.** That is the
+same number phase two ended on — *a new file in this program costs about four
+hundred lines* — except worse, because this one is a whole page rather than
+one widget: a table of settings, a row that is either a choice or a field, a
+value store, and fourteen tests. The rule holds and the estimate ignored it
+again. `settings.zig` is a third documentation, a third tests and a third
+code, exactly as predicted, and knowing that in advance still did not make
+the number in the table right.
+
+**The seam that would have worked** is the one phases one and two both name
+and this one did not take: *split the model from the widget that draws it.*
+`State` — the option table, the value store, `nextChoice` — is arithmetic
+over bytes with no UI in it at all, and it is half the tests. Landing it as
+`the settings a reader may change`, then `a page over them`, would have been
+two commits of about three hundred and fifty, which is the shape `field.zig`
+took and the shape this should have taken.
+
+**The bug that was not on the list.** `a selection ends where the pen did` is
+the smallest commit of the phase and the only one anybody reported: selecting
+a paragraph drew a right-hand edge that wandered by half an em from line to
+line. The cause was a guess in `hlidskjalf/text.zig` — the last glyph of a
+run has no next glyph to be measured against and was given half its point
+size — and the fix was to stop guessing, because the interpreter has the
+number and was throwing it away. One `f32` on `TextRun`, which is per run and
+not per glyph, took the spread on a page of a justified paper from 7.0 points
+to 2.8, with thirty-four of forty-five lines now ending at exactly the same
+x. What is left is the producer's own typesetting and not ours.
 
 ### Phase 4 — the rails and the panels
 
@@ -481,7 +561,7 @@ document them as reserved, and do not fire them:
 | `SelectionChanged` | lands with this phase; the data is in `View.selection` |
 | `AnnotationAdd`/`Remove`/`Change` | fires today as `highlight` |
 | `PageRender` | fires **once per page completion**, on the frame thread, from `collectPage` — never per frame, and never on the rasterising thread, which owns the `Document` and cannot also own a Lua state |
-| `ThemeChanged` | lands with the light theme |
+| `ThemeChanged` | **reserved.** The theme landed in phase three; the bus it would fire on is this one, and `Session.useTheme` is the one place that would fire it |
 | `DocSave` | **reserved.** fenrir cannot write PDFs at all |
 | `FormFieldFocus` | **reserved.** Annotations draw from appearance streams; none is interactive |
 | `BeforeRedact` | **reserved.** No redaction exists |
@@ -594,6 +674,23 @@ Things that cost time once and should not cost it again.
   gains glyphs whenever a theme adds path data. It reports zero, as Týr's
   fallback does and for the fallback's stated reason, and the live number is
   on the `Set` behind it.
+- **A colour literal outlives the file that replaced it.** `Theme.zig` landed
+  in phase 0 and `read.zig` still had four colours of its own three phases
+  later, because nothing drawn in the dark looked wrong. The check that
+  actually finds these is not reading the code, it is *running the other
+  theme* — one of the four turned out to be the panel grey and had made the
+  status bar invisible against its own backdrop since the day it was written.
+- **Ask the widget's state, not the box tree, when you are early in the
+  frame.** Input is handled before the chrome is built, so "is a menu
+  swallowing this key" cannot be answered by hover: there is no tree yet.
+  It is answered by the menu's own `open`, which is on the caller for exactly
+  this reason — the same argument as a checkbox's bool, arrived at twice.
+- **A control that appears already wanting the keyboard has to ask for
+  focus.** Focus follows a press, and the press that turned a settings row
+  into a text field landed on the box the field *replaced*. The field has to
+  set focus on itself the frame it first appears, which means knowing its key
+  before it exists — which is free, since a key is a hash of the call-site
+  string seeded with its parent's.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
@@ -621,6 +718,14 @@ fenrir read F --shot s.png --device     # what the GPU actually drew, read back
 Most of the new code is testable with no window, no device and no font —
 Þviti's solver, `keys`, `Layout`, `Marks`, and everything planned for
 `outline.zig` and `svgpath.zig`. That is where the tests go.
+
+**A popup cannot be photographed by a shot, so open it by hand.** `--shot`
+draws one frame of a reader nobody has clicked in, which is every menu and
+every panel closed. Two lines at the top of the session — `menu.show(…)`, or
+`settings.show()` — and a `--device` shot is the picture, and both come out
+again before the commit. That is *draw the thing before committing the thing*
+applied to the half of the interface a shot cannot reach, and it is how the
+zoom menu and the settings page were each found to be a few pixels out.
 
 **Performance is part of the contract.** Chrome is drawn every frame, so a
 change to it gets the standard treatment from `CLAUDE.md`: build both
