@@ -28,6 +28,14 @@
 //! The same `Command` the key sends, reached a second way. A rail is never
 //! the only way to anything: the panel toggles here are latches over state
 //! the reader already keeps, and the keymap will reach the same state.
+//!
+//! ## The counter is a control, the way the zoom is
+//!
+//! A number drawn in a corner that cannot be typed into is a number somebody
+//! will try to type into. Clicking it turns it into a field, the same trade
+//! the settings page makes for a value cell -- and with the same consequence,
+//! which is that it has to ask for focus the frame it appears, because the
+//! press that started the edit landed on the box the field replaced.
 
 const std = @import("std");
 const fenrir = @import("fenrir");
@@ -55,6 +63,10 @@ const inset: f32 = (width - button) / 2;
 /// The counter at the foot of the rail: the page over the count.
 const counter_height: f32 = 38;
 const counter_text: f32 = 12;
+
+/// The longest page number worth a field. A million pages is a hundred times
+/// the largest PDF anybody has made.
+const page_digits = 7;
 
 /// Which overlay is showing. One at a time: they dock to the same edge and
 /// two of them would be a second split tree nobody asked for.
@@ -111,6 +123,16 @@ pub const Rails = struct {
     /// Which overlay is open.
     panel: Panel = .none,
 
+    /// The counter is being typed in.
+    editing: bool = false,
+    /// Its model. `bytes` is an interior pointer into `page_buf` and is
+    /// re-aimed at it every frame, so this survives being copied -- which it
+    /// has to, since a `Session` is returned by value in the reader's tests.
+    field: w.Field = .{ .bytes = &.{} },
+    page_buf: [page_digits]u8 = undefined,
+    /// The field has just appeared and wants the keyboard. See the header.
+    focus_next: bool = false,
+
     pub fn show(r: *Rails, p: Panel) void {
         r.panel = p;
     }
@@ -121,11 +143,25 @@ pub const Rails = struct {
         r.panel = if (r.panel == p) .none else p;
     }
 
-    /// Whether the rails are holding this frame's keyboard. Never, yet: the
-    /// rail is latches and a number, and neither wants a key.
+    /// Whether the rails are holding this frame's keyboard, which they are
+    /// while a page number is being typed. Asked before the keymap reads a
+    /// key, which is why it is answered from here and not from the tree.
     pub fn grabbing(r: *const Rails) bool {
-        _ = r;
-        return false;
+        return r.editing;
+    }
+
+    /// What a click on the counter does. Named because the test drives it
+    /// without a pointer, and because it is the one place the field's three
+    /// pieces of setup have to happen together.
+    fn beginEdit(r: *Rails, page: u32) void {
+        r.editing = true;
+        r.focus_next = true;
+        r.field.bytes = &r.page_buf;
+        var buf: [page_digits]u8 = undefined;
+        // What is there already, selected: the first digit replaces it, which
+        // is what every page box anywhere does.
+        r.field.set(std.fmt.bufPrint(&buf, "{d}", .{page}) catch "");
+        r.field.selectAll();
     }
 };
 
@@ -142,6 +178,16 @@ pub fn rightRail(
     r: *Rails,
     tips: *w.Tips,
 ) Error!?Want {
+    // Before the build, so the field sees it in the same frame it is first
+    // drawn in: `signal` reads `ui.focus`, and a focus set afterwards would
+    // cost a frame of typing.
+    if (r.focus_next) {
+        r.focus_next = false;
+        ui.setFocus(thviti.key.make(thviti.key.make(ui.root.key, "right rail"), "page"));
+    }
+    // Re-aimed every frame rather than on creation: see `Rails.field`.
+    r.field.bytes = &r.page_buf;
+
     ui.pushStyle(.{ .font = face, .font_size = counter_text, .fg = t.text, .bg = t.panel });
     defer ui.popStyle();
 
@@ -186,13 +232,32 @@ pub fn rightRail(
 /// that ran behind it would put its counter under the mode line.
 pub const reserved_below: f32 = @import("chrome.zig").status_height;
 
-/// The page counter at the foot of the rail: the page over the count.
-///
-/// Clickable already, and it does nothing yet. The next commit is what makes
-/// it a field somebody types a page into; this one is the rail, which is
-/// reserved space, a row of latches and a number -- all of it the pointer's.
+/// The page counter at the foot of the rail: the page over the count, and a
+/// field when it is clicked.
 fn counter(ui: *UI, t: Theme, st: Right, r: *Rails) Error!?u32 {
-    _ = r;
+    if (r.editing) {
+        const res = try w.field.textField(ui, "page", &r.field, .{
+            .w = .px(width - 4),
+            .h = .px(22),
+        });
+        try w.spacer(ui, .px(inset));
+
+        if (res.cancelled) {
+            r.editing = false;
+            return null;
+        }
+        if (!res.submitted) return null;
+
+        // Over either way. A refused number is not a reason to keep somebody
+        // in a field, and the counter coming back with the old number in it
+        // is what says the page did not move.
+        r.editing = false;
+        const typed = std.fmt.parseInt(u32, std.mem.trim(u8, r.field.slice(), " "), 10) catch
+            return null;
+        if (typed == 0 or typed > st.pages) return null;
+        return typed;
+    }
+
     ui.next(.{
         .w = .px(width - 4),
         .h = .px(counter_height),
@@ -208,6 +273,7 @@ fn counter(ui: *UI, t: Theme, st: Right, r: *Rails) Error!?u32 {
         },
     });
     const cell = try ui.open("page");
+    const sig = ui.signal(cell);
     {
         defer ui.close(cell);
         _ = try w.labelf(ui, "{d}###now", .{st.page});
@@ -217,6 +283,8 @@ fn counter(ui: *UI, t: Theme, st: Right, r: *Rails) Error!?u32 {
         _ = try w.labelf(ui, "/{d}###of", .{st.pages});
     }
     try w.spacer(ui, .px(inset));
+
+    if (sig.clicked) r.beginEdit(st.page);
     return null;
 }
 
@@ -330,3 +398,92 @@ test "a panel button asks for its panel, and the same button closes it" {
     try testing.expectEqual(Panel.none, second.panel);
 }
 
+
+test "the counter is typed in, and enter is what goes there" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var r: Rails = .{};
+    const st: Right = .{ .page = 7, .pages = 48 };
+    _ = try rig.frame(st, &r, .{});
+
+    const at = middleOf(rig.find("page").?);
+    try testing.expect(try rig.click(st, &r, at) == null);
+    try testing.expect(r.editing);
+    try testing.expect(r.grabbing());
+    try testing.expectEqualStrings("7", r.field.slice());
+    try testing.expect(r.field.hasSelection());
+
+    // A frame to build the field and let it take focus, then type.
+    _ = try rig.frame(st, &r, .{ .mouse = at });
+    _ = try rig.frame(st, &r, .{ .mouse = at, .events = &.{.{ .text = "23" }} });
+    try testing.expectEqualStrings("23", r.field.slice());
+
+    const want = (try rig.frame(st, &r, .{
+        .mouse = at,
+        .events = &.{.{ .key_down = .{ .code = .enter } }},
+    })).?;
+    try testing.expectEqual(@as(u32, 23), want.page);
+    try testing.expect(!r.editing);
+}
+
+test "escape drops the edit and asks for nothing" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var r: Rails = .{};
+    const st: Right = .{ .page = 7, .pages = 48 };
+    _ = try rig.frame(st, &r, .{});
+    r.beginEdit(st.page);
+    _ = try rig.frame(st, &r, .{});
+    r.field.set("23");
+
+    const out = try rig.frame(st, &r, .{
+        .events = &.{.{ .key_down = .{ .code = .escape } }},
+    });
+    try testing.expect(out == null);
+    try testing.expect(!r.editing);
+}
+
+test "a page past the end asks for nothing, and so does a word" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    const st: Right = .{ .page = 7, .pages = 48 };
+    const enter: Input = .{ .events = &.{.{ .key_down = .{ .code = .enter } }} };
+
+    for ([_][]const u8{ "49", "0", "", "seven" }) |typed| {
+        var r: Rails = .{};
+        _ = try rig.frame(st, &r, .{});
+        // The click, without the pointer: `beginEdit` is what one calls.
+        r.beginEdit(st.page);
+        _ = try rig.frame(st, &r, .{});
+        r.field.set(typed);
+
+        try testing.expect(try rig.frame(st, &r, enter) == null);
+        try testing.expect(!r.editing);
+    }
+}
+
+test "a rail state survives being copied, field and all" {
+    // A `Session` is returned by value in the reader's own tests, so a state
+    // holding a pointer into itself has to be able to take that.
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var first: Rails = .{};
+    _ = try rig.frame(.{ .page = 3, .pages = 9 }, &first, .{});
+
+    var second = first;
+    second.editing = true;
+    second.field.bytes = &.{};
+    _ = try rig.frame(.{ .page = 3, .pages = 9 }, &second, .{});
+
+    second.field.set("5");
+    try testing.expectEqualStrings("5", second.field.slice());
+    try testing.expect(second.field.bytes.ptr == &second.page_buf);
+}
