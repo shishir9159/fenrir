@@ -69,6 +69,7 @@ const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const library = @import("library.zig");
 const Library = library.Library;
+const rails_mod = @import("rails.zig");
 const settings_page = @import("settings.zig");
 
 const content = fenrir.content;
@@ -3212,15 +3213,25 @@ const Session = struct {
     /// The rectangle the windows get, which is the client area less whatever
     /// the interface has taken off it.
     ///
-    /// The status bar is *reserved*, not drawn over: a bar that floated on
-    /// top would cover the last line of the page, and a reader whose last
-    /// line is hidden is worse than one with a shorter page. Every window's
-    /// fit refits to this, because `Layout.arrange` calls `refit` on each
-    /// rectangle it hands out -- which is also why a page fitted down the
-    /// window fits above the bar rather than behind it.
+    /// The status bar and the rails are *reserved*, not drawn over: a bar
+    /// that floated on top would cover the last line of the page, and a
+    /// reader whose last line is hidden is worse than one with a shorter
+    /// page. Every window's fit refits to this, because `Layout.arrange`
+    /// calls `refit` on each rectangle it hands out -- which is also why a
+    /// page fitted down the window fits above the bar rather than behind it.
+    ///
+    /// Reserving the rail rather than floating it is also what settles which
+    /// of the two a click belonged to: a pointer over a rail is never also
+    /// over a page, so there is nothing to arbitrate. The panels are the ones
+    /// that overlay, and they are asked about separately.
     fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
-        const taken: f32 = if (s.chrome != null) chrome_mod.status_height else 0;
-        return .fromRect(0, 0, width, @max(height - taken, 1));
+        if (s.chrome == null) return .fromRect(0, 0, width, @max(height, 1));
+        return .fromRect(
+            0,
+            0,
+            @max(width - rails_mod.width, 1),
+            @max(height - chrome_mod.status_height, 1),
+        );
     }
 
     /// What the mode line says, gathered from wherever the reader keeps it.
@@ -3277,6 +3288,22 @@ const Session = struct {
         }
 
         return st;
+    }
+
+    /// What the right rail shows: where you are, and how far it goes.
+    fn railLine(s: *Session) rails_mod.Right {
+        const v = s.view();
+        return .{ .page = v.currentPage() + 1, .pages = @intCast(v.pages.len) };
+    }
+
+    /// What the right rail asked for, carried out.
+    fn applyRail(s: *Session, want: rails_mod.Want) void {
+        const c = s.chrome orelse return;
+        switch (want) {
+            .panel => |p| c.rails.show(p),
+            .page => |page| _ = s.goToPage(page),
+        }
+        s.dirty_title = true;
     }
 
     fn updateTitle(s: *Session, window: lyngvi.Window) void {
@@ -3673,11 +3700,14 @@ const Session = struct {
             if (s.chrome) |c| {
                 try c.begin(extent, input);
                 const want = try c.status(s.statusLine());
-                // After the bar, so it is over it: a popup is on top by
-                // being built last, and nothing here sorts.
+                const asked = try c.rightRail(s.railLine());
+                // After the bar and the rails, so it is over them: a popup is
+                // on top by being built last, and nothing here sorts.
                 const changed = try settings_page.page(&c.ui, c.face, c.theme, &s.settings);
+                try c.tips();
                 c.end();
                 if (want) |wanted| s.applyZoom(wanted);
+                if (asked) |wanted| s.applyRail(wanted);
                 if (changed) |c2| s.changeSetting(c2);
                 try c.flush(&over, &list, &renderer, &uploads);
             }

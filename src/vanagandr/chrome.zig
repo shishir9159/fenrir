@@ -30,11 +30,13 @@ const lyngvi = fenrir.lyngvi;
 const thviti = fenrir.thviti;
 const tyr = fenrir.tyr;
 
+const rails = @import("rails.zig");
 const sysfont = @import("sysfont.zig");
 
 const Bounds = fenrir.gelgja.Bounds;
 const DrawList = gleipnir.DrawList;
 const Fonts = tyr.Fonts;
+const Icons = thviti.Icons;
 const Theme = thviti.Theme;
 const UI = thviti.UI;
 const w = thviti.widgets;
@@ -50,6 +52,10 @@ pub const gutter: f32 = 10;
 pub const Chrome = struct {
     gpa: Allocator,
     fonts: Fonts,
+    /// The icon registry, which borrows `&fonts` and so cannot outlive it --
+    /// the same rule the metrics vtable follows, and the other reason a
+    /// `Chrome` is never returned by value.
+    icons: Icons,
     ui: UI,
     painter: thviti.draw.Renderer,
 
@@ -81,6 +87,15 @@ pub const Chrome = struct {
     /// be able to ask whether a menu is open before it reads a key.
     zoom: Zoom = .{},
 
+    /// The rails', for the same reason: a rail with a page number half typed
+    /// into it is holding the digits, and that is asked before the keymap
+    /// sees them.
+    rails: rails.Rails = .{},
+
+    /// The one tooltip a window can have. Drawn by `tips`, at the end of the
+    /// frame, because a popup is on top only by being built last.
+    tip: w.Tips = .{},
+
     /// On the heap, and not by value, because `UI` reaches text through a
     /// vtable whose pointer is `&c.fonts`. A `Chrome` returned by value is
     /// copied to its caller and that pointer is left aiming at the frame it
@@ -94,6 +109,7 @@ pub const Chrome = struct {
         c.* = .{
             .gpa = gpa,
             .fonts = try .init(gpa, .{ .subpixel_positions = 3 }),
+            .icons = undefined,
             .ui = undefined,
             .painter = .init(gpa),
         };
@@ -101,6 +117,10 @@ pub const Chrome = struct {
             c.painter.deinit();
             c.fonts.deinit();
         }
+        // After `fonts` is at the address it will keep: the registry holds
+        // the icon face's glyph table, which `Fonts` owns.
+        c.icons = try .init(gpa, &c.fonts);
+        errdefer c.icons.deinit();
 
         if (sysfont.forInterface(io, gpa)) |bytes| {
             c.program = bytes;
@@ -117,6 +137,7 @@ pub const Chrome = struct {
         const gpa = c.gpa;
         c.painter.deinit();
         c.ui.deinit();
+        c.icons.deinit();
         // Before the bytes it borrows: a backend reads the program lazily,
         // and closing the face is what stops it.
         c.fonts.deinit();
@@ -174,10 +195,22 @@ pub const Chrome = struct {
         return statusBar(&c.ui, c.face, c.theme, st, &c.zoom);
     }
 
+    /// The right rail, for a reader that does not want to know how one is
+    /// built. Returns what it was asked for, if anything.
+    pub fn rightRail(c: *Chrome, st: rails.Right) !?rails.Want {
+        return rails.rightRail(&c.ui, c.face, c.theme, &c.icons, st, &c.rails, &c.tip);
+    }
+
+    /// The tooltip, if the pointer has been resting on something long enough.
+    /// Last of everything: a popup is on top by being built last.
+    pub fn tips(c: *Chrome) !void {
+        return w.tool.tooltips(&c.ui, &c.tip);
+    }
+
     /// Whether the interface is holding the keyboard and the pointer this
-    /// frame, which it is while a menu is open.
+    /// frame, which it is while a menu is open or a rail is being typed in.
     pub fn grabbing(c: *const Chrome) bool {
-        return c.zoom.menu.open;
+        return c.zoom.menu.open or c.rails.grabbing();
     }
 
     /// The solved tree, as instances on `over`, plus whatever rows Týr
