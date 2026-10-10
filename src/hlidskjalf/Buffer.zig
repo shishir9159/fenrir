@@ -43,6 +43,10 @@ title: []const u8 = &.{},
 
 doc: *fenrir.Document = undefined,
 pages: []const fenrir.Page = &.{},
+/// The document's own table of contents, flat with a depth on each entry.
+/// Read once when the document opens and owned by its arena, like `pages`;
+/// empty for a document that has none or whose outline would not parse.
+outline: []const fenrir.outline.Entry = &.{},
 
 /// The highlights, shared by every view. See `Marks`.
 marks: Marks = .{},

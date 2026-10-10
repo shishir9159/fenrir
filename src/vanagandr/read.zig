@@ -1070,6 +1070,9 @@ const Session = struct {
             .title = std.fs.path.basename(path),
             .doc = doc,
             .pages = pages,
+            // A table of contents that will not parse is no table of
+            // contents, and never a document that will not open.
+            .outline = fenrir.outline.all(doc, pages) catch &.{},
         });
 
         const id: u32 = @intCast(s.buffers.items.len - 1);
@@ -3355,7 +3358,21 @@ const Session = struct {
         s.rows.clearRetainingCapacity();
 
         switch (which) {
-            .none, .bookmarks => {},
+            .none => {},
+            .bookmarks => {
+                // Already in reading order and already flat: `outline.zig`
+                // returns the tree walked, with a depth per entry, because
+                // that is the shape a list widget draws.
+                for (b.outline, 0..) |e, i| {
+                    s.rows.append(s.gpa, .{
+                        .label = e.title,
+                        .page = if (e.page) |p| p + 1 else 0,
+                        .depth = e.depth,
+                        // From one, because zero is `State.chosen`'s "none".
+                        .id = i + 1,
+                    }) catch break;
+                }
+            },
             .annotations => {
                 for (b.marks.items()) |m| {
                     s.rows.append(s.gpa, .{
@@ -3373,6 +3390,36 @@ const Session = struct {
             },
         }
         return s.rows.items;
+    }
+
+    /// An outline entry, by its row id, which is its index plus one.
+    ///
+    /// Not `scrollToBox`, which moves as little as it can: a bookmark is a
+    /// place somebody asked to be taken to, so the destination goes to the
+    /// top of the window rather than merely into it. An entry whose
+    /// destination did not resolve says so and moves nothing -- the title was
+    /// worth keeping even though the place was not.
+    fn goToBookmark(s: *Session, id: u64) void {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        if (id == 0 or id > b.outline.len) return;
+        const entry = b.outline[id - 1];
+
+        const page = entry.page orelse {
+            s.say("\"{s}\" does not say where it goes", .{
+                entry.title[0..@min(entry.title.len, 64)],
+            });
+            return;
+        };
+        if (page >= v.pages.len) return;
+
+        v.scrollToPage(page);
+        // User space counts upwards from the bottom of the page, so how far
+        // down the page a destination is, is the page's height less its `top`.
+        const t = entry.top orelse return;
+        const height: f32 = @floatCast(v.pages[page].displayHeight());
+        v.scroll += std.math.clamp(height - @as(f32, @floatCast(t)), 0, height) * v.zoom;
+        v.clampScroll();
     }
 
     fn lessByReading(b: *Buffer, x: panels.Row, y: panels.Row) bool {
@@ -3409,7 +3456,8 @@ const Session = struct {
             return;
         }
         switch (which) {
-            .none, .bookmarks => {},
+            .none => {},
+            .bookmarks => s.goToBookmark(chosen.id),
             // The same gesture `n` makes: the highlight goes in hand and the
             // view scrolls to it, so clicking a row and pressing `d` deletes
             // the one that was clicked.

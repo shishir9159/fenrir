@@ -64,6 +64,8 @@ const row_height: f32 = 30;
 const pad: f32 = 8;
 /// The colour chip at the near edge of a row that has one.
 const chip: f32 = 5;
+/// How far a row is pushed in per level of depth, for a tree drawn flat.
+const indent: f32 = 12;
 
 /// One line of a panel.
 ///
@@ -254,16 +256,35 @@ fn line(ui: *UI, t: Theme, l: w.List, index: u32, r: Row, selected: bool) Error!
     });
     _ = try ui.box("###chip");
 
-    try w.spacer(ui, .px(pad - chip + @as(f32, @floatFromInt(r.depth)) * 12));
-    ui.next(.{
-        .w = .fill,
-        .h = .text(0),
-        .fg = if (r.label.len == 0) t.text_dim else t.text,
-        .flags = .{ .draw_text = true, .clip = true },
-    });
-    // `boxText` and not `box`: the label is a document's, and a note with
-    // `###` typed into it would otherwise split and key on its own tail.
-    _ = try ui.boxText("label", if (r.label.len == 0) "no note" else r.label);
+    try w.spacer(ui, .px(pad - chip + @as(f32, @floatFromInt(r.depth)) * indent));
+
+    // The label goes in a box of its own that clips, because a box does not
+    // clip the text it draws itself -- only what its children draw. Without
+    // this a long heading runs out from under its own row and over the page
+    // number beside it, which is what the first outline drawn here did. The
+    // same rule the status bar's left group uses, and for the same reason:
+    // let the sizes elide, rather than measuring a string every frame.
+    {
+        ui.next(.{
+            .w = .fill,
+            .h = .fill,
+            .axis = .x,
+            .child_align = .center,
+            .flags = .{ .clip = true, .overflow_x = true },
+        });
+        const room = try ui.open("###room");
+        defer ui.close(room);
+
+        ui.next(.{
+            .w = .text(0),
+            .h = .text(0),
+            .fg = if (r.label.len == 0) t.text_dim else t.text,
+            .flags = .{ .draw_text = true },
+        });
+        // `boxText` and not `box`: the label is a document's, and a note with
+        // `###` typed into it would otherwise split and key on its own tail.
+        _ = try ui.boxText("label", if (r.label.len == 0) "no note" else r.label);
+    }
 
     if (r.page != 0) {
         try w.spacer(ui, .px(pad));
@@ -378,11 +399,11 @@ test "a row says what is written on it, or that nothing is" {
     const rows = rig.find(&.{ "body", "rows" }).?;
     try testing.expectEqualStrings(
         "worth checking",
-        rig.ui.find(key.make(key.make(rows.key, "row0"), "label")).?.text,
+        rig.ui.find(key.make(key.make(key.make(rows.key, "row0"), "room"), "label")).?.text,
     );
     try testing.expectEqualStrings(
         "no note",
-        rig.ui.find(key.make(key.make(rows.key, "row1"), "label")).?.text,
+        rig.ui.find(key.make(key.make(key.make(rows.key, "row1"), "room"), "label")).?.text,
     );
     try testing.expectEqualStrings(
         "9",
