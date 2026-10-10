@@ -25,6 +25,7 @@ pub const Parser = @import("gjoll/Parser.zig");
 pub const content = @import("gjoll/content.zig");
 pub const filter = @import("gjoll/filter.zig");
 pub const image = @import("gjoll/image.zig");
+pub const outline = @import("gjoll/outline.zig");
 pub const pages = @import("gjoll/pages.zig");
 pub const print = @import("gjoll/print.zig");
 pub const xref = @import("gjoll/xref.zig");
@@ -118,6 +119,7 @@ test {
     _ = content;
     _ = filter;
     _ = image;
+    _ = outline;
     _ = pages;
     _ = print;
     _ = xref;
