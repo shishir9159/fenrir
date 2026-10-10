@@ -70,6 +70,7 @@ const Images = @import("images.zig").Images;
 const library = @import("library.zig");
 const Library = library.Library;
 const rails_mod = @import("rails.zig");
+const panels = @import("panels.zig");
 const settings_page = @import("settings.zig");
 
 const content = fenrir.content;
@@ -882,6 +883,21 @@ const Session = struct {
     /// and after every change, never per frame: see `settings.zig`.
     settings: settings_page.State = .{},
 
+    /// The panel docked to the right rail, and the rows in it.
+    ///
+    /// The rows are rebuilt when what is behind them changes and not once a
+    /// frame: `rows_for` is which buffer they were built from and what that
+    /// buffer's marks were at the time, and a highlight added or removed is
+    /// what makes them stale. The labels are the marks' own note bytes,
+    /// which live on the buffer, so nothing here owns a string.
+    panel: panels.State = .{},
+    rows: std.ArrayList(panels.Row) = .empty,
+    rows_for: struct {
+        which: rails_mod.Panel = .none,
+        buffer: u32 = 0,
+        revision: u64 = 0,
+    } = .{},
+
     /// The accent a person configured, or null for the theme's own.
     ///
     /// Kept apart from the theme so that `useTheme` can put it back on top of
@@ -1017,6 +1033,7 @@ const Session = struct {
         s.order.deinit(s.gpa);
         s.borders.deinit(s.gpa);
         s.boxes.deinit(s.gpa);
+        s.rows.deinit(s.gpa);
     }
 
     // -- buffers -------------------------------------------------------------
@@ -2778,6 +2795,16 @@ const Session = struct {
         const down = in.buttons.left;
         const pressed = down and !s.view().was_down;
 
+        // The one place the interface and the page share pixels. A rail is
+        // reserved space and can never be both; a panel floats over the
+        // document, so the press that lands in it has to be kept off the text
+        // underneath -- and `rect` is last frame's, which is the rectangle
+        // that was there when the button went down.
+        if (s.panel.holds(in.mouse)) {
+            s.view().was_down = down;
+            return;
+        }
+
         // Before anything else: a gesture that began on the line between two
         // windows belongs to that line until it is let go.
         if (s.dragSplit(in, down, pressed)) return;
@@ -3300,8 +3327,93 @@ const Session = struct {
     fn applyRail(s: *Session, want: rails_mod.Want) void {
         const c = s.chrome orelse return;
         switch (want) {
+            // Nothing is filled here: which panel is open is part of what
+            // makes the rows stale, and the panel is built later this same
+            // frame. One place fills them, and it is `panelRows`.
             .panel => |p| c.rails.show(p),
             .page => |page| _ = s.goToPage(page),
+        }
+        s.dirty_title = true;
+    }
+
+    /// The rows the open panel shows, rebuilt only when they have gone stale.
+    ///
+    /// Stale is a different panel, a different buffer, or a change to that
+    /// buffer's marks -- `Marks.revision` is bumped by every one of them. A
+    /// reader sitting still with the annotations open rebuilds nothing, which
+    /// is the rule about doing no work per frame that can be done on change.
+    fn panelRows(s: *Session, which: rails_mod.Panel) []const panels.Row {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        const stamp: @TypeOf(s.rows_for) = .{
+            .which = which,
+            .buffer = v.buffer,
+            .revision = b.marks.revision,
+        };
+        if (std.meta.eql(s.rows_for, stamp)) return s.rows.items;
+        s.rows_for = stamp;
+        s.rows.clearRetainingCapacity();
+
+        switch (which) {
+            .none, .bookmarks => {},
+            .annotations => {
+                for (b.marks.items()) |m| {
+                    s.rows.append(s.gpa, .{
+                        .label = m.note,
+                        .page = m.page + 1,
+                        .swatch = m.color,
+                        .id = m.key,
+                    }) catch break;
+                }
+                // Reading order, which is the order `n` walks them in and the
+                // order somebody would find them by reading. The keys go with
+                // the rows, so sorting here cannot lose track of which
+                // highlight a row is.
+                std.mem.sort(panels.Row, s.rows.items, b, lessByReading);
+            },
+        }
+        return s.rows.items;
+    }
+
+    fn lessByReading(b: *Buffer, x: panels.Row, y: panels.Row) bool {
+        const a = b.marks.byKey(x.id) orelse return false;
+        const c = b.marks.byKey(y.id) orelse return true;
+        return Marks.readsBefore(a.*, c.*);
+    }
+
+    /// The panel the rail has open, and what was clicked in it.
+    fn drawPanel(s: *Session, c: *chrome_mod.Chrome) !void {
+        const which = c.rails.panel;
+        if (which == .none) {
+            s.panel.rect = .empty;
+            return;
+        }
+        s.panel.chosen = s.focus_mark orelse 0;
+
+        const chosen = try panels.panel(
+            &c.ui,
+            c.face,
+            c.theme,
+            &c.icons,
+            which.label(),
+            switch (which) {
+                .none, .annotations => "no highlights yet",
+                .bookmarks => "this document has no outline",
+            },
+            s.panelRows(which),
+            &s.panel,
+        ) orelse return;
+
+        if (panels.wasClosed(chosen)) {
+            c.rails.show(.none);
+            return;
+        }
+        switch (which) {
+            .none, .bookmarks => {},
+            // The same gesture `n` makes: the highlight goes in hand and the
+            // view scrolls to it, so clicking a row and pressing `d` deletes
+            // the one that was clicked.
+            .annotations => s.focusMark(chosen.id),
         }
         s.dirty_title = true;
     }
@@ -3701,13 +3813,15 @@ const Session = struct {
                 try c.begin(extent, input);
                 const want = try c.status(s.statusLine());
                 const asked = try c.rightRail(s.railLine());
-                // After the bar and the rails, so it is over them: a popup is
-                // on top by being built last, and nothing here sorts.
+                if (asked) |wanted| s.applyRail(wanted);
+                try s.drawPanel(c);
+                // After the bar, the rails and the panel, so it is over all
+                // of them: a popup is on top by being built last, and nothing
+                // here sorts.
                 const changed = try settings_page.page(&c.ui, c.face, c.theme, &s.settings);
                 try c.tips();
                 c.end();
                 if (want) |wanted| s.applyZoom(wanted);
-                if (asked) |wanted| s.applyRail(wanted);
                 if (changed) |c2| s.changeSetting(c2);
                 try c.flush(&over, &list, &renderer, &uploads);
             }
