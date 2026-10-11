@@ -69,15 +69,16 @@ the same source. These are the rules every widget is written to:
    ^left rail                                    ^scrollbar ^right rail
 ```
 
-Left rail: normal / visual / edit / draw, then the highlight colour palette.
-These **are** the existing keymap modes (`keys.Mode`), not a parallel concept
-— a rail button sends the same `Command` the key does. Right rail: panel
-toggles at the top, the page counter at the bottom.
+Left rail: normal / visual / edit, then the highlight colour palette. Draw
+joins them in phase nine, when there is something behind it. These **are** the
+existing keymap modes (`keys.Mode`), not a parallel concept — a rail button
+goes through `keys.enter` and a swatch through `keys.paletteCommand`, which
+are the same two functions the keys go through. Right rail: panel toggles at
+the top, the page counter at the bottom.
 
 The zoom is a **control**, not a reading: it says what the zoom is tied to and
-what it is, and opens a menu of the four fits and six sizes. That is the one
-place in the bar anything can be clicked, and the page counter beside it is
-where the right rail's own counter will go in phase four.
+what it is, and opens a menu of the four fits and six sizes. The page counter
+beside it is a reading; the rail's own counter is the one that is typed into.
 
 Panels open as an **overlay docked to the right rail**, over the page — not as
 a third column that reflows it. Reflowing would refit every fitted view on
@@ -445,29 +446,100 @@ not per glyph, took the spread on a page of a justified paper from 7.0 points
 to 2.8, with thirty-four of forty-five lines now ending at exactly the same
 x. What is left is the producer's own typesetting and not ours.
 
-### Phase 4 — the rails and the panels
+### Phase 4 — the rails and the panels ✅
 
-| Commit | Files | ~ |
-|---|---|---|
-| the right rail, with the page number on it | `read.zig` | 250 |
-| a panel listing the highlights and their notes | `read.zig` | 250 |
-| the document outline, read out of `/Outlines` | `src/gjoll/outline.zig` | 300 |
-| a bookmarks panel over the outline | `read.zig` | 200 |
-| the left rail: modes and the colour palette | `read.zig` | 250 |
+Five commits were budgeted and six were written. The extra one was planned
+here in advance for the first time — the keyboard split from the mouse, which
+is the seam phases one and two both named after the fact.
+
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | the right rail, with the page number on it | `src/vanagandr/rails.zig`, `chrome.zig`, `read.zig` | 407 |
+| ✅ | a page number typed into the rail | `rails.zig` | 177 |
+| ✅ | a panel listing the highlights and their notes | `src/vanagandr/panels.zig`, `read.zig` | 572 |
+| ✅ | the document outline, read out of `/Outlines` | `src/gjoll/outline.zig` | 622 |
+| ✅ | a bookmarks panel over the outline | `Buffer.zig`, `panels.zig`, `read.zig` | 87 |
+| ✅ | the left rail: modes and the colour palette | `hlidskjalf/keys.zig`, `rails.zig`, `read.zig` | 394 |
 
 A "comment" in fenrir is a note on a highlight — one panel, not two. The
 annotations panel is a list over `Buffer.marks.items()` sorted by
-`Marks.readsBefore`; clicking a row calls `View.scrollToBox`.
+`Marks.readsBefore`; clicking a row calls `Session.focusMark`, which is the
+same gesture `n` makes, so a row clicked and then `d` deletes the one clicked.
 
-**Nothing parses `/Outlines` today.** `gjoll/outline.zig` sits beside
-`pages.zig` and does the same kind of job: walk `/First`/`/Next` with a depth
-cap and cycle detection, read `/Title`, resolve a destination from `/Dest` or
-from `/A` with `/S /GoTo` — the `[page /XYZ x y]`, `/Fit` and `/FitH` forms
-and named destinations through both `/Dests` and the `/Names` name tree. It
-returns a flat array with a depth per entry, which is what a tree widget wants
-and what makes it testable with no window. Damage tolerance as everywhere
-else: a broken outline yields no bookmarks, never an error that stops the
-document opening.
+**`gjoll/outline.zig` sits beside `pages.zig`** and does the same kind of job:
+walk `/First`/`/Next` with a depth cap and cycle detection, read `/Title`,
+resolve a destination from `/Dest` or from `/A` with `/S /GoTo` — the
+`[page /XYZ x y]`, `/Fit`, `/FitH`, `/FitBH` and `/FitR` forms, and named
+destinations through both `/Dests` and the `/Names` name tree. It returns a
+flat array with a depth per entry, which is what a list widget wants and what
+makes it testable with no window. Damage tolerance as everywhere else: a
+broken outline yields no bookmarks, never an error that stops the document
+opening, and an entry whose destination will not resolve keeps its title and
+points nowhere.
+
+**Two files came out of `read.zig` rather than going into it**, as the table
+had said. `rails.zig` and `panels.zig` follow `chrome.zig`'s division exactly:
+a struct of strings and numbers in, a `Want` out, no view and no buffer
+anywhere, and the whole thing built and clicked in a test with no window and
+no PDF. `read.zig` was 4695 lines before this phase and would have been six
+thousand after it.
+
+**Panels are a vocabulary, not a panel per feature.** A `panels.Row` is a
+label, a page, a colour chip, a depth and an id; the annotations panel and the
+outline are the same widget with different rows, and that is the shape phase
+eight's plugin panels are declared in. The rows are the reader's array,
+refilled when `Marks.revision` or the open panel changes and at no other time.
+
+**The left rail's modes *are* `keys.Mode`.** Two functions were added to
+`keys.zig` so that they could be: `enter(state, mode)` sets the mode and
+returns the command the key would have pushed, and `paletteCommand(mode,
+index)` says what a colour means where it means anything. The digits go
+through the second one now too, so a swatch and the key printed in its tooltip
+cannot come to mean different things. That is the design language's "a button
+is a second way to reach something the keymap already reaches", made
+structural instead of merely intended.
+
+**Known gap: the rails do not turn off.** The design language asks for it —
+"rails and bars toggle, and the toggle is remembered" — and nothing here does.
+It is a setting in `settings.zig`'s table, two bools in `windowRect`, and a
+`:set` name; call it 80 lines, and it belongs with whichever phase next
+touches the settings page.
+
+### What phase 4 cost, against what it was budgeted
+
+Five commits at 1250 became six at 2259, and the average commit was 376.
+
+**The planned split worked, and it is the third time that seam has.** The
+right rail landed as the pointer's half and then the keyboard's, 407 and 177,
+because the plan said to split it rather than leaving it to be noticed
+afterwards. The second half is the smallest real commit of the phase and the
+one with the fewest surprises in it: a field, three tests, and nothing to
+argue about, because the argument was settled by the commit before.
+
+**The split that was not planned is the same one phase three missed.** `a
+panel listing the highlights and their notes` is 572 lines because the panel
+widget and the reader's row-building landed together. `panels.zig` alone is
+400 — a `Row`, a `State`, a list and six tests — and the reader's half is 120:
+the sort, the staleness check and the click. Landing them as *a panel of
+typed rows* and then *the highlights in one* would have been two commits of
+about three hundred and fifty. **Split the model from the widget that draws
+it** has now been the answer three phases running and been taken once.
+
+**`outline.zig` is the fourth data point for four hundred lines a file, and
+the first that is not a widget.** It came in at 622 with ten tests, and the
+thirds hold exactly: the argument for why a destination is three grammars and
+one answer, the tests that write a malformed PDF down and say what comes out,
+and the walk itself. The seam inside it that was there to take: `decode` — a
+PDF text string as UTF-8 — is eighty lines of arithmetic over bytes with no
+document anywhere in it, and it is the piece nothing else in the program had
+and several things will want. *Pdf text strings, as utf-8* was a commit.
+
+**The cheapest commit of the phase is the one that used the two before it.**
+`a bookmarks panel over the outline` is 87 lines: a field on `Buffer`, a
+`switch` arm that turns entries into rows, and the scroll. Phase three said a
+phase spent using the last two phases is a cheap phase; a *commit* spent using
+the last two commits is a cheap commit, and it is worth ordering a phase so
+that there is one.
 
 ### Phase 5 — tabpages
 
@@ -691,6 +763,38 @@ Things that cost time once and should not cost it again.
   set focus on itself the frame it first appears, which means knowing its key
   before it exists — which is free, since a key is a hash of the call-site
   string seeded with its parent's.
+- **A box does not clip the text it draws itself — only what its children
+  draw.** A label that has to be cut short needs a parent that clips and a
+  text box sized to its own text inside it. The status bar's rule is the same
+  rule from the other side and reads as though it were about strictness; it is
+  not, it is about which box the `clip` flag is on. The first outline drawn in
+  a panel had a heading running out from under its own row and over the page
+  number beside it, and a `--device` shot is what said so.
+- **Reserve a rail; overlay a panel; and that is what decides who gets the
+  click.** A rail comes off `windowRect` the way the status bar's height does,
+  so a pointer over a rail is never also over a page and there is nothing to
+  arbitrate. A panel floats over the document, so it records its rectangle as
+  it is built and `Session.pointer` asks before it hands a press to the text.
+  That is the only pointer arbitration in the reader, and it exists because
+  reflowing the windows for a list somebody opened to glance at would refit
+  every fitted view on every toggle.
+- **Last frame's rectangle is not a wrinkle, it is the answer.** A panel reads
+  `box.rect` as it builds, which is before this frame is solved and after the
+  last one was — and that is exactly the rectangle that was under the pointer
+  when the button went down. The test needs two frames before it can ask, and
+  saying so in the test is better than working around it.
+- **Two ways into the same thing go through one function.** `keys.enter` and
+  `keys.paletteCommand` exist because a rail button that built its own command
+  would be a second keymap with no tests and no name. The rule generalises:
+  wherever the interface offers a second way to something the keyboard already
+  reaches, the second way calls what the first one calls — it does not
+  reimplement the switch.
+- **Verify the parser through the thing that will use it, and commit in that
+  order.** `outline.zig` was written, wired to a panel, photographed against a
+  real paper, and only then committed — in two commits, parser first. Ten
+  tests over hand-written fixtures said the walk was right; the picture is
+  what said the *destinations* were, and it is also what found the clipping
+  bug above. Neither would have been found by reading the code.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30

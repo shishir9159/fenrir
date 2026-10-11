@@ -1036,6 +1036,7 @@ src/
     xref.zig                both table encodings, /Prev chains, reconstruction
     Document.zig            resolution, object streams, stream decoding
     pages.zig               the page tree walk and attribute inheritance
+    outline.zig             /Outlines, its destinations, and text strings
     Page.zig                a page, its geometry, and its content stream
     print.zig               objects -> readable text
     filter.zig              the filter pipeline
