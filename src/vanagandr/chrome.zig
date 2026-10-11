@@ -195,10 +195,14 @@ pub const Chrome = struct {
         return statusBar(&c.ui, c.face, c.theme, st, &c.zoom);
     }
 
-    /// The right rail, for a reader that does not want to know how one is
-    /// built. Returns what it was asked for, if anything.
+    /// The rails, for a reader that does not want to know how one is built.
+    /// Each returns what it was asked for, if anything.
     pub fn rightRail(c: *Chrome, st: rails.Right) !?rails.Want {
         return rails.rightRail(&c.ui, c.face, c.theme, &c.icons, st, &c.rails, &c.tip);
+    }
+
+    pub fn leftRail(c: *Chrome, st: rails.Left) !?rails.Want {
+        return rails.leftRail(&c.ui, c.face, c.theme, &c.icons, st, &c.tip);
     }
 
     /// The tooltip, if the pointer has been resting on something long enough.

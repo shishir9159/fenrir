@@ -1,10 +1,11 @@
 //! The rails: the thin columns of controls either side of the page.
 //!
-//! The right one is here. It carries the panel toggles at the top and the
-//! page counter at the bottom, which is the arrangement the plan's sketch
-//! draws and the one the design language argues for: the things you reach for
-//! are at the top where the pointer already is, and the thing you *read* is
-//! at the bottom, out of the way of both.
+//! The right one carries the panel toggles at the top and the page counter at
+//! the bottom, which is the arrangement the plan's sketch draws and the one
+//! the design language argues for: the things you reach for are at the top
+//! where the pointer already is, and the thing you *read* is at the bottom,
+//! out of the way of both. The left one carries the modes and the highlight
+//! palette, which are the two things a hand hovers over while reading.
 //!
 //! ## A rail is reserved, not floated
 //!
@@ -26,8 +27,13 @@
 //! ## What a rail button is
 //!
 //! The same `Command` the key sends, reached a second way. A rail is never
-//! the only way to anything: the panel toggles here are latches over state
-//! the reader already keeps, and the keymap will reach the same state.
+//! the only way to anything: the panel toggles are latches over state the
+//! reader already keeps, and the left rail's modes *are* `keys.Mode` -- the
+//! button lights from the mode the keymap is in, and pressing one goes
+//! through `keys.enter`, which is the function the `v` key would call if a
+//! key could. The palette is the same arrangement one step further along:
+//! `keys.paletteCommand` says what a colour means in a mode, and the digits
+//! and the swatches both ask it.
 //!
 //! ## The counter is a control, the way the zoom is
 //!
@@ -42,10 +48,12 @@ const fenrir = @import("fenrir");
 
 const thviti = fenrir.thviti;
 
+const Color = fenrir.gelgja.Color;
 const Fonts = fenrir.tyr.Fonts;
 const Icons = thviti.Icons;
 const Theme = thviti.Theme;
 const UI = thviti.UI;
+const keys = fenrir.hlidskjalf.keys;
 const w = thviti.widgets;
 
 pub const Error = UI.Error;
@@ -113,7 +121,77 @@ pub const Want = union(enum) {
     panel: Panel,
     /// Go here, numbered from one.
     page: u32,
+    /// Go into this mode. The same `keys.Mode` the keymap has, not a
+    /// parallel idea of one: `keys.enter` is what both ways in go through.
+    mode: keys.Mode,
+    /// The palette colour a digit picks, numbered as `keys` numbers them --
+    /// zero is `1`. What it *does* depends on the mode, which is a question
+    /// `keys.paletteCommand` answers for the rail and the keyboard alike.
+    colour: u8,
 };
+
+/// One colour in the left rail's palette, as the reader names it.
+pub const Swatch = struct {
+    /// For the tooltip. The rail does not know what colours are called.
+    name: []const u8,
+    color: Color,
+};
+
+/// What the left rail shows.
+pub const Left = struct {
+    mode: keys.Mode = .normal,
+    /// The colours a digit picks, in that order: the first is `1`.
+    palette: []const Swatch = &.{},
+};
+
+/// The modes the rail has a button for, in the order it draws them.
+///
+/// Not every mode. `visual_line` is `V` and is the same button as `v` with a
+/// different gesture behind it; `note` and `command` are things you are in
+/// the middle of rather than places you go; `draw` has no commands behind it
+/// yet and a button that does nothing is worse than no button.
+pub const mode_buttons = [_]keys.Mode{ .normal, .visual, .edit };
+
+fn modeLabel(m: keys.Mode) []const u8 {
+    return switch (m) {
+        .visual, .visual_line => "Visual",
+        .edit, .note => "Edit",
+        .command => "Command",
+        .normal => "Normal",
+    };
+}
+
+fn modeIcon(m: keys.Mode) []const u8 {
+    return switch (m) {
+        .visual, .visual_line => "fenrir.visual",
+        .edit, .note => "fenrir.edit",
+        .normal, .command => "fenrir.normal",
+    };
+}
+
+/// The key that reaches a mode, drawn in its tooltip. The design language
+/// asks for it everywhere a command has a binding, and a rail is no
+/// exception: the button is the second way in, and the tooltip is where it
+/// says what the first one is.
+fn modeKey(m: keys.Mode) []const u8 {
+    return switch (m) {
+        .visual, .visual_line => "v",
+        .edit, .note => "i",
+        .command => ":",
+        .normal => "escape",
+    };
+}
+
+/// Which rail button is lit for a mode. Note mode is edit mode with a note
+/// half typed, and visual-line is visual with whole lines; neither is a
+/// fourth button.
+fn buttonFor(m: keys.Mode) keys.Mode {
+    return switch (m) {
+        .visual, .visual_line => .visual,
+        .edit, .note => .edit,
+        .normal, .command => .normal,
+    };
+}
 
 /// The rails' own state, kept by the reader for the reason a checkbox's bool
 /// is: the reader has to be able to ask whether the rail is holding the
@@ -227,10 +305,111 @@ pub fn rightRail(
     return want;
 }
 
-/// How much of the window the rail leaves alone at the bottom. The status bar
+/// How much of the window a rail leaves alone at the bottom. The status bar
 /// is drawn over the same pixels the rail would otherwise reach, and a rail
 /// that ran behind it would put its counter under the mode line.
 pub const reserved_below: f32 = @import("chrome.zig").status_height;
+
+/// The left rail: which mode you are in, and what colour you are marking in.
+///
+/// The mode buttons are not a parallel notion of a mode. They are
+/// `keys.Mode`, they light from the mode the keymap is in, and pressing one
+/// goes through `keys.enter` -- the same function the `v` key would have gone
+/// through if there were a way to make a key call it. A rail is the second
+/// way to something the keyboard already reaches, never the only way.
+pub fn leftRail(
+    ui: *UI,
+    face: Fonts.FontId,
+    t: Theme,
+    icons: *const Icons,
+    st: Left,
+    tips: *w.Tips,
+) Error!?Want {
+    ui.pushStyle(.{ .font = face, .font_size = counter_text, .fg = t.text, .bg = t.panel });
+    defer ui.popStyle();
+
+    ui.next(.{
+        .w = .px(width),
+        .h = .px(@max(ui.viewport.height() - reserved_below, 1)),
+        .axis = .y,
+        .child_align = .center,
+        .fixed_x = 0,
+        .fixed_y = 0,
+        .flags = .{
+            .floating_x = true,
+            .floating_y = true,
+            .draw_background = true,
+            .clip = true,
+        },
+    });
+    const rail = try ui.open("left rail");
+    defer ui.close(rail);
+
+    var want: ?Want = null;
+    const lit = buttonFor(st.mode);
+
+    try w.spacer(ui, .px(inset));
+    for (mode_buttons) |m| {
+        const sig = try w.iconButton(ui, modeLabel(m), icons.byName(modeIcon(m), .sidebar), .{
+            .on = lit == m,
+            .accent = t.accent,
+        });
+        var hint: [40]u8 = undefined;
+        w.tool.hint(ui, tips, sig, std.fmt.bufPrint(&hint, "{s} ({s})", .{
+            modeLabel(m), modeKey(m),
+        }) catch modeLabel(m));
+        if (sig.clicked) want = .{ .mode = m };
+        try w.spacer(ui, .px(2));
+    }
+
+    if (st.palette.len != 0) {
+        try w.spacer(ui, .px(inset));
+        ui.next(.{
+            .w = .px(button - 6),
+            .h = .px(1),
+            .bg = t.border,
+            .flags = .{ .draw_background = true },
+        });
+        _ = try ui.box("###rule");
+        try w.spacer(ui, .px(inset));
+    }
+
+    for (st.palette, 0..) |s, i| {
+        if (try swatch(ui, t, tips, s, @intCast(i))) want = .{ .colour = @intCast(i) };
+        try w.spacer(ui, .px(3));
+    }
+
+    try w.fill(ui);
+    return want;
+}
+
+/// One colour of the palette. A filled square and nothing else: the colour is
+/// the whole content, so a glyph on top of it would be a second thing to read
+/// in a control that has one.
+fn swatch(ui: *UI, t: Theme, tips: *w.Tips, s: Swatch, index: u8) Error!bool {
+    ui.next(.{
+        .w = .px(button - 6),
+        .h = .px(button - 6),
+        .bg = s.color,
+        .border_color = t.border,
+        .radius = .all(3),
+        .flags = .{
+            .clickable = true,
+            .draw_background = true,
+            .draw_border = true,
+            .hot_animation = true,
+            .active_animation = true,
+        },
+    });
+    var name: [16]u8 = undefined;
+    const sig = ui.signal(try ui.box(std.fmt.bufPrint(&name, "###colour{d}", .{index}) catch "###colour"));
+
+    // The digit that picks it, beside its name: the rail is the second way to
+    // a colour and the keyboard is the first.
+    var hint: [48]u8 = undefined;
+    w.tool.hint(ui, tips, sig, std.fmt.bufPrint(&hint, "{s} ({d})", .{ s.name, index + 1 }) catch s.name);
+    return sig.clicked;
+}
 
 /// The page counter at the foot of the rail: the page over the count, and a
 /// field when it is clicked.
@@ -325,8 +504,25 @@ const Rig = struct {
         return want;
     }
 
+    fn frameLeft(rig: *Rig, st: Left, in: Input) !?Want {
+        try rig.ui.begin(.fromRect(0, 0, 900, 600), in);
+        const want = try leftRail(&rig.ui, Fonts.fallback_font, .dark, &rig.icons, st, &rig.tips);
+        rig.ui.end();
+        return want;
+    }
+
     fn find(rig: *Rig, name: []const u8) ?*thviti.Box {
         return rig.ui.find(key.make(key.make(rig.ui.root.key, "right rail"), name));
+    }
+
+    fn findLeft(rig: *Rig, name: []const u8) ?*thviti.Box {
+        return rig.ui.find(key.make(key.make(rig.ui.root.key, "left rail"), name));
+    }
+
+    fn clickLeft(rig: *Rig, st: Left, at: Point) !?Want {
+        _ = try rig.frameLeft(st, .{ .mouse = at });
+        _ = try rig.frameLeft(st, .{ .mouse = at, .buttons = .{ .left = true } });
+        return rig.frameLeft(st, .{ .mouse = at });
     }
 
     /// Onto a box, press, release: a press only reaches a box the pointer was
@@ -486,4 +682,96 @@ test "a rail state survives being copied, field and all" {
     second.field.set("5");
     try testing.expectEqualStrings("5", second.field.slice());
     try testing.expect(second.field.bytes.ptr == &second.page_buf);
+}
+
+// -- the left rail ----------------------------------------------------------
+
+const palette = [_]Swatch{
+    .{ .name = "the usual colour", .color = .gray(0.42) },
+    .{ .name = "yellow", .color = .{ .r = 1, .g = 0.9, .b = 0.2 } },
+    .{ .name = "green", .color = .{ .r = 0.3, .g = 0.8, .b = 0.4 } },
+};
+
+test "the left rail is a column against the near edge" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    _ = try rig.frameLeft(.{ .palette = &palette }, .{});
+    const rail = rig.ui.root.first.?;
+    try testing.expectEqual(@as(f32, 0), rail.rect.min_x);
+    try testing.expectEqual(width, rail.rect.max_x);
+    try testing.expectEqual(600 - reserved_below, rail.rect.max_y);
+}
+
+test "one button is lit, and it is the one for the mode the keymap is in" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    // Note mode is edit mode with a note half typed, and visual-line is
+    // visual with whole lines. Neither is a fourth button.
+    try testing.expectEqual(keys.Mode.edit, buttonFor(.note));
+    try testing.expectEqual(keys.Mode.visual, buttonFor(.visual_line));
+    try testing.expectEqual(keys.Mode.normal, buttonFor(.command));
+
+    for ([_]keys.Mode{ .normal, .visual, .visual_line, .edit, .note }) |m| {
+        _ = try rig.frameLeft(.{ .mode = m, .palette = &palette }, .{});
+        var lit: u32 = 0;
+        for (mode_buttons) |b| {
+            const box = rig.findLeft(modeLabel(b)).?;
+            // An icon button draws in the accent when it is on, and the
+            // accent is the one colour in the rail that is not a grey.
+            if (box.style.fg.b > box.style.fg.r + 0.05) lit += 1;
+        }
+        try testing.expectEqual(@as(u32, 1), lit);
+    }
+}
+
+test "a mode button asks for its mode, and the keymap is what enters it" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    const st: Left = .{ .mode = .normal, .palette = &palette };
+    _ = try rig.frameLeft(st, .{});
+
+    const want = (try rig.clickLeft(st, middleOf(rig.findLeft("Visual").?))).?;
+    try testing.expectEqual(keys.Mode.visual, want.mode);
+
+    // And what that means is `keys`', not the rail's: the same command `v`
+    // pushes, with the mode already moved.
+    var state: keys.State = .{};
+    try testing.expectEqual(keys.Command.enter_visual, keys.enter(&state, want.mode));
+    try testing.expectEqual(keys.Mode.visual, state.mode);
+}
+
+test "a swatch asks for the colour its digit picks" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    const st: Left = .{ .mode = .visual, .palette = &palette };
+    _ = try rig.frameLeft(st, .{});
+
+    const want = (try rig.clickLeft(st, middleOf(rig.findLeft("colour1").?))).?;
+    try testing.expectEqual(@as(u8, 1), want.colour);
+
+    // Which in visual mode is the highlight the digit `2` would have made --
+    // the swatch and the key go through one table, so they cannot drift.
+    const cmd = keys.paletteCommand(.visual, want.colour).?;
+    try testing.expectEqual(@as(?u8, 1), cmd.highlight_selection);
+    // And in normal mode a colour means nothing at all, from either way in.
+    try testing.expect(keys.paletteCommand(.normal, want.colour) == null);
+}
+
+test "a rail with no palette draws the modes and no rule under them" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    _ = try rig.frameLeft(.{}, .{});
+    try testing.expect(rig.findLeft("Normal") != null);
+    try testing.expect(rig.findLeft("rule") == null);
+    try testing.expect(rig.findLeft("colour0") == null);
 }

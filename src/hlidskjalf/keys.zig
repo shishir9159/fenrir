@@ -391,6 +391,41 @@ fn digit(c: u21) ?u8 {
     return @intCast(c - '1');
 }
 
+/// What picking palette colour `index` does in `mode`, or null where the mode
+/// has no use for a colour.
+///
+/// Public because the digits are not the only way to reach one: the left rail
+/// draws the palette as swatches, and a swatch that meant something different
+/// from the digit printed in its tooltip would be a bug nobody could see. One
+/// table, two ways in.
+pub fn paletteCommand(mode: Mode, index: u8) ?Command {
+    if (index >= palette_size) return null;
+    return switch (mode) {
+        .visual, .visual_line => .{ .highlight_selection = index },
+        .edit, .note => .{ .recolour_mark = index },
+        .normal, .command => null,
+    };
+}
+
+/// Enters a mode from something that is not a key -- a rail button, a menu
+/// row -- and returns the command the keymap would have pushed beside it.
+///
+/// The mode change and the command are one act and they are here together for
+/// that reason: `v` sets `state.mode` and pushes `.enter_visual`, and a
+/// caller that did one without the other would leave the reader in a mode
+/// nothing had prepared.
+pub fn enter(state: *State, mode: Mode) Command {
+    state.mode = mode;
+    return switch (mode) {
+        .normal => .leave_mode,
+        .visual => .enter_visual,
+        .visual_line => .enter_visual_line,
+        .edit => .enter_edit,
+        .note => .enter_note,
+        .command => .enter_command,
+    };
+}
+
 fn normalKey(state: *State, c: u21, out: *Result) void {
     if (motion(c)) |step| return out.push(.{ .move_cursor = step });
     const cmd: Command = switch (c) {
@@ -429,8 +464,11 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
 fn visualKey(state: *State, c: u21, out: *Result) void {
     if (motion(c)) |step| return out.push(.{ .move_cursor = step });
     if (digit(c)) |d| {
+        // The mode ends on a colour: the highlight is made and there is
+        // nothing selected any more.
+        const cmd = paletteCommand(state.mode, d) orelse return;
         state.mode = .normal;
-        return out.push(.{ .highlight_selection = d });
+        return out.push(cmd);
     }
     const cmd: Command = switch (c) {
         'o' => .swap_selection_ends,
@@ -467,7 +505,10 @@ fn visualKey(state: *State, c: u21, out: *Result) void {
 }
 
 fn editKey(state: *State, c: u21, out: *Result) void {
-    if (digit(c)) |d| return out.push(.{ .recolour_mark = d });
+    if (digit(c)) |d| {
+        if (paletteCommand(state.mode, d)) |cmd| return out.push(cmd);
+        return;
+    }
     const cmd: Command = switch (c) {
         'n', 'j' => .next_mark,
         'N', 'k' => .previous_mark,

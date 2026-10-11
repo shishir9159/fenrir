@@ -898,6 +898,9 @@ const Session = struct {
         revision: u64 = 0,
     } = .{},
 
+    /// The left rail's colours, filled when the highlight colour changes.
+    palette: [keys.palette_size]rails_mod.Swatch = @splat(.{ .name = "", .color = .gray(0) }),
+
     /// The accent a person configured, or null for the theme's own.
     ///
     /// Kept apart from the theme so that `useTheme` can put it back on top of
@@ -1748,11 +1751,21 @@ const Session = struct {
     /// the accent when the reader has chosen one, so the key a person reaches
     /// for first gives the colour they set; the rest are the named colours
     /// `fenrir config accent` accepts, in rainbow order.
+    /// The colours a digit picks, from `2` onwards. `1` is whatever the
+    /// reader highlights with by default, which is a setting and not a name.
+    const palette_names = [_][]const u8{
+        "yellow", "green", "blue", "pink", "orange", "purple", "red",
+    };
+
     fn paletteColor(s: *const Session, index: ?u8) Color {
-        const names = [_][]const u8{ "yellow", "green", "blue", "pink", "orange", "purple", "red" };
         const i = index orelse return s.highlight;
-        if (i == 0 or i > names.len) return s.highlight;
-        return Library.parseColor(names[i - 1]).?;
+        if (i == 0 or i > palette_names.len) return s.highlight;
+        return Library.parseColor(palette_names[i - 1]).?;
+    }
+
+    fn paletteName(index: u8) []const u8 {
+        if (index == 0 or index > palette_names.len) return "the usual colour";
+        return palette_names[index - 1];
     }
 
     /// The glyphs between two text positions, as one box per line per page.
@@ -3256,10 +3269,11 @@ const Session = struct {
     /// that overlay, and they are asked about separately.
     fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
         if (s.chrome == null) return .fromRect(0, 0, width, @max(height, 1));
+        const left = rails_mod.width;
         return .fromRect(
+            left,
             0,
-            0,
-            @max(width - rails_mod.width, 1),
+            @max(width - rails_mod.width, left + 1),
             @max(height - chrome_mod.status_height, 1),
         );
     }
@@ -3326,10 +3340,38 @@ const Session = struct {
         return .{ .page = v.currentPage() + 1, .pages = @intCast(v.pages.len) };
     }
 
-    /// What the right rail asked for, carried out.
+    /// What the left rail shows: the mode, and the colours a digit picks.
+    ///
+    /// The palette is filled into a fixed array on the session rather than
+    /// built fresh: eight colours parsed from their names every frame would
+    /// be the one place in the reader that does string work on a frame path,
+    /// for a rail that changes when a setting does.
+    fn modeRail(s: *Session) rails_mod.Left {
+        if (s.palette[0].name.len == 0 or !std.meta.eql(s.palette[0].color, s.highlight)) {
+            for (&s.palette, 0..) |*sw, i| {
+                sw.* = .{
+                    .name = paletteName(@intCast(i)),
+                    .color = s.paletteColor(@intCast(i)),
+                };
+            }
+        }
+        return .{ .mode = s.keymap.mode, .palette = &s.palette };
+    }
+
+    /// What a rail asked for, carried out.
     fn applyRail(s: *Session, want: rails_mod.Want) void {
         const c = s.chrome orelse return;
         switch (want) {
+            // Through `keys`, both of them: the rail names a mode and a
+            // colour, and what those mean is the keymap's to say. A button
+            // that built its own command would be a second keymap.
+            .mode => |m| _ = s.apply(keys.enter(&s.keymap, m)),
+            .colour => |i| {
+                const cmd = keys.paletteCommand(s.keymap.mode, i) orelse return;
+                if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
+                _ = s.apply(cmd);
+                s.applyEffects();
+            },
             // Nothing is filled here: which panel is open is part of what
             // makes the rows stale, and the panel is built later this same
             // frame. One place fills them, and it is `panelRows`.
@@ -3862,6 +3904,7 @@ const Session = struct {
                 const want = try c.status(s.statusLine());
                 const asked = try c.rightRail(s.railLine());
                 if (asked) |wanted| s.applyRail(wanted);
+                if (try c.leftRail(s.modeRail())) |wanted| s.applyRail(wanted);
                 try s.drawPanel(c);
                 // After the bar, the rails and the panel, so it is over all
                 // of them: a popup is on top by being built last, and nothing
