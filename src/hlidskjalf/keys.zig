@@ -31,13 +31,19 @@
 //! overrule a change it cannot honour -- edit mode on a document with no
 //! highlights goes straight back to normal -- and does so by writing `mode`.
 //!
-//! ## The `<C-w>` prefix
+//! ## Prefixes
 //!
-//! Window commands are `<C-w>` followed by a key, in normal mode. A prefix that
-//! is never completed times out after `prefix_timeout`, the way a terminal's
-//! escape sequences do. `<C-w>` cannot be read from typed text -- no platform
-//! sends text for a key held with ctrl -- which is what `Input.chorded` and the
-//! `char` on a key event exist for. See `thviti/input.zig`.
+//! Window commands are `<C-w>` followed by a key, and tabpages are `g`
+//! followed by one, both in normal mode. A prefix that is never completed
+//! times out after `prefix_timeout`, the way a terminal's escape sequences do.
+//!
+//! The two are read from different places and have to be. `<C-w>` cannot come
+//! from typed text -- no platform sends text for a key held with ctrl -- which
+//! is what `Input.chorded` and the `char` on a key event exist for. `g` is a
+//! letter somebody typed, so it is read where the letters are, in the loop
+//! over the frame's text; that is also what keeps `gt` and `gT` apart, since
+//! `typedKey` folds case on purpose and a codepoint does not.
+//! See `thviti/input.zig`.
 
 const std = @import("std");
 
@@ -95,6 +101,17 @@ pub const Command = union(enum) {
     focus_side: Layout.Side,
     cycle_window: bool,
     equalise,
+
+    // -- tabpages
+    /// A tabpage holding one window on whatever this one is looking at.
+    new_tab,
+    /// Close the tabpage on screen. Refused when it is the only one, as in
+    /// Vim: leaving the reader is what `q` is for.
+    close_tab,
+    /// `gt` and `gT`: forwards or backwards along the bar, wrapping.
+    go_tab: i32,
+    /// `<C-w>T`: move the focused window into a tabpage of its own.
+    window_to_tab,
 
     // -- buffers
     next_buffer,
@@ -169,11 +186,20 @@ pub const Command = union(enum) {
     redo,
 };
 
+/// A key that has been pressed and is waiting for the one after it.
+pub const Prefix = enum {
+    none,
+    /// `<C-w>`: windows.
+    window,
+    /// `g`: tabpages.
+    g,
+};
+
 /// What survives between frames.
 pub const State = struct {
     mode: Mode = .normal,
-    /// True while `<C-w>` has been pressed and its second key has not.
-    pending: bool = false,
+    /// Which prefix has been pressed and not yet completed.
+    pending: Prefix = .none,
     /// Seconds the prefix has been waiting.
     waited: f32 = 0,
 };
@@ -242,7 +268,7 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
     // `<C-w>` replaces the window prefix rather than competing with it.
     var claimed_ctrl_w = false;
     var claimed_ctrl_r = false;
-    if (!state.pending) {
+    if (state.pending == .none) {
         for (in.events) |e| switch (e) {
             .key_down => |k| {
                 if (k.repeat or k.char == 0 or !(k.modifiers.ctrl or k.modifiers.alt)) continue;
@@ -258,27 +284,31 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
 
     // The prefix first, and its expiry: a `<C-w>` left pending from two
     // minutes ago must not turn the next `v` into a split.
-    if (state.pending) {
+    if (state.pending != .none) {
         state.waited += in.dt;
-        if (state.waited > prefix_timeout) state.pending = false;
+        if (state.waited > prefix_timeout) state.pending = .none;
     }
-    if (state.pending) {
+    // Only the window prefix is finished here. `g` is a letter and its second
+    // key is one too, so it is completed down in the loop over the frame's
+    // text -- where the codepoint still has its case and `gt` and `gT` are
+    // two different keys.
+    if (state.pending == .window) {
         if (windowKey(in)) |c| {
-            state.pending = false;
+            state.pending = .none;
             out.push(c);
             return out;
         }
         if (in.pressedOnce(.escape)) {
-            state.pending = false;
+            state.pending = .none;
             return out;
         }
         // Anything else is swallowed: half a window command is not a scroll.
-        if (in.events.len != 0) state.pending = false;
-        if (state.pending) return out;
+        if (in.events.len != 0) state.pending = .none;
+        if (state.pending == .window) return out;
     }
 
     if (state.mode == .normal and !claimed_ctrl_w and in.chorded(.ctrlKey('w'))) {
-        state.pending = true;
+        state.pending = .window;
         state.waited = 0;
         return out;
     }
@@ -320,7 +350,11 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
     }
 
     if (in.pressedOnce(.escape)) {
-        if (state.mode == .normal) {
+        // A half-typed `g` goes first, so escape abandons the prefix rather
+        // than the cursor somebody was about to move with it.
+        if (state.pending == .g) {
+            state.pending = .none;
+        } else if (state.mode == .normal) {
             out.push(.hide_cursor);
         } else {
             state.mode = .normal;
@@ -343,6 +377,13 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
         }
         if (state.mode == .command) {
             if (c >= 0x20 and c != 0x7f) out.push(.{ .command_char = c });
+            continue;
+        }
+        // The key after `g`, before anything else can claim it: a tabpage
+        // command is `g` and one letter, and that letter is not a motion.
+        if (state.pending == .g) {
+            state.pending = .none;
+            if (tabKey(c)) |cmd| out.push(cmd);
             continue;
         }
         if (Lookup.get(plugins, state.mode, .{ .char = c })) |id| {
@@ -455,6 +496,11 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
         ':' => blk: {
             state.mode = .command;
             break :blk .enter_command;
+        },
+        'g' => {
+            state.pending = .g;
+            state.waited = 0;
+            return;
         },
         else => return,
     };
@@ -585,11 +631,26 @@ fn windowKey(in: Input) ?Command {
         .{ '=', Command.equalise },
         .{ 'n', Command.next_buffer },
         .{ 'b', Command.previous_buffer },
+        .{ 'T', Command.window_to_tab },
     };
     inline for (pairs) |p| {
         if (in.typedKey(p[0])) return p[1];
     }
     return null;
+}
+
+/// The key after `g`.
+///
+/// Read from the codepoint rather than from a key event, because `gt` and
+/// `gT` differ only in their case and `Input.typedKey` folds it -- deliberately,
+/// since a layout that reports `W` for the `w` key should still answer to
+/// `<C-w>w`. What is right for a chord is wrong for a letter.
+fn tabKey(c: u21) ?Command {
+    return switch (c) {
+        't' => .{ .go_tab = 1 },
+        'T' => .{ .go_tab = -1 },
+        else => null,
+    };
 }
 
 // -- tests --------------------------------------------------------------------
@@ -736,7 +797,7 @@ test "in a note every key is text, even the ones that are commands elsewhere" {
 test "window commands are not available while selecting" {
     var state: State = .{ .mode = .visual };
     _ = command(&state, frame(&.{press('w', true)}));
-    try testing.expect(!state.pending);
+    try testing.expectEqual(Prefix.none, state.pending);
 }
 
 test "u undoes in every mode that is not typing, and ctrl-r redoes" {
@@ -756,10 +817,10 @@ test "the window prefix takes the next key and nothing else" {
     var state: State = .{};
     const armed = command(&state, frame(&.{press('w', true)}));
     try testing.expectEqual(@as(usize, 0), armed.items().len);
-    try testing.expect(state.pending);
+    try testing.expectEqual(Prefix.window, state.pending);
 
     const out = command(&state, frame(&.{press('v', false)}));
-    try testing.expect(!state.pending);
+    try testing.expectEqual(Prefix.none, state.pending);
     try testing.expectEqual(Layout.Direction.vertical, out.items()[0].split);
     // And `v` after the prefix is a split, not visual mode.
     try testing.expectEqual(Mode.normal, state.mode);
@@ -769,7 +830,7 @@ test "an abandoned prefix times out rather than eating a later key" {
     var state: State = .{};
     _ = command(&state, frame(&.{press('w', true)}));
     _ = command(&state, .{ .dt = prefix_timeout + 0.1 });
-    try testing.expect(!state.pending);
+    try testing.expectEqual(Prefix.none, state.pending);
 }
 
 test "every window key is bound, and to the thing vim binds it to" {
@@ -789,6 +850,52 @@ test "every window key is bound, and to the thing vim binds it to" {
         try testing.expectEqual(@as(usize, 1), out.items().len);
         try testing.expectEqualDeep(c[1], out.items()[0]);
     }
+}
+
+test "gt and gT are two keys apart, which is why they are read as codepoints" {
+    var state: State = .{};
+    const armed = command(&state, typing("g"));
+    try testing.expectEqual(@as(usize, 0), armed.items().len);
+    try testing.expectEqual(Prefix.g, state.pending);
+
+    try testing.expectEqual(@as(i32, 1), command(&state, typing("t")).items()[0].go_tab);
+    try testing.expectEqual(Prefix.none, state.pending);
+
+    _ = command(&state, typing("g"));
+    try testing.expectEqual(@as(i32, -1), command(&state, typing("T")).items()[0].go_tab);
+}
+
+test "a whole tabpage command typed inside one frame still means one thing" {
+    var state: State = .{};
+    // `g` and `T` in the same frame: the prefix is completed in the loop over
+    // the text, so `T` is never looked up as a key of its own.
+    const out = command(&state, typing("gT"));
+    try testing.expectEqual(@as(usize, 1), out.items().len);
+    try testing.expectEqual(@as(i32, -1), out.items()[0].go_tab);
+    try testing.expectEqual(Prefix.none, state.pending);
+
+    // And a letter `g` has no meaning after does nothing at all, rather than
+    // falling through to whatever that letter means on its own.
+    try testing.expectEqual(@as(usize, 0), command(&state, typing("gv")).items().len);
+    try testing.expectEqual(Mode.normal, state.mode);
+}
+
+test "an abandoned g is escaped away without also hiding the cursor" {
+    var state: State = .{};
+    _ = command(&state, typing("g"));
+    const out = command(&state, frame(&.{keyDown(.escape)}));
+    try testing.expectEqual(Prefix.none, state.pending);
+    try testing.expectEqual(@as(usize, 0), out.items().len);
+
+    // Escape with nothing pending is the cursor again, as it always was.
+    try testing.expectEqual(Command.hide_cursor, command(&state, frame(&.{keyDown(.escape)})).items()[0]);
+}
+
+test "ctrl-w T moves the window to a tabpage of its own" {
+    var state: State = .{};
+    _ = command(&state, frame(&.{press('w', true)}));
+    const out = command(&state, frame(&.{press('T', false)}));
+    try testing.expectEqual(Command.window_to_tab, out.items()[0]);
 }
 
 test "ctrl and the wheel is a zoom, and the wheel alone is a scroll" {
@@ -861,7 +968,7 @@ test "a plugin binding takes a key before the built-in one" {
     state.mode = .normal;
     const chord = commandWith(&state, frame(&.{press('w', true)}), lookup);
     try testing.expectEqual(@as(u32, 9), chord.items()[0].plugin_key);
-    try testing.expect(!state.pending);
+    try testing.expectEqual(Prefix.none, state.pending);
 
     // And on the command line, nothing is a binding.
     state.mode = .command;

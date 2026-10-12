@@ -92,6 +92,7 @@ const Scene = gleipnir.scene.Scene;
 const Buffer = hlidskjalf.Buffer;
 const Layout = hlidskjalf.Layout;
 const Marks = hlidskjalf.Marks;
+const Tabs = hlidskjalf.Tabs;
 const View = hlidskjalf.View;
 const keys = hlidskjalf.keys;
 const text = hlidskjalf.text;
@@ -438,15 +439,15 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
     if (start_page > first.pages.len) {
         return ctx.fail("page {d}: {s} has {d} pages", .{ start_page, first.title, first.pages.len });
     }
-    try session.layout.init(gpa, .{
+    try session.tabs.init(gpa, .{
         .buffer = 0,
         .pages = first.pages,
         .zoom = std.math.clamp(zoom orelse 1.0, min_zoom, max_zoom),
         .fit_on_open = zoom == null,
     });
 
-    const resumed = session.restore(session.layout.current(), 0, page_given, zoom == null);
-    if (!page_given and resumed == null) session.layout.current().scrollToPage(start_page - 1);
+    const resumed = session.restore(session.layout().current(), 0, page_given, zoom == null);
+    if (!page_given and resumed == null) session.layout().current().scrollToPage(start_page - 1);
     if (resumed) |p| {
         ctx.note("resuming at page {d} of {d}", .{ p.page + 1, first.pages.len });
     }
@@ -857,7 +858,11 @@ const Session = struct {
     /// dependencies run one way. Touched only from `produce`, which is to say
     /// only on the rasterising thread, for the same reason `Document` is.
     faces: std.ArrayList(glyphmod.Cache) = .empty,
-    layout: Layout = .{},
+    /// The tabpages, and the tree of windows in each. The one on screen is
+    /// `layout()`, which is what almost everything here means by "the
+    /// windows": a tab nobody is looking at is drawn by nothing and
+    /// rasterised for nobody.
+    tabs: Tabs = .{},
     keymap: keys.State = .{},
 
     /// The interface drawn over the page: Þviti, a face off this machine, and
@@ -1024,7 +1029,7 @@ const Session = struct {
         s.cmdline.deinit(s.gpa);
         s.note.deinit(s.gpa);
         s.recorded.deinit(s.gpa);
-        s.layout.deinit(s.gpa);
+        s.tabs.deinit(s.gpa);
         for (s.faces.items) |*c| c.deinit();
         s.faces.deinit(s.gpa);
         for (s.buffers.items) |*b| {
@@ -1087,8 +1092,13 @@ const Session = struct {
         return &s.buffers.items[index];
     }
 
+    /// The tabpage on screen. Every window command means this one.
+    fn layout(s: *Session) *Layout {
+        return s.tabs.current();
+    }
+
     fn view(s: *Session) *View {
-        return s.layout.current();
+        return s.layout().current();
     }
 
     /// Points the focused window at another open document. `<C-w>n`.
@@ -1265,12 +1275,14 @@ const Session = struct {
     /// focused one is written last and wins for a document open twice.
     fn rememberAll(s: *Session) void {
         if (!s.remembers_place) return;
-        var it = s.layout.iterator();
+        // Every tabpage, not only the one on screen: a window on a tab
+        // nobody has looked at since morning was still left somewhere.
+        var it = s.tabs.iterator();
         while (it.next()) |v| {
-            if (v == s.layout.current()) continue;
+            if (v == s.layout().current()) continue;
             s.rememberPlace(v);
         }
-        s.rememberPlace(s.layout.current());
+        s.rememberPlace(s.layout().current());
     }
 
     // -- work ----------------------------------------------------------------
@@ -1429,8 +1441,8 @@ const Session = struct {
     /// fresh split fills in the way a person reads rather than in page order.
     /// The focused window goes first, because that is the one being looked at.
     fn firstMissing(s: *Session) ?Job {
-        if (s.missingIn(s.layout.current())) |job| return job;
-        var it = s.layout.iterator();
+        if (s.missingIn(s.layout().current())) |job| return job;
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             if (s.missingIn(v)) |job| return job;
         }
@@ -1454,8 +1466,8 @@ const Session = struct {
         // edge must never be rendered ahead of one the reader is looking at,
         // or a split would sit on blank paper while the worker filled a page
         // nobody can see.
-        if (s.aheadIn(s.layout.current())) |job| return job;
-        var it = s.layout.iterator();
+        if (s.aheadIn(s.layout().current())) |job| return job;
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             if (s.aheadIn(v)) |job| return job;
         }
@@ -1623,7 +1635,7 @@ const Session = struct {
     /// of all of them, because the window that asked may have closed while
     /// another one still wants the page.
     fn wantedNow(s: *Session, job: Job) bool {
-        var it = s.layout.iterator();
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             if (v.buffer == job.buffer and v.zoom == job.zoom) return true;
         }
@@ -1885,7 +1897,7 @@ const Session = struct {
     fn activeSelection(s: *Session, v: *View) ?[2]View.Position {
         if (v.selection()) |sel| return sel;
         const d = s.drag orelse return null;
-        if (d.buffer != v.buffer or v != s.layout.current()) return null;
+        if (d.buffer != v.buffer or v != s.layout().current()) return null;
         return View.Position.ordered(d.from, d.to);
     }
 
@@ -2228,7 +2240,7 @@ const Session = struct {
         const args = std.mem.trim(u8, line[space..], " \t");
         const v = s.view();
 
-        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, bn, bnext, bp, bprevious, page, zoom, fit, set, settings, undo, redo, marks, lua, messages, plugins, echo };
+        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, tabnew, tabclose, tabonly, tabn, tabnext, tabp, tabprevious, bn, bnext, bp, bprevious, page, zoom, fit, set, settings, undo, redo, marks, lua, messages, plugins, echo };
         const which = std.meta.stringToEnum(Builtin, name) orelse {
             if (s.plugins) |rt| {
                 if (rt.runCommand(name, args)) |ran| return ran;
@@ -2245,7 +2257,30 @@ const Session = struct {
             .sp, .split => s.splitWindow(.horizontal),
             .vs, .vsplit => s.splitWindow(.vertical),
             .close => _ = s.closeWindow(),
-            .only => s.layout.only(s.gpa),
+            .only => s.layout().only(s.gpa),
+            .tabnew => s.newTab(),
+            .tabclose => if (!s.closeTab()) {
+                s.say("this is the only tabpage; :q leaves the reader", .{});
+                return false;
+            },
+            .tabonly => s.tabs.only(s.gpa),
+            // `:tabnext` alone is the next one; with a number it is that one,
+            // counted from 1 as a person counts the bar.
+            .tabn, .tabnext, .tabp, .tabprevious => {
+                const back = which == .tabp or which == .tabprevious;
+                if (args.len == 0) {
+                    s.goTab(if (back) -1 else 1);
+                } else if (std.fmt.parseInt(u32, args, 10)) |n| {
+                    if (n == 0 or n > s.tabs.count()) {
+                        s.say("there is no tabpage {d}", .{n});
+                        return false;
+                    }
+                    s.showTab(n - 1);
+                } else |_| {
+                    s.say(":{s} takes a tabpage number, or nothing", .{name});
+                    return false;
+                }
+            },
             .bn, .bnext => s.showBuffer(1),
             .bp, .bprevious => s.showBuffer(-1),
             .page => {
@@ -2620,7 +2655,7 @@ const Session = struct {
     /// does not exist yet.
     fn handle(s: *Session, in: lyngvi.Input) bool {
         if (s.interfaceHasInput()) {
-            var it = s.layout.iterator();
+            var it = s.layout().iterator();
             while (it.next()) |v| v.clampScroll();
             return s.quit;
         }
@@ -2637,7 +2672,7 @@ const Session = struct {
         }
         s.applyEffects();
 
-        var it = s.layout.iterator();
+        var it = s.layout().iterator();
         while (it.next()) |v| v.clampScroll();
         s.reportChanges();
         return s.quit;
@@ -2682,10 +2717,15 @@ const Session = struct {
 
             .split => |dir| s.splitWindow(dir),
             .close_window => _ = s.closeWindow(),
-            .only_window => s.layout.only(s.gpa),
-            .focus_side => |side| _ = s.layout.focusSide(side),
-            .cycle_window => |back| s.layout.cycle(s.gpa, back),
-            .equalise => s.layout.equalise(),
+            .only_window => s.layout().only(s.gpa),
+            .focus_side => |side| _ = s.layout().focusSide(side),
+            .cycle_window => |back| s.layout().cycle(s.gpa, back),
+            .equalise => s.layout().equalise(),
+
+            .new_tab => s.newTab(),
+            .close_tab => _ = s.closeTab(),
+            .go_tab => |delta| s.goTab(delta),
+            .window_to_tab => s.windowToTab(),
 
             .next_buffer => s.showBuffer(1),
             .previous_buffer => s.showBuffer(-1),
@@ -2830,13 +2870,13 @@ const Session = struct {
         // `s.drag` and take the last gesture's selection for this one's.
         if (pressed) {
             s.drag = null;
-            _ = s.layout.focusAt(in.mouse);
+            _ = s.layout().focusAt(in.mouse);
         }
 
         // Every window's scrollbar is live, not only the focused one's: a
         // thumb you can see and cannot drag is worse than no thumb.
         var handled = false;
-        var it = s.layout.iterator();
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             const inside = v.rect.contains(in.mouse) or v.dragging != null;
             if (v.dragScrollbar(if (inside) in.mouse else .{ .x = -1e9, .y = -1e9 }, down and inside)) {
@@ -2906,12 +2946,12 @@ const Session = struct {
     /// drop the gesture just as someone leans into it.
     fn dragSplit(s: *Session, in: lyngvi.Input, down: bool, pressed: bool) bool {
         if (down and pressed and s.split_drag == null) {
-            s.split_drag = s.layout.dividerAt(in.mouse, divider_slack);
+            s.split_drag = s.layout().dividerAt(in.mouse, divider_slack);
         }
         const d = s.split_drag orelse return false;
 
         if (down) {
-            s.layout.moveDivider(d, if (d.dir == .vertical) in.mouse.x else in.mouse.y);
+            s.layout().moveDivider(d, if (d.dir == .vertical) in.mouse.x else in.mouse.y);
         } else {
             s.split_drag = null;
         }
@@ -2944,7 +2984,7 @@ const Session = struct {
         s.clearSelection();
         if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
 
-        const made = s.layout.split(s.gpa, dir) catch null;
+        const made = s.layout().split(s.gpa, dir) catch null;
         if (made == null) {
             s.status = "no room to split";
             return;
@@ -2952,14 +2992,104 @@ const Session = struct {
         s.placed = null;
     }
 
-    /// Closes the focused window. False when it was the last one, which the
-    /// caller turns into a quit.
+    /// Closes the focused window. False when it was the last one anywhere,
+    /// which the caller turns into a quit.
+    ///
+    /// The last window of a tabpage closes the tabpage, as `:q` does in Vim:
+    /// a tabpage with no windows in it is not a thing, so the only question
+    /// is whether there is another tabpage to fall back to.
     fn closeWindow(s: *Session) bool {
-        if (s.layout.count() < 2) return false;
+        if (s.layout().count() < 2) return s.closeTab();
         s.rememberPlace(s.view());
-        _ = s.layout.close(s.gpa);
+        _ = s.layout().close(s.gpa);
         s.placed = null;
         return true;
+    }
+
+    // -- tabpages ------------------------------------------------------------
+
+    /// A tabpage of one window, looking at whatever this one is. `:tabnew`.
+    ///
+    /// Looking at the same document, and not at nothing: a reader opens a tab
+    /// to keep an arrangement, not to be handed an empty one. `<C-w>n` in the
+    /// new tab is what moves it to another buffer, exactly as it would in a
+    /// split.
+    fn newTab(s: *Session) void {
+        const copy = s.leavingTab();
+        _ = s.tabs.open(s.gpa, copy) catch {
+            s.say("no memory for another tabpage", .{});
+            return;
+        };
+        s.enteredTab();
+    }
+
+    /// Closes the tabpage on screen. False when it is the only one, which
+    /// `closeWindow` turns into a quit and `:tabclose` reports.
+    fn closeTab(s: *Session) bool {
+        if (s.tabs.count() < 2) return false;
+
+        // Every window in it, not only the focused one: the whole
+        // arrangement is going, and each was somewhere in a document.
+        var it = s.layout().iterator();
+        while (it.next()) |v| s.rememberPlace(v);
+
+        s.clearSelection();
+        if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
+        _ = s.tabs.close(s.gpa);
+        s.enteredTab();
+        return true;
+    }
+
+    /// `gt` and `gT`.
+    fn goTab(s: *Session, delta: i32) void {
+        if (s.tabs.count() < 2) return;
+        _ = s.leavingTab();
+        s.tabs.go(delta);
+        s.enteredTab();
+    }
+
+    /// A tabpage by number, from zero. What `:tabnext 2` and a click on the
+    /// bar both go through.
+    fn showTab(s: *Session, index: u32) void {
+        if (index >= s.tabs.count() or index == s.tabs.active) return;
+        _ = s.leavingTab();
+        s.tabs.show(index);
+        s.enteredTab();
+    }
+
+    /// The focused window, moved into a tabpage of its own. `<C-w>T`.
+    fn windowToTab(s: *Session) void {
+        if (s.layout().count() < 2) {
+            s.say("this window is the whole tabpage already", .{});
+            return;
+        }
+        _ = s.leavingTab();
+        _ = s.tabs.moveToNewTab(s.gpa) catch {
+            s.say("no memory for another tabpage", .{});
+            return;
+        };
+        s.enteredTab();
+    }
+
+    /// Everything that has to happen before this tabpage stops being the one
+    /// on screen, and a copy of the window that was focused in it.
+    ///
+    /// A selection belongs to the window it was dragged in, and a window on
+    /// another tabpage is one nobody can see the selection in -- so it goes,
+    /// the way a split's does and for the same reason.
+    fn leavingTab(s: *Session) View {
+        const copy = s.view().*;
+        s.clearSelection();
+        if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
+        s.rememberPlace(s.view());
+        return copy;
+    }
+
+    /// And after: the pages on the device belong to whichever windows are
+    /// showing, and which those are has just changed.
+    fn enteredTab(s: *Session) void {
+        s.placed = null;
+        s.dirty_title = true;
     }
 
     // -- the frame -----------------------------------------------------------
@@ -2980,10 +3110,10 @@ const Session = struct {
         s.recorded.stamp = s.stamp;
 
         s.order.clearRetainingCapacity();
-        try s.layout.leaves(&s.order, s.gpa);
+        try s.layout().leaves(&s.order, s.gpa);
 
         for (s.order.items) |leaf| {
-            const v = s.layout.viewAt(s.layout.nodes.items[leaf].pane.view().?);
+            const v = s.layout().viewAt(s.layout().nodes.items[leaf].pane.view().?);
             // Everything a window draws is confined to its own rectangle, or
             // a page scrolled past the bottom of one split would appear in
             // the next.
@@ -2997,11 +3127,11 @@ const Session = struct {
         // The lines between windows, then the focus ring, on top of
         // everything so neither is covered by a page.
         s.borders.clearRetainingCapacity();
-        try s.layout.borders(&s.borders, s.gpa);
+        try s.layout().borders(&s.borders, s.gpa);
         for (s.borders.items) |b| try over.fill(b, s.theme.divider);
 
-        if (s.layout.count() > 1) {
-            const focused = s.layout.nodes.items[s.layout.focus].rect;
+        if (s.layout().count() > 1) {
+            const focused = s.layout().nodes.items[s.layout().focus].rect;
             try over.border(focused, .all(0), 2, .{
                 .r = s.accent.r,
                 .g = s.accent.g,
@@ -3080,7 +3210,7 @@ const Session = struct {
         over: *DrawList,
     ) !void {
         const editing = s.keymap.mode == .edit or s.keymap.mode == .note;
-        const in_focus = v == s.layout.current();
+        const in_focus = v == s.layout().current();
         for (b.marks.items()) |mark| {
             if (mark.page < range.first or mark.page >= range.end) continue;
             const page = mark.page;
@@ -3170,7 +3300,7 @@ const Session = struct {
         // A hairline at this zoom, never thinner than a pixel, so it is
         // visible on a page scaled down to a thumbnail.
         const w = @max(1.5, v.zoom);
-        const focused = v == s.layout.current();
+        const focused = v == s.layout().current();
         try over.fill(
             .fromRect(box.min_x - w * 0.5, box.min_y, box.min_x + w * 0.5, box.max_y),
             if (focused) .{ .r = 0.1, .g = 0.45, .b = 0.95, .a = 1 } else .gray(0.55),
@@ -3209,7 +3339,7 @@ const Session = struct {
             mix(&h, e.page);
             mix(&h, e.buffer);
         }
-        var it = s.layout.iterator();
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             mix(&h, v.buffer);
             mix(&h, v.scroll);
@@ -3232,7 +3362,7 @@ const Session = struct {
     fn placeVisible(s: *Session) !void {
         s.recorded.frame.reset();
 
-        var it = s.layout.iterator();
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             const box: [4]f32 = .{ v.rect.min_x, v.rect.min_y, v.rect.max_x, v.rect.max_y };
             const range = v.visiblePages();
@@ -3299,7 +3429,7 @@ const Session = struct {
             .pages = @intCast(v.pages.len),
             .percent = v.percent(),
             .fit = v.fit.label(),
-            .windows = s.layout.count(),
+            .windows = s.layout().count(),
         };
 
         switch (mode) {
@@ -3511,7 +3641,7 @@ const Session = struct {
     fn updateTitle(s: *Session, window: lyngvi.Window) void {
         const v = s.view();
         const page = v.currentPage();
-        const windows = s.layout.count();
+        const windows = s.layout().count();
         if (!s.dirty_title and page == s.shown.page and v.zoom == s.shown.zoom and
             v.buffer == s.shown.buffer and windows == s.shown.windows) return;
 
@@ -3561,10 +3691,10 @@ const Session = struct {
         // shot is always the CPU rasteriser, whatever the window would use.
         s.backend = .cpu;
 
-        s.layout.arrange(.fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
+        s.tabs.arrange(.fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
         s.applySplits(splits);
 
-        var it = s.layout.iterator();
+        var it = s.layout().iterator();
         while (it.next()) |v| {
             if (v.fit_on_open) v.fitTo(.width);
             if (v.scroll == 0) v.scrollToPage(start_page);
@@ -3632,8 +3762,8 @@ const Session = struct {
             dest,
             slot,
             if (slot == 1) "" else "s",
-            s.layout.count(),
-            if (s.layout.count() == 1) "" else "s",
+            s.layout().count(),
+            if (s.layout().count() == 1) "" else "s",
             s.view().percent(),
         }) catch {};
     }
@@ -3688,7 +3818,7 @@ const Session = struct {
         // Now there is a display to be a percentage of, and a window to fit
         // to. Both have to happen before the first `scrollToPage`.
         const scale = window.scale();
-        s.layout.arrange(s.windowRect(@floatFromInt(size.width), @floatFromInt(size.height)));
+        s.tabs.arrange(s.windowRect(@floatFromInt(size.width), @floatFromInt(size.height)));
         {
             const v = s.view();
             v.dpi_scale = scale;
@@ -3699,7 +3829,7 @@ const Session = struct {
             // After the splits, because a split refits the zoom and a zoom
             // moves where every page starts: scrolling to `--page` first
             // would land above it by however much the refit moved things.
-            var it = s.layout.iterator();
+            var it = s.layout().iterator();
             while (it.next()) |v| {
                 v.dpi_scale = scale;
                 if (settings.page_given) v.scrollToPage(settings.start_page);
@@ -3863,7 +3993,7 @@ const Session = struct {
                 continue;
             }
 
-            s.layout.arrange(s.windowRect(
+            s.tabs.arrange(s.windowRect(
                 @floatFromInt(swapchain.extent.width),
                 @floatFromInt(swapchain.extent.height),
             ));
@@ -4065,8 +4195,8 @@ fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !S
         .title = "a.pdf",
         .pages = pages,
     });
-    try s.layout.init(gpa, .{ .buffer = 0, .pages = pages, .zoom = zoom });
-    s.layout.arrange(.fromRect(0, 0, w, h));
+    try s.tabs.init(gpa, .{ .buffer = 0, .pages = pages, .zoom = zoom });
+    s.tabs.arrange(.fromRect(0, 0, w, h));
     return s;
 }
 
@@ -4075,7 +4205,7 @@ fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
-    s.layout.deinit(s.gpa);
+    s.tabs.deinit(s.gpa);
     for (s.buffers.items) |*b| {
         b.marks.deinit(s.gpa);
         for (&b.maps) |*m| m.map.deinit(s.gpa);
@@ -4091,19 +4221,19 @@ test "a split is two windows on one document, scrolling apart" {
     defer closeSession(&s);
 
     s.splitWindow(.vertical);
-    try testing.expectEqual(@as(u32, 2), s.layout.count());
+    try testing.expectEqual(@as(u32, 2), s.layout().count());
 
     // Both are looking at the same buffer...
-    var it = s.layout.iterator();
+    var it = s.layout().iterator();
     while (it.next()) |v| try testing.expectEqual(@as(u32, 0), v.buffer);
 
     // ...and scrolling one does not move the other, which is the whole point
     // of the scroll living in the view.
     s.view().scroll = 500;
     var others: u32 = 0;
-    var walk = s.layout.iterator();
+    var walk = s.layout().iterator();
     while (walk.next()) |v| {
-        if (v != s.layout.current() and v.scroll != 500) others += 1;
+        if (v != s.layout().current() and v.scroll != 500) others += 1;
     }
     try testing.expectEqual(@as(u32, 1), others);
 }
@@ -4124,7 +4254,7 @@ test "a highlight made in one window is in the other" {
     try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
     try testing.expect(s.buffer(0).marks.revision != before);
 
-    var it = s.layout.iterator();
+    var it = s.layout().iterator();
     while (it.next()) |v| {
         try testing.expect(v.marks_seen != s.buffer(v.buffer).marks.revision);
     }
@@ -4162,8 +4292,8 @@ test "two windows at different zooms need two rasters and one recording" {
     s.splitWindow(.vertical);
     s.view().setZoom(2);
 
-    const a = s.layout.viewAt(0);
-    const b = s.layout.viewAt(1);
+    const a = s.layout().viewAt(0);
+    const b = s.layout().viewAt(1);
     try testing.expect(a.zoom != b.zoom);
 
     s.backend = .cpu;
@@ -4199,7 +4329,7 @@ test "closing the last window is a quit, and closing others is not" {
     try testing.expect(!s.closeWindow());
     s.splitWindow(.vertical);
     try testing.expect(s.closeWindow());
-    try testing.expectEqual(@as(u32, 1), s.layout.count());
+    try testing.expectEqual(@as(u32, 1), s.layout().count());
     try testing.expect(!s.closeWindow());
 }
 
@@ -4533,6 +4663,90 @@ test "showing another document in a window keeps the place in the first" {
     try testing.expect(was > 0);
 }
 
+test "a tabpage keeps its own windows, and gt goes between them" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.view().scroll = 300;
+    _ = s.apply(.{ .split = .vertical });
+    _ = s.apply(.new_tab);
+
+    try testing.expectEqual(@as(u32, 2), s.tabs.count());
+    // The new tabpage is one window on the same document, where that window
+    // was: a tab is an arrangement, not a second file.
+    try testing.expectEqual(@as(u32, 1), s.layout().count());
+    try testing.expectEqual(@as(u32, 0), s.view().buffer);
+    try testing.expectApproxEqAbs(@as(f32, 300), s.view().scroll, 0.001);
+
+    s.view().scroll = 0;
+    _ = s.apply(.{ .go_tab = 1 });
+    try testing.expectEqual(@as(u32, 2), s.layout().count());
+    try testing.expectApproxEqAbs(@as(f32, 300), s.view().scroll, 0.001);
+}
+
+test "the last window of a tabpage closes the tabpage, not the reader" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(.new_tab);
+    try testing.expectEqual(@as(u32, 2), s.tabs.count());
+
+    // `q` in a tab of one window: the tab goes and the reader stays.
+    try testing.expect(!s.apply(.quit));
+    try testing.expectEqual(@as(u32, 1), s.tabs.count());
+
+    // And on the last window of the last tabpage it is a quit again.
+    try testing.expect(s.apply(.quit));
+}
+
+test "a window moved to its own tabpage is one window in each" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // Nothing to move: one window is a tabpage already, and the reader says
+    // so rather than making an identical tab beside it.
+    _ = s.apply(.window_to_tab);
+    try testing.expectEqual(@as(u32, 1), s.tabs.count());
+
+    _ = s.apply(.{ .split = .horizontal });
+    _ = s.apply(.window_to_tab);
+    try testing.expectEqual(@as(u32, 2), s.tabs.count());
+    try testing.expectEqual(@as(u32, 1), s.layout().count());
+    _ = s.apply(.{ .go_tab = -1 });
+    try testing.expectEqual(@as(u32, 1), s.layout().count());
+    // The window left behind took the whole rectangle back.
+    try testing.expectApproxEqAbs(@as(f32, 800), s.view().rect.height(), 0.001);
+}
+
+test "the tab commands on the : line reach the same places the keys do" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(s.exec("tabnew"));
+    try testing.expect(s.exec("tabnew"));
+    try testing.expectEqual(@as(u32, 3), s.tabs.count());
+
+    try testing.expect(s.exec("tabnext 1"));
+    try testing.expectEqual(@as(u32, 0), s.tabs.active);
+    try testing.expect(!s.exec("tabnext 9"));
+    try testing.expectEqual(@as(u32, 0), s.tabs.active);
+    try testing.expect(s.exec("tabprevious"));
+    try testing.expectEqual(@as(u32, 2), s.tabs.active);
+
+    try testing.expect(s.exec("tabonly"));
+    try testing.expectEqual(@as(u32, 1), s.tabs.count());
+    // And the only tabpage will not close: leaving is `:q`'s job.
+    try testing.expect(!s.exec("tabclose"));
+}
+
 test "a job only equals a job for the same page of the same document at the same zoom" {
     const a: Job = .{ .buffer = 0, .page = 3, .zoom = 1.5 };
     try testing.expect(a.eql(.{ .buffer = 0, .page = 3, .zoom = 1.5 }));
@@ -4653,9 +4867,9 @@ test "command lines: page numbers, relative pages, zoom, and unknown names" {
     try testing.expectApproxEqAbs(@as(f32, 200), s.view().percent(), 0.5);
 
     try testing.expect(s.exec("vsplit"));
-    try testing.expectEqual(@as(u32, 2), s.layout.count());
+    try testing.expectEqual(@as(u32, 2), s.layout().count());
     try testing.expect(s.exec("q"));
-    try testing.expectEqual(@as(u32, 1), s.layout.count());
+    try testing.expectEqual(@as(u32, 1), s.layout().count());
     try testing.expect(!s.quit);
     try testing.expect(s.exec("q"));
     try testing.expect(s.quit);
@@ -4798,7 +5012,7 @@ test "dragging the line between two windows resizes both of them" {
     defer closeSession(&s);
 
     s.splitWindow(.vertical);
-    const left = s.layout.viewAt(0);
+    const left = s.layout().viewAt(0);
     const line = left.rect.max_x;
 
     // A press on the line, then a drag well to the left of it.
