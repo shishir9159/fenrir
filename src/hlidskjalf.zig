@@ -38,6 +38,7 @@ const std = @import("std");
 pub const Buffer = @import("hlidskjalf/Buffer.zig");
 pub const Layout = @import("hlidskjalf/Layout.zig");
 pub const Marks = @import("hlidskjalf/Marks.zig");
+pub const Tabs = @import("hlidskjalf/Tabs.zig");
 pub const View = @import("hlidskjalf/View.zig");
 pub const keys = @import("hlidskjalf/keys.zig");
 pub const text = @import("hlidskjalf/text.zig");
@@ -49,6 +50,7 @@ test {
     _ = Buffer;
     _ = Layout;
     _ = Marks;
+    _ = Tabs;
     _ = View;
     _ = keys;
     _ = text;
