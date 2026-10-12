@@ -2983,7 +2983,7 @@ const Session = struct {
         try s.layout.leaves(&s.order, s.gpa);
 
         for (s.order.items) |leaf| {
-            const v = s.layout.viewAt(s.layout.nodes.items[leaf].view);
+            const v = s.layout.viewAt(s.layout.nodes.items[leaf].pane.view().?);
             // Everything a window draws is confined to its own rectangle, or
             // a page scrolled past the bottom of one split would appear in
             // the next.

@@ -2,7 +2,7 @@
 //!
 //! Modelled on Vim's window layout, because that model is correct and forty
 //! years of people using it have worked the corners out. A node is either a
-//! **leaf** holding one view, or a **row** or **column** holding children that
+//! **leaf** holding one pane, or a **row** or **column** holding children that
 //! divide its rectangle. Splitting a leaf turns it into a row or column of
 //! two; closing the last child of a node collapses the node into its parent.
 //!
@@ -48,12 +48,35 @@ pub const Direction = enum { horizontal, vertical };
 /// Which way to look for a neighbour, spelled the way Vim spells it.
 pub const Side = enum { left, right, up, down };
 
+/// What a leaf holds.
+///
+/// A view index until now, and a union from here on, because the canvas
+/// planned beside the page is another *kind of leaf in this tree* rather than
+/// a second layout system beside it. Splitting, closing, focusing by geometry
+/// and dragging the line between two of them are the same operations whatever
+/// the leaves are, and they are written once here.
+pub const Pane = union(enum) {
+    /// A window onto a document: an index into `views`.
+    document: u32,
+    /// A node claimed but not yet pointed at anything, and every row and
+    /// column, which hold children rather than content.
+    empty,
+
+    /// The view this holds, or null for a pane that is not one.
+    pub fn view(p: Pane) ?u32 {
+        return switch (p) {
+            .document => |v| v,
+            .empty => null,
+        };
+    }
+};
+
 pub const Node = struct {
     kind: Kind = .free,
     /// The node this hangs from, or `none` for the root.
     parent: u32 = none,
-    /// For a leaf: the view. For a row or column: unused.
-    view: u32 = none,
+    /// For a leaf: what is in it. For a row or column: `.empty`.
+    pane: Pane = .empty,
     /// For a row or column: its children, in order left-to-right or
     /// top-to-bottom. Vim allows any number per level and so does this, which
     /// is what makes three side-by-side windows one row rather than a row
@@ -96,7 +119,7 @@ pub fn deinit(l: *Layout, gpa: Allocator) void {
 pub fn init(l: *Layout, gpa: Allocator, first: View) Allocator.Error!void {
     const v = try l.newView(gpa, first);
     const n = try l.newNode(gpa);
-    l.asLeaf(n, v, none);
+    l.asLeaf(n, .{ .document = v }, none);
     l.root = n;
     l.focus = n;
 }
@@ -124,7 +147,7 @@ fn newNode(l: *Layout, gpa: Allocator) Allocator.Error!u32 {
         if (n.kind != .free) continue;
         n.kind = .leaf;
         n.parent = none;
-        n.view = none;
+        n.pane = .empty;
         n.children.clearRetainingCapacity();
         n.shares.clearRetainingCapacity();
         return @intCast(i);
@@ -133,13 +156,13 @@ fn newNode(l: *Layout, gpa: Allocator) Allocator.Error!u32 {
     return @intCast(l.nodes.items.len - 1);
 }
 
-/// Points an already-claimed node at a view, without touching its lists --
+/// Points an already-claimed node at a pane, without touching its lists --
 /// which a whole-struct assignment would replace, leaking whatever capacity
 /// the recycled slot had.
-fn asLeaf(l: *Layout, node: u32, view: u32, parent: u32) void {
+fn asLeaf(l: *Layout, node: u32, pane: Pane, parent: u32) void {
     const n = &l.nodes.items[node];
     n.kind = .leaf;
-    n.view = view;
+    n.pane = pane;
     n.parent = parent;
     n.children.clearRetainingCapacity();
     n.shares.clearRetainingCapacity();
@@ -157,11 +180,11 @@ pub fn count(l: Layout) u32 {
 
 /// The focused view, which always exists while a layout does.
 pub fn current(l: *Layout) *View {
-    return &l.views.items[l.nodes.items[l.focus].view];
+    return &l.views.items[l.currentIndex()];
 }
 
 pub fn currentIndex(l: Layout) u32 {
-    return l.nodes.items[l.focus].view;
+    return l.nodes.items[l.focus].pane.view().?;
 }
 
 pub fn viewAt(l: *Layout, index: u32) *View {
@@ -236,7 +259,7 @@ pub fn split(l: *Layout, gpa: Allocator, dir: Direction) Allocator.Error!?u32 {
     const along = if (dir == .vertical) rect.width() else rect.height();
     if (along / 2 < min_side) return null;
 
-    const copy = l.views.items[l.nodes.items[leaf].view];
+    const copy = l.views.items[l.currentIndex()];
     const v = try l.newView(gpa, copy);
     errdefer l.live.items[v] = false;
 
@@ -250,7 +273,7 @@ pub fn split(l: *Layout, gpa: Allocator, dir: Direction) Allocator.Error!?u32 {
     if (parent != none and l.nodes.items[parent].kind == want) {
         const at = indexOf(l.nodes.items[parent].children.items, leaf).?;
         const fresh = try l.newNode(gpa);
-        l.asLeaf(fresh, v, parent);
+        l.asLeaf(fresh, .{ .document = v }, parent);
 
         const p = &l.nodes.items[parent];
         try p.children.insert(gpa, at + 1, fresh);
@@ -272,12 +295,12 @@ pub fn split(l: *Layout, gpa: Allocator, dir: Direction) Allocator.Error!?u32 {
     const moved = try l.newNode(gpa);
     const fresh = try l.newNode(gpa);
 
-    l.asLeaf(moved, l.nodes.items[leaf].view, leaf);
-    l.asLeaf(fresh, v, leaf);
+    l.asLeaf(moved, l.nodes.items[leaf].pane, leaf);
+    l.asLeaf(fresh, .{ .document = v }, leaf);
 
     const holder = &l.nodes.items[leaf];
     holder.kind = want;
-    holder.view = none;
+    holder.pane = .empty;
     holder.children.clearRetainingCapacity();
     holder.shares.clearRetainingCapacity();
     try holder.children.appendSlice(gpa, &.{ moved, fresh });
@@ -295,7 +318,7 @@ pub fn close(l: *Layout, gpa: Allocator) ?u32 {
     const leaf = l.focus;
     if (leaf == none or leaf == l.root) return null;
 
-    const gone = l.nodes.items[leaf].view;
+    const gone = l.nodes.items[leaf].pane.view().?;
     const parent = l.nodes.items[leaf].parent;
     const at = indexOf(l.nodes.items[parent].children.items, leaf).?;
 
@@ -322,7 +345,7 @@ pub fn close(l: *Layout, gpa: Allocator) ?u32 {
 
         const into = &l.nodes.items[parent];
         into.kind = kept.kind;
-        into.view = kept.view;
+        into.pane = kept.pane;
         into.children.clearRetainingCapacity();
         into.shares.clearRetainingCapacity();
         into.children.appendSlice(gpa, kept.children.items) catch {};
@@ -340,7 +363,8 @@ pub fn only(l: *Layout, gpa: Allocator) void {
     const keep = l.focus;
     if (keep == none or keep == l.root) return;
 
-    const view = l.nodes.items[keep].view;
+    const kept = l.nodes.items[keep].pane;
+    const view = kept.view().?;
     for (l.live.items, 0..) |*in_use, i| {
         if (i != view) in_use.* = false;
     }
@@ -353,12 +377,12 @@ pub fn only(l: *Layout, gpa: Allocator) void {
         n.shares.clearRetainingCapacity();
         n.kind = .free;
         n.parent = none;
-        n.view = none;
+        n.pane = .empty;
     }
 
     const r = &l.nodes.items[l.root];
     r.kind = .leaf;
-    r.view = view;
+    r.pane = kept;
     r.children.clearRetainingCapacity();
     r.shares.clearRetainingCapacity();
     l.focus = l.root;
@@ -390,7 +414,7 @@ fn release(l: *Layout, gpa: Allocator, node: u32) void {
     n.shares.clearRetainingCapacity();
     n.kind = .free;
     n.parent = none;
-    n.view = none;
+    n.pane = .empty;
 }
 
 fn firstLeaf(l: *Layout, node: u32) u32 {
@@ -488,7 +512,7 @@ fn place(l: *Layout, node: u32, rect: Bounds) void {
     switch (n.kind) {
         .free => {},
         .leaf => {
-            const v = &l.views.items[n.view];
+            const v = &l.views.items[n.pane.view().?];
             const resized = v.rect.width() != rect.width() or v.rect.height() != rect.height();
             v.rect = rect;
             // Only on a change of size: `arrange` runs every frame, and a
@@ -683,6 +707,21 @@ test "a fresh layout is one window filling everything" {
     // The last window cannot be closed: that is a quit, and not this
     // module's decision.
     try testing.expectEqual(@as(?u32, null), l.close(gpa));
+}
+
+test "every leaf holds a document pane, and every branch holds none" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var l = try started(gpa, fakePages(&buf, 3));
+    defer l.deinit(gpa);
+
+    _ = try l.split(gpa, .vertical);
+    try testing.expectEqual(l.currentIndex(), l.nodes.items[l.focus].pane.document);
+
+    for (l.nodes.items) |n| switch (n.kind) {
+        .leaf => try testing.expect(n.pane.view() != null),
+        .row, .column, .free => try testing.expectEqual(Pane.empty, n.pane),
+    };
 }
 
 test "a vertical split makes two columns, and focus follows the new one" {
