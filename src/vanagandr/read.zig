@@ -153,6 +153,9 @@ pub const usage =
     \\    :settings            all of them, as a page over the document
     \\    :sp, :vs, :close     split below, split beside, close the window
     \\    :only, :bn, :bp      close the others, next / previous document
+    \\    :tabnew, :tabclose   a tabpage of this window, close this tabpage
+    \\    :tabonly             close every other tabpage
+    \\    :tabn, :tabp         next / previous tabpage; with N, that one
     \\    :q, :qa              close the window, close the reader
     \\    :undo, :redo         highlight history
     \\    :marks, :marks clear how many highlights, or remove them all
@@ -169,6 +172,11 @@ pub const usage =
     \\    <C-w>w, <C-w>W       the next / previous window
     \\    <C-w>=               make them all the same size
     \\    <C-w>n, <C-w>b       show the next / previous open document here
+    \\
+    \\tabpages -- each one its own arrangement of windows:
+    \\    gt, gT               the next / previous tabpage
+    \\    <C-w>T               move this window into a tabpage of its own
+    \\    the bar at the top   appears as soon as there are two
     \\
     \\normal mode (reading):
     \\    drag the scrollbar   scroll; a press on the track moves a screen
@@ -903,6 +911,19 @@ const Session = struct {
         revision: u64 = 0,
     } = .{},
 
+    /// What is written on the tabs, and the bytes those names point into.
+    ///
+    /// Rebuilt when the bar would read differently and not once a frame: a
+    /// tab is named for the document its focused window is looking at, and
+    /// that changes when somebody makes it change. `tab_ends` is where each
+    /// name stops in `tab_text`, kept because appending to the text moves it
+    /// and a slice taken before the last name was written would be aimed at
+    /// freed bytes.
+    tab_names: std.ArrayList([]const u8) = .empty,
+    tab_text: std.ArrayList(u8) = .empty,
+    tab_ends: std.ArrayList(u32) = .empty,
+    tabs_for: u64 = 0,
+
     /// The left rail's colours, filled when the highlight colour changes.
     palette: [keys.palette_size]rails_mod.Swatch = @splat(.{ .name = "", .color = .gray(0) }),
 
@@ -1042,6 +1063,9 @@ const Session = struct {
         s.borders.deinit(s.gpa);
         s.boxes.deinit(s.gpa);
         s.rows.deinit(s.gpa);
+        s.tab_names.deinit(s.gpa);
+        s.tab_text.deinit(s.gpa);
+        s.tab_ends.deinit(s.gpa);
     }
 
     // -- buffers -------------------------------------------------------------
@@ -3400,11 +3424,12 @@ const Session = struct {
     fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
         if (s.chrome == null) return .fromRect(0, 0, width, @max(height, 1));
         const left = rails_mod.width;
+        const top = s.tabInset();
         return .fromRect(
             left,
-            0,
+            top,
             @max(width - rails_mod.width, left + 1),
-            @max(height - chrome_mod.status_height, 1),
+            @max(height - chrome_mod.status_height, top + 1),
         );
     }
 
@@ -3462,6 +3487,97 @@ const Session = struct {
         }
 
         return st;
+    }
+
+    /// How much of the window the tab bar takes off the top.
+    ///
+    /// Zero for a single tabpage, which is every session until somebody opens
+    /// a second one: a bar showing one tab says what the title bar says and
+    /// costs a row of the page to say it. Asked here rather than of the
+    /// chrome because `windowRect` needs the answer before the chrome for
+    /// this frame has been built.
+    fn tabInset(s: *const Session) f32 {
+        return if (s.tabs.count() > 1) chrome_mod.tab_height else 0;
+    }
+
+    /// What is written on each tab: the document its focused window is
+    /// looking at, and how many windows are in it when there is more than
+    /// one.
+    ///
+    /// The count is on the tab because it is the one thing that distinguishes
+    /// two tabs on the same document, which is the normal way a second tab
+    /// begins -- `:tabnew` opens on what you were reading.
+    fn tabLabels(s: *Session) []const []const u8 {
+        const stamp = s.tabsKey();
+        if (stamp == s.tabs_for) return s.tab_names.items;
+        s.tabs_for = stamp;
+
+        s.tab_text.clearRetainingCapacity();
+        s.tab_ends.clearRetainingCapacity();
+        s.tab_names.clearRetainingCapacity();
+
+        var i: u32 = 0;
+        while (i < s.tabs.count()) : (i += 1) {
+            const l = s.tabs.at(i);
+            const title = s.buffer(l.current().buffer).title;
+            // Through a buffer rather than a writer over the list: the name
+            // is a basename and a number, and a fixed print cannot fail on
+            // anything but a pathological title -- which then keeps its own
+            // name and loses only the count.
+            var buf: [192]u8 = undefined;
+            const name = if (l.count() > 1)
+                std.fmt.bufPrint(&buf, "{s} ({d})", .{ title[0..@min(title.len, 160)], l.count() }) catch title
+            else
+                title;
+            s.tab_text.appendSlice(s.gpa, name) catch break;
+            s.tab_ends.append(s.gpa, @intCast(s.tab_text.items.len)) catch break;
+        }
+
+        // The slices last, once the bytes have stopped moving.
+        var from: u32 = 0;
+        for (s.tab_ends.items) |to| {
+            s.tab_names.append(s.gpa, s.tab_text.items[from..to]) catch break;
+            from = to;
+        }
+        return s.tab_names.items;
+    }
+
+    /// Everything the bar would draw differently, hashed. Compared rather
+    /// than invalidated by hand, for the reason `placementKey` is: a flag set
+    /// in every place that opens, closes or retitles a tab is a flag that
+    /// will be forgotten in one of them.
+    fn tabsKey(s: *Session) u64 {
+        var h: u64 = 1469598103934665603;
+        const mix = struct {
+            fn go(acc: *u64, value: u64) void {
+                acc.* = (acc.* ^ value) *% 1099511628211;
+            }
+        }.go;
+
+        mix(&h, s.tabs.count());
+        mix(&h, s.tabs.active);
+        var i: u32 = 0;
+        while (i < s.tabs.count()) : (i += 1) {
+            const l = s.tabs.at(i);
+            mix(&h, l.current().buffer);
+            mix(&h, l.count());
+        }
+        return h;
+    }
+
+    /// What the tab bar was asked for, carried out.
+    ///
+    /// A tab closed by its cross is shown first and closed after, so that
+    /// closing one is the same act as clicking it and typing `:tabclose` --
+    /// one path through the session, and the windows in it get their places
+    /// written down on the way out either way.
+    fn applyTabs(s: *Session, r: thviti.widgets.tabs.Result) void {
+        if (r.activated) |i| s.showTab(i);
+        if (r.closed) |i| {
+            s.showTab(i);
+            _ = s.closeTab();
+        }
+        if (r.added) s.newTab();
     }
 
     /// What the right rail shows: where you are, and how far it goes.
@@ -3621,6 +3737,7 @@ const Session = struct {
             },
             s.panelRows(which),
             &s.panel,
+            c.top,
         ) orelse return;
 
         if (panels.wasClosed(chosen)) {
@@ -4031,7 +4148,12 @@ const Session = struct {
             // both may have it.
             if (s.chrome) |c| {
                 try c.begin(extent, input);
+                // Before anything that starts below the bar: the rails and
+                // the panel are floated against the top of the window and
+                // have to be told how much of it is already spoken for.
+                c.top = s.tabInset();
                 const want = try c.status(s.statusLine());
+                if (try c.tabBar(s.tabLabels(), s.tabs.active)) |asked_tabs| s.applyTabs(asked_tabs);
                 const asked = try c.rightRail(s.railLine());
                 if (asked) |wanted| s.applyRail(wanted);
                 if (try c.leftRail(s.modeRail())) |wanted| s.applyRail(wanted);
@@ -4206,6 +4328,9 @@ fn closeSession(s: *Session) void {
     s.note.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
+    s.tab_names.deinit(s.gpa);
+    s.tab_text.deinit(s.gpa);
+    s.tab_ends.deinit(s.gpa);
     for (s.buffers.items) |*b| {
         b.marks.deinit(s.gpa);
         for (&b.maps) |*m| m.map.deinit(s.gpa);
@@ -4745,6 +4870,52 @@ test "the tab commands on the : line reach the same places the keys do" {
     try testing.expectEqual(@as(u32, 1), s.tabs.count());
     // And the only tabpage will not close: leaving is `:q`'s job.
     try testing.expect(!s.exec("tabclose"));
+}
+
+test "a tab is named for its document, and says how many windows are in it" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(.new_tab);
+    _ = s.apply(.{ .split = .vertical });
+    _ = s.apply(.{ .split = .horizontal });
+
+    const names = s.tabLabels();
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("a.pdf", names[0]);
+    try testing.expectEqualStrings("a.pdf (3)", names[1]);
+
+    // Nothing the bar would draw has changed, so nothing is rebuilt: the
+    // slices are the same bytes, not equal copies of them.
+    const again = s.tabLabels();
+    try testing.expectEqual(names.ptr, again.ptr);
+    try testing.expectEqual(names[1].ptr, again[1].ptr);
+
+    // A window closed is a different bar, and the name follows it.
+    _ = s.apply(.close_window);
+    try testing.expectEqualStrings("a.pdf (2)", s.tabLabels()[1]);
+}
+
+test "the bar takes a row off the pages, and only once there are two tabs" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // One tabpage: a bar showing one tab would say what the title bar says,
+    // so there is no bar and the page keeps the row.
+    try testing.expectEqual(@as(f32, 0), s.tabInset());
+    _ = s.apply(.new_tab);
+    try testing.expectEqual(chrome_mod.tab_height, s.tabInset());
+    _ = s.apply(.close_tab);
+    try testing.expectEqual(@as(f32, 0), s.tabInset());
+
+    // And with no interface at all -- a test, and `--shot --path cpu` --
+    // the windows get the whole thing however many tabpages there are.
+    _ = s.apply(.new_tab);
+    try testing.expectEqual(@as(f32, 0), s.windowRect(1000, 800).min_y);
 }
 
 test "a job only equals a job for the same page of the same document at the same zoom" {

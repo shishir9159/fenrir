@@ -123,17 +123,18 @@ pub fn panel(
     empty: []const u8,
     rows: []const Row,
     st: *State,
+    top: f32,
 ) Error!?Row {
     ui.pushStyle(.{ .font = face, .font_size = 13, .fg = t.text, .bg = t.panel });
     defer ui.popStyle();
 
-    const height = @max(ui.viewport.height() - rails.reserved_below, 1);
+    const height = @max(ui.viewport.height() - top - rails.reserved_below, 1);
     ui.next(.{
         .w = .px(width),
         .h = .px(height),
         .axis = .y,
         .fixed_x = ui.viewport.width() - rails.width - width,
-        .fixed_y = 0,
+        .fixed_y = top,
         .border_color = t.divider,
         .flags = .{
             .floating_x = true,
@@ -334,6 +335,7 @@ const Rig = struct {
             "no highlights yet",
             rows,
             st,
+            0,
         );
         rig.ui.end();
         return out;

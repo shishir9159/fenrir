@@ -255,6 +255,7 @@ pub fn rightRail(
     st: Right,
     r: *Rails,
     tips: *w.Tips,
+    top: f32,
 ) Error!?Want {
     // Before the build, so the field sees it in the same frame it is first
     // drawn in: `signal` reads `ui.focus`, and a focus set afterwards would
@@ -271,11 +272,11 @@ pub fn rightRail(
 
     ui.next(.{
         .w = .px(width),
-        .h = .px(@max(ui.viewport.height() - reserved_below, 1)),
+        .h = .px(@max(ui.viewport.height() - top - reserved_below, 1)),
         .axis = .y,
         .child_align = .center,
         .fixed_x = ui.viewport.width() - width,
-        .fixed_y = 0,
+        .fixed_y = top,
         .flags = .{
             .floating_x = true,
             .floating_y = true,
@@ -324,17 +325,18 @@ pub fn leftRail(
     icons: *const Icons,
     st: Left,
     tips: *w.Tips,
+    top: f32,
 ) Error!?Want {
     ui.pushStyle(.{ .font = face, .font_size = counter_text, .fg = t.text, .bg = t.panel });
     defer ui.popStyle();
 
     ui.next(.{
         .w = .px(width),
-        .h = .px(@max(ui.viewport.height() - reserved_below, 1)),
+        .h = .px(@max(ui.viewport.height() - top - reserved_below, 1)),
         .axis = .y,
         .child_align = .center,
         .fixed_x = 0,
-        .fixed_y = 0,
+        .fixed_y = top,
         .flags = .{
             .floating_x = true,
             .floating_y = true,
@@ -499,14 +501,14 @@ const Rig = struct {
 
     fn frame(rig: *Rig, st: Right, r: *Rails, in: Input) !?Want {
         try rig.ui.begin(.fromRect(0, 0, 900, 600), in);
-        const want = try rightRail(&rig.ui, Fonts.fallback_font, .dark, &rig.icons, st, r, &rig.tips);
+        const want = try rightRail(&rig.ui, Fonts.fallback_font, .dark, &rig.icons, st, r, &rig.tips, 0);
         rig.ui.end();
         return want;
     }
 
     fn frameLeft(rig: *Rig, st: Left, in: Input) !?Want {
         try rig.ui.begin(.fromRect(0, 0, 900, 600), in);
-        const want = try leftRail(&rig.ui, Fonts.fallback_font, .dark, &rig.icons, st, &rig.tips);
+        const want = try leftRail(&rig.ui, Fonts.fallback_font, .dark, &rig.icons, st, &rig.tips, 0);
         rig.ui.end();
         return want;
     }

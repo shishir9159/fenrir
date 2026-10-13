@@ -45,6 +45,11 @@ const w = thviti.widgets;
 /// mode line, not a dashboard.
 pub const status_height: f32 = 26;
 pub const status_text: f32 = 12;
+
+/// The tab bar along the top, when there is one. The same height as the
+/// status bar, and the widget's own number rather than a second one beside
+/// it.
+pub const tab_height: f32 = w.tabs.height;
 /// The inset at either end of the bar, and between the things in it.
 pub const gutter: f32 = 10;
 
@@ -95,6 +100,18 @@ pub const Chrome = struct {
     /// The one tooltip a window can have. Drawn by `tips`, at the end of the
     /// frame, because a popup is on top only by being built last.
     tip: w.Tips = .{},
+
+    /// How much of the window the chrome has taken off the top: the tab bar,
+    /// when there is one. Set by the reader each frame, and read by the rails
+    /// and the panel, which begin below it.
+    ///
+    /// Here rather than a parameter on each of them because all three are
+    /// reached through this struct and it is one number about the window,
+    /// not three about three widgets. It is the reader's to set because only
+    /// the reader knows how many tabpages there are -- and it has to be known
+    /// before any of this is built, since `windowRect` takes the same inset
+    /// off the pages.
+    top: f32 = 0,
 
     /// On the heap, and not by value, because `UI` reaches text through a
     /// vtable whose pointer is `&c.fonts`. A `Chrome` returned by value is
@@ -198,11 +215,42 @@ pub const Chrome = struct {
     /// The rails, for a reader that does not want to know how one is built.
     /// Each returns what it was asked for, if anything.
     pub fn rightRail(c: *Chrome, st: rails.Right) !?rails.Want {
-        return rails.rightRail(&c.ui, c.face, c.theme, &c.icons, st, &c.rails, &c.tip);
+        return rails.rightRail(&c.ui, c.face, c.theme, &c.icons, st, &c.rails, &c.tip, c.top);
     }
 
     pub fn leftRail(c: *Chrome, st: rails.Left) !?rails.Want {
-        return rails.leftRail(&c.ui, c.face, c.theme, &c.icons, st, &c.tip);
+        return rails.leftRail(&c.ui, c.face, c.theme, &c.icons, st, &c.tip, c.top);
+    }
+
+    /// The tab bar along the top, and what was clicked on it.
+    ///
+    /// Nothing at all for a single tabpage: a bar showing one tab is a row of
+    /// chrome that says what the title bar already says, and the reader looks
+    /// exactly as it did before tabpages existed until somebody opens one.
+    /// `top` is set from the same count, so the pages get the row back too.
+    pub fn tabBar(c: *Chrome, labels: []const []const u8, active: u32) !?w.tabs.Result {
+        if (labels.len < 2) return null;
+
+        c.ui.pushStyle(.{
+            .font = c.face,
+            .font_size = status_text,
+            .fg = c.theme.text,
+            .bg = c.theme.panel,
+            .border_color = c.theme.divider,
+        });
+        defer c.ui.popStyle();
+
+        c.ui.next(.{
+            .w = .px(c.ui.viewport.width()),
+            .fixed_x = 0,
+            .fixed_y = 0,
+            .flags = .{ .floating_x = true, .floating_y = true },
+        });
+        return try w.tabBar(&c.ui, "tabs", labels, active, .{
+            .h = tab_height,
+            .accent = c.theme.accent,
+            .add = true,
+        });
     }
 
     /// The tooltip, if the pointer has been resting on something long enough.
