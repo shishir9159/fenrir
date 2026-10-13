@@ -40,6 +40,7 @@ pub const Layout = @import("hlidskjalf/Layout.zig");
 pub const Marks = @import("hlidskjalf/Marks.zig");
 pub const Tabs = @import("hlidskjalf/Tabs.zig");
 pub const View = @import("hlidskjalf/View.zig");
+pub const commands = @import("hlidskjalf/commands.zig");
 pub const keys = @import("hlidskjalf/keys.zig");
 pub const text = @import("hlidskjalf/text.zig");
 
@@ -52,6 +53,7 @@ test {
     _ = Marks;
     _ = Tabs;
     _ = View;
+    _ = commands;
     _ = keys;
     _ = text;
 }

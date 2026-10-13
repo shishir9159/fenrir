@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const Context = @import("vanagandr/Context.zig");
+const commands_cmd = @import("vanagandr/commands.zig");
 const dump = @import("vanagandr/dump.zig");
 const extract = @import("vanagandr/extract.zig");
 const fonts = @import("vanagandr/fonts.zig");
@@ -43,6 +44,7 @@ const commands = [_]Command{
     .{ .name = "config", .summary = "the settings the reader remembers", .usage = library.config_usage, .run = library.configRun },
     .{ .name = "marks", .summary = "the highlights made in a document", .usage = library.marks_usage, .run = library.marksRun },
     .{ .name = "plugins", .summary = "load init.lua and the plugins, and report", .usage = plugins.usage, .run = plugins.run },
+    .{ .name = "commands", .summary = "list the reader's `:` commands", .usage = commands_cmd.usage, .run = commands_cmd.run },
     .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
     .{ .name = "icons", .summary = "list the icon registry, and draw a sheet of it", .usage = icons.usage, .run = icons.run },

@@ -94,6 +94,7 @@ const Layout = hlidskjalf.Layout;
 const Marks = hlidskjalf.Marks;
 const Tabs = hlidskjalf.Tabs;
 const View = hlidskjalf.View;
+const commands = hlidskjalf.commands;
 const keys = hlidskjalf.keys;
 const text = hlidskjalf.text;
 const Theme = thviti.Theme;
@@ -2249,6 +2250,11 @@ const Session = struct {
     /// plugins registered, so that a plugin cannot make `:q` mean something
     /// else by accident.
     ///
+    /// The name is looked up in `hlidskjalf.commands`, which is the one place
+    /// a built-in is written down: `fenrir commands` prints that table and
+    /// the palette lists it, so a command that exists here and nowhere else
+    /// is not possible.
+    ///
     /// Returns false when the line did nothing, having said why.
     fn exec(s: *Session, raw: []const u8) bool {
         const line = std.mem.trim(u8, raw, " \t");
@@ -2264,8 +2270,7 @@ const Session = struct {
         const args = std.mem.trim(u8, line[space..], " \t");
         const v = s.view();
 
-        const Builtin = enum { q, quit, qa, qall, sp, split, vs, vsplit, close, only, tabnew, tabclose, tabonly, tabn, tabnext, tabp, tabprevious, bn, bnext, bp, bprevious, page, zoom, fit, set, settings, undo, redo, marks, lua, messages, plugins, echo };
-        const which = std.meta.stringToEnum(Builtin, name) orelse {
+        const entry = commands.find(name) orelse {
             if (s.plugins) |rt| {
                 if (rt.runCommand(name, args)) |ran| return ran;
             }
@@ -2273,13 +2278,13 @@ const Session = struct {
             return false;
         };
 
-        switch (which) {
-            .q, .quit => {
+        switch (entry.id) {
+            .quit => {
                 if (!s.closeWindow()) s.quit = true;
             },
-            .qa, .qall => s.quit = true,
-            .sp, .split => s.splitWindow(.horizontal),
-            .vs, .vsplit => s.splitWindow(.vertical),
+            .quit_all => s.quit = true,
+            .split => s.splitWindow(.horizontal),
+            .vsplit => s.splitWindow(.vertical),
             .close => _ = s.closeWindow(),
             .only => s.layout().only(s.gpa),
             .tabnew => s.newTab(),
@@ -2290,8 +2295,8 @@ const Session = struct {
             .tabonly => s.tabs.only(s.gpa),
             // `:tabnext` alone is the next one; with a number it is that one,
             // counted from 1 as a person counts the bar.
-            .tabn, .tabnext, .tabp, .tabprevious => {
-                const back = which == .tabp or which == .tabprevious;
+            .tabnext, .tabprevious => {
+                const back = entry.id == .tabprevious;
                 if (args.len == 0) {
                     s.goTab(if (back) -1 else 1);
                 } else if (std.fmt.parseInt(u32, args, 10)) |n| {
@@ -2305,8 +2310,8 @@ const Session = struct {
                     return false;
                 }
             },
-            .bn, .bnext => s.showBuffer(1),
-            .bp, .bprevious => s.showBuffer(-1),
+            .bnext => s.showBuffer(1),
+            .bprevious => s.showBuffer(-1),
             .page => {
                 // `:page 12`, `:page +2`, `:page -1`.
                 const relative = args.len > 0 and (args[0] == '+' or args[0] == '-');
