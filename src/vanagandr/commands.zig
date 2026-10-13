@@ -21,13 +21,14 @@ const std = @import("std");
 const fenrir = @import("fenrir");
 
 const Context = @import("Context.zig");
+const palette = @import("palette.zig");
 
 const commands = fenrir.hlidskjalf.commands;
-const Icons = fenrir.thviti.Icons;
 const Fonts = fenrir.tyr.Fonts;
+const Icons = fenrir.thviti.Icons;
 
 pub const usage =
-    \\fenrir commands [--names]
+    \\fenrir commands [--names] [--match QUERY]
     \\
     \\    Lists every built-in `:` command: its name, the abbreviations it
     \\    also answers to, what it takes, the keys that reach the same thing
@@ -37,6 +38,10 @@ pub const usage =
     \\
     \\    --names  just the names and abbreviations, one per line, for
     \\             completion in a shell.
+    \\    --match QUERY
+    \\             what the palette would show for QUERY, in its order, with
+    \\             the score beside each. How the ranking is checked without
+    \\             opening a window and typing into one.
     \\
     \\    The commands plugins add are not in this table -- they exist once
     \\    Lua has run. `fenrir plugins` loads the configuration and lists
@@ -45,15 +50,23 @@ pub const usage =
 
 pub fn run(ctx: *Context, args: []const []const u8) !void {
     var names_only = false;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--names")) {
+    var query: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--names")) {
             names_only = true;
+        } else if (std.mem.eql(u8, args[i], "--match")) {
+            i += 1;
+            if (i >= args.len) return ctx.fail("--match needs something to match", .{});
+            query = args[i];
         } else {
-            return ctx.fail("unknown option {s}", .{arg});
+            return ctx.fail("unknown option {s}", .{args[i]});
         }
     }
 
     const w = ctx.out;
+    if (query) |q| return matched(ctx, q);
     if (names_only) {
         for (commands.table) |e| {
             try w.print("{s}\n", .{e.name});
@@ -109,6 +122,32 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
         missing,
         if (missing == 1) "" else "s",
     });
+}
+
+/// What the palette would show, in its order.
+///
+/// The ranking is the half of a palette that is worth being sure of, and the
+/// half a picture cannot check: a screenshot says the list is drawn, not that
+/// `tn` should have found `tabnew` before `tabonly`. This prints it, so a
+/// change to the scoring is a diff of two listings rather than an afternoon
+/// of typing into a window.
+fn matched(ctx: *Context, query: []const u8) !void {
+    var storage: [palette.max_rows]palette.Row = undefined;
+    const rows = palette.builtins(&storage);
+
+    var order: [palette.max_rows]u16 = undefined;
+    const n = palette.rank(query, rows, &order);
+
+    const w = ctx.out;
+    try w.print("{d} of {d} commands match '{s}':\n\n", .{ n, rows.len, query });
+    for (order[0..n]) |index| {
+        const r = rows[index];
+        try w.print("  {d: >5}  :{s: <14} {s}\n", .{
+            palette.scoreRow(query, r).?,
+            r.name,
+            r.about,
+        });
+    }
 }
 
 /// `qa, quitall`, in a caller's buffer. A command has one abbreviation or
