@@ -84,6 +84,10 @@ Panels open as an **overlay docked to the right rail**, over the page — not as
 a third column that reflows it. Reflowing would refit every fitted view on
 every toggle.
 
+The tab bar is **not drawn at all while there is one tabpage**, and the rails
+run to the top of the window when it is not there. A bar showing a single tab
+says what the title bar already says and charges a row of the page to say it.
+
 ---
 
 ## Where it stands
@@ -541,20 +545,86 @@ phase spent using the last two phases is a cheap phase; a *commit* spent using
 the last two commits is a cheap commit, and it is worth ordering a phase so
 that there is one.
 
-### Phase 5 — tabpages
+### Phase 5 — tabpages ✅
 
-| Commit | Files | ~ |
-|---|---|---|
-| tab pages, each with its own split tree | `src/hlidskjalf/Tabs.zig` | 250 |
-| the tab bar | `read.zig` | 180 |
+Two commits were budgeted and four were written. The two extra are the same
+two seams this plan has now named four times: the forward-looking change split
+off in front, and the model split from the widget that draws it.
+
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | a layout leaf holds a pane, not a view index | `hlidskjalf/Layout.zig` | 62 |
+| ✅ | tab pages, each with its own split tree | `src/hlidskjalf/Tabs.zig` | 393 |
+| ✅ | the reader in tabpages: gt, :tabnew and ctrl-w T | `keys.zig`, `read.zig` | 408 |
+| ✅ | the tab bar, once there are two tabpages | `chrome.zig`, `rails.zig`, `panels.zig`, `read.zig` | 235 |
 
 A tabpage owns a `Layout`, as in Vim. `Tabs` is a list of them plus an active
-index; `Session` holds a `Tabs` where it held a `Layout`. `:tabnew`,
-`:tabclose`, `gt`/`gT`, `<C-w>T`.
+index; `Session` holds a `Tabs` where it held a `Layout`, and `layout()` is
+the one on screen. `:tabnew`, `:tabclose`, `:tabonly`, `:tabn`/`:tabp`,
+`gt`/`gT`, `<C-w>T`.
 
-**One forward-looking change lands here.** `Layout`'s leaf payload becomes a
-`Pane` tagged union rather than a bare view index, with one variant today,
-`.document`. See *Decisions taken for the canvas*.
+**The bar was already written.** `thviti/widgets/tabs.zig` landed in phase one
+with its accent mark, its crosses, its middle-click and its strictness, and it
+has been exercised by `fenrir ui` and by nothing else since. The reader's half
+of that commit is the two hundred lines around it: which tabs there are, what
+they are called, and what a click on one means. **A widget written a phase
+early and left untouched still fitted**, which is worth more than it sounds —
+it is the first evidence that phase one built a widget set rather than four
+widgets for four call sites.
+
+**`g` is a prefix and `<C-w>` is a chord, and that is not a detail.**
+`State.pending` became a `Prefix` enum, and the two are completed in different
+places: the window prefix from key events before the text loop, `g` from
+inside it. They have to be. `Input.typedKey` folds case on purpose — a layout
+reporting `W` for the `w` key should still answer to `<C-w>w` — and `gt` and
+`gT` are two commands that differ *only* in their case. What is right for a
+chord is wrong for a letter.
+
+**The last window of a tabpage closes the tabpage.** `closeWindow` returns
+`closeTab()` where it used to return false, which makes `q` mean exactly what
+it means in Vim at every level: close the window, and if that was the last
+window close the tab, and if that was the last tab leave. One line, and it is
+the only place in the reader that knows the three are nested.
+
+**The bar is not drawn for one tabpage**, and `windowRect` takes nothing off
+the top when there is not one, so a session that never opens a tab looks
+exactly as it did before this phase. That is also why `Chrome.top` exists: the
+rails and the panel float against the top of the window and have to be told
+how much of it is already spoken for, and the reader is the only thing that
+knows.
+
+### What phase 5 cost, against what it was budgeted
+
+Two commits at 430 became four at 1098, and the average commit was 274 — the
+first phase whose average is under three hundred. Phase four planned one split
+in advance and found the second afterwards; this one planned both, and neither
+had to be noticed.
+
+**The forward-looking change is cheap exactly once.** `a layout leaf holds a
+pane, not a view index` is 62 lines and one test. It would have been the same
+62 lines inside the tabpages commit and invisible there, and it will be free
+in the phase that adds a canvas, because the callers that have to change have
+already changed. The plan named it in advance; naming it is what made it a
+commit.
+
+**`Tabs.zig` is the fifth data point for four hundred lines a file**, and the
+thirds hold again: 130 of documentation, 120 of code, 140 of tests. The rule
+has not missed yet.
+
+**The keyboard and the mouse split themselves this time.** `gt` and `:tabnew`
+landed in one commit and the bar in the next, and the second is 235 lines
+because the first had already settled what a tab *is*, what closing one does
+to the places it was left at, and what a selection does when the window it was
+made in goes off screen. That is the cheap commit phase four asked for and it
+was ordered on purpose.
+
+**The tests cannot see this one, and knowing that in advance is the point.**
+The rails and the panel are floated at `fixed_y = 0`, so a bar above them is
+something they have to be *told* about — and every test of all three passes
+`top = 0`, because until this phase there was nothing above them and there
+still is not in a test. The check that a rail starts under the bar is a
+picture and can only be a picture: `newTab` twice at the top of the session, a
+`--device` shot in each theme, and both taken out again before the commit.
 
 ### Phase 6 — the command registry and the palette
 
@@ -795,6 +865,20 @@ Things that cost time once and should not cost it again.
   tests over hand-written fixtures said the walk was right; the picture is
   what said the *destinations* were, and it is also what found the clipping
   bug above. Neither would have been found by reading the code.
+- **What is right for a chord is wrong for a letter.** `Input.typedKey` folds
+  case deliberately, because a layout that reports `W` for the `w` key should
+  still answer to `<C-w>w`. `gt` and `gT` are two commands that differ only in
+  their case, so they cannot be read through it — they are read from the
+  codepoint, in the loop over the frame's text. Two prefixes, completed in two
+  places, and the reason is which kind of key each one is followed by.
+- **A floating box has to be told what is above it.** Both rails and the panel
+  are pinned at `fixed_y = 0`, which was the whole answer while the only
+  chrome above the page was nothing. The tab bar put something there, and none
+  of the three could find that out for itself: `ui.viewport` is the window,
+  not the space left in it. It is one number passed down from the reader —
+  `Chrome.top` — for the same reason `reserved_below` is a constant in
+  `rails.zig`, and the tests of all three still pass zero, because in a test
+  there is nothing above them. A picture is the only check.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
