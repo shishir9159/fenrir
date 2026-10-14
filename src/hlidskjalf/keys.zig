@@ -177,6 +177,11 @@ pub const Command = union(enum) {
     command_char: u21,
     command_backspace,
     command_run,
+    /// The palette: the same commands, listed and filtered rather than
+    /// spelled out. `<C-p>`, which is a chord and not a letter, so it works
+    /// in every mode that is not typing -- a person who cannot remember a
+    /// command's name cannot be asked to leave visual mode to look it up.
+    show_commands,
 
     /// A key a plugin has bound, by the id its runtime gave the binding.
     plugin_key: u32,
@@ -268,6 +273,7 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
     // `<C-w>` replaces the window prefix rather than competing with it.
     var claimed_ctrl_w = false;
     var claimed_ctrl_r = false;
+    var claimed_ctrl_p = false;
     if (state.pending == .none) {
         for (in.events) |e| switch (e) {
             .key_down => |k| {
@@ -277,6 +283,7 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
                 out.push(.{ .plugin_key = id });
                 if (key.ctrl and !key.alt and key.char == 'w') claimed_ctrl_w = true;
                 if (key.ctrl and !key.alt and key.char == 'r') claimed_ctrl_r = true;
+                if (key.ctrl and !key.alt and key.char == 'p') claimed_ctrl_p = true;
             },
             else => {},
         };
@@ -313,6 +320,7 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
         return out;
     }
     if (!claimed_ctrl_r and in.chorded(.ctrlKey('r'))) out.push(.redo);
+    if (!claimed_ctrl_p and in.chorded(.ctrlKey('p'))) out.push(.show_commands);
 
     // The wheel scrolls in every mode: reading on while a selection is held
     // is how a selection longer than a screen gets made.

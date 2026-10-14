@@ -69,8 +69,9 @@ const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const library = @import("library.zig");
 const Library = library.Library;
-const rails_mod = @import("rails.zig");
+const palette_mod = @import("palette.zig");
 const panels = @import("panels.zig");
+const rails_mod = @import("rails.zig");
 const settings_page = @import("settings.zig");
 
 const content = fenrir.content;
@@ -897,6 +898,15 @@ const Session = struct {
     /// and after every change, never per frame: see `settings.zig`.
     settings: settings_page.State = .{},
 
+    /// The command palette, and the rows it is filtering.
+    ///
+    /// The rows are rebuilt when the palette opens and not once a frame: the
+    /// built-in half is a table in the binary and the plugin half changes
+    /// when a plugin registers something, which is while Lua runs and never
+    /// during a frame. `palette.zig` re-ranks on the same rule.
+    palette: palette_mod.State = .{},
+    palette_rows: std.ArrayList(palette_mod.Row) = .empty,
+
     /// The panel docked to the right rail, and the rows in it.
     ///
     /// The rows are rebuilt when what is behind them changes and not once a
@@ -926,7 +936,7 @@ const Session = struct {
     tabs_for: u64 = 0,
 
     /// The left rail's colours, filled when the highlight colour changes.
-    palette: [keys.palette_size]rails_mod.Swatch = @splat(.{ .name = "", .color = .gray(0) }),
+    swatches: [keys.palette_size]rails_mod.Swatch = @splat(.{ .name = "", .color = .gray(0) }),
 
     /// The accent a person configured, or null for the theme's own.
     ///
@@ -1064,6 +1074,7 @@ const Session = struct {
         s.borders.deinit(s.gpa);
         s.boxes.deinit(s.gpa);
         s.rows.deinit(s.gpa);
+        s.palette_rows.deinit(s.gpa);
         s.tab_names.deinit(s.gpa);
         s.tab_text.deinit(s.gpa);
         s.tab_ends.deinit(s.gpa);
@@ -2345,6 +2356,7 @@ const Session = struct {
                 s.settings.toggle();
                 if (s.settings.open) s.readSettings();
             },
+            .palette => s.showPalette(),
             .undo => s.undoMarks(false),
             .redo => s.undoMarks(true),
             .marks => {
@@ -2394,6 +2406,58 @@ const Session = struct {
             .echo => s.say("{s}", .{args[0..@min(args.len, 400)]}),
         }
         return true;
+    }
+
+    // -- the palette ----------------------------------------------------------
+
+    /// Opens it, having refilled the rows.
+    ///
+    /// The built-in half comes from the registry and the plugins' half from
+    /// the runtime, and once they are in one array nothing downstream can
+    /// tell which is which -- which is the point, since a person looking for
+    /// a command does not know either.
+    fn showPalette(s: *Session) void {
+        s.palette_rows.clearRetainingCapacity();
+        s.palette_rows.ensureTotalCapacity(s.gpa, commands.table.len) catch return;
+        s.palette_rows.items.len = commands.table.len;
+        _ = palette_mod.builtins(s.palette_rows.items);
+
+        if (s.plugins) |rt| {
+            for (rt.commandNames()) |c| {
+                s.palette_rows.append(s.gpa, .{
+                    .name = c.name,
+                    .about = c.description,
+                    // A plugin's command has no icon of its own until phase
+                    // eight lets a manifest name one, and the reader is the
+                    // wrong place to invent one per plugin.
+                    .icon = "fenrir.menu",
+                }) catch break;
+            }
+        }
+        s.palette.show();
+    }
+
+    /// A row chosen, or a line typed into the palette that matched nothing.
+    ///
+    /// A command that needs an argument cannot be *run* from a list -- there
+    /// is nothing to run it with -- so it goes onto the `:` line with a space
+    /// after it and the caret where the argument goes. That is the one thing
+    /// the palette hands to the older way in rather than doing itself, and it
+    /// is the honest handover: the two are the same commands.
+    fn runChosen(s: *Session, chosen: palette_mod.Chosen) void {
+        switch (chosen) {
+            .row => |r| {
+                if (!r.needs_argument) {
+                    _ = s.exec(r.name);
+                    return;
+                }
+                s.cmdline.clearRetainingCapacity();
+                s.cmdline.appendSlice(s.gpa, r.name) catch return;
+                s.cmdline.append(s.gpa, ' ') catch return;
+                s.keymap.mode = .command;
+            },
+            .line => |line| _ = s.exec(line),
+        }
     }
 
     /// `:set theme=light`, and `:set theme` to be told what it is.
@@ -2714,7 +2778,7 @@ const Session = struct {
     /// of a box tree that does not exist yet -- which is why that state is
     /// the caller's in both files rather than living in the tree.
     fn interfaceHasInput(s: *const Session) bool {
-        if (s.settings.open) return true;
+        if (s.settings.open or s.palette.open) return true;
         const c = s.chrome orelse return false;
         return c.grabbing();
     }
@@ -2847,6 +2911,7 @@ const Session = struct {
                 _ = s.exec(copy[0..len]);
                 return s.quit;
             },
+            .show_commands => s.showPalette(),
             .plugin_key => |id| if (s.plugins) |rt| rt.runKeymap(id),
 
             .undo => s.undoMarks(false),
@@ -3204,7 +3269,6 @@ const Session = struct {
                 // tells you the page exists and is coming.
                 try list.fill(rect, s.theme.paper);
             }
-
         }
 
         try s.drawMarks(v, b, range, over);
@@ -3598,15 +3662,15 @@ const Session = struct {
     /// be the one place in the reader that does string work on a frame path,
     /// for a rail that changes when a setting does.
     fn modeRail(s: *Session) rails_mod.Left {
-        if (s.palette[0].name.len == 0 or !std.meta.eql(s.palette[0].color, s.highlight)) {
-            for (&s.palette, 0..) |*sw, i| {
+        if (s.swatches[0].name.len == 0 or !std.meta.eql(s.swatches[0].color, s.highlight)) {
+            for (&s.swatches, 0..) |*sw, i| {
                 sw.* = .{
                     .name = paletteName(@intCast(i)),
                     .color = s.paletteColor(@intCast(i)),
                 };
             }
         }
-        return .{ .mode = s.keymap.mode, .palette = &s.palette };
+        return .{ .mode = s.keymap.mode, .palette = &s.swatches };
     }
 
     /// What a rail asked for, carried out.
@@ -4167,10 +4231,21 @@ const Session = struct {
                 // of them: a popup is on top by being built last, and nothing
                 // here sorts.
                 const changed = try settings_page.page(&c.ui, c.face, c.theme, &s.settings);
+                const chosen = try palette_mod.palette(
+                    &c.ui,
+                    c.face,
+                    c.theme,
+                    &c.icons,
+                    s.palette_rows.items,
+                    &s.palette,
+                );
                 try c.tips();
                 c.end();
                 if (want) |wanted| s.applyZoom(wanted);
                 if (changed) |c2| s.changeSetting(c2);
+                // After the frame is closed, because a command may open
+                // another window, close this one, or leave the reader.
+                if (chosen) |what| s.runChosen(what);
                 try c.flush(&over, &list, &renderer, &uploads);
             }
 
@@ -4331,6 +4406,7 @@ fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !S
 fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
     s.note.deinit(s.gpa);
+    s.palette_rows.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
     s.tab_names.deinit(s.gpa);
@@ -5317,4 +5393,52 @@ test "with no library every setting is unset, and saying so is not a crash" {
     // The theme still changes; there is simply nowhere to keep it.
     s.changeSetting(.{ .key = "theme", .value = "light" });
     try testing.expectEqualStrings("light", s.theme.name);
+}
+
+test "the palette holds the keyboard, and opens from the key and the command" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    try testing.expect(!s.interfaceHasInput());
+    _ = s.apply(.show_commands);
+    try testing.expect(s.palette.open);
+    try testing.expect(s.interfaceHasInput());
+    // Every built-in is in it, whether or not this build has plugins.
+    try testing.expectEqual(commands.table.len, s.palette_rows.items.len);
+
+    s.palette.hide();
+    try testing.expect(s.exec("commands"));
+    try testing.expect(s.palette.open);
+}
+
+test "a row chosen in the palette runs the command it names" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.showPalette();
+    s.runChosen(.{ .row = .{ .name = "split" } });
+    try testing.expectEqual(@as(usize, 2), s.layout().count());
+
+    // And a line nothing matched goes down the same path a typed one does.
+    s.runChosen(.{ .line = "page 3" });
+    try testing.expectEqual(@as(u32, 2), s.view().currentPage());
+}
+
+test "a command that needs an argument lands on the : line, not in the void" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.showPalette();
+    const entry = commands.get(.page);
+    try testing.expect(entry.needs_argument);
+    s.runChosen(.{ .row = .{ .name = entry.name, .needs_argument = true } });
+
+    try testing.expectEqual(keys.Mode.command, s.keymap.mode);
+    try testing.expectEqualStrings("page ", s.cmdline.items);
 }

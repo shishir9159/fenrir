@@ -83,6 +83,7 @@ pub const Id = enum {
     fit,
     set,
     settings,
+    palette,
     undo,
     redo,
     marks,
@@ -156,6 +157,7 @@ pub const table = [_]Entry{
 
     .{ .id = .set, .name = "set", .args = "[NAME=VALUE]", .icon = "fenrir.settings", .about = "a setting, by name" },
     .{ .id = .settings, .name = "settings", .icon = "fenrir.settings", .about = "the settings page, which lists them all" },
+    .{ .id = .palette, .name = "commands", .icon = "fenrir.menu", .binding = "<C-p>", .about = "every command there is, filtered as you type" },
     .{ .id = .undo, .name = "undo", .icon = "fenrir.chevron_left", .binding = "u", .about = "undo the last change to the highlights" },
     .{ .id = .redo, .name = "redo", .icon = "fenrir.chevron_right", .binding = "<C-r>", .about = "redo what was undone" },
     .{ .id = .marks, .name = "marks", .args = "[clear]", .icon = "fenrir.highlight", .about = "how many highlights this document has, or clear them" },

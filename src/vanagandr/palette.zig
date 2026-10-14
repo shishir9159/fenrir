@@ -11,9 +11,10 @@
 //! not a `Session`, and nothing that can be run: the palette reports the row
 //! that was chosen and the reader runs it, which is the same division
 //! `panels.zig` draws for a panel row and `settings.zig` for a setting. So
-//! the matcher and the ranking are asked about in a test with no window, no
-//! device and no document -- and `fenrir commands --match` asks the same
-//! question from a terminal.
+//! the whole thing -- the matcher, the ranking, the keyboard -- is built and
+//! typed into in a test with no window, no device and no document, and
+//! `fenrir commands --match` asks the ranking the same question from a
+//! terminal.
 //!
 //! It also means a plugin's command is a `Row` like any other. The reader
 //! fills the array from the built-in table and from `Runtime.commandNames()`,
@@ -43,7 +44,13 @@ const fenrir = @import("fenrir");
 const thviti = fenrir.thviti;
 
 const commands = fenrir.hlidskjalf.commands;
+const Fonts = fenrir.tyr.Fonts;
+const Icons = thviti.Icons;
+const Theme = thviti.Theme;
+const UI = thviti.UI;
 const w = thviti.widgets;
+
+pub const Error = UI.Error;
 
 /// The longest query worth keeping. A command name and its argument; a person
 /// typing more than this wants the `:` line, which is still there.
@@ -265,6 +272,239 @@ pub fn rank(query: []const u8, rows: []const Row, out: []u16) u16 {
     return @intCast(take);
 }
 
+// -- the widget ----------------------------------------------------------------
+
+/// How wide it is, and where down the window it sits. Near the top rather
+/// than centred: the list grows downwards and a box that moved as it filled
+/// would be unreadable while somebody typed into it.
+const width: f32 = 560;
+const from_top: f32 = 0.14;
+const row_height: f32 = 26;
+const rows_shown: f32 = 10;
+const pad: f32 = 8;
+/// The field at the top, and the room around it.
+const head_height: f32 = 26 + pad;
+/// The gutter the icon sits in, at the near edge of a row.
+const gutter: f32 = 22;
+
+/// Where the field will be, worked out rather than remembered.
+///
+/// A key is a hash of the call-site string seeded with its parent's, so a
+/// box's key is known before the box is: popup, head, field. The same trick
+/// the settings page uses, and for the same reason -- a control that appears
+/// already wanting the keyboard has to ask for focus, which means naming
+/// itself a moment before it exists.
+fn queryKey(ui: *const UI) thviti.key.Key {
+    const head = thviti.key.make(thviti.key.make(ui.root.key, "palette"), "head");
+    return thviti.key.make(head, "query");
+}
+
+/// The palette, and the command it was asked for.
+///
+/// Built last of everything, because a popup is on top by being built last
+/// and nothing here sorts.
+pub fn palette(
+    ui: *UI,
+    face: Fonts.FontId,
+    t: Theme,
+    icons: *const Icons,
+    rows: []const Row,
+    st: *State,
+) Error!?Chosen {
+    if (!st.open) return null;
+
+    // Re-aimed every frame rather than on creation: see `State.field`.
+    st.field.bytes = &st.query_buf;
+
+    // Before the build, so the field has the keyboard in the same frame it
+    // first appears: `signal` reads `ui.focus`, and a focus set afterwards
+    // costs a frame of typing.
+    if (st.focus_next) {
+        st.focus_next = false;
+        ui.setFocus(queryKey(ui));
+    }
+
+    // The selection, before the field sees the same frame. Up and down are
+    // not keys a text field uses, and the ctrl pair is swallowed by it, so
+    // neither is taken twice.
+    if (ui.in.repeated(.down)) st.step(1);
+    if (ui.in.repeated(.up)) st.step(-1);
+    if (ui.in.chorded(.ctrlKey('n'))) st.step(1);
+    if (ui.in.chorded(.ctrlKey('p'))) st.step(-1);
+
+    if (st.dirty) st.rerank(rows);
+
+    ui.pushStyle(.{ .font = face, .font_size = 13, .fg = t.text, .bg = t.panel });
+    defer ui.popStyle();
+
+    // Exactly as many whole rows as are showing. The list is `.fill`, so a
+    // few pixels of slack here are not padding at the bottom -- they are an
+    // eleventh row cut in half, which reads as a list that has been badly
+    // measured rather than one that scrolls.
+    const listed = @min(@as(f32, @floatFromInt(st.shown)), rows_shown);
+    const height = head_height + @max(listed, 1) * row_height;
+    const p = try w.popup.open(ui, "palette", .{
+        .at = .{
+            .x = @round((ui.viewport.width() - width) * 0.5),
+            .y = @round(ui.viewport.height() * from_top),
+        },
+        .w = .px(width),
+        .h = .px(height),
+    });
+    defer w.popup.close(ui, p);
+    if (p.dismissed) {
+        st.hide();
+        return null;
+    }
+
+    var out: ?Chosen = null;
+    {
+        ui.next(.{ .w = .fill, .h = .px(head_height), .axis = .x, .child_align = .center });
+        const head = try ui.open("###head");
+        defer ui.close(head);
+
+        try w.spacer(ui, .px(pad));
+        const r = try w.field.textField(ui, "query", &st.field, .{
+            .h = .px(26),
+            .placeholder = "a command, or part of one",
+        });
+        try w.spacer(ui, .px(pad));
+
+        if (r.edited) {
+            st.at = 0;
+            st.dirty = true;
+            st.rerank(rows);
+        }
+        if (r.cancelled) {
+            st.hide();
+            return null;
+        }
+        if (r.submitted) out = choose(st, rows);
+    }
+
+    ui.next(.{ .w = .fill, .h = .fill, .axis = .x });
+    const body = try ui.open("###body");
+    {
+        defer ui.close(body);
+
+        if (st.shown == 0) {
+            ui.next(.{ .w = .fill, .h = .fill, .axis = .x, .child_align = .center });
+            const none = try ui.open("###empty");
+            defer ui.close(none);
+            try w.spacer(ui, .px(pad + gutter));
+            ui.next(.{ .fg = t.text_dim, .font_size = 12 });
+            _ = try w.label(ui, "no command matches; enter runs it as a `:` line");
+        } else {
+            ui.next(.{ .w = .fill, .h = .fill });
+            const l = try w.list.open(ui, "rows", .{
+                .count = st.shown,
+                .row_height = row_height,
+            });
+            {
+                defer w.list.close(ui, l);
+                var it = l.rows();
+                while (it.next()) |n| {
+                    if (try line(ui, t, icons, rows[st.order[n]], n, n == st.at)) {
+                        st.at = @intCast(n);
+                        out = choose(st, rows);
+                    }
+                }
+            }
+            if (st.reveal) {
+                st.reveal = false;
+                l.scrollTo(st.at);
+            }
+
+            ui.next(.{ .bg = t.ground });
+            try w.list.scrollBar(ui, "bar", l);
+        }
+    }
+
+    if (out != null) st.hide();
+    return out;
+}
+
+/// Enter, or a click: the highlighted row, or the line itself when nothing
+/// matched. The second is what makes this a command line and not a menu.
+fn choose(st: *State, rows: []const Row) ?Chosen {
+    if (st.selected(rows)) |r| return .{ .row = r };
+    const line_typed = st.query();
+    if (line_typed.len == 0) return null;
+    return .{ .line = line_typed };
+}
+
+/// One row: the icon, the name and its abbreviation, what it is for, and the
+/// keys that do the same thing.
+fn line(ui: *UI, t: Theme, icons: *const Icons, r: Row, index: u32, selected: bool) Error!bool {
+    ui.next(.{
+        .w = .fill,
+        .h = .px(row_height),
+        .axis = .x,
+        .child_align = .center,
+        .bg = if (selected) t.selection else t.panel.withAlpha(0),
+        .flags = .{
+            .clickable = true,
+            .draw_background = true,
+            .hot_animation = true,
+            .clip = true,
+        },
+    });
+    var name: [16]u8 = undefined;
+    const b = try ui.open(std.fmt.bufPrint(&name, "###row{d}", .{index}) catch "###row");
+    defer ui.close(b);
+    const sig = ui.signal(b);
+
+    try w.spacer(ui, .px(pad));
+    {
+        ui.next(.{ .w = .px(gutter), .h = .fill, .axis = .x, .child_align = .center });
+        const slot = try ui.open("###icon");
+        defer ui.close(slot);
+        if (r.icon.len != 0) {
+            const drawn = icons.byName(r.icon, .menu);
+            ui.next(.{
+                .w = .text(0),
+                .h = .text(0),
+                .font = drawn.font,
+                .font_size = drawn.px,
+                .fg = if (selected) t.text else t.text_dim,
+                .flags = .{ .draw_text = true },
+            });
+            _ = try ui.boxText("###glyph", drawn.text);
+        }
+    }
+
+    // Each label in a box that clips, sized to its own text: a box does not
+    // clip the text it draws itself, only what its children draw.
+    {
+        ui.next(.{ .w = .fill, .h = .fill, .axis = .x, .child_align = .center, .flags = .{ .clip = true, .overflow_x = true } });
+        const room = try ui.open("###room");
+        defer ui.close(room);
+
+        ui.next(.{ .w = .text(0), .h = .text(0), .flags = .{ .draw_text = true } });
+        _ = try ui.boxText("###name", r.name);
+
+        if (r.aliases.len != 0) {
+            try w.spacer(ui, .px(6));
+            ui.next(.{ .w = .text(0), .h = .text(0), .fg = t.text_dim, .font_size = 11, .flags = .{ .draw_text = true } });
+            _ = try ui.boxText("###short", r.aliases[0]);
+        }
+        if (r.about.len != 0) {
+            try w.spacer(ui, .px(10));
+            ui.next(.{ .w = .text(0), .h = .text(0), .fg = t.text_dim, .font_size = 12, .flags = .{ .draw_text = true } });
+            _ = try ui.boxText("###about", r.about);
+        }
+    }
+
+    if (r.binding.len != 0) {
+        try w.spacer(ui, .px(pad));
+        ui.next(.{ .w = .text(0), .h = .text(0), .fg = t.text_dim, .font_size = 11, .flags = .{ .draw_text = true } });
+        _ = try ui.boxText("###keys", r.binding);
+    }
+    try w.spacer(ui, .px(pad));
+
+    return sig.clicked;
+}
+
 // -- tests --------------------------------------------------------------------
 
 const testing = std.testing;
@@ -412,4 +652,235 @@ test "a narrowing query keeps the selection inside what is left" {
     st.rerank(rows);
     try testing.expectEqual(@as(u16, 0), st.shown);
     try testing.expect(st.selected(rows) == null);
+}
+
+// -- tests, with a box tree ------------------------------------------------
+
+const key = thviti.key;
+const Input = thviti.Input;
+const Point = fenrir.gelgja.Point;
+const Event = thviti.input.Event;
+
+const Rig = struct {
+    fonts: Fonts,
+    icons: Icons,
+    ui: UI,
+    rows: []Row,
+    storage: [max_rows]Row = undefined,
+
+    fn init(rig: *Rig) !void {
+        rig.* = .{
+            .fonts = try .init(testing.allocator, .{}),
+            .icons = undefined,
+            .ui = .init(testing.allocator, UI.fixed_metrics),
+            .rows = &.{},
+        };
+        rig.icons = try .init(testing.allocator, &rig.fonts);
+        rig.rows = builtins(&rig.storage);
+    }
+
+    fn deinit(rig: *Rig) void {
+        rig.ui.deinit();
+        rig.icons.deinit();
+        rig.fonts.deinit();
+    }
+
+    fn frame(rig: *Rig, st: *State, in: Input) !?Chosen {
+        try rig.ui.begin(.fromRect(0, 0, 900, 600), in);
+        const out = try palette(&rig.ui, Fonts.fallback_font, .dark, &rig.icons, rig.rows, st);
+        rig.ui.end();
+        return out;
+    }
+
+    fn typed(rig: *Rig, st: *State, s: []const u8) !?Chosen {
+        var ev = [_]Event{.{ .text = s }};
+        return rig.frame(st, .{ .events = &ev });
+    }
+
+    fn pressed(rig: *Rig, st: *State, code: thviti.input.KeyCode) !?Chosen {
+        var ev = [_]Event{.{ .key_down = .{ .code = code } }};
+        return rig.frame(st, .{ .events = &ev });
+    }
+
+    /// A box by the path of names from the popup down.
+    fn find(rig: *Rig, path: []const []const u8) ?*thviti.Box {
+        var k = key.make(rig.ui.root.key, "palette");
+        for (path) |name| k = key.make(k, name);
+        return rig.ui.find(k);
+    }
+
+    /// The nth visible row's box, by the key `line` gives it.
+    fn rowBox(rig: *Rig, index: u32) ?*thviti.Box {
+        var name: [16]u8 = undefined;
+        return rig.find(&.{ "body", "rows", std.fmt.bufPrint(&name, "row{d}", .{index}) catch unreachable });
+    }
+};
+
+fn middleOf(b: *thviti.Box) Point {
+    return .{ .x = (b.rect.min_x + b.rect.max_x) * 0.5, .y = (b.rect.min_y + b.rect.max_y) * 0.5 };
+}
+
+test "a closed palette builds nothing and asks for nothing" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    try testing.expect(try rig.frame(&st, .{}) == null);
+    try testing.expect(rig.find(&.{ "head", "query" }) == null);
+}
+
+test "an open palette shows the whole table and highlights the first row" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+
+    try testing.expectEqual(@as(u16, @intCast(rig.rows.len)), st.shown);
+    try testing.expectEqual(@as(u16, 0), st.at);
+    try testing.expect(rig.find(&.{ "head", "query" }) != null);
+}
+
+test "the field has the keyboard the frame the palette appears" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+    try testing.expectEqual(rig.find(&.{ "head", "query" }).?.key, rig.ui.focus);
+
+    // And typing lands in it rather than anywhere else.
+    _ = try rig.typed(&st, "tabn");
+    try testing.expectEqualStrings("tabn", st.query());
+}
+
+test "typing narrows the list and puts the selection back at the top" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+    _ = try rig.pressed(&st, .down);
+    try testing.expectEqual(@as(u16, 1), st.at);
+
+    _ = try rig.typed(&st, "tabnew");
+    try testing.expectEqual(@as(u16, 0), st.at);
+    try testing.expectEqualStrings("tabnew", st.selected(rig.rows).?.name);
+}
+
+test "the arrows and the ctrl pair move the same selection" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+
+    _ = try rig.pressed(&st, .down);
+    _ = try rig.pressed(&st, .down);
+    try testing.expectEqual(@as(u16, 2), st.at);
+    _ = try rig.pressed(&st, .up);
+    try testing.expectEqual(@as(u16, 1), st.at);
+
+    var ctrl_n = [_]Event{.{ .key_down = .{ .code = .other, .char = 'n', .modifiers = .{ .ctrl = true } } }};
+    _ = try rig.frame(&st, .{ .events = &ctrl_n });
+    try testing.expectEqual(@as(u16, 2), st.at);
+    // And a chord does not become text in the field.
+    try testing.expectEqualStrings("", st.query());
+}
+
+test "enter chooses the highlighted row and closes" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+    _ = try rig.typed(&st, "settings");
+
+    const out = try rig.pressed(&st, .enter);
+    try testing.expectEqualStrings("settings", out.?.row.name);
+    try testing.expect(!st.open);
+}
+
+test "enter with nothing matching hands back the line itself" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+    _ = try rig.typed(&st, "zzz");
+    try testing.expectEqual(@as(u16, 0), st.shown);
+
+    const out = try rig.pressed(&st, .enter);
+    try testing.expectEqualStrings("zzz", out.?.line);
+    try testing.expect(!st.open);
+}
+
+test "escape closes it, and it opens empty rather than where it was left" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+    _ = try rig.typed(&st, "quit");
+
+    try testing.expect(try rig.pressed(&st, .escape) == null);
+    try testing.expect(!st.open);
+
+    st.show();
+    _ = try rig.frame(&st, .{});
+    try testing.expectEqualStrings("", st.query());
+    try testing.expectEqual(@as(u16, @intCast(rig.rows.len)), st.shown);
+}
+
+test "a click on a row chooses it" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    // Two frames before anything can be clicked: a signal is about the
+    // rectangle the box had last frame, which is the one that was under the
+    // pointer when the button went down.
+    _ = try rig.frame(&st, .{});
+    _ = try rig.frame(&st, .{});
+
+    const at = middleOf(rig.rowBox(2).?);
+    _ = try rig.frame(&st, .{ .mouse = at });
+    _ = try rig.frame(&st, .{ .mouse = at, .buttons = .{ .left = true } });
+    const out = try rig.frame(&st, .{ .mouse = at });
+
+    try testing.expectEqualStrings(rig.rows[st.order[2]].name, out.?.row.name);
+    try testing.expect(!st.open);
+}
+
+test "a press outside it puts it away" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var st: State = .{};
+    st.show();
+    _ = try rig.frame(&st, .{});
+    _ = try rig.frame(&st, .{});
+
+    const away: Point = .{ .x = 20, .y = 560 };
+    _ = try rig.frame(&st, .{ .mouse = away });
+    _ = try rig.frame(&st, .{ .mouse = away, .buttons = .{ .left = true } });
+    try testing.expect(!st.open);
 }
