@@ -1014,6 +1014,13 @@ fn internFont(it: *Interpreter, dict: Dict, ref: u32, name: []const u8) Error!us
     const font = try Font.load(it.arena(), it.doc, dict, ref);
     const id = try it.builder.fontId(ref, name, font.base_font, font.kind == .composite);
 
+    // What the codes mean, recorded once per font rather than once per glyph.
+    // Resolved here and not by whoever extracts the text, because the chain
+    // behind it -- `/ToUnicode`, `/Differences`, `/BaseEncoding` -- is four
+    // entries of a dictionary that only this layer can still see.
+    const meaning = try font.unicodeSpans(it.arena());
+    try it.builder.fontUnicode(id, meaning.spans, meaning.text);
+
     // `fontId` reuses an entry when the object matches, so the two tables can
     // only diverge if a font is interned twice under different names.
     if (id == it.fonts.items.len) {

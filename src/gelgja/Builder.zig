@@ -35,6 +35,7 @@ const Paint = paint.Paint;
 const Path = DisplayList.Path;
 const Stroke = paint.Stroke;
 const TextRun = DisplayList.TextRun;
+const UnicodeSpan = DisplayList.UnicodeSpan;
 
 const Builder = @This();
 
@@ -48,6 +49,8 @@ scalars: std.ArrayList(f32) = .empty,
 fonts: std.ArrayList(FontInfo) = .empty,
 strings: std.ArrayList(u8) = .empty,
 bytes: std.ArrayList(u8) = .empty,
+unicode: std.ArrayList(UnicodeSpan) = .empty,
+unicode_text: std.ArrayList(u8) = .empty,
 
 page: Bounds = .empty,
 
@@ -78,6 +81,8 @@ pub fn deinit(b: *Builder) void {
     b.fonts.deinit(b.gpa);
     b.strings.deinit(b.gpa);
     b.bytes.deinit(b.gpa);
+    b.unicode.deinit(b.gpa);
+    b.unicode_text.deinit(b.gpa);
     b.* = undefined;
 }
 
@@ -325,6 +330,52 @@ pub fn fontId(
     return id;
 }
 
+/// Records what a font's character codes mean, in UTF-8.
+///
+/// Separate from `fontId` because the two are known at different moments and
+/// by different code: a font is interned the instant `Tf` names it, and what
+/// its codes *mean* is a `/ToUnicode` stream plus an encoding chain that the
+/// PDF layer resolves afterwards. Called twice for one font, the second call
+/// is ignored -- `fontId` reuses an entry when the object matches, and the
+/// spans would otherwise be appended a second time.
+///
+/// The spans are sorted here rather than trusted from the caller, because
+/// `DisplayList.unicodeFor` binary-searches them and a CMap's entries arrive
+/// in whatever order the producer wrote them.
+pub fn fontUnicode(
+    b: *Builder,
+    id: FontId,
+    spans: []const UnicodeSpan,
+    pool: []const u8,
+) Error!void {
+    if (id >= b.fonts.items.len or spans.len == 0) return;
+    if (b.fonts.items[id].unicode.count != 0) return;
+
+    const text_base: u32 = @intCast(b.unicode_text.items.len);
+    try b.unicode_text.appendSlice(b.gpa, pool);
+
+    const start: u32 = @intCast(b.unicode.items.len);
+    for (spans) |s| {
+        if (s.len == 0 or s.high < s.low) continue;
+        if (@as(usize, s.at) + s.len > pool.len) continue;
+        try b.unicode.append(b.gpa, .{
+            .low = s.low,
+            .high = s.high,
+            .at = text_base + s.at,
+            .len = s.len,
+            .step = s.step,
+        });
+    }
+
+    const added = b.unicode.items[start..];
+    std.mem.sort(UnicodeSpan, added, {}, lowerCode);
+    b.fonts.items[id].unicode = .{ .start = start, .count = @intCast(added.len) };
+}
+
+fn lowerCode(_: void, a: UnicodeSpan, c: UnicodeSpan) bool {
+    return a.low < c.low;
+}
+
 /// Copies a string into the list's string pool and returns its span.
 pub fn intern(b: *Builder, s: []const u8) Error!Range {
     if (s.len == 0) return .empty;
@@ -381,6 +432,8 @@ pub fn finish(b: *Builder) Error!DisplayList {
         .fonts = try b.fonts.toOwnedSlice(b.gpa),
         .strings = try b.strings.toOwnedSlice(b.gpa),
         .bytes = try b.bytes.toOwnedSlice(b.gpa),
+        .unicode = try b.unicode.toOwnedSlice(b.gpa),
+        .unicode_text = try b.unicode_text.toOwnedSlice(b.gpa),
         .page = b.page,
         .unbalanced = unbalanced,
     };

@@ -27,18 +27,39 @@
 //!   the CID mapping is wrong for the CJK ones.
 //!
 //! Embedded CMap streams *are* parsed, because they are self-contained.
+//!
+//! ## What a code *means*
+//!
+//! Decoding and advancing are about where a glyph goes. `unicodeSpans` is the
+//! other question -- which letter it is -- and it is the same four entries
+//! read a second way: `/ToUnicode` when the producer wrote one, and otherwise
+//! the encoding chain, `/Differences` over `/BaseEncoding` over Standard,
+//! ending at a glyph name that `tyr.encoding` turns into a code point.
+//!
+//! That import is the one edge Gjöll has outside Gelgja, and it is worth
+//! saying why: the three tables behind it -- Standard, WinAnsi, MacRoman --
+//! are *PDF's* encodings, Annex D of the specification, not any font format's.
+//! They live in Týr because Týr was the only thing that needed them until
+//! now. Copying them here to keep the layering picture tidy would be two
+//! thousand lines of the same data in two places, drifting apart.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const DisplayList = @import("../../gelgja/DisplayList.zig");
 const Document = @import("../Document.zig");
 const Lexer = @import("../Lexer.zig");
+const encoding = @import("../../tyr/encoding.zig");
 const matrix = @import("matrix.zig");
 const pdf = @import("../object.zig");
 
 const Dict = pdf.Dict;
 const Matrix = matrix.Matrix;
 const Object = pdf.Object;
+const UnicodeSpan = DisplayList.UnicodeSpan;
+
+/// The most UTF-8 one code can stand for; see `DisplayList.max_unicode`.
+pub const max_unicode = DisplayList.max_unicode;
 
 const Font = @This();
 
@@ -78,6 +99,20 @@ missing_width: f64 = 0,
 /// True when neither `/Widths` nor `/MissingWidth` said anything, so
 /// `assumed_width` is in play.
 widths_assumed: bool = false,
+/// `/Encoding`, or `/Encoding /BaseEncoding`, for a simple font. `.builtin`
+/// when the dictionary named none.
+base_encoding: encoding.Kind = .builtin,
+/// `/Encoding /Differences`, 256 entries of glyph name or empty. Read for
+/// every simple font, not only Type 3: it is the first link of the chain
+/// that says what a code means.
+differences: ?[]const []const u8 = null,
+
+// -- what the codes mean ----------------------------------------------------
+
+/// `/ToUnicode`, as spans into `unicode_text`. Empty when the document
+/// carried none, which is when the encoding chain does the work.
+to_unicode: []const UnicodeSpan = &.{},
+unicode_text: []const u8 = &.{},
 
 // -- composite fonts --------------------------------------------------------
 
@@ -98,8 +133,6 @@ font_matrix: Matrix = .{ .a = 0.001, .d = 0.001 },
 char_procs: ?Dict = null,
 /// The font's own `/Resources`, which its glyph procedures run against.
 resources: ?Dict = null,
-/// `/Encoding /Differences`, 256 entries of glyph name or empty.
-encoding: ?[]const []const u8 = null,
 
 pub const CidRange = struct {
     first: u32,
@@ -181,12 +214,114 @@ fn type3Width(f: *const Font, code: u32) f64 {
     return w * f.font_matrix.a;
 }
 
-/// The glyph name a Type 3 code maps to, or null.
+/// The glyph name a code maps to through `/Differences`, or null. It is what
+/// finds a Type 3 procedure, and the first link of the chain in
+/// `unicodeSpans`.
 pub fn glyphName(f: *const Font, code: u32) ?[]const u8 {
-    const names = f.encoding orelse return null;
+    const names = f.differences orelse return null;
     if (code >= names.len) return null;
     const name = names[code];
     return if (name.len == 0) null else name;
+}
+
+// -- what the codes mean ----------------------------------------------------
+
+/// One font's map, in the form the display list carries.
+pub const Mapping = struct {
+    spans: []const UnicodeSpan = &.{},
+    text: []const u8 = &.{},
+};
+
+/// What this font's codes mean, as spans a display list can carry.
+///
+/// A composite font gets `/ToUnicode` and nothing else: its codes are CIDs
+/// into an external character collection, and guessing there would read a
+/// page of Japanese as Latin letters. A simple font's codes are the 256
+/// bytes, so every one of them is resolved here, once, rather than carrying
+/// three tables and an encoding chain into the layer that extracts text.
+pub fn unicodeSpans(f: *const Font, arena: Allocator) Allocator.Error!Mapping {
+    if (f.kind == .composite) return .{ .spans = f.to_unicode, .text = f.unicode_text };
+
+    var spans: std.ArrayList(UnicodeSpan) = .empty;
+    var text: std.ArrayList(u8) = .empty;
+    // The code point the last span started at, so a run of codes that means a
+    // run of code points can be folded into one stepping span. Printable
+    // ASCII is exactly that run under all three standard encodings, so this
+    // turns ninety-five spans into one and is why a Latin font's map is five
+    // entries rather than two hundred.
+    var last_cp: u21 = 0;
+    var last_single = false;
+
+    var buf: [max_unicode]u8 = undefined;
+    for (0..256) |i| {
+        const code: u32 = @intCast(i);
+        const meaning = f.unicodeFor(code, &buf);
+        if (meaning.len == 0) {
+            last_single = false;
+            continue;
+        }
+
+        const single: ?u21 = if (std.unicode.utf8CountCodepoints(meaning) catch 1 == 1)
+            (std.unicode.utf8Decode(meaning) catch null)
+        else
+            null;
+
+        if (single) |cp| {
+            if (last_single and spans.items.len != 0) {
+                const prev = &spans.items[spans.items.len - 1];
+                if (prev.high + 1 == code and @as(u32, cp) == last_cp + (code - prev.low)) {
+                    prev.high = code;
+                    prev.step = true;
+                    continue;
+                }
+            }
+            last_cp = cp;
+            last_single = true;
+        } else {
+            last_single = false;
+        }
+
+        const at: u32 = @intCast(text.items.len);
+        try text.appendSlice(arena, meaning);
+        try spans.append(arena, .{
+            .low = code,
+            .high = code,
+            .at = at,
+            .len = @intCast(meaning.len),
+        });
+    }
+
+    return .{ .spans = spans.items, .text = text.items };
+}
+
+/// What one code means, in UTF-8, written into `buf`. Empty when nothing in
+/// the document says.
+///
+/// `/ToUnicode` first, because it is the producer stating the answer. Then
+/// the encoding chain: `/Differences`, the named base encoding, and Standard
+/// behind both. Standard as the last resort is the specification's own
+/// default (§9.6.6.2) and is right for printable ASCII under every encoding
+/// a document can name; above 0x7f it is a guess, and a wrong letter there is
+/// still better for a search than a hole.
+pub fn unicodeFor(f: *const Font, code: u32, buf: *[max_unicode]u8) []const u8 {
+    const mapped = DisplayList.unicodeIn(f.to_unicode, f.unicode_text, code, buf);
+    if (mapped.len != 0) return mapped;
+
+    if (f.kind == .composite or code > 0xff) return &.{};
+
+    const byte: u8 = @intCast(code);
+    const cp = if (f.glyphName(code)) |name|
+        // A `/Differences` name nothing recognises means nothing: the base
+        // encoding's letter for that code is exactly what the name was
+        // written to override.
+        encoding.unicodeForName(name) orelse return &.{}
+    else
+        encoding.codepointFor(f.base_encoding, byte) orelse
+            encoding.codepointFor(.standard, byte) orelse
+            return &.{};
+
+    const len = std.unicode.utf8Encode(cp, buf) catch return &.{};
+    return buf[0..len];
 }
 
 // -- CMaps ------------------------------------------------------------------
@@ -373,6 +508,167 @@ fn parseCMap(arena: Allocator, src: []const u8) Allocator.Error!CMap {
     };
 }
 
+/// Parses a `/ToUnicode` CMap stream (§9.10.3).
+///
+/// Two operators carry everything: `bfchar` maps one code to one destination,
+/// `bfrange` maps a run of them either to a run of destinations -- the string
+/// form, where the last code point moves on with the code -- or to an array
+/// with one destination per code. Destinations are UTF-16BE strings, so a
+/// ligature and an accented letter both arrive as several code points, which
+/// is the whole reason this produces text rather than code points.
+///
+/// A destination may also be a glyph *name*, which some producers emit; it
+/// goes through the same table as the encoding chain's names do.
+fn parseToUnicode(arena: Allocator, src: []const u8) Allocator.Error!Mapping {
+    var spans: std.ArrayList(UnicodeSpan) = .empty;
+    var text: std.ArrayList(u8) = .empty;
+
+    var lexer: Lexer = .init(src);
+
+    const Section = enum { none, bfchar, bfrange };
+    var section: Section = .none;
+    // The source codes collected so far: one for `bfchar`, two for
+    // `bfrange`.
+    var codes: [2]u32 = .{ 0, 0 };
+    var have: usize = 0;
+    // Inside a `bfrange`'s array form, and how far along it we are.
+    var in_array = false;
+    var index: u32 = 0;
+
+    while (true) {
+        const token = lexer.next(arena) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+
+        const destination: []const u8 = switch (token) {
+            .eof => break,
+            .keyword => |word| {
+                if (std.mem.eql(u8, word, "beginbfchar")) {
+                    section = .bfchar;
+                } else if (std.mem.eql(u8, word, "beginbfrange")) {
+                    section = .bfrange;
+                } else {
+                    section = .none;
+                }
+                have = 0;
+                in_array = false;
+                continue;
+            },
+            .array_open => {
+                // Only meaningful once both ends of a range are in hand;
+                // anywhere else it is a malformed entry to be stepped over.
+                in_array = section == .bfrange and have == 2;
+                index = 0;
+                continue;
+            },
+            .array_close => {
+                in_array = false;
+                have = 0;
+                continue;
+            },
+            .string => |s| s,
+            .name => |n| blk: {
+                // A name destination is only ever a destination, never a
+                // source: sources are hex strings.
+                if (section == .none or (!in_array and have == 0)) continue;
+                var one: [max_unicode]u8 = undefined;
+                const cp = encoding.unicodeForName(n) orelse continue;
+                const len = std.unicode.utf8Encode(cp, &one) catch continue;
+                break :blk try arena.dupe(u8, one[0..len]);
+            },
+            else => {
+                if (!in_array) have = 0;
+                continue;
+            },
+        };
+
+        if (section == .none) continue;
+
+        // A source code, while there is still one to collect.
+        const wanted: usize = if (section == .bfchar) 1 else 2;
+        if (!in_array and have < wanted) {
+            if (destination.len == 0 or destination.len > 4) continue;
+            codes[have] = packBytes(destination);
+            have += 1;
+            continue;
+        }
+
+        const low = codes[0];
+        const high = if (section == .bfchar) codes[0] else codes[1];
+        const at: u32 = @intCast(text.items.len);
+        const len = try appendUtf8(arena, &text, destination);
+        if (len != 0) {
+            if (in_array) {
+                // One destination per code, so nothing steps and the entry
+                // covers exactly the code it was written for.
+                const code = low + index;
+                if (code <= high) {
+                    try spans.append(arena, .{ .low = code, .high = code, .at = at, .len = len });
+                }
+            } else {
+                try spans.append(arena, .{
+                    .low = low,
+                    .high = high,
+                    .at = at,
+                    .len = len,
+                    .step = high > low,
+                });
+            }
+        }
+
+        if (in_array) {
+            index += 1;
+        } else {
+            have = 0;
+        }
+    }
+
+    // `unicodeIn` binary-searches these, and a producer writes its entries in
+    // whatever order it likes.
+    std.mem.sort(UnicodeSpan, spans.items, {}, lowerCode);
+    return .{ .spans = spans.items, .text = text.items };
+}
+
+fn lowerCode(_: void, a: UnicodeSpan, b: UnicodeSpan) bool {
+    return a.low < b.low;
+}
+
+/// Appends a UTF-16BE destination string to the pool as UTF-8, and says how
+/// many bytes it added.
+///
+/// Truncated at `max_unicode`, which is thirty-two bytes and eight times the
+/// longest ligature anyone has written: a destination longer than that is a
+/// producer emitting a whole word for one code, and carrying it would let one
+/// bad font grow the pool without bound.
+fn appendUtf8(
+    arena: Allocator,
+    text: *std.ArrayList(u8),
+    utf16be: []const u8,
+) Allocator.Error!u16 {
+    const before = text.items.len;
+    var i: usize = 0;
+    while (i + 1 < utf16be.len) : (i += 2) {
+        var cp: u32 = (@as(u32, utf16be[i]) << 8) | utf16be[i + 1];
+        if (cp >= 0xd800 and cp <= 0xdbff and i + 3 < utf16be.len) {
+            const low = (@as(u32, utf16be[i + 2]) << 8) | utf16be[i + 3];
+            if (low >= 0xdc00 and low <= 0xdfff) {
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                i += 2;
+            }
+        }
+        // An unpaired surrogate, and U+0000, which producers use as filler in
+        // a `bfrange` array for codes they did not want to map.
+        if (cp == 0 or (cp >= 0xd800 and cp <= 0xdfff)) continue;
+
+        var one: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(@intCast(cp), &one) catch continue;
+        if (text.items.len - before + len > max_unicode) break;
+        try text.appendSlice(arena, one[0..len]);
+    }
+    return @intCast(text.items.len - before);
+}
+
 fn packBytes(bytes: []const u8) u32 {
     var v: u32 = 0;
     for (bytes[0..@min(bytes.len, 4)]) |b| v = (v << 8) | b;
@@ -393,19 +689,75 @@ pub fn load(arena: Allocator, doc: *Document, dict: Dict, ref: u32) Error!Font {
 
     const subtype = if (try doc.get(dict, "Subtype")) |v| v.asName() orelse "" else "";
 
+    // Before the branch: a `/ToUnicode` on a Type0 font says what its CIDs
+    // mean and is the only thing that can, so it is not a simple-font detail.
+    try f.loadToUnicode(arena, doc, dict);
+
     if (std.mem.eql(u8, subtype, "Type0")) {
         f.kind = .composite;
         try f.loadComposite(arena, doc, dict);
         return f;
     }
 
-    if (std.mem.eql(u8, subtype, "Type3")) {
-        f.kind = .type3;
-        try f.loadType3(arena, doc, dict);
-    }
+    if (std.mem.eql(u8, subtype, "Type3")) f.kind = .type3;
 
+    try f.loadEncoding(arena, doc, dict);
+    if (f.kind == .type3) try f.loadType3(doc, dict);
     try f.loadSimpleWidths(arena, doc, dict);
     return f;
+}
+
+fn loadToUnicode(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Error!void {
+    const v = try doc.get(dict, "ToUnicode") orelse return;
+    const stream = v.asStream() orelse return;
+    const data = try doc.streamData(stream);
+    const map = try parseToUnicode(arena, data.data);
+    f.to_unicode = map.spans;
+    f.unicode_text = map.text;
+}
+
+/// `/Encoding`, which is either a name or a dictionary with a `/BaseEncoding`
+/// and a `/Differences` array (§9.6.6).
+///
+/// Read for every simple font. It used to be read only for Type 3, where
+/// `/Differences` is the only way a code finds its glyph procedure; the rest
+/// of the chain happened in `vanagandr/glyphs.zig`, which reads the same
+/// dictionary again to bind a Týr face. Both still do -- that one is about
+/// finding an *outline* and this one is about finding a *letter*, and they
+/// disagree on purpose for symbolic fonts.
+fn loadEncoding(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Error!void {
+    const enc = try doc.get(dict, "Encoding") orelse return;
+
+    if (enc.asName()) |name| {
+        f.base_encoding = encoding.Kind.fromName(name) orelse .builtin;
+        return;
+    }
+
+    const table = enc.asDict() orelse return;
+    if (try doc.get(table, "BaseEncoding")) |base| {
+        if (base.asName()) |name| {
+            f.base_encoding = encoding.Kind.fromName(name) orelse .builtin;
+        }
+    }
+
+    const diff = try doc.get(table, "Differences") orelse return;
+    const entries = diff.asArray() orelse return;
+
+    const names = try arena.alloc([]const u8, 256);
+    @memset(names, "");
+    // An integer sets the code the following names are assigned from, and
+    // each name advances it: `[1 /a /b 5 /z]` is a, b, then z at 5.
+    var code: usize = 0;
+    for (entries) |entry| {
+        const resolved = try doc.resolve(entry);
+        if (resolved.asInt()) |n| {
+            code = if (n < 0 or n > 255) 256 else @intCast(n);
+        } else if (resolved.asName()) |name| {
+            if (code < 256) names[code] = name;
+            code += 1;
+        }
+    }
+    f.differences = names;
 }
 
 fn loadSimpleWidths(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Error!void {
@@ -437,7 +789,7 @@ fn loadSimpleWidths(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Erro
     f.widths_assumed = f.widths.len == 0 and f.missing_width == 0 and f.kind != .type3;
 }
 
-fn loadType3(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Error!void {
+fn loadType3(f: *Font, doc: *Document, dict: Dict) Error!void {
     if (try doc.get(dict, "FontMatrix")) |v| {
         if (v.asArray()) |a| {
             if (a.len >= 6) {
@@ -451,29 +803,6 @@ fn loadType3(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Error!void 
     }
     if (try doc.get(dict, "CharProcs")) |v| f.char_procs = v.asDict();
     if (try doc.get(dict, "Resources")) |v| f.resources = v.asDict();
-
-    // `/Differences` is the only way a Type 3 code finds its procedure.
-    if (try doc.get(dict, "Encoding")) |enc| {
-        if (enc.asDict()) |encoding| {
-            if (try doc.get(encoding, "Differences")) |diff| {
-                if (diff.asArray()) |entries| {
-                    const names = try arena.alloc([]const u8, 256);
-                    @memset(names, "");
-                    var code: usize = 0;
-                    for (entries) |entry| {
-                        const resolved = try doc.resolve(entry);
-                        if (resolved.asInt()) |n| {
-                            code = if (n < 0 or n > 255) 256 else @intCast(n);
-                        } else if (resolved.asName()) |name| {
-                            if (code < 256) names[code] = name;
-                            code += 1;
-                        }
-                    }
-                    f.encoding = names;
-                }
-            }
-        }
-    }
 }
 
 fn loadComposite(f: *Font, arena: Allocator, doc: *Document, dict: Dict) Error!void {
@@ -692,4 +1021,120 @@ test "a Type 3 width goes through the font matrix, not through 1000" {
         .font_matrix = .{ .a = 0.01, .d = 0.01 },
     };
     try testing.expectApproxEqAbs(@as(f64, 1.0), f.advance(.{ .code = 0, .cid = 0, .len = 1 }), 1e-9);
+}
+
+test "a bfchar maps one code and a bfrange maps a run of them" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const src =
+        \\/CIDInit /ProcSet findresource begin
+        \\1 begincodespacerange <00> <ff> endcodespacerange
+        \\2 beginbfchar
+        \\<01> <0041>
+        \\<02> <00660069>
+        \\endbfchar
+        \\1 beginbfrange
+        \\<10> <12> <0061>
+        \\endbfrange
+        \\endcmap
+    ;
+    const map = try parseToUnicode(arena_state.allocator(), src);
+    const f: Font = .{ .to_unicode = map.spans, .unicode_text = map.text };
+
+    var buf: [max_unicode]u8 = undefined;
+    try testing.expectEqualStrings("A", f.unicodeFor(0x01, &buf));
+    // A ligature: one code, two letters, which is why this produces text.
+    try testing.expectEqualStrings("fi", f.unicodeFor(0x02, &buf));
+    try testing.expectEqualStrings("a", f.unicodeFor(0x10, &buf));
+    try testing.expectEqualStrings("c", f.unicodeFor(0x12, &buf));
+}
+
+test "a bfrange array gives one destination per code and steps nothing" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const src =
+        \\1 beginbfrange
+        \\<20> <22> [<0041> <005A> <0030>]
+        \\endbfrange
+    ;
+    const map = try parseToUnicode(arena_state.allocator(), src);
+    const f: Font = .{ .to_unicode = map.spans, .unicode_text = map.text };
+
+    var buf: [max_unicode]u8 = undefined;
+    try testing.expectEqualStrings("A", f.unicodeFor(0x20, &buf));
+    try testing.expectEqualStrings("Z", f.unicodeFor(0x21, &buf));
+    try testing.expectEqualStrings("0", f.unicodeFor(0x22, &buf));
+}
+
+test "a surrogate pair is one code point, and an unpaired one is dropped" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const src =
+        \\2 beginbfchar
+        \\<01> <D83DDE00>
+        \\<02> <D800>
+        \\endbfchar
+    ;
+    const map = try parseToUnicode(arena_state.allocator(), src);
+    const f: Font = .{ .to_unicode = map.spans, .unicode_text = map.text };
+
+    var buf: [max_unicode]u8 = undefined;
+    try testing.expectEqualStrings("\u{1F600}", f.unicodeFor(0x01, &buf));
+    // Half a pair is not a character. Nothing, rather than U+D800, which is
+    // not encodable as UTF-8 at all.
+    try testing.expectEqualStrings("", f.unicodeFor(0x02, &buf));
+}
+
+test "with no /ToUnicode the encoding chain answers, differences first" {
+    var names: [256][]const u8 = @splat("");
+    names[0x41] = "bullet";
+    const f: Font = .{ .base_encoding = .win_ansi, .differences = &names };
+
+    var buf: [max_unicode]u8 = undefined;
+    // `/Differences` beats the base encoding for the code it names.
+    try testing.expectEqualStrings("\u{2022}", f.unicodeFor(0x41, &buf));
+    // And the base encoding answers for every code it does not.
+    try testing.expectEqualStrings("B", f.unicodeFor(0x42, &buf));
+    // WinAnsi's high range, which Standard would have read differently.
+    try testing.expectEqualStrings("\u{20AC}", f.unicodeFor(0x80, &buf));
+}
+
+test "a font that names no encoding still reads as ASCII" {
+    // The commonest simple font there is: no /ToUnicode, no /Encoding, and
+    // a search over the page still has to find the word.
+    const f: Font = .{};
+    var buf: [max_unicode]u8 = undefined;
+    try testing.expectEqualStrings("A", f.unicodeFor('A', &buf));
+    try testing.expectEqualStrings(" ", f.unicodeFor(' ', &buf));
+}
+
+test "a composite font with no /ToUnicode says nothing rather than guessing" {
+    const f: Font = .{ .kind = .composite };
+    var buf: [max_unicode]u8 = undefined;
+    try testing.expectEqualStrings("", f.unicodeFor(0x41, &buf));
+}
+
+test "a simple font's map folds its ASCII run into one stepping span" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const f: Font = .{};
+    const map = try f.unicodeSpans(arena_state.allocator());
+
+    // Every letter and digit means itself under StandardEncoding, so the
+    // whole of `0..9A..Za..z` is three spans and not sixty-two.
+    var covering: ?UnicodeSpan = null;
+    for (map.spans) |s| {
+        if ('A' >= s.low and 'A' <= s.high) covering = s;
+    }
+    try testing.expect(covering != null);
+    try testing.expect(covering.?.high >= 'Z');
+    try testing.expect(covering.?.step);
+
+    var buf: [max_unicode]u8 = undefined;
+    try testing.expectEqualStrings("A", DisplayList.unicodeIn(map.spans, map.text, 'A', &buf));
+    try testing.expectEqualStrings("~", DisplayList.unicodeIn(map.spans, map.text, '~', &buf));
 }

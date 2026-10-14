@@ -108,6 +108,41 @@ pub fn unicodeForName(name: []const u8) ?u21 {
     return null;
 }
 
+/// The code point a code means under one of the standard encodings: the three
+/// tables and the glyph list folded together at compile time.
+///
+/// `nameFor` and then `unicodeForName` is the same answer, and is how the
+/// only caller wrote it first. That is a scan of three hundred names per
+/// code, and text extraction asks for all two hundred and fifty-six of a
+/// font's codes the moment the font is loaded -- eighty thousand string
+/// compares per font per page, for an answer that cannot change. Folded, it
+/// is one array index.
+pub fn codepointFor(k: Kind, code: u8) ?u21 {
+    const table = switch (k) {
+        .standard => &standard_points,
+        .win_ansi => &win_ansi_points,
+        .mac_roman => &mac_roman_points,
+        .mac_expert, .builtin => return null,
+    };
+    // Zero is the unmapped marker rather than a sentinel of its own: no
+    // encoding names the null character, so nothing is lost saying so.
+    return if (table[code] == 0) null else table[code];
+}
+
+const standard_points = foldPoints(standard);
+const win_ansi_points = foldPoints(win_ansi);
+const mac_roman_points = foldPoints(mac_roman);
+
+fn foldPoints(comptime table: [256]?[]const u8) [256]u21 {
+    @setEvalBranchQuota(200_000);
+    var out: [256]u21 = @splat(0);
+    for (table, 0..) |entry, i| {
+        const name = entry orelse continue;
+        out[i] = unicodeForName(name) orelse 0;
+    }
+    return out;
+}
+
 /// `g42`, `glyph42`, `index42`, `cid42`: a name that is really a glyph number.
 ///
 /// Subsetters that drop the `post` table emit these, and a reader that does

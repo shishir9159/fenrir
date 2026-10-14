@@ -170,24 +170,32 @@ fn writeText(w: *Writer, list: DisplayList, run: TextRun, opts: Options) Writer.
     try writePaint(w, run.fill);
     try w.print(" {f} {d}g", .{ run.transform, glyphs.len });
 
+    var buf: [DisplayList.max_unicode]u8 = undefined;
+
     if (opts.glyphs) {
         for (glyphs, 0..) |g, i| {
             try w.print("\n    [{d}] code=0x{X:0>4}", .{ i, g.code });
             if (g.id != Glyph.unresolved_glyph) try w.print(" gid={d}", .{g.id});
+            const meaning = list.unicodeFor(run.font, g.code, &buf);
+            if (meaning.len != 0) try w.print(" \"{s}\"", .{meaning});
             try w.print(" at {f}", .{g.offset});
         }
     } else {
-        // A best-effort readable form. Codes are not Unicode until the font
-        // layer resolves /ToUnicode, but for the simple fonts that dominate
-        // most documents they are close enough to read a trace by.
+        // The run as text, which is the one line of a trace that says whether
+        // the `/ToUnicode` chain worked -- a font whose codes nothing maps
+        // prints a row of dots here and is a subset with no map and no
+        // recognisable names.
         try w.writeAll(" \"");
         for (glyphs) |g| {
-            if (g.code >= 0x20 and g.code < 0x7f) {
-                if (g.code == '"' or g.code == '\\') try w.writeByte('\\');
-                try w.writeByte(@intCast(g.code));
-            } else {
+            const meaning = list.unicodeFor(run.font, g.code, &buf);
+            if (meaning.len == 0) {
                 try w.writeByte('.');
+                continue;
             }
+            if (meaning.len == 1 and (meaning[0] == '"' or meaning[0] == '\\')) {
+                try w.writeByte('\\');
+            }
+            try w.writeAll(meaning);
         }
         try w.writeByte('"');
     }
