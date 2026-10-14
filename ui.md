@@ -626,20 +626,89 @@ still is not in a test. The check that a rail starts under the bar is a
 picture and can only be a picture: `newTab` twice at the top of the session, a
 `--device` shot in each theme, and both taken out again before the commit.
 
-### Phase 6 — the command registry and the palette
+### Phase 6 — the command registry and the palette ✅
 
-| Commit | Files | ~ |
-|---|---|---|
-| commands, in a table with their names | `src/hlidskjalf/commands.zig` | 250 |
-| the command palette | `read.zig` | 280 |
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | commands, in a table with their names | `hlidskjalf/commands.zig`, `vanagandr/commands.zig` | 438 |
+| ✅ | ranking the commands against what was typed | `vanagandr/palette.zig` | 459 |
+| ✅ | the command palette, on ctrl-p and :commands | `palette.zig`, `keys.zig`, `read.zig` | 615 |
 
-`Session.exec` dispatches on `std.meta.stringToEnum(Builtin, …)` — names with
+`Session.exec` dispatched on `std.meta.stringToEnum(Builtin, …)` — names with
 no descriptions and nothing to enumerate. The registry is one array of
-`{ name, aliases, description, icon, mode_mask }`; `exec` looks it up and then
-runs the same switch. One source of truth, and the palette, the menus and
-`fenrir commands` all read it. Plugin commands come from
-`Runtime.commandNames()` and keymaps from `keymapList()`, both of which
-already exist.
+`{ id, name, aliases, args, about, icon, binding, modes }`; `exec` looks a
+name up and runs the same switch it always ran. `<C-p>` and `:commands` open
+the palette over the page; a row runs its command, and a row that needs an
+argument puts its name on the `:` line with a space after it.
+
+**The abbreviations were the enum's real cost.** `q`, `sp`, `vs`, `tabn`,
+`bn` were a second dozen tags, which made every arm read `.q, .quit =>` and
+made the list of commands unenumerable — twelve of the thirty-three names
+were spellings of another name and nothing said so. As `aliases` they are
+data: `find` walks them, the listing prints them in a column, and the palette
+searches them, so `sp` finds `:split` in all three places from one table.
+
+**The mode mask is the one field nothing narrows yet, and it was still right
+to put in.** Every built-in is offered in every mode. It is there because a
+plugin's command already declares one — Galdr's keymaps have carried a
+`ModeSet` since they were written — and the palette merges the two lists into
+one array of rows. A row that could not say which modes it belongs in would
+have had to be two kinds of row, and phase eight would have added the field
+anyway, to a table with call sites.
+
+### What phase 6 cost, against what it was budgeted
+
+Two commits at 530 became three at 1512, and the average commit was 504 — the
+worst of any phase here, and against a rule that asks for three hundred.
+
+**A table is not a small commit, and calling it one is the mistake.** The
+budget said 250 for the registry and it landed at 438 with the command that
+prints it. The table itself is 30 lines of data; the other 400 are the
+documentation of what a field means, the checks that no two commands answer
+to the same word, and `fenrir commands`. The same thing happened in phase two
+with the icons. **The estimate to make for a registry is the estimate for a
+file, four hundred lines, and not the estimate for its data.**
+
+**The table was written out one field a line and it was unreadable.** Eight
+lines an entry for twenty-six entries is a page of braces, and the thing
+being checked by eye — that twenty-six rows agree about their column widths,
+their voice, their icons — cannot be checked across a page of braces. Written
+one entry a line it is 30 lines and a column can be read down. The reason the
+first version came out long is that every other struct in this program is
+written that way, and every other struct is not a table.
+
+**`fenrir commands --match` is the half of a palette a picture cannot check.**
+A `--device` shot says the list is drawn, in the right colours, with the last
+row whole. It says nothing at all about whether `tn` should have found
+`tabnew` before `tabonly`, which is the half that decides whether the palette
+is any good. Printing the ranking with the score beside each row made that a
+diff, and it is how the description matcher was found to be wrong: matching a
+sentence as a subsequence, `ce` hit twenty of twenty-five commands. A
+substring there and a subsequence in the name is the whole fix, and it took
+one run of a command that already existed to see it.
+
+**The picture found what the picture always finds, which is a number.** The
+popup's height was `pad * 2 + 26 + rows * 26`, which looks right and leaves an
+eleventh row cut in half at the bottom, because the list is `.fill` and slack
+at the bottom of a scroll view is not padding — it is another row. Twelve
+tests over the ranking, the keyboard, the clicks and the dismissal all passed
+with it wrong. That is the third phase running where the tests covered the
+behaviour and a shot covered the geometry.
+
+**A control that appears already wanting the keyboard has to ask, and has to
+name itself correctly.** The settings page learned this in phase three, and
+the palette got it wrong anyway: the focus key was `palette/query` and the
+field is `palette/head/query`, because it is inside the row that holds it.
+Nothing crashed, nothing looked wrong in a shot — the palette simply did not
+take what was typed, which was two tests failing in a way that named the box
+rather than the bug. **A key worked out by hand is a path, and a path is
+wrong until something walks it.**
+
+**Two names for two palettes.** `Session.palette` was the left rail's eight
+highlight colours and the command palette wanted the same word. The colours
+became `swatches`, which is what they are. A field renamed on the day a second
+meaning arrives costs three lines; the same rename after the second meaning
+has call sites is the kind of change nobody makes.
 
 ### Phase 7 — text as characters, then search
 
@@ -879,10 +948,40 @@ Things that cost time once and should not cost it again.
   `Chrome.top` — for the same reason `reserved_below` is a constant in
   `rails.zig`, and the tests of all three still pass zero, because in a test
   there is nothing above them. A picture is the only check.
+- **A registry costs what a file costs, not what its data costs.** The icon
+  table and the command table were both budgeted at their rows and both came
+  in at four hundred lines, because a registry arrives with a paragraph per
+  field explaining what it means, a test that no two rows collide, and the
+  command that prints it. Estimate the file.
+- **A table is written one entry a line.** Every other struct in this program
+  is written one field a line and a table is not another struct: the thing
+  being checked by eye is that twenty-six rows agree with each other about
+  their voice, their columns and their icons, and that cannot be checked
+  across a page of braces. Twenty-six entries are thirty lines, not two
+  hundred.
+- **A key worked out by hand is a path, and the path is wrong until something
+  walks it.** The palette's field asks for focus before it exists, which means
+  naming it — and the name was `palette/query` where the box is
+  `palette/head/query`, because it sits inside the row that holds it. Nothing
+  crashed and no shot looked wrong; the field simply never took what was
+  typed. A test that types a letter and reads it back is the check, and it is
+  two lines.
+- **A ranking is the half of a list that a picture cannot check.** A shot says
+  the rows are drawn and the last one is whole. It says nothing about whether
+  `tn` should have found `tabnew` before `tabonly`, which is the half that
+  decides whether a palette is worth opening. `fenrir commands --match`
+  prints the order with the score beside each row, which makes a change to the
+  scoring a diff — and is how matching a description as a subsequence was
+  found to hit twenty of twenty-five commands for `ce`.
+- **Rename a field the day a second meaning arrives.** `Session.palette` was
+  the left rail's eight colours and the command palette wanted the word. The
+  colours became `swatches` in three lines. The same rename once the second
+  meaning has call sites is the kind nobody makes, and the two live side by
+  side being confused for each other for a year.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
-  and 472, because a widget arrives with its documentation and its tests and
+  and 615, because a widget arrives with its documentation and its tests and
   the three do not divide neatly. Two seams that did work, and are worth
   reaching for first: split a *model* from the *widget that draws it* (the
   text field), and split the *keyboard* from the *mouse* (the same). Splitting
@@ -901,6 +1000,9 @@ zig build -Dtarget=x86_64-linux-gnu     # if the change touches Lyngvi or the bu
 fenrir ui --out ui.png [--atlas a.png]  # the whole stack, no GPU: fastest look at a layout
 fenrir read F --shot s.png --path cpu   # the composed reader frame, no display
 fenrir read F --shot s.png --device     # what the GPU actually drew, read back
+
+fenrir icons [--out sheet.png]          # every icon, and whether it draws
+fenrir commands [--match QUERY]         # every `:` command, and how it ranks
 ```
 
 Most of the new code is testable with no window, no device and no font —
