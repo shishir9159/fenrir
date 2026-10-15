@@ -16,6 +16,7 @@ const fenrir = @import("fenrir");
 const Context = @import("Context.zig");
 
 const content = fenrir.content;
+const search = fenrir.hlidskjalf.search;
 const trace = fenrir.gelgja.trace;
 
 pub const usage =
@@ -34,6 +35,8 @@ pub const usage =
     \\                 line of recovered text, with the column it was put in.
     \\    --text       The page as one string, which is what a search runs
     \\                 over. `--lines` is the same text with its geometry.
+    \\    --find Q     Every match of Q on the page, with the boxes a
+    \\                 highlight would be drawn over. Pair with --all.
     \\    --no-rotate  Ignore /Rotate, so coordinates match the file's own
     \\                 numbers rather than what a reader would display.
     \\    --no-type3   Do not run Type 3 glyph procedures.
@@ -49,6 +52,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     // What to print. Four mutually exclusive shapes rather than four bools,
     // because `--stats --lines` has no meaning and a flag each invites it.
     var shape: Shape = .list;
+    var query: []const u8 = &.{};
     var options: content.Options = .{};
     var trace_options: trace.Options = .{};
 
@@ -70,6 +74,11 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             trace_options.glyphs = true;
         } else if (std.mem.eql(u8, arg, "--text")) {
             shape = .text;
+        } else if (std.mem.eql(u8, arg, "--find")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--find needs something to look for", .{});
+            query = argv[i];
+            shape = .find;
         } else if (std.mem.eql(u8, arg, "--lines")) {
             shape = .lines;
         } else if (std.mem.eql(u8, arg, "--no-rotate")) {
@@ -105,7 +114,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         for (list, 0..) |p, index| {
             if (index != 0) try ctx.out.writeByte('\n');
             try ctx.out.print("# ---- page {d} of {d} ----\n", .{ index + 1, list.len });
-            const diag = try tracePage(ctx, &doc, p, options, trace_options, shape);
+            const diag = try tracePage(ctx, &doc, p, options, trace_options, shape, query);
             accumulate(&total, diag);
         }
         try ctx.out.print("\n# {d} pages\n", .{list.len});
@@ -124,12 +133,13 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         options,
         trace_options,
         shape,
+        query,
     );
     try writeDiagnostics(ctx, diag);
 }
 
 /// What `trace` prints for a page.
-const Shape = enum { list, stats, lines, text };
+const Shape = enum { list, stats, lines, text, find };
 
 fn tracePage(
     ctx: *Context,
@@ -138,6 +148,7 @@ fn tracePage(
     options: content.Options,
     trace_options: trace.Options,
     shape: Shape,
+    query: []const u8,
 ) !content.Interpreter.Diagnostics {
     var result = content.page(ctx.gpa, doc, p, options) catch |err|
         return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
@@ -164,6 +175,37 @@ fn tracePage(
         defer map.deinit(ctx.gpa);
         try ctx.out.writeAll(map.text);
         try ctx.out.writeByte('\n');
+        return result.diagnostics;
+    }
+
+    if (shape == .find) {
+        var map = try fenrir.hlidskjalf.text.build(ctx.gpa, result.list);
+        defer map.deinit(ctx.gpa);
+
+        var hits: std.ArrayList(search.Hit) = .empty;
+        defer hits.deinit(ctx.gpa);
+        // Smartcase, the same rule the reader's `/` uses: a query with a
+        // capital in it is case-sensitive.
+        const fold_case = for (query) |c| {
+            if (std.ascii.isUpper(c)) break false;
+        } else true;
+        try search.find(ctx.gpa, &hits, map, p.index, query, fold_case);
+
+        for (hits.items) |h| {
+            try ctx.out.print(
+                "page {d:>4}  line {d:>4}  x {d: >7.2}..{d: >7.2}  y {d: >7.2}  {d:>3}g  {s}{s}\n",
+                .{
+                    h.page + 1,
+                    h.line,
+                    h.box.min_x,
+                    h.box.max_x,
+                    h.box.min_y,
+                    h.count,
+                    if (h.starts) "" else "... ",
+                    map.lines[h.line].string(map),
+                },
+            );
+        }
         return result.diagnostics;
     }
 
