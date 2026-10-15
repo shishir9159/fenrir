@@ -4541,23 +4541,39 @@ test "closing the last window is a quit, and closing others is not" {
 
 /// `rows` lines of `cols` glyphs each, twenty points apart, as page `page`'s
 /// text map in buffer 0. Words are two glyphs long.
+/// `rows` lines of `cols` glyphs, as two words a line.
+///
+/// Two runs and not one, because that is the only shape a word gap can
+/// reach this layer in: a `TJ` kern moves the text matrix and so ends the
+/// run, which means the next word starts a few points right of where the
+/// last one finished. Inside a run the glyphs are flush against each other,
+/// and `w` has nothing to stop at.
 fn putText(s: *Session, page: u32, rows: usize, cols: usize) !void {
     const gpa = s.gpa;
     const glyphs = try gpa.alloc(gelgja.DisplayList.Glyph, rows * cols);
     defer gpa.free(glyphs);
-    const cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, rows);
+    const cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, rows * 2);
     defer gpa.free(cmds);
+
+    const word = @max(cols / 2, 1);
+    const advance = 10 * @as(f32, @floatFromInt(word));
     for (0..rows) |row| {
         for (0..cols) |col| {
-            // Every second glyph is followed by a wider advance: a word gap.
-            const x = 10 * @as(f32, @floatFromInt(col)) + 6 * @as(f32, @floatFromInt(col / 2));
-            glyphs[row * cols + col] = .{ .code = 'a', .offset = .{ .x = x, .y = 0 } };
+            const within: f32 = @floatFromInt(col % word);
+            glyphs[row * cols + col] = .{ .code = 'a', .offset = .{ .x = 10 * within, .y = 0 } };
         }
-        cmds[row] = .{ .text = .{
-            .size = 10,
-            .transform = .translation(100, 700 - 20 * @as(f32, @floatFromInt(row))),
-            .glyphs = .{ .start = @intCast(row * cols), .count = @intCast(cols) },
-        } };
+        for (0..2) |w| {
+            const first = row * cols + w * word;
+            cmds[row * 2 + w] = .{ .text = .{
+                .size = 10,
+                .transform = .translation(
+                    100 + @as(f32, @floatFromInt(w)) * (advance + 6),
+                    700 - 20 * @as(f32, @floatFromInt(row)),
+                ),
+                .glyphs = .{ .start = @intCast(first), .count = @intCast(@min(word, cols - w * word)) },
+                .advance = advance,
+            } };
+        }
     }
     s.buffer(0).putMap(gpa, page, try text.build(gpa, .{ .glyphs = glyphs, .cmds = cmds }));
 }

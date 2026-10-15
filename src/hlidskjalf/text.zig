@@ -36,6 +36,22 @@
 //! paper, and half an em past the *start* of the last letter is a different
 //! place for an `l` than for an `m`.
 //!
+//! ## The page as a string
+//!
+//! `Page.text` is the same glyphs read as words: every line's text end to
+//! end, in reading order, with a newline between lines. It exists so that a
+//! search is a substring search over one buffer rather than a walk over
+//! boxes, and every box and line carries its span of it, so a byte offset
+//! comes back as a rectangle on the page in two binary searches.
+//!
+//! What a code *means* is not worked out here. `DisplayList.unicodeFor` has
+//! it, resolved once per font by the layer that could still see the font
+//! dictionary; this asks per glyph and writes down the answer.
+//!
+//! The only text this file invents is the word spaces, and the rule for them
+//! is `gapIsSpace`, which is worth reading before changing anything about
+//! word boundaries.
+//!
 //! ## Displayed equations are still wrong, and are the next thing here
 //!
 //! Inline mathematics is handled: `fold` puts a dropped subscript back on the
@@ -71,9 +87,14 @@ const Point = gelgja.Point;
 /// One glyph, placed.
 pub const Box = struct {
     /// The character code from the content stream, as `DisplayList.Glyph`
-    /// carries it. Kept so that a selection can one day become text; nothing
-    /// here interprets it.
+    /// carries it. Kept beside the text because it is what a font binding
+    /// and a trace are written in terms of.
     code: u32 = 0,
+    /// What this glyph says, as a span of `Page.text`. Usually one letter;
+    /// several for a ligature, and none for a code the document gives no
+    /// meaning to.
+    at: u32 = 0,
+    len: u8 = 0,
     /// In PDF user space.
     box: Bounds = .empty,
     /// The glyph's own baseline in user space -- where the pen was, not where
@@ -81,17 +102,14 @@ pub const Box = struct {
     /// descender, and grouping by a guess would put the lines of a document
     /// two points off where its text actually sits.
     base: f32 = 0,
-    /// The advance after this glyph looked like it contained a space.
-    ///
-    /// PDFs made by TeX, and many others, never draw a space: the gap between
-    /// words is a kerning number in a `TJ` array, so a word boundary is only
-    /// visible as a glyph whose advance is longer than a glyph's. This is that
-    /// guess, made while the run is still together -- once glyphs are sorted
-    /// into lines, which glyph followed which in the file is gone.
-    space_after: bool = false,
+    /// True when this glyph *is* a space, taken from what it says rather
+    /// than from its code: a composite font's code 32 is a CID and means
+    /// whatever the character collection says it means, which on a page of
+    /// Japanese is a letter.
+    space: bool = false,
 
     pub fn isSpace(b: Box) bool {
-        return b.code == ' ';
+        return b.space;
     }
 
     pub fn middle(b: Box) f32 {
@@ -112,9 +130,17 @@ pub const Line = struct {
     /// Which column of the page the line belongs to, counting from the left.
     /// Zero on a page with one column, which is most of them.
     column: u32 = 0,
+    /// The line as a span of `Page.text`, its inserted word spaces included
+    /// and its newline not.
+    at: u32 = 0,
+    len: u32 = 0,
 
     pub fn glyphs(l: Line, page: Page) []const Box {
         return page.boxes[l.first..][0..l.count];
+    }
+
+    pub fn string(l: Line, page: Page) []const u8 {
+        return page.text[@min(l.at, page.text.len)..][0..@min(l.len, page.text.len - l.at)];
     }
 };
 
@@ -122,15 +148,66 @@ pub const Line = struct {
 pub const Page = struct {
     boxes: []Box = &.{},
     lines: []Line = &.{},
+    /// The whole page as one string, in reading order: each line's glyphs
+    /// end to end, a space where a word boundary was drawn as a gap rather
+    /// than as a space, and a newline between lines.
+    ///
+    /// One string and not one per line, because a search is a substring
+    /// search and a search that had to be run per line would miss nothing
+    /// and allocate per line to find it. Every box and every line carries
+    /// its span of this, so a byte offset in here goes back to a rectangle
+    /// on the page in two binary searches.
+    text: []const u8 = &.{},
 
     pub fn deinit(p: *Page, gpa: Allocator) void {
         gpa.free(p.boxes);
         gpa.free(p.lines);
+        gpa.free(p.text);
         p.* = .{};
     }
 
     pub fn isEmpty(p: Page) bool {
         return p.lines.len == 0;
+    }
+
+    /// What one glyph says.
+    pub fn stringOf(p: Page, b: Box) []const u8 {
+        if (b.at >= p.text.len) return &.{};
+        return p.text[b.at..][0..@min(b.len, p.text.len - b.at)];
+    }
+
+    /// Where a byte of `text` is on the page: the glyph that wrote it, as an
+    /// index into `boxes`.
+    ///
+    /// Boxes are in reading order and so their spans ascend, which is what
+    /// makes this a search rather than a scan -- a match in the footnotes of
+    /// a dense page is forty thousand boxes in.
+    ///
+    /// A byte that no glyph wrote -- an inserted word space, a newline --
+    /// belongs to the glyph before it, which is the one a search wants: a
+    /// match beginning at a space still has to highlight something.
+    pub fn glyphAt(p: Page, at: u32) ?u32 {
+        if (p.boxes.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = p.boxes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (p.boxes[mid].at <= at) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) 0 else @intCast(lo - 1);
+    }
+
+    /// Which line a box belongs to. Lines are spans of `boxes` in order, so
+    /// this is the same search from the other side.
+    pub fn lineOf(p: Page, box: u32) u32 {
+        if (p.lines.len == 0) return 0;
+        var lo: usize = 0;
+        var hi: usize = p.lines.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (p.lines[mid].first <= box) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) 0 else @intCast(lo - 1);
     }
 
     /// The line nearest a point in user space, for a click and for a cursor
@@ -180,21 +257,15 @@ pub const Page = struct {
 
     /// Whether glyph `i` of `line` begins a word: `w` and `b` stop here.
     ///
-    /// Three signs of a boundary, any of which will do: an explicit space
-    /// glyph before it, an advance before it long enough to hide one, or a
-    /// visible gap between the two boxes -- which is how words emitted as
-    /// separate `Tj` operators look. The gap is measured against the glyph's
-    /// height so that it means the same at eight points and at twenty-four.
+    /// Two signs, either of which will do: a space glyph before it, or a
+    /// visible gap between the two boxes. See `gapIsSpace`.
     pub fn wordStart(p: Page, line: u32, i: u32) bool {
         if (line >= p.lines.len) return false;
         const glyphs = p.lines[line].glyphs(p);
         if (i >= glyphs.len) return false;
         if (glyphs[i].isSpace()) return false;
         if (i == 0) return true;
-        const prev = glyphs[i - 1];
-        if (prev.isSpace() or prev.space_after) return true;
-        const gap = glyphs[i].box.min_x - prev.box.max_x;
-        return gap > glyphs[i].box.height() * 0.15;
+        return glyphs[i - 1].isSpace() or gapIsSpace(glyphs[i - 1], glyphs[i]);
     }
 
     /// Whether glyph `i` ends a word: `e` stops here.
@@ -241,6 +312,16 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
     var boxes: std.ArrayList(Box) = .empty;
     errdefer boxes.deinit(gpa);
 
+    // What each glyph says, in the order the content stream drew them. The
+    // page's own string cannot be built here: reading order is not drawing
+    // order and is not known until the boxes have been grouped. So the text
+    // is gathered once, addressed by span, and copied into its final order
+    // below -- which is one pass over a few hundred kilobytes rather than
+    // resolving every code a second time.
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    var meaning_buf: [DisplayList.max_unicode]u8 = undefined;
+
     for (list.cmds) |cmd| {
         const run = switch (cmd) {
             .text => |t| t,
@@ -248,7 +329,6 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
         };
         const glyphs = list.glyphsOf(run);
         if (glyphs.len == 0) continue;
-        const gap_after = wordGap(glyphs, run.size);
 
         for (glyphs, 0..) |g, i| {
             // The advance the producer actually used, which is what puts a
@@ -279,12 +359,18 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
             if (box.isEmpty()) continue;
             if (!std.math.isFinite(box.min_x) or !std.math.isFinite(box.max_y)) continue;
 
+            const meaning = list.unicodeFor(run.font, g.code, &meaning_buf);
+            const at: u32 = @intCast(scratch.items.len);
+            try scratch.appendSlice(gpa, meaning);
+
             const pen = run.transform.apply(g.offset);
             try boxes.append(gpa, .{
                 .code = g.code,
+                .at = at,
+                .len = @intCast(meaning.len),
                 .box = box,
                 .base = pen.y,
-                .space_after = i + 1 < glyphs.len and advance > gap_after,
+                .space = meaning.len == 1 and meaning[0] == ' ',
             });
         }
     }
@@ -297,24 +383,79 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
     const owned = try boxes.toOwnedSlice(gpa);
     errdefer gpa.free(owned);
     const lines = try group(gpa, owned);
-    return .{ .boxes = owned, .lines = lines };
+    errdefer gpa.free(lines);
+    const text = try flatten(gpa, owned, lines, scratch.items);
+    return .{ .boxes = owned, .lines = lines, .text = text };
 }
 
-/// How long an advance has to be before it is taken to contain a space.
+/// Puts the page's text together in reading order, and rewrites every box's
+/// and line's span to point into it.
 ///
-/// The larger of three-fifths of an em and half as much again as the run's
-/// typical advance. The em alone would split every `m` and `W` in two; the
-/// median alone would split every word of a run set in a narrow font.
-/// Together they catch TeX's interword space, which is a letter plus a third
-/// of an em, and miss the widest letters.
-fn wordGap(glyphs: []const DisplayList.Glyph, size: f32) f32 {
-    if (glyphs.len < 2) return std.math.floatMax(f32);
-    var buf: [256]f32 = undefined;
-    const n = @min(glyphs.len - 1, buf.len);
-    for (0..n) |i| buf[i] = glyphs[i + 1].offset.x - glyphs[i].offset.x;
-    std.mem.sort(f32, buf[0..n], {}, std.sort.asc(f32));
-    const median = buf[n / 2];
-    return @max(size * 0.6, median * 1.45);
+/// The two insertions are the whole of the work. A **space** goes in wherever
+/// a word boundary was drawn as a gap rather than as a space glyph, which on
+/// a page set by TeX is every word boundary there is -- without it the page
+/// reads as one unbroken word and no search for two words could match. A
+/// **newline** goes between lines, and not a space, because a line break is
+/// the one thing a reader can see in the extracted text that tells them the
+/// match they are looking at spans two lines.
+fn flatten(
+    gpa: Allocator,
+    boxes: []Box,
+    lines: []Line,
+    scratch: []const u8,
+) Allocator.Error![]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.ensureTotalCapacity(gpa, scratch.len + boxes.len / 4);
+
+    for (lines, 0..) |*l, i| {
+        if (i != 0) try text.append(gpa, '\n');
+        l.at = @intCast(text.items.len);
+
+        const on_line = boxes[l.first..][0..l.count];
+        for (on_line, 0..) |*b, k| {
+            // Two spaces in a row would be a word break that a search for
+            // "the end" could not match across, so a drawn space suppresses
+            // an inserted one on either side of it.
+            if (k != 0 and !b.space and !on_line[k - 1].space and
+                gapIsSpace(on_line[k - 1], b.*))
+            {
+                try text.append(gpa, ' ');
+            }
+
+            const said = scratch[b.at..][0..b.len];
+            b.at = @intCast(text.items.len);
+            try text.appendSlice(gpa, said);
+        }
+
+        l.len = @intCast(text.items.len - l.at);
+    }
+
+    return text.toOwnedSlice(gpa);
+}
+
+/// Whether the space between two glyphs on a line is a word boundary.
+///
+/// This is the *only* word boundary a PDF has that is not a space glyph, and
+/// working out why took a page of measurements. A document set by TeX never
+/// draws a space: the gap is a number in a `TJ` array. But a number in a `TJ`
+/// array moves the text matrix, which ends the run -- so an interword gap is
+/// never inside a run at all, it is a run that starts a few points to the
+/// right of where the last one finished. Inside a run, every offset comes
+/// from `/Widths` plus a spacing that is the same for every glyph, so a long
+/// advance there is a wide letter and nothing else.
+///
+/// Which is why the old rule here -- an advance longer than the run's typical
+/// one -- could only ever be wrong. It fired on the `A` of `Alternative` and
+/// the `m` of `commonly`, and it could not fire on a word boundary, because
+/// the last glyph of a run has no next glyph to be measured against.
+///
+/// On the paper this was measured against, at 14.35pt: every gap within a
+/// word is between -0.5 and 0, and every gap between words is 3.5 or more.
+/// A seventh of the glyph's height sits in the middle of that and scales
+/// with the type, so it means the same on a footnote as on a heading.
+fn gapIsSpace(prev: Box, next: Box) bool {
+    return next.box.min_x - prev.box.max_x > next.box.height() * 0.15;
 }
 
 /// Sorts glyphs into reading order and cuts them into lines.
@@ -878,17 +1019,25 @@ test "a page with no text at all is empty rather than a line of nothing" {
 }
 
 test "words are found in a run that draws no spaces, the way TeX sets them" {
-    // "ab cd": four glyphs at size 10, letters advancing 5 points, and the
-    // gap between the words hidden in the advance after `b` -- a letter plus
-    // a third of an em, which is what a `TJ` kern of -333 produces.
+    // "ab cd" as TeX emits it: a `TJ` kern between the words, which moves
+    // the text matrix and therefore ends the run. So it is two runs, and the
+    // word gap is the 3.3 points between where one stops and the next
+    // starts -- not an advance inside either of them.
     const gpa = testing.allocator;
     const glyphs = try gpa.alloc(DisplayList.Glyph, 4);
     defer gpa.free(glyphs);
-    const xs = [_]f32{ 0, 5, 13.3, 18.3 };
-    for (glyphs, 0..) |*g, i| g.* = .{ .code = "abcd"[i], .offset = .{ .x = xs[i], .y = 0 } };
-    var cmds = try gpa.alloc(DisplayList.DrawCmd, 1);
+    for (glyphs, 0..) |*g, i| g.* = .{
+        .code = "abcd"[i],
+        .offset = .{ .x = if (i % 2 == 0) 0 else 5, .y = 0 },
+    };
+    const cmds = try gpa.alloc(DisplayList.DrawCmd, 2);
     defer gpa.free(cmds);
-    cmds[0] = .{ .text = .{ .size = 10, .transform = .translation(100, 700), .glyphs = .{ .start = 0, .count = 4 } } };
+    for (cmds, 0..) |*c, i| c.* = .{ .text = .{
+        .size = 10,
+        .transform = .translation(if (i == 0) 100 else 113.3, 700),
+        .glyphs = .{ .start = @intCast(i * 2), .count = 2 },
+        .advance = 10,
+    } };
 
     var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
     defer page.deinit(gpa);
@@ -901,23 +1050,29 @@ test "words are found in a run that draws no spaces, the way TeX sets them" {
     try testing.expect(!page.wordEnd(0, 0));
     try testing.expect(page.wordEnd(0, 1));
     try testing.expect(page.wordEnd(0, 3));
+
+    // And the page reads as two words, with the space nobody drew.
+    try testing.expectEqualStrings("ab cd", page.text);
 }
 
 test "a wide letter is not a word break" {
-    // `mwm` at size 10 with advances of 8 -- as wide as letters get. The
-    // median rule is what keeps these together.
+    // `mwm` at size 10 with advances of 8 -- as wide as letters get, and
+    // three points more than the letters either side of them. Inside a run
+    // that is a wide glyph and never a space, because a kern would have
+    // ended the run.
     const gpa = testing.allocator;
     const glyphs = try gpa.alloc(DisplayList.Glyph, 3);
     defer gpa.free(glyphs);
     for (glyphs, 0..) |*g, i| g.* = .{ .code = "mwm"[i], .offset = .{ .x = 8 * @as(f32, @floatFromInt(i)), .y = 0 } };
     var cmds = try gpa.alloc(DisplayList.DrawCmd, 1);
     defer gpa.free(cmds);
-    cmds[0] = .{ .text = .{ .size = 10, .transform = .translation(100, 700), .glyphs = .{ .start = 0, .count = 3 } } };
+    cmds[0] = .{ .text = .{ .size = 10, .transform = .translation(100, 700), .glyphs = .{ .start = 0, .count = 3 }, .advance = 24 } };
 
     var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
     defer page.deinit(gpa);
     try testing.expect(!page.wordStart(0, 1));
     try testing.expect(!page.wordStart(0, 2));
+    try testing.expectEqualStrings("mwm", page.text);
 }
 
 test "an explicit space glyph separates words and is not one" {
@@ -1032,4 +1187,77 @@ test "one column of the same text stays one column" {
 
     try testing.expectEqual(@as(usize, rows), page.lines.len);
     for (page.lines) |l| try testing.expectEqual(@as(u32, 0), l.column);
+}
+
+test "a page's text is its lines in reading order, one newline between them" {
+    const gpa = testing.allocator;
+    const glyphs = try gpa.alloc(DisplayList.Glyph, 4);
+    defer gpa.free(glyphs);
+    for (glyphs, 0..) |*g, i| g.* = .{ .code = "abcd"[i], .offset = .origin };
+    const cmds = try gpa.alloc(DisplayList.DrawCmd, 4);
+    defer gpa.free(cmds);
+    // Two lines of two letters, emitted bottom line first: the file's order
+    // is not reading order and the string has to be the second one.
+    const place = [_][2]f32{ .{ 100, 680 }, .{ 110, 680 }, .{ 100, 700 }, .{ 110, 700 } };
+    for (cmds, 0..) |*c, i| c.* = .{ .text = .{
+        .size = 10,
+        .transform = .translation(place[i][0], place[i][1]),
+        .glyphs = .{ .start = @intCast(i), .count = 1 },
+        .advance = 10,
+    } };
+
+    var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer page.deinit(gpa);
+    try testing.expectEqualStrings("cd\nab", page.text);
+    try testing.expectEqualStrings("cd", page.lines[0].string(page));
+    try testing.expectEqualStrings("ab", page.lines[1].string(page));
+}
+
+test "a byte of the page's text goes back to the glyph that wrote it" {
+    const gpa = testing.allocator;
+    const glyphs = try gpa.alloc(DisplayList.Glyph, 6);
+    defer gpa.free(glyphs);
+    for (glyphs, 0..) |*g, i| g.* = .{ .code = "abcdef"[i], .offset = .{ .x = 5 * @as(f32, @floatFromInt(i % 3)), .y = 0 } };
+    const cmds = try gpa.alloc(DisplayList.DrawCmd, 2);
+    defer gpa.free(cmds);
+    for (cmds, 0..) |*c, i| c.* = .{ .text = .{
+        .size = 10,
+        .transform = .translation(100, 700 - 20 * @as(f32, @floatFromInt(i))),
+        .glyphs = .{ .start = @intCast(i * 3), .count = 3 },
+        .advance = 15,
+    } };
+
+    var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer page.deinit(gpa);
+    try testing.expectEqualStrings("abc\ndef", page.text);
+
+    // The `e` is byte 5, and it is the fifth box, on the second line.
+    const box = page.glyphAt(5).?;
+    try testing.expectEqualStrings("e", page.stringOf(page.boxes[box]));
+    try testing.expectEqual(@as(u32, 1), page.lineOf(box));
+
+    // The newline was written by nobody, so it belongs to the glyph before
+    // it -- a match that starts on a line break still has to be drawn.
+    try testing.expectEqualStrings("c", page.stringOf(page.boxes[page.glyphAt(3).?]));
+}
+
+test "a drawn space is not doubled by an inserted one" {
+    const gpa = testing.allocator;
+    const glyphs = try gpa.alloc(DisplayList.Glyph, 3);
+    defer gpa.free(glyphs);
+    for (glyphs, 0..) |*g, i| g.* = .{ .code = "a b"[i], .offset = .origin };
+    const cmds = try gpa.alloc(DisplayList.DrawCmd, 3);
+    defer gpa.free(cmds);
+    // Three runs, each a visible gap apart -- so every boundary looks like a
+    // word break, and the middle one already draws a space.
+    for (cmds, 0..) |*c, i| c.* = .{ .text = .{
+        .size = 10,
+        .transform = .translation(100 + 12 * @as(f32, @floatFromInt(i)), 700),
+        .glyphs = .{ .start = @intCast(i), .count = 1 },
+        .advance = 5,
+    } };
+
+    var page = try build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
+    defer page.deinit(gpa);
+    try testing.expectEqualStrings("a b", page.text);
 }

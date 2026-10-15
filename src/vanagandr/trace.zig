@@ -32,6 +32,8 @@ pub const usage =
     \\    --glyphs     Print one line per glyph instead of a decoded string.
     \\    --lines      The text map instead of the display list: one line per
     \\                 line of recovered text, with the column it was put in.
+    \\    --text       The page as one string, which is what a search runs
+    \\                 over. `--lines` is the same text with its geometry.
     \\    --no-rotate  Ignore /Rotate, so coordinates match the file's own
     \\                 numbers rather than what a reader would display.
     \\    --no-type3   Do not run Type 3 glyph procedures.
@@ -44,8 +46,9 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var path: ?[]const u8 = null;
     var page_number: u32 = 1;
     var all = false;
-    var stats_only = false;
-    var lines = false;
+    // What to print. Four mutually exclusive shapes rather than four bools,
+    // because `--stats --lines` has no meaning and a flag each invites it.
+    var shape: Shape = .list;
     var options: content.Options = .{};
     var trace_options: trace.Options = .{};
 
@@ -60,13 +63,15 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--all")) {
             all = true;
         } else if (std.mem.eql(u8, arg, "--stats")) {
-            stats_only = true;
+            shape = .stats;
         } else if (std.mem.eql(u8, arg, "--paths")) {
             trace_options.paths = true;
         } else if (std.mem.eql(u8, arg, "--glyphs")) {
             trace_options.glyphs = true;
+        } else if (std.mem.eql(u8, arg, "--text")) {
+            shape = .text;
         } else if (std.mem.eql(u8, arg, "--lines")) {
-            lines = true;
+            shape = .lines;
         } else if (std.mem.eql(u8, arg, "--no-rotate")) {
             options.rotate = false;
         } else if (std.mem.eql(u8, arg, "--no-type3")) {
@@ -100,7 +105,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         for (list, 0..) |p, index| {
             if (index != 0) try ctx.out.writeByte('\n');
             try ctx.out.print("# ---- page {d} of {d} ----\n", .{ index + 1, list.len });
-            const diag = try tracePage(ctx, &doc, p, options, trace_options, stats_only, lines);
+            const diag = try tracePage(ctx, &doc, p, options, trace_options, shape);
             accumulate(&total, diag);
         }
         try ctx.out.print("\n# {d} pages\n", .{list.len});
@@ -118,11 +123,13 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         list[page_number - 1],
         options,
         trace_options,
-        stats_only,
-        lines,
+        shape,
     );
     try writeDiagnostics(ctx, diag);
 }
+
+/// What `trace` prints for a page.
+const Shape = enum { list, stats, lines, text };
 
 fn tracePage(
     ctx: *Context,
@@ -130,29 +137,37 @@ fn tracePage(
     p: fenrir.Page,
     options: content.Options,
     trace_options: trace.Options,
-    stats_only: bool,
-    lines: bool,
+    shape: Shape,
 ) !content.Interpreter.Diagnostics {
     var result = content.page(ctx.gpa, doc, p, options) catch |err|
         return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
     defer result.deinit(ctx.gpa);
 
-    if (lines) {
+    if (shape == .lines) {
         // The same map the reader puts a caret and a selection on, which is
         // the only way to see from outside the window whether a page's
-        // columns were found.
+        // columns were found -- and, with the text beside it, whether the
+        // words came back as words.
         var map = try fenrir.hlidskjalf.text.build(ctx.gpa, result.list);
         defer map.deinit(ctx.gpa);
         for (map.lines, 0..) |l, i| {
             try ctx.out.print(
-                "line {d:>4}  column {d}  y {d: >8.2}  x {d: >7.2}..{d: >7.2}  {d} glyphs\n",
-                .{ i, l.column, l.baseline, l.box.min_x, l.box.max_x, l.count },
+                "line {d:>4}  column {d}  y {d: >8.2}  x {d: >7.2}..{d: >7.2}  {d:>4}g  {s}\n",
+                .{ i, l.column, l.baseline, l.box.min_x, l.box.max_x, l.count, l.string(map) },
             );
         }
         return result.diagnostics;
     }
 
-    if (stats_only) {
+    if (shape == .text) {
+        var map = try fenrir.hlidskjalf.text.build(ctx.gpa, result.list);
+        defer map.deinit(ctx.gpa);
+        try ctx.out.writeAll(map.text);
+        try ctx.out.writeByte('\n');
+        return result.diagnostics;
+    }
+
+    if (shape == .stats) {
         const s = result.list.stats();
         try ctx.out.print(
             "page {d}: {d} commands, {d} fills, {d} strokes, {d} clips, " ++

@@ -1117,15 +1117,27 @@ test "the caret is brought into view without recentring the page" {
 }
 
 /// Two lines of TeX-style text with no space glyphs: "ab cd" over "ef gh".
+///
+/// A run a word, which is the shape a `TJ` kern leaves behind and the only
+/// way a word gap reaches here: within a run the glyphs are flush.
 fn twoLines(gpa: std.mem.Allocator) !text.Page {
     const glyphs = try gpa.alloc(gelgja.DisplayList.Glyph, 8);
     defer gpa.free(glyphs);
-    const xs = [_]f32{ 0, 5, 13.3, 18.3 };
-    for (glyphs, 0..) |*g, i| g.* = .{ .code = "abcdefgh"[i], .offset = .{ .x = xs[i % 4], .y = 0 } };
-    const cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, 2);
+    for (glyphs, 0..) |*g, i| g.* = .{
+        .code = "abcdefgh"[i],
+        .offset = .{ .x = if (i % 2 == 0) 0 else 5, .y = 0 },
+    };
+    const cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, 4);
     defer gpa.free(cmds);
-    cmds[0] = .{ .text = .{ .size = 10, .transform = .translation(100, 700), .glyphs = .{ .start = 0, .count = 4 } } };
-    cmds[1] = .{ .text = .{ .size = 10, .transform = .translation(100, 680), .glyphs = .{ .start = 4, .count = 4 } } };
+    for (cmds, 0..) |*c, i| c.* = .{ .text = .{
+        .size = 10,
+        .transform = .translation(
+            if (i % 2 == 0) 100 else 113.3,
+            if (i < 2) 700 else 680,
+        ),
+        .glyphs = .{ .start = @intCast(i * 2), .count = 2 },
+        .advance = 10,
+    } };
     return text.build(gpa, .{ .glyphs = glyphs, .cmds = cmds });
 }
 
