@@ -88,6 +88,11 @@ The tab bar is **not drawn at all while there is one tabpage**, and the rails
 run to the top of the window when it is not there. A bar showing a single tab
 says what the title bar already says and charges a row of the page to say it.
 
+The search bar is the same argument taken further: it is **not in the chrome
+at all** until `/` brings it into existence, floating over the top-right
+corner of the page beside the right rail. Nothing opens it but the key, and
+escape takes it away.
+
 ---
 
 ## Where it stands
@@ -710,28 +715,109 @@ became `swatches`, which is what they are. A field renamed on the day a second
 meaning arrives costs three lines; the same rename after the second meaning
 has call sites is the kind of change nobody makes.
 
-### Phase 7 — text as characters, then search
+### Phase 7 — text as characters, then search ✅
 
-| Commit | Files | ~ |
-|---|---|---|
-| `/ToUnicode`, and glyph names as a fallback | `gjoll/content/Font.zig` | 250 |
-| a page's text as a string | `hlidskjalf/text.zig` | 200 |
-| searching a document, on the worker thread | `src/hlidskjalf/search.zig` | 250 |
-| the search widget | `read.zig` | 280 |
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | what a character code means: /ToUnicode and the encoding chain | `gjoll/content/Font.zig`, `gelgja/DisplayList.zig`, `Builder.zig`, `tyr/encoding.zig` | 757 |
+| ✅ | a page's text as a string, and the word gap it turns out to be | `hlidskjalf/text.zig`, `View.zig`, `vanagandr/trace.zig` | 346 |
+| ✅ | searching a document, a page at a time, wrapping where it started | `src/hlidskjalf/search.zig`, `vanagandr/trace.zig` | 525 |
+| ✅ | the search bar, on slash, with n and N stepping the matches | `src/vanagandr/find.zig`, `read.zig`, `keys.zig` | 757 |
 
-**Nothing maps character codes to Unicode today.** `text.Box.code` is the raw
-content-stream code. The pieces exist and are only unwired: the CMap parser
-deliberately skips the ToUnicode operators, and `tyr/encoding.unicodeForName`
-and `Font.glyphName` are both there. For a simple font the chain is
-`glyphName` → `unicodeForName`, falling back to `encoding.nameFor(kind, code)`
-for the base encodings; for a composite one it is `beginbfchar` /
-`beginbfrange` in the existing parser.
+`text.Box.code` was the raw content-stream code and nothing turned it into a
+letter. `/ToUnicode` is parsed now — `bfchar`, both forms of `bfrange`, and
+UTF-16BE destinations, so a ligature is the two letters it stands for — and
+behind it the encoding chain, `/Differences` over `/BaseEncoding` over
+Standard, ending at a glyph name that `tyr.encoding` turns into a code point.
+A simple font's whole map is resolved once when the font is loaded; a
+composite font gets `/ToUnicode` and nothing else, because its codes are CIDs
+into a character collection this program does not have.
 
-The search widget **appears only on `/`**: not in the chrome until a search
+The search bar **appears only on `/`**: not in the chrome until a search
 begins, takes focus, highlights matches on the visible pages, steps with
 `n`/`N`, and escape closes it and clears them. The scan runs on the existing
-`Rasteriser` worker thread and reports incrementally, so a search in a
-600-page document does not stall a frame.
+`Rasteriser` worker thread, last in the queue behind everything on screen,
+and reports incrementally — so the count reads `4+` while it is running and
+`12` when it has finished.
+
+### What phase 7 cost, against what it was budgeted
+
+Four commits at 980 became four at 2385, which is two and a half times the
+estimate and the worst overrun of any phase here. Three of the four are over
+five hundred lines and two are at seven hundred and fifty.
+
+**The estimate was for the feature and the cost was for the format.** 250
+lines was the honest size of "read `/ToUnicode`". What landed at 757 is that
+parser plus a span type in Gelgja with its lookup, a builder call that sorts
+and rebases it, the `bfrange` array form, surrogate pairs, the truncation
+bound, a fold of three encoding tables at comptime, and eleven tests. None of
+that is padding and none of it could be left out: a `/ToUnicode` map that
+handled only the common shape would be a map that silently mangled a quarter
+of the documents anyone owns. **The rule from phase six generalises past
+registries: estimate the file, and estimate a file per format the commit has
+to understand.**
+
+**The layering question was decided by arithmetic, not by taste.** Gjöll has
+imported nothing but Gelgja since it was written, and the encoding chain
+needed Týr's three tables. Copying them would have been two thousand lines of
+the same data in two places. They are *PDF's* encodings — Annex D of the
+specification, not any font format's — and they live in Týr only because Týr
+was the first thing that needed them. The import is written down at the top
+of `Font.zig` with that argument, which is the least a new edge in the
+dependency graph deserves.
+
+**`space_after` was wrong from the day it was written, and only a printer
+could show it.** The field guessed a word boundary from an advance longer
+than a glyph's. The first `fenrir trace --text` of a real paper came out as
+`AnA lternativeView :W henDo` — no space between any two words, and a
+spurious one after every `A`, `W` and `m`. The reason is structural: a `TJ`
+kern moves the text matrix, which *ends the run*, so an interword gap is
+never inside a run at all — and inside a run every offset comes from
+`/Widths` plus a spacing that is the same for every glyph, so a long advance
+there is a wide letter and nothing else. The rule it was looking for could
+not fire, and the rule it did fire on could only be wrong. It is a gap
+between boxes, it always was, and `wordStart` had already been measuring that
+gap correctly beside it for three phases.
+
+**The numbers that fixed it were printed, not reasoned about.** Twelve lines
+of throwaway code in `trace --lines` printed every gap on a line with the
+glyph height beside it: within a word, −0.5 to 0; between words, 3.5 and up,
+at a height of 13.6. That is not a close call and no amount of reading the
+code would have produced either number. The threshold had been right all
+along — it was being consulted in one place and ignored in the other.
+
+**A picture of a search is a picture of nothing, because the search has not
+run yet.** `--shot` waits until the visible pages are ready and then fires,
+and the scan is deliberately last in the job queue — so the shot is taken in
+the first frame in which the search is allowed to start. Six hundred frames
+of waiting produced a bar saying `searching` over a page with no matches on
+it. Seeding one page's hits inline before the window opens is what made the
+picture, and the picture is what found the colour bug below. **A background
+feature has to be *stood still* before it can be photographed, and the two
+lines that do it come out again with the popup-opening ones.**
+
+**The accent is white, and a white wash over white paper is nothing at all.**
+The matches were drawn in `s.accent` at a highlight's alpha, which on the
+only kind of page most documents have is invisible. `read.zig` already says
+this in a comment three hundred lines above, about why a highlight made
+without a colour is grey — and the selection's grey and the caret's blue are
+both fixed constants for the same reason. The matches are now the selection's
+grey with the caret's blue on the one being stood on, and the argument is
+written beside them: **the page underneath is the document's colour, and
+anything the interface draws on it has to be a colour, not the theme's.**
+
+**`n` meant the next page and Vim means the next match.** Both, and which one
+depends on whether a search is live — with `<space>` keeping the page
+movement unconditionally, so nothing was taken away. A key that means two
+things is usually a mistake; this one is not, because the two never overlap:
+`n` steps matches exactly while a bar is on screen saying how many there are,
+and escape takes the bar away and gives the key back.
+
+**Removing a heuristic made the reader faster.** `wordGap` sorted up to 256
+floats per text run, and a page of a paper is sixteen hundred runs. Taking it
+out is the whole of why `read --frames 1200` came in at 0.692s against
+0.734s: the phase added a Unicode lookup per glyph and still ran six per cent
+faster than the phase before it. Measured interleaved, best of five.
 
 ### Phase 8 — what a plugin may contribute
 
@@ -978,6 +1064,44 @@ Things that cost time once and should not cost it again.
   colours became `swatches` in three lines. The same rename once the second
   meaning has call sites is the kind nobody makes, and the two live side by
   side being confused for each other for a year.
+- **A heuristic that cannot fire is worse than no heuristic, and only the
+  output says which you have.** `space_after` guessed a word boundary from a
+  long advance, and a long advance inside a run is a wide letter: a `TJ` kern
+  ends the run, so the gap it was hunting for is never inside one. Twelve
+  tests passed over it, a caret and a selection used it for three phases, and
+  the first page printed as a string came out with no spaces in it and one
+  after every `A`. **When a rule is about what a format can contain, check
+  what the format can contain.**
+- **Print the numbers before choosing the threshold.** The fix above needed
+  one measurement: the gaps between adjacent glyphs, with the glyph height
+  beside them. Within a word, −0.5 to 0; between words, 3.5 and up. Twelve
+  throwaway lines in a command that already existed, and the answer was not a
+  close call — which is the difference between a threshold and a guess that
+  has a number in it.
+- **A colour for the page cannot come from the theme.** The accent is white
+  by default, and white at a wash's alpha over white paper leaves the paper
+  exactly as white as it was. The selection's grey and the caret's blue are
+  fixed constants and say so; search matches are now the same two, for the
+  same reason. Anything the interface draws *on the document* is its own
+  colour, because the document is not the interface's to tint and the theme
+  cannot know what the paper is.
+- **Estimate the file, and one file per format.** Phase six learned this for
+  registries and phase seven paid it again: `/ToUnicode` is 250 lines of
+  parser and 757 lines of commit, because a format arrives with its edge
+  cases -- a `bfrange` array, a surrogate pair, a destination that is a glyph
+  name -- and each of them is a test and a paragraph.
+- **A new edge in the dependency graph is written down where it is made.**
+  Gjöll had imported nothing but Gelgja until the encoding chain needed Týr's
+  three tables. The alternative was two thousand lines of the same data
+  twice. The import is at the top of `Font.zig` with the argument beside it:
+  those tables are the PDF specification's, not a font format's, and they are
+  in Týr only because Týr needed them first.
+- **Background work has to be stood still before it can be photographed.** A
+  search is last in the job queue on purpose, and `--shot` fires the moment
+  the visible pages are ready -- which is the first frame the scan is allowed
+  to begin. The picture was of a bar saying `searching` over a page with
+  nothing on it. Seeding one page's results before the window opens is what
+  made the shot, and it comes out again with the `menu.show(…)` lines.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
@@ -1003,6 +1127,9 @@ fenrir read F --shot s.png --device     # what the GPU actually drew, read back
 
 fenrir icons [--out sheet.png]          # every icon, and whether it draws
 fenrir commands [--match QUERY]         # every `:` command, and how it ranks
+fenrir trace F --text                   # the page as the words it came out as
+fenrir trace F --lines                  # the same, with the geometry beside it
+fenrir trace F --all --find Q           # every match, and the boxes it covers
 ```
 
 Most of the new code is testable with no window, no device and no font —
