@@ -69,6 +69,7 @@ const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const library = @import("library.zig");
 const Library = library.Library;
+const find_mod = @import("find.zig");
 const palette_mod = @import("palette.zig");
 const panels = @import("panels.zig");
 const rails_mod = @import("rails.zig");
@@ -97,6 +98,7 @@ const Tabs = hlidskjalf.Tabs;
 const View = hlidskjalf.View;
 const commands = hlidskjalf.commands;
 const keys = hlidskjalf.keys;
+const search = hlidskjalf.search;
 const text = hlidskjalf.text;
 const Theme = thviti.Theme;
 
@@ -189,7 +191,10 @@ pub const usage =
     \\    escape               put the cursor away
     \\    page up / page down  a screen at a time
     \\    home / end           the first and last page
-    \\    n / p                the next and previous page
+    \\    space / p            the next and previous page
+    \\    /                    search the document; escape ends it
+    \\    n / N                the next and previous match, or the next and
+    \\                         previous page when nothing is being searched for
     \\    drag over text       select it; a click puts the selection away
     \\    m                    highlight the selection, or the cursor's line,
     \\                         or remove the highlight under the cursor
@@ -727,9 +732,20 @@ const Job = struct {
     buffer: u32,
     page: u32,
     zoom: f32,
+    want: Want = .page,
+
+    /// What the worker is being asked for.
+    ///
+    /// A page and its text come out of one interpretation, so `.page` is
+    /// both. `.text` is the same interpretation with the drawing thrown
+    /// away, which is what a search wants from the six hundred pages nobody
+    /// is looking at -- rasterising them would be a hundred times the work
+    /// for pixels that go straight in the bin.
+    const Want = enum { page, text };
 
     fn eql(a: Job, b: Job) bool {
-        return a.buffer == b.buffer and a.page == b.page and a.zoom == b.zoom;
+        return a.buffer == b.buffer and a.page == b.page and
+            a.zoom == b.zoom and a.want == b.want;
     }
 };
 
@@ -907,6 +923,15 @@ const Session = struct {
     palette: palette_mod.State = .{},
     palette_rows: std.ArrayList(palette_mod.Row) = .empty,
 
+    /// The search bar, and what it has found.
+    ///
+    /// Two states and not one, because they answer to different things: the
+    /// bar is a widget that is open or shut, and the search is a query, a
+    /// frontier and a list of hits that the worker thread fills in. `/`
+    /// starts both and escape ends both; nothing else touches the pair.
+    find: find_mod.State = .{},
+    search: search.State = .{},
+
     /// The panel docked to the right rail, and the rows in it.
     ///
     /// The rows are rebuilt when what is behind them changes and not once a
@@ -1059,6 +1084,7 @@ const Session = struct {
         if (s.plugins) |p| p.destroy();
         if (s.config_dir) |d| s.gpa.free(d);
         s.cmdline.deinit(s.gpa);
+        s.search.deinit(s.gpa);
         s.note.deinit(s.gpa);
         s.recorded.deinit(s.gpa);
         s.tabs.deinit(s.gpa);
@@ -1339,6 +1365,9 @@ const Session = struct {
         out.map = text.build(gpa, result.list) catch null;
         errdefer if (out.map) |*m| m.deinit(gpa);
 
+        // A search wants the words and not the picture.
+        if (job.want == .text) return;
+
         out.result = switch (s.backend) {
             .cpu => .{ .cpu = try s.rasterise(job, result.list, b) },
             // No zoom in it: the outline is recorded in page space and the
@@ -1452,12 +1481,12 @@ const Session = struct {
     /// and two windows at two zooms need two CPU entries and one GPU entry.
     fn cached(s: *const Session, v: *const View, page: u32) bool {
         return switch (s.backend) {
-            .cpu => s.find(v.buffer, page, v.zoom) != null,
+            .cpu => s.cachedSlot(v.buffer, page, v.zoom) != null,
             .gpu => s.recorded.has(v.buffer, page),
         };
     }
 
-    fn find(s: *const Session, buf: u32, page: u32, zoom: f32) ?*const Slot {
+    fn cachedSlot(s: *const Session, buf: u32, page: u32, zoom: f32) ?*const Slot {
         for (&s.slots) |*slot| {
             if (slot.matches(buf, page, zoom)) return slot;
         }
@@ -1507,7 +1536,21 @@ const Session = struct {
         while (it.next()) |v| {
             if (s.aheadIn(v)) |job| return job;
         }
-        return null;
+
+        // Last of all, and deliberately: a search over six hundred pages is
+        // six hundred interpretations, and a reader who scrolls while it
+        // runs must not wait behind a page they cannot see. The scan gets
+        // whatever is left over, one page at a time, and stops the instant
+        // something on screen is missing.
+        return s.searchJob();
+    }
+
+    /// The next page the search wants interpreted, if it wants one.
+    fn searchJob(s: *Session) ?Job {
+        const page = s.search.frontier() orelse return null;
+        const v = s.layout().current();
+        if (page >= v.pages.len) return null;
+        return .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = .text };
     }
 
     /// Whether the cache has a slot the windows are not already using.
@@ -1609,6 +1652,22 @@ const Session = struct {
     ) !?[]u8 {
         const gpa = s.gpa;
         var finished = worker.collect() orelse return null;
+
+        if (finished.job.want == .text) {
+            // The scan's own page, and it is not cached: the buffer keeps
+            // eight maps for the cursor to walk through, and a search that
+            // put six hundred of them through that cache would evict the
+            // eight that were doing something.
+            //
+            // A page that would not interpret still counts as scanned. The
+            // alternative is a frontier that never advances and a search
+            // that spins on one broken page forever.
+            var map = finished.map orelse text.Page{};
+            defer map.deinit(gpa);
+            finished.map = null;
+            s.search.take(gpa, finished.job.page, map) catch {};
+            return null;
+        }
 
         if (finished.map) |map| {
             s.buffer(finished.job.buffer).putMap(gpa, finished.job.page, map);
@@ -2437,6 +2496,74 @@ const Session = struct {
         s.palette.show();
     }
 
+    // -- search ---------------------------------------------------------------
+
+    /// `/`: the bar appears, empty, with the keyboard.
+    fn beginSearch(s: *Session) void {
+        s.find.show();
+        s.search.start(s.gpa, "", s.view().currentPage(), s.pageCount()) catch {};
+    }
+
+    /// Escape, or the close button: the bar goes and the highlights go with
+    /// it, which is the whole of what a reader means by ending a search.
+    fn endSearch(s: *Session) void {
+        s.find.hide();
+        s.search.start(s.gpa, "", 0, 0) catch {};
+    }
+
+    /// The query changed. The scan restarts from the page in front of the
+    /// reader, because a query one letter longer is a different search and
+    /// the hits for the old one are answers to a question nobody asked.
+    fn requery(s: *Session) void {
+        s.search.start(s.gpa, s.find.query(), s.view().currentPage(), s.pageCount()) catch {};
+    }
+
+    /// `n`, `N`, and the two chevrons.
+    fn stepSearch(s: *Session, back: bool) void {
+        const hit = s.search.step(back) orelse return;
+        const v = s.view();
+        // Not `scrollToPage`: the match may be the last line of a page that
+        // is already half on screen, and scrolling to the top of it would
+        // move the window away from the thing it was asked to show.
+        // `scrollToBox` is the rule the caret and a chosen highlight use,
+        // which is to move as little as will do.
+        v.scrollToBox(hit.page, hit.box);
+    }
+
+    fn pageCount(s: *Session) u32 {
+        return @intCast(s.buffer(s.view().buffer).pages.len);
+    }
+
+    /// What the bar was asked to do, carried out.
+    fn applyFind(s: *Session, what: find_mod.Action) void {
+        switch (what) {
+            .typed => s.requery(),
+            .step => |back| s.stepSearch(back),
+            // Enter is `n` without moving the hands, and on the first press
+            // that means landing on the first hit rather than stepping past
+            // it -- which `search.step` already knows.
+            .submitted => s.stepSearch(false),
+            .close => s.endSearch(),
+        }
+    }
+
+    /// What the bar writes beside the field.
+    fn searchCount(s: *Session) find_mod.Count {
+        var found: u32 = 0;
+        var at: ?u32 = null;
+        for (s.search.hits.items, 0..) |h, i| {
+            if (!h.starts) continue;
+            found += 1;
+            if (s.search.landed and i == s.search.current) at = found;
+        }
+        return .{
+            .at = at,
+            .found = found,
+            .scanned = s.search.scanned,
+            .pages = s.search.pages,
+        };
+    }
+
     /// A row chosen, or a line typed into the palette that matched nothing.
     ///
     /// A command that needs an argument cannot be *run* from a list -- there
@@ -2779,6 +2906,12 @@ const Session = struct {
     /// the caller's in both files rather than living in the tree.
     fn interfaceHasInput(s: *const Session) bool {
         if (s.settings.open or s.palette.open) return true;
+        // The search bar is the one of these that gives the keyboard *back*:
+        // enter drops focus so `n` and `N` step the matches while the count
+        // stays on screen. So the question is whether the field has it, not
+        // whether the bar is open -- and the answer is last frame's, for the
+        // same reason the rest of this function's answers are.
+        if (s.find.typing) return true;
         const c = s.chrome orelse return false;
         return c.grabbing();
     }
@@ -2845,6 +2978,12 @@ const Session = struct {
                 // so leaving is never the same key as leaving cursor mode.
                 if (s.drag != null) {
                     s.drag = null;
+                } else if (s.find.open) {
+                    // The search bar hands the keyboard back on enter, so
+                    // this is the escape that ends a search somebody has
+                    // stopped typing into. Before the caret, because the
+                    // highlights are the louder thing on the page.
+                    s.endSearch();
                 } else if (v.cursor.visible) {
                     v.cursor.visible = false;
                 } else return true;
@@ -2912,6 +3051,18 @@ const Session = struct {
                 return s.quit;
             },
             .show_commands => s.showPalette(),
+
+            .enter_search => s.beginSearch(),
+            .search_step => |back| {
+                // `n` is the next page until a search is live. See the note
+                // on `keys.Command.search_step`.
+                if (s.search.isEmpty()) {
+                    v.scrollToPage(if (back)
+                        v.currentPage() -| 1
+                    else
+                        @min(v.currentPage() + 1, v.pages.len - 1));
+                } else s.stepSearch(back);
+            },
             .plugin_key => |id| if (s.plugins) |rt| rt.runKeymap(id),
 
             .undo => s.undoMarks(false),
@@ -2950,7 +3101,7 @@ const Session = struct {
         // document, so the press that lands in it has to be kept off the text
         // underneath -- and `rect` is last frame's, which is the rectangle
         // that was there when the button went down.
-        if (s.panel.holds(in.mouse)) {
+        if (s.panel.holds(in.mouse) or s.find.holds(in.mouse.x, in.mouse.y)) {
             s.view().was_down = down;
             return;
         }
@@ -3272,6 +3423,7 @@ const Session = struct {
         }
 
         try s.drawMarks(v, b, range, over);
+        try s.drawSearchHits(v, range, over);
 
         v.marks_seen = b.marks.revision;
         try s.drawSelection(v, over);
@@ -3333,6 +3485,55 @@ const Session = struct {
             }
         }
     }
+
+    /// The search's matches on the pages a window can see.
+    ///
+    /// Over the page rather than under it, like a highlight and for the same
+    /// reason: a PDF's paper is opaque.
+    ///
+    /// Not in the accent, which is the trap. The accent is white by default,
+    /// and white at a wash's alpha over white paper leaves the paper exactly
+    /// as white as it was -- every match would be invisible on the only kind
+    /// of page most documents have. So these are fixed colours, the way the
+    /// selection's grey and the caret's blue are fixed and for the argument
+    /// written beside them: the page underneath is the document's colour and
+    /// the interface has no business tinting it. Matches get the selection's
+    /// grey, because a match is the same kind of thing -- the interface
+    /// pointing at the page, not a mark on it -- and the one being stood on
+    /// gets the caret's blue, which is already this reader's word for where
+    /// you are.
+    ///
+    /// Drawn in every window and not only the focused one: two windows on
+    /// one document are looking at one search.
+    fn drawSearchHits(s: *Session, v: *View, range: View.Visible, over: *DrawList) !void {
+        const hits = s.search.hits.items;
+        if (hits.len == 0) return;
+
+        // Which hits are the match being stood on: the current one, plus its
+        // continuation onto the next line if it has one. Both halves of a
+        // match across a line break are one thing and are drawn as one.
+        var last = s.search.current;
+        if (s.search.at() != null) {
+            while (last + 1 < hits.len and !hits[last + 1].starts) last += 1;
+        }
+        const standing = s.search.at() != null;
+
+        const radius = markRadius(v.zoom);
+        for (hits, 0..) |hit, i| {
+            if (hit.page < range.first or hit.page >= range.end) continue;
+            const on = standing and i >= s.search.current and i <= last;
+            const block = blockOf(v.windowBox(hit.page, hit.box), v.zoom);
+            try over.rounded(block, .all(radius), if (on) current_block else match_block);
+            try over.border(block, .all(radius), 1, if (on) current_edge else match_edge);
+        }
+    }
+
+    /// A match, and the one the reader is standing on. See `drawSearchHits`
+    /// for why neither is the accent.
+    const match_block: Color = .{ .r = 0.32, .g = 0.33, .b = 0.35, .a = 0.22 };
+    const match_edge: Color = .{ .r = 0.32, .g = 0.33, .b = 0.35, .a = 0.5 };
+    const current_block: Color = .{ .r = 0.1, .g = 0.45, .b = 0.95, .a = 0.28 };
+    const current_edge: Color = .{ .r = 0.1, .g = 0.45, .b = 0.95, .a = 0.95 };
 
     /// A highlight's own shape: the glyph boxes, padded.
     ///
@@ -4227,6 +4428,15 @@ const Session = struct {
                 if (asked) |wanted| s.applyRail(wanted);
                 if (try c.leftRail(s.modeRail())) |wanted| s.applyRail(wanted);
                 try s.drawPanel(c);
+                const asked_find = try find_mod.bar(
+                    &c.ui,
+                    c.face,
+                    c.theme,
+                    &c.icons,
+                    &s.find,
+                    s.searchCount(),
+                    c.top,
+                );
                 // After the bar, the rails and the panel, so it is over all
                 // of them: a popup is on top by being built last, and nothing
                 // here sorts.
@@ -4243,6 +4453,7 @@ const Session = struct {
                 c.end();
                 if (want) |wanted| s.applyZoom(wanted);
                 if (changed) |c2| s.changeSetting(c2);
+                if (asked_find) |what| s.applyFind(what);
                 // After the frame is closed, because a command may open
                 // another window, close this one, or leave the reader.
                 if (chosen) |what| s.runChosen(what);
@@ -4407,6 +4618,7 @@ fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.palette_rows.deinit(s.gpa);
+    s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
     s.tab_names.deinit(s.gpa);
@@ -5457,4 +5669,193 @@ test "a command that needs an argument lands on the : line, not in the void" {
 
     try testing.expectEqual(keys.Mode.command, s.keymap.mode);
     try testing.expectEqualStrings("page ", s.cmdline.items);
+}
+
+/// One page of `words`, one run a word, at the top of the page. The same
+/// shape `search.zig`'s own fixture uses, because a word gap only reaches
+/// the text map as a gap between runs.
+fn putWords(s: *Session, page: u32, words: []const []const u8) !void {
+    const gpa = s.gpa;
+    var glyphs: std.ArrayList(gelgja.DisplayList.Glyph) = .empty;
+    defer glyphs.deinit(gpa);
+    var cmds: std.ArrayList(gelgja.DisplayList.DrawCmd) = .empty;
+    defer cmds.deinit(gpa);
+
+    var x: f32 = 100;
+    for (words) |word| {
+        const start: u32 = @intCast(glyphs.items.len);
+        for (word, 0..) |c, i| try glyphs.append(gpa, .{
+            .code = c,
+            .offset = .{ .x = 5 * @as(f32, @floatFromInt(i)), .y = 0 },
+        });
+        const advance = 5 * @as(f32, @floatFromInt(word.len));
+        try cmds.append(gpa, .{ .text = .{
+            .size = 10,
+            .transform = .translation(x, 700),
+            .glyphs = .{ .start = start, .count = @intCast(word.len) },
+            .advance = advance,
+        } });
+        x += advance + 4;
+    }
+    s.buffer(0).putMap(gpa, page, try text.build(gpa, .{
+        .glyphs = glyphs.items,
+        .cmds = cmds.items,
+    }));
+}
+
+/// Runs the scan to completion the way the frame loop would: the frontier
+/// asks for a page, the worker builds its map, the search takes it.
+fn scanAll(s: *Session, on: []const []const []const u8) !void {
+    while (s.searchJob()) |job| {
+        try putWords(s, job.page, on[job.page]);
+        const map = s.buffer(job.buffer).textMap(job.page).?;
+        try s.search.take(s.gpa, job.page, map);
+    }
+}
+
+test "slash opens a search that is empty until something is typed" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(.enter_search);
+    try testing.expect(s.find.open);
+    try testing.expect(s.find.typing);
+    // An empty query asks for no pages at all: a scan of the whole document
+    // for nothing is the worst thing `/` could do on its own.
+    try testing.expect(s.searchJob() == null);
+}
+
+test "the scan walks every page from the one in front of the reader" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 4), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.view().scrollToPage(2);
+    _ = s.apply(.enter_search);
+    s.find.field.bytes = &s.find.query_buf;
+    _ = s.find.field.insert("fox");
+    s.applyFind(.typed);
+
+    // Page 2 first, because that is the one being read.
+    try testing.expectEqual(@as(u32, 2), s.searchJob().?.page);
+    try scanAll(&s, &.{
+        &.{ "the", "fox" },
+        &.{"nothing"},
+        &.{"nothing"},
+        &.{ "a", "fox", "here" },
+    });
+
+    try testing.expect(s.search.done());
+    try testing.expectEqual(@as(u32, 2), s.searchCount().found);
+    // Page 3 comes before page 0, because a reader on page 2 meets it first.
+    try testing.expectEqual(@as(u32, 3), s.search.hits.items[0].page);
+    try testing.expectEqual(@as(u32, 0), s.search.hits.items[1].page);
+}
+
+test "n steps the matches while a search is live and turns the page when it is not" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 4), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // No search: `n` is the next page, as it has always been.
+    try testing.expectEqual(@as(u32, 0), s.view().currentPage());
+    _ = s.apply(.{ .search_step = false });
+    try testing.expectEqual(@as(u32, 1), s.view().currentPage());
+
+    s.view().scrollToPage(0);
+    _ = s.apply(.enter_search);
+    s.find.field.bytes = &s.find.query_buf;
+    _ = s.find.field.insert("fox");
+    s.applyFind(.typed);
+    try scanAll(&s, &.{
+        &.{"nothing"},
+        &.{ "a", "fox" },
+        &.{"nothing"},
+        &.{ "another", "fox" },
+    });
+
+    // Now it steps the matches, and the first `n` lands on the first rather
+    // than stepping past it.
+    //
+    // The check is that the match is *on screen*, not that the window has
+    // moved to the top of its page: `scrollToBox` moves as little as will
+    // do, so a match near the top of the next page is brought into view
+    // with the page before it still mostly showing -- which is the right
+    // thing and makes `currentPage` the wrong question.
+    _ = s.apply(.{ .search_step = false });
+    try testing.expectEqual(@as(u32, 1), s.search.at().?.page);
+    try testing.expectEqual(@as(u32, 1), s.searchCount().at.?);
+    try testing.expect(onScreen(s.view(), 1));
+
+    _ = s.apply(.{ .search_step = false });
+    try testing.expectEqual(@as(u32, 3), s.search.at().?.page);
+    try testing.expectEqual(@as(u32, 2), s.searchCount().at.?);
+    try testing.expect(onScreen(s.view(), 3));
+
+    // And back round, which is what wrapping means.
+    _ = s.apply(.{ .search_step = false });
+    try testing.expectEqual(@as(u32, 1), s.search.at().?.page);
+    try testing.expect(onScreen(s.view(), 1));
+}
+
+fn onScreen(v: *View, page: u32) bool {
+    const range = v.visiblePages();
+    return page >= range.first and page < range.end;
+}
+
+test "escape ends the search, takes the highlights with it, and gives n back" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 4), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(.enter_search);
+    s.find.field.bytes = &s.find.query_buf;
+    _ = s.find.field.insert("fox");
+    s.applyFind(.typed);
+    try scanAll(&s, &.{
+        &.{ "a", "fox" },
+        &.{"nothing"},
+        &.{"nothing"},
+        &.{"nothing"},
+    });
+    try testing.expectEqual(@as(u32, 1), s.searchCount().found);
+
+    // The field no longer has the keyboard -- enter gave it back -- so this
+    // is the escape the keymap sends, not the field's own.
+    s.find.typing = false;
+    _ = s.apply(.hide_cursor);
+    try testing.expect(!s.find.open);
+    try testing.expectEqual(@as(usize, 0), s.search.hits.items.len);
+
+    // And `n` is the next page again.
+    const was = s.view().currentPage();
+    _ = s.apply(.{ .search_step = false });
+    try testing.expectEqual(was + 1, s.view().currentPage());
+}
+
+test "a query that matches nothing says so rather than saying nothing" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(.enter_search);
+    s.find.field.bytes = &s.find.query_buf;
+    _ = s.find.field.insert("aardvark");
+    s.applyFind(.typed);
+    try scanAll(&s, &.{ &.{"nothing"}, &.{"nothing"} });
+
+    const count = s.searchCount();
+    try testing.expectEqual(@as(u32, 0), count.found);
+    try testing.expect(!count.scanning());
+    try testing.expect(count.at == null);
+    // Stepping a search with nothing in it moves nothing.
+    const was = s.view().scroll;
+    _ = s.apply(.{ .search_step = false });
+    try testing.expectEqual(was, s.view().scroll);
 }

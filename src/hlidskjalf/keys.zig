@@ -26,6 +26,11 @@
 //! `u` and `<C-r>` undo and redo in normal, visual and edit modes alike: an
 //! undo is not a thing that should need a mode change first.
 //!
+//! Search is not a mode. `/` opens a bar that takes the keyboard by having
+//! focus, the way the palette does, so the keymap stands aside while it is
+//! being typed into without anything here having to know. See
+//! `Command.search_step` for why `n` means two things.
+//!
 //! The mode is changed *here*, as each key is read, so that `vjjm` typed
 //! faster than a frame still means select-down-down-highlight. The reader may
 //! overrule a change it cannot honour -- edit mode on a document with no
@@ -182,6 +187,19 @@ pub const Command = union(enum) {
     /// in every mode that is not typing -- a person who cannot remember a
     /// command's name cannot be asked to leave visual mode to look it up.
     show_commands,
+
+    // -- search
+    /// `/`: the search bar, which does not exist until this arrives.
+    enter_search,
+    /// `n` and `N`.
+    ///
+    /// `n` has been the next page since the reader was a scroller, and in
+    /// Vim it is the next match. Both, and which one depends on whether a
+    /// search is live: with the bar open `n` steps through the matches, and
+    /// with it closed it turns the page as it always did. `<space>` is the
+    /// next page either way, so the page keys never go anywhere, and escape
+    /// ends the search and gives `n` back.
+    search_step: bool,
 
     /// A key a plugin has bound, by the id its runtime gave the binding.
     plugin_key: u32,
@@ -480,8 +498,11 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
     const cmd: Command = switch (c) {
         'q' => .quit,
         'Q' => .quit_all,
-        'n', ' ' => .next_page,
+        ' ' => .next_page,
+        'n' => .{ .search_step = false },
+        'N' => .{ .search_step = true },
         'p' => .previous_page,
+        '/' => .enter_search,
         'm' => .toggle_highlight,
         'M' => .clear_highlights,
         'u' => .undo,
@@ -982,4 +1003,21 @@ test "a plugin binding takes a key before the built-in one" {
     state.mode = .command;
     const typed_j = commandWith(&state, typing("j"), lookup);
     try testing.expectEqual(@as(u21, 'j'), typed_j.items()[0].command_char);
+}
+
+test "slash opens a search, and n and N step it while space still turns the page" {
+    var state: State = .{};
+    const out = command(&state, typing("/"));
+    try testing.expectEqual(Command.enter_search, out.items()[0]);
+    // `/` does not change the mode: the search bar is a widget and takes the
+    // keyboard by having focus, not by the keymap standing aside.
+    try testing.expectEqual(Mode.normal, state.mode);
+
+    const stepping = command(&state, typing("nN "));
+    try testing.expectEqual(false, stepping.items()[0].search_step);
+    try testing.expectEqual(true, stepping.items()[1].search_step);
+    // The page keys never go anywhere, which is what lets `n` mean two
+    // things without anybody losing one of them.
+    try testing.expectEqual(Command.next_page, stepping.items()[2]);
+    try testing.expectEqual(Command.previous_page, command(&state, typing("p")).items()[0]);
 }
