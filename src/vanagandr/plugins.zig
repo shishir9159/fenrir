@@ -130,6 +130,19 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             }) catch {};
         }
     }
+    if (rt.handlers.items.len != 0) {
+        ctx.out.print("events:\n", .{}) catch {};
+        for (rt.handlerList()) |h| {
+            if (!h.live) continue;
+            ctx.out.print("  {s: <18} {s}", .{ @tagName(h.event), h.pattern }) catch {};
+            if (h.group.len != 0) ctx.out.print("  group {s}", .{h.group}) catch {};
+            // A handler on an event nothing fires is not an error, but it is
+            // the difference between a plugin that does nothing and a plugin
+            // that was never asked to.
+            if (!h.event.fires()) ctx.out.print("  (reserved: never fires)", .{}) catch {};
+            ctx.out.print("\n", .{}) catch {};
+        }
+    }
     if (rt.commands.items.len != 0) {
         ctx.out.print("commands:\n", .{}) catch {};
         for (rt.commandNames()) |c| {

@@ -1031,10 +1031,11 @@ const Session = struct {
     mode_buf: [96]u8 = undefined,
     /// A highlight's colour as text, for the one `highlightAt` being answered.
     hex_buf: [7]u8 = undefined,
-    /// What events were last reported with, so that `page` and `mode` fire on
-    /// a change and not on every frame.
+    /// What events were last reported with, so that the three that are a
+    /// difference fire on a change and not on every frame.
     reported_page: u32 = std.math.maxInt(u32),
     reported_mode: keys.Mode = .normal,
+    reported_selection: ?[2]galdr.Host.Position = null,
 
     slots: [cache_slots]Slot = @splat(.{}),
     stamp: u64 = 0,
@@ -1689,6 +1690,7 @@ const Session = struct {
             errdefer source.deinit(gpa);
             try s.recorded.insert(gpa, finished.job.buffer, finished.job.page, source);
             s.pages_rendered += 1;
+            s.announceRender(finished.job);
             s.placed = null;
             return null;
         }
@@ -1722,7 +1724,23 @@ const Session = struct {
             .stride = image.width * 4,
         });
         s.pages_rendered += 1;
+        s.announceRender(finished.job);
         return image.pixels;
+    }
+
+    /// `PageRender`, once for the page that has just finished.
+    ///
+    /// Here rather than where the page is *drawn*, which is the whole reason
+    /// the event is affordable: a page finishes once and is drawn sixty times
+    /// a second, and this is the frame thread, which is the only one that may
+    /// touch a Lua state -- the rasterising thread owns the `Document`.
+    fn announceRender(s: *Session, job: Job) void {
+        const rt = s.plugins orelse return;
+        rt.emit(.{
+            .event = .PageRender,
+            .path = s.buffer(job.buffer).path,
+            .data = .{ .page = job.page + 1 },
+        });
     }
 
     /// Whether any window still wants this exact job. With one window that is
@@ -2239,13 +2257,16 @@ const Session = struct {
 
     fn announceEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
         const rt = s.plugins orelse return;
-        const action: []const u8, const mark: Marks.Mark = switch (e) {
-            .insert => |key| .{ "add", (b.marks.byKey(key) orelse return).* },
-            .update => |key| .{ "change", (b.marks.byKey(key) orelse return).* },
-            .delete => |m| .{ "remove", m },
+        // Three events rather than one with an `action` field: a plugin that
+        // only cares about a highlight being made should not have to be told
+        // about every recolouring and then throw it away.
+        const event: galdr.Runtime.Event, const mark: Marks.Mark = switch (e) {
+            .insert => .{ .AnnotationAdd, (b.marks.byKey(e.insert) orelse return).* },
+            .update => .{ .AnnotationChange, (b.marks.byKey(e.update) orelse return).* },
+            .delete => |m| .{ .AnnotationRemove, m },
         };
         var hex: [7]u8 = undefined;
-        rt.emit(.{ .highlight = .{ .action = action, .highlight = .{
+        rt.emit(.{ .event = event, .path = b.path, .data = .{ .highlight = .{
             .id = mark.key,
             .page = mark.page + 1,
             .x0 = mark.box.min_x,
@@ -2301,7 +2322,11 @@ const Session = struct {
         }
 
         for (s.buffers.items) |b| {
-            rt.emit(.{ .open = .{ .path = b.path, .title = b.title, .pages = @intCast(b.pages.len) } });
+            rt.emit(.{ .event = .DocOpen, .path = b.path, .data = .{ .document = .{
+                .path = b.path,
+                .title = b.title,
+                .pages = @intCast(b.pages.len),
+            } } });
         }
     }
 
@@ -2721,10 +2746,18 @@ const Session = struct {
     }
 
     fn hostSelection(ptr: *anyopaque) ?[2]galdr.Host.Position {
-        // Either kind: a plugin asking what is selected means what the reader
-        // can see selected, and does not care which hand made it.
         const s = hostSession(ptr);
-        const sel = s.activeSelection(s.view()) orelse return null;
+        return s.hostSelectionOf(s.view());
+    }
+
+    /// What a plugin sees selected in a window, in its numbering.
+    ///
+    /// Either kind: a plugin asking what is selected means what the reader
+    /// can see selected, and does not care which hand made it. Named because
+    /// `SelectionChanged` compares two of these rather than watching the
+    /// three places a selection can move from.
+    fn hostSelectionOf(s: *Session, v: *View) ?[2]galdr.Host.Position {
+        const sel = s.activeSelection(v) orelse return null;
         return .{ fromOne(sel[0]), fromOne(sel[1]) };
     }
 
@@ -2916,17 +2949,27 @@ const Session = struct {
         return c.grabbing();
     }
 
-    /// Fires `page` and `mode` when either has changed since last reported.
+    /// Fires the three events that are a difference rather than an act, when
+    /// either half of the difference has moved since it was last reported.
     fn reportChanges(s: *Session) void {
         const rt = s.plugins orelse return;
+        const path = s.buffer(s.view().buffer).path;
         const page = s.view().currentPage();
         if (page != s.reported_page) {
             s.reported_page = page;
-            rt.emit(.{ .page = page + 1 });
+            rt.emit(.{ .event = .PageChanged, .path = path, .data = .{ .page = page + 1 } });
         }
         if (s.keymap.mode != s.reported_mode) {
             s.reported_mode = s.keymap.mode;
-            rt.emit(.{ .mode = @tagName(s.keymap.mode) });
+            rt.emit(.{ .event = .ModeChanged, .path = path, .data = .{ .mode = @tagName(s.keymap.mode) } });
+        }
+        // The selection is read out of the view rather than kept beside it:
+        // it moves with a key, with a drag and with a command, and a flag set
+        // at each of those would be three places to forget one.
+        const selection = s.hostSelectionOf(s.view());
+        if (!std.meta.eql(selection, s.reported_selection)) {
+            s.reported_selection = selection;
+            rt.emit(.{ .event = .SelectionChanged, .path = path, .data = .{ .selection = selection } });
         }
     }
 
@@ -4226,7 +4269,7 @@ const Session = struct {
         // The window exists and every window is where it will start, so a
         // plugin reacting to `start` can split, scroll or zoom and see it.
         if (s.plugins) |rt| {
-            rt.emit(.start);
+            rt.emit(.{ .event = .Start });
             s.reportChanges();
         }
 
@@ -4401,6 +4444,14 @@ const Session = struct {
             };
             if (s.nextJob()) |job| worker.post(job);
 
+            // One resumption each for the handlers that yielded, and no more:
+            // a handler that gave the frame back gets it back on the next
+            // one, which is the whole of what a coroutine is promised here.
+            if (s.plugins) |rt| {
+                rt.pump();
+                s.applyEffects();
+            }
+
             const extent: Bounds = .fromRect(
                 0,
                 0,
@@ -4523,7 +4574,7 @@ const Session = struct {
         // Before the place is written, so a plugin that moves on `quit` is
         // remembered where it left the reader.
         if (s.plugins) |rt| {
-            rt.emit(.quit);
+            rt.emit(.{ .event = .Quit, .path = s.buffer(s.view().buffer).path });
             s.applyEffects();
         }
         s.rememberAll();
@@ -5374,8 +5425,10 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
 
     try testing.expect(rt.runString("init.lua",
         \\events = {}
-        \\fenrir.on("highlight", function(h) events[#events + 1] = h.action .. ":" .. h.page end)
-        \\fenrir.on("page", function(p) last_page = p end)
+        \\local function note(e) events[#events + 1] = e.event .. ":" .. e.page end
+        \\fenrir.on("AnnotationAdd", note)
+        \\fenrir.on("AnnotationRemove", note)
+        \\fenrir.on("PageChanged", function(e) last_page = e.page end)
         \\fenrir.keymap("n", "g", function() fenrir.go(fenrir.document().pages) end)
         \\fenrir.command("Mark", function(args)
         \\  fenrir.highlight{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", note = "from lua" }
@@ -5400,7 +5453,7 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
     _ = s.apply(.undo);
     s.applyEffects();
     s.reportChanges();
-    try testing.expect(s.exec("lua assert(events[1] == 'add:3' and events[2] == 'remove:3', table.concat(events, ',')) assert(last_page == 10)"));
+    try testing.expect(s.exec("lua assert(events[1] == 'AnnotationAdd:3' and events[2] == 'AnnotationRemove:3', table.concat(events, ',')) assert(last_page == 10)"));
     try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
 
     // A broken binding reports and leaves the reader running.

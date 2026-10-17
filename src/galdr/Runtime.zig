@@ -68,28 +68,82 @@ const lua = @import("lua.zig");
 
 const Runtime = @This();
 
+/// What a plugin can listen for.
+///
+/// Written the way Vim writes an autocommand, in the case Lua spells them in,
+/// because `@tagName` is then the name a script types and there is no second
+/// table mapping one to the other. Half of them name features that do not
+/// exist yet: the names are reserved so a plugin written against them keeps
+/// working when they arrive, and `Event.fires` is what says which is which.
 pub const Event = enum {
     /// Every plugin is loaded and the window is open.
-    start,
+    Start,
     /// A document was opened. `{path, title, pages}`.
-    open,
-    /// The focused window's current page changed. The new page, from 1.
-    page,
-    /// The mode changed. Its name: "normal", "visual", "edit", ...
-    mode,
-    /// A highlight was added, removed or changed. `{action, id, page, ...}`.
-    highlight,
+    DocOpen,
+    /// The focused window's current page changed. `{page}`, from 1.
+    PageChanged,
+    /// The mode changed. `{mode}`: "normal", "visual", "edit", ...
+    ModeChanged,
+    /// The selection moved or was cleared. `{from, to}`, or neither.
+    SelectionChanged,
+    /// A highlight was made, taken away, or recoloured or annotated.
+    AnnotationAdd,
+    AnnotationRemove,
+    AnnotationChange,
+    /// One page finished rasterising. `{page}`. Once per page, on the frame
+    /// thread -- never per frame, and never on the rasterising thread, which
+    /// owns the `Document` and cannot also own a Lua state.
+    PageRender,
     /// The reader is about to close.
-    quit,
+    Quit,
+
+    /// The interface's colours changed. **Reserved**: the theme landed in
+    /// phase three and `Session.useTheme` is the one place that would fire
+    /// this, but nothing does yet.
+    ThemeChanged,
+    /// **Reserved.** fenrir cannot write PDFs at all.
+    DocSave,
+    /// **Reserved.** Annotations draw from appearance streams; none of them
+    /// is interactive.
+    FormFieldFocus,
+    /// **Reserved.** No redaction exists.
+    BeforeRedact,
+
+    /// Whether anything fires it. A handler on one that does not is not an
+    /// error -- it is a plugin written against a version that will have it --
+    /// but `fenrir health` says so, because a plugin that never runs and a
+    /// plugin that never fires look identical from inside.
+    pub fn fires(e: Event) bool {
+        return switch (e) {
+            .ThemeChanged, .DocSave, .FormFieldFocus, .BeforeRedact => false,
+            else => true,
+        };
+    }
 };
 
-pub const Payload = union(Event) {
-    start,
-    open: Host.Document,
+/// What an event carries, past the two fields every one of them has.
+pub const Data = union(enum) {
+    none,
+    document: Host.Document,
     page: u32,
+    /// A mode's name.
     mode: []const u8,
-    highlight: struct { action: []const u8, highlight: Host.Highlight },
-    quit,
+    /// Null for a selection that was cleared, which is a change like any
+    /// other and is the reason this is an optional rather than no event.
+    selection: ?[2]Host.Position,
+    highlight: Host.Highlight,
+};
+
+/// One event, as the reader hands it over.
+///
+/// `path` is what a handler's pattern is matched against, so every event
+/// carries one whether or not its data mentions a document. Empty for the
+/// ones that are about the reader rather than about a file, which `*` still
+/// matches.
+pub const Payload = struct {
+    event: Event,
+    path: []const u8 = "",
+    data: Data = .none,
 };
 
 /// What a plugin may reach, as a manifest asks for it.
@@ -201,6 +255,10 @@ pub const Options = struct {
     /// a current machine: far more than any key binding should take.
     step_limit: u64 = 5_000,
     hook_interval: c_int = 10_000,
+    /// How many times a yielded handler may be resumed before the reader
+    /// gives up on it. A handler that yields once a frame and is still going
+    /// after this has been running for minutes and is not coming back.
+    resume_limit: u32 = 100_000,
 };
 
 const ModeSet = packed struct(u8) {
@@ -241,11 +299,28 @@ const UserCommand = struct {
     description: []u8,
 };
 
-const Handler = struct {
+/// One `fenrir.on`, as the runtime keeps it.
+pub const Handler = struct {
     id: u32,
     event: Event,
+    /// The glob the event's path has to match. Owned; `*` for every path,
+    /// which is what a handler that gave none gets.
+    pattern: []u8,
+    /// What `fenrir.clear` takes away in one call. Owned, empty for none.
+    group: []u8,
     ref: c_int,
     live: bool = true,
+};
+
+/// A handler that yielded, waiting for the host to resume it.
+const Pending = struct {
+    /// The coroutine, referenced in the registry so that it is not collected
+    /// between one resumption and the next.
+    ref: c_int,
+    thread: *lua.State,
+    id: u32,
+    event: Event,
+    resumes: u32 = 0,
 };
 
 pub const Plugin = struct {
@@ -276,6 +351,8 @@ keymaps: std.ArrayList(Keymap) = .empty,
 commands: std.ArrayList(UserCommand) = .empty,
 handlers: std.ArrayList(Handler) = .empty,
 next_handler: u32 = 1,
+/// The handlers that are part way through, oldest first. See `pump`.
+pending: std.ArrayList(Pending) = .empty,
 
 /// Every error a script has raised this session, oldest first, capped. What
 /// `:messages` shows.
@@ -329,7 +406,12 @@ pub fn destroy(rt: *Runtime) void {
         gpa.free(c.description);
     }
     rt.commands.deinit(gpa);
+    for (rt.handlers.items) |h| {
+        gpa.free(h.pattern);
+        gpa.free(h.group);
+    }
     rt.handlers.deinit(gpa);
+    rt.pending.deinit(gpa);
     for (rt.messages.items) |m| gpa.free(m);
     rt.messages.deinit(gpa);
     for (rt.plugins.items) |p| {
@@ -442,6 +524,7 @@ const api = [_]Api{
     .{ .name = "manifest", .func = apiManifest },
     .{ .name = "on", .func = apiOn },
     .{ .name = "off", .func = apiOff },
+    .{ .name = "clear", .func = apiClear },
 
     .{ .name = "notify", .func = apiNotify, .cap = .ui },
     .{ .name = "exec", .func = apiExec, .cap = .ui },
@@ -559,7 +642,6 @@ fn traceback(L: ?*lua.State) callconv(.c) c_int {
 const Job = struct {
     ref: c_int,
     args: ?[]const u8 = null,
-    payload: ?Payload = null,
 };
 
 fn trampoline(L: ?*lua.State) callconv(.c) c_int {
@@ -568,10 +650,6 @@ fn trampoline(L: ?*lua.State) callconv(.c) c_int {
     var n: c_int = 0;
     if (job.args) |a| {
         lua.pushString(L, a);
-        n += 1;
-    }
-    if (job.payload) |p| {
-        pushPayload(L, p);
         n += 1;
     }
     lua.lua_callk(L, n, 0, 0, null);
@@ -862,39 +940,253 @@ pub fn runCommand(rt: *Runtime, name: []const u8, args: []const u8) ?bool {
     return null;
 }
 
+// -- the event bus ------------------------------------------------------------
+
 /// Tells every handler of an event about it.
+///
+/// Each one starts on a coroutine of its own, resumed once here and then by
+/// `pump` for as long as it keeps yielding. That is what "async by default"
+/// can mean in a reader: a handler that has more to do than a frame has time
+/// for yields and is picked up next frame, instead of being killed at the
+/// step limit or holding the window still until it is done.
 pub fn emit(rt: *Runtime, payload: Payload) void {
     if (!lua.available) return;
     if (rt.emitting >= max_event_depth) return;
     rt.emitting += 1;
     defer rt.emitting -= 1;
 
-    const event = std.meta.activeTag(payload);
     // By index, and to the length at the start: a handler may add or remove
     // handlers, and those take effect from the next event.
     const count = rt.handlers.items.len;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const h = rt.handlers.items[i];
-        if (!h.live or h.event != event) continue;
-        var what: [64]u8 = undefined;
-        const label = std.fmt.bufPrint(&what, "on {s}", .{@tagName(event)}) catch "event";
-        _ = rt.invoke(.{ .ref = h.ref, .payload = payload }, label);
+        if (!h.live or h.event != payload.event) continue;
+        if (!matches(h.pattern, payload.path)) continue;
+        rt.spawn(h.id, h.ref, payload);
     }
 }
 
+/// How many handlers are part way through. What the reader asks to know
+/// whether `pump` has anything to do, and what `fenrir health` prints.
+pub fn waiting(rt: *const Runtime) usize {
+    return rt.pending.items.len;
+}
+
+/// Resumes every handler that yielded, once each.
+///
+/// Called once a frame by the reader. Once each rather than to completion:
+/// a handler that yields is asking for the frame back, and resuming it in a
+/// loop until it finished would be refusing to give it.
+pub fn pump(rt: *Runtime) void {
+    if (!lua.available) return;
+    var i: usize = 0;
+    while (i < rt.pending.items.len) {
+        // Re-read every time: a resumed handler can emit, and an emit can
+        // append here and move the array out from under a pointer.
+        const p = rt.pending.items[i];
+        if (p.resumes >= rt.options.resume_limit) {
+            var what: [80]u8 = undefined;
+            rt.report(
+                std.fmt.bufPrint(&what, "on {s}", .{@tagName(p.event)}) catch "event",
+                "the handler yielded too many times and was dropped",
+            );
+            rt.finish(i);
+            continue;
+        }
+        rt.pending.items[i].resumes += 1;
+        if (rt.step(p.thread, 0, p.event) == lua.yield) {
+            i += 1;
+            continue;
+        }
+        rt.finish(i);
+    }
+}
+
+/// Drops the pending handler at `index`, letting the coroutine be collected.
+fn finish(rt: *Runtime, index: usize) void {
+    const p = rt.pending.items[index];
+    lua.luaL_unref(rt.L, lua.registry_index, p.ref);
+    _ = rt.pending.orderedRemove(index);
+}
+
+const SpawnJob = struct {
+    ref: c_int,
+    payload: Payload,
+    thread: ?*lua.State = null,
+    thread_ref: c_int = lua.no_ref,
+};
+
+/// Makes the coroutine and puts the handler and its table on it.
+///
+/// Everything that allocates happens here, inside a protected call, for the
+/// reason `trampoline` gives: at the memory limit an allocation that failed
+/// outside one would raise with no `pcall` to catch it, and Lua's answer to
+/// that is to abort the process. The table is built on the main state and
+/// moved across, because a raise on a coroutine nobody has resumed yet is
+/// exactly that unprotected case.
+fn spawnTrampoline(L: ?*lua.State) callconv(.c) c_int {
+    const job: *SpawnJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
+    const rt = of(L);
+
+    const co = lua.lua_newthread(L) orelse lua.raise(L, "galdr: no memory for a handler");
+    // Hooks are per thread in Lua 5.4 and a new one inherits none, so the
+    // step limit has to be put on every coroutine by hand -- otherwise a
+    // handler is the one place in the sandbox where `while true do end` runs
+    // forever.
+    lua.lua_sethook(co, hook, lua.mask_count, rt.options.hook_interval);
+
+    _ = lua.lua_rawgeti(L, lua.registry_index, job.ref);
+    pushPayload(L, job.payload);
+    if (lua.lua_checkstack(co, 2) == 0) lua.raise(L, "galdr: no stack for a handler");
+    lua.lua_xmove(L, co, 2);
+
+    job.thread = co;
+    job.thread_ref = lua.luaL_ref(L, lua.registry_index);
+    return 0;
+}
+
+fn spawn(rt: *Runtime, id: u32, ref: c_int, payload: Payload) void {
+    var job: SpawnJob = .{ .ref = ref, .payload = payload };
+    lua.lua_pushcclosure(rt.L, spawnTrampoline, 0);
+    lua.lua_pushlightuserdata(rt.L, &job);
+
+    var what: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&what, "on {s}", .{@tagName(payload.event)}) catch "event";
+    if (!rt.call(1, 0, label)) return;
+    const co = job.thread orelse return;
+
+    // One argument: the table. The function itself sits under it on the
+    // coroutine's stack and is not counted, which is what starting a
+    // coroutine means as against calling a function.
+    if (rt.step(co, 1, payload.event) != lua.yield) {
+        lua.luaL_unref(rt.L, lua.registry_index, job.thread_ref);
+        return;
+    }
+    rt.pending.append(rt.gpa, .{
+        .ref = job.thread_ref,
+        .thread = co,
+        .id = id,
+        .event = payload.event,
+    }) catch lua.luaL_unref(rt.L, lua.registry_index, job.thread_ref);
+}
+
+/// One resumption of a coroutine, with the step budget it is allowed.
+///
+/// The budget is per resumption rather than per handler, which is the whole
+/// of what a coroutine buys: a handler with a million lines of work yields,
+/// gets a fresh budget next frame, and finishes -- where the same work in a
+/// plain call is stopped as a runaway.
+fn step(rt: *Runtime, co: *lua.State, nargs: c_int, event: Event) c_int {
+    rt.steps = 0;
+    var results: c_int = 0;
+    const status = lua.lua_resume(co, rt.L, nargs, &results);
+    if (status == lua.ok or status == lua.yield) {
+        lua.lua_settop(co, 0);
+        return status;
+    }
+
+    var what: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&what, "on {s}", .{@tagName(event)}) catch "event";
+    // The traceback is of the coroutine's stack and is built on the main
+    // one, because the coroutine is in an error state and pushing to it is
+    // not a thing to be doing.
+    const message = lua.toString(co, -1) orelse "(no message)";
+    lua.pushString(rt.L, message);
+    lua.luaL_traceback(rt.L, co, @ptrCast(lua.lua_tolstring(rt.L, -1, null)), 0);
+    rt.report(label, lua.toString(rt.L, -1) orelse message);
+    lua.pop(rt.L, 2);
+    lua.lua_settop(co, 0);
+    return status;
+}
+
+/// The one table a handler is given.
+///
+/// Every event is the same shape -- `event` and `path`, then whatever that
+/// event is about -- so a function registered for three of them can tell
+/// which fired without three signatures to remember.
 fn pushPayload(L: ?*lua.State, payload: Payload) void {
-    switch (payload) {
-        .start, .quit => lua.lua_pushnil(L),
-        .page => |p| lua.lua_pushinteger(L, p),
-        .mode => |m| lua.pushString(L, m),
-        .open => |d| pushDocument(L, d),
+    lua.lua_createtable(L, 0, 8);
+    lua.pushString(L, @tagName(payload.event));
+    lua.lua_setfield(L, -2, "event");
+    lua.pushString(L, payload.path);
+    lua.lua_setfield(L, -2, "path");
+
+    switch (payload.data) {
+        .none => {},
+        .page => |p| {
+            lua.lua_pushinteger(L, p);
+            lua.lua_setfield(L, -2, "page");
+        },
+        .mode => |m| {
+            lua.pushString(L, m);
+            lua.lua_setfield(L, -2, "mode");
+        },
+        .document => |d| {
+            lua.pushString(L, d.title);
+            lua.lua_setfield(L, -2, "title");
+            lua.lua_pushinteger(L, d.pages);
+            lua.lua_setfield(L, -2, "pages");
+        },
+        .selection => |maybe| if (maybe) |sel| {
+            pushPosition(L, sel[0]);
+            lua.lua_setfield(L, -2, "from");
+            pushPosition(L, sel[1]);
+            lua.lua_setfield(L, -2, "to");
+        },
         .highlight => |h| {
-            pushHighlight(L, h.highlight);
-            lua.pushString(L, h.action);
-            lua.lua_setfield(L, -2, "action");
+            lua.lua_pushinteger(L, @intCast(h.id));
+            lua.lua_setfield(L, -2, "id");
+            lua.lua_pushinteger(L, h.page);
+            lua.lua_setfield(L, -2, "page");
+            inline for (.{ "x0", "y0", "x1", "y1" }) |field| {
+                lua.lua_pushnumber(L, @field(h, field));
+                lua.lua_setfield(L, -2, field);
+            }
+            lua.pushString(L, h.color);
+            lua.lua_setfield(L, -2, "color");
+            lua.pushString(L, h.note);
+            lua.lua_setfield(L, -2, "note");
         },
     }
+}
+
+/// Whether a document path matches a handler's pattern.
+///
+/// `*` is any run of characters and `?` is one, which is the whole of what a
+/// pattern in an autocommand has ever needed. Two liberties, both because
+/// these are file names: a separator matches either spelling, so a pattern
+/// written with `/` finds a path Windows wrote with `\`; and case is folded,
+/// because half the machines this runs on have a case-insensitive filesystem
+/// and a pattern that works on one should work on the other.
+pub fn matches(pattern: []const u8, path: []const u8) bool {
+    var p: usize = 0;
+    var s: usize = 0;
+    // Where to come back to when a `*` has to swallow one more character.
+    var star: ?usize = null;
+    var mark: usize = 0;
+
+    while (s < path.len) {
+        if (p < pattern.len and (pattern[p] == '?' or same(pattern[p], path[s]))) {
+            p += 1;
+            s += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            mark = s;
+            p += 1;
+        } else if (star) |at| {
+            p = at + 1;
+            mark += 1;
+            s = mark;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+fn same(a: u8, b: u8) bool {
+    if (a == '\\' or a == '/') return b == '\\' or b == '/';
+    return std.ascii.toLower(a) == std.ascii.toLower(b);
 }
 
 /// Every command name plugins have registered, for `:commands`.
@@ -904,6 +1196,11 @@ pub fn commandNames(rt: *const Runtime) []const UserCommand {
 
 pub fn keymapList(rt: *const Runtime) []const Keymap {
     return rt.keymaps.items;
+}
+
+/// Every `fenrir.on` that is still live, for the commands that print them.
+pub fn handlerList(rt: *const Runtime) []const Handler {
+    return rt.handlers.items;
 }
 
 // -- the fenrir table ---------------------------------------------------------
@@ -1194,19 +1491,52 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
     return 0;
 }
 
-/// `fenrir.on(event, function)`, returning an id for `fenrir.off`.
+/// `fenrir.on(event, pattern, function, group)`, returning an id for
+/// `fenrir.off`.
+///
+/// Vim's autocommand, with Vim's arguments: what happened, which files it has
+/// to have happened to, and what to do. The pattern may be left out --
+/// `fenrir.on("Quit", f)` -- because three of the events are about the reader
+/// and have no file to match. The group may be left out too, and is what
+/// `fenrir.clear` takes away when a plugin is reloaded and wants its own
+/// handlers gone before it registers them again.
 fn apiOn(L: ?*lua.State) callconv(.c) c_int {
     const name = lua.checkString(L, 1);
-    lua.luaL_checktype(L, 2, @intFromEnum(lua.Type.function));
-    const event = std.meta.stringToEnum(Event, name) orelse
-        lua.raise(L, "galdr: events are start, open, page, mode, highlight and quit");
+    const event = std.meta.stringToEnum(Event, name) orelse {
+        var msg: [200]u8 = undefined;
+        lua.raise(L, std.fmt.bufPrint(&msg, "galdr: \"{s}\" is not an event; `fenrir health` lists them", .{
+            name[0..@min(name.len, 40)],
+        }) catch "galdr: not an event");
+    };
 
-    lua.lua_pushvalue(L, 2);
+    // Two shapes, told apart by what is in the second place. A string there
+    // is a pattern and a function there is the handler.
+    const shifted = lua.typeOf(L, 2) == .function;
+    const pattern = if (shifted) "*" else lua.checkString(L, 2);
+    const at: c_int = if (shifted) 2 else 3;
+    lua.luaL_checktype(L, at, @intFromEnum(lua.Type.function));
+    const group = lua.optString(L, at + 1) orelse "";
+
+    lua.lua_pushvalue(L, at);
     const ref = lua.luaL_ref(L, lua.registry_index);
 
     const rt = of(L);
+    const owned_pattern = rt.gpa.dupe(u8, pattern) catch null;
+    const owned_group = rt.gpa.dupe(u8, group) catch null;
     const id = rt.next_handler;
-    rt.handlers.append(rt.gpa, .{ .id = id, .event = event, .ref = ref }) catch return rt.outOfMemory(L, ref);
+    const added = owned_pattern != null and owned_group != null and
+        (if (rt.handlers.append(rt.gpa, .{
+            .id = id,
+            .event = event,
+            .pattern = owned_pattern.?,
+            .group = owned_group.?,
+            .ref = ref,
+        })) true else |_| false);
+    if (!added) {
+        if (owned_pattern) |s| rt.gpa.free(s);
+        if (owned_group) |s| rt.gpa.free(s);
+        return rt.outOfMemory(L, ref);
+    }
     rt.next_handler += 1;
     lua.lua_pushinteger(L, id);
     return 1;
@@ -1221,6 +1551,23 @@ fn apiOff(L: ?*lua.State) callconv(.c) c_int {
         lua.luaL_unref(L, lua.registry_index, h.ref);
     }
     return 0;
+}
+
+/// `fenrir.clear(group)`: every handler registered under that name, gone.
+/// Returns how many there were, so a plugin reloading itself can say so.
+fn apiClear(L: ?*lua.State) callconv(.c) c_int {
+    const group = lua.checkString(L, 1);
+    if (group.len == 0) lua.raise(L, "galdr: a group has a name");
+    const rt = of(L);
+    var cleared: lua.Integer = 0;
+    for (rt.handlers.items) |*h| {
+        if (!h.live or !std.mem.eql(u8, h.group, group)) continue;
+        h.live = false;
+        lua.luaL_unref(L, lua.registry_index, h.ref);
+        cleared += 1;
+    }
+    lua.lua_pushinteger(L, cleared);
+    return 1;
 }
 
 fn pushDocument(L: ?*lua.State, d: Host.Document) void {
@@ -1715,24 +2062,156 @@ test "events reach their handlers, which can be turned off" {
 
     try testing.expect(rt.runString("init.lua",
         \\seen = {}
-        \\local id = fenrir.on("page", function(p) seen[#seen + 1] = p end)
-        \\fenrir.on("open", function(d) opened = d.title .. ":" .. d.pages end)
-        \\fenrir.on("highlight", function(h) action = h.action .. h.page end)
+        \\local id = fenrir.on("PageChanged", function(e) seen[#seen + 1] = e.page end)
+        \\fenrir.on("DocOpen", function(e) opened = e.title .. ":" .. e.pages .. ":" .. e.path end)
+        \\fenrir.on("AnnotationAdd", function(e) made = e.event .. e.page end)
+        \\fenrir.on("SelectionChanged", function(e) sel = e.from and e.from.line or "none" end)
         \\off_id = id
     ));
-    rt.emit(.{ .page = 4 });
-    rt.emit(.{ .open = .{ .path = "/a.pdf", .title = "a.pdf", .pages = 9 } });
-    rt.emit(.{ .highlight = .{ .action = "add", .highlight = .{ .page = 2, .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 } } });
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 4 } });
+    rt.emit(.{ .event = .DocOpen, .path = "/a.pdf", .data = .{ .document = .{
+        .path = "/a.pdf",
+        .title = "a.pdf",
+        .pages = 9,
+    } } });
+    rt.emit(.{ .event = .AnnotationAdd, .data = .{ .highlight = .{
+        .page = 2,
+        .x0 = 0,
+        .y0 = 0,
+        .x1 = 1,
+        .y1 = 1,
+    } } });
+    rt.emit(.{ .event = .SelectionChanged, .data = .{ .selection = null } });
     try testing.expect(rt.runString("check",
         \\assert(seen[1] == 4)
-        \\assert(opened == "a.pdf:9")
-        \\assert(action == "add2")
+        \\assert(opened == "a.pdf:9:/a.pdf", tostring(opened))
+        \\assert(made == "AnnotationAdd2", tostring(made))
+        \\assert(sel == "none")
         \\fenrir.off(off_id)
     ));
-    rt.emit(.{ .page = 5 });
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 5 } });
     try testing.expect(rt.runString("check2", "assert(#seen == 1, 'handler still ran')"));
 
     try testing.expect(!rt.runString("bad", "fenrir.on('nonsense', function() end)"));
+    // A reserved event takes a handler and never fires it. That is not an
+    // error: it is a plugin written for the version that will have it.
+    try testing.expect(rt.runString("reserved", "fenrir.on('BeforeRedact', function() end)"));
+}
+
+test "a pattern decides which documents a handler hears about" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\papers, all = 0, 0
+        \\fenrir.on("DocOpen", "*/papers/*.pdf", function() papers = papers + 1 end)
+        \\fenrir.on("DocOpen", "*", function() all = all + 1 end)
+    ));
+    for ([_][]const u8{ "/home/x/papers/a.pdf", "/home/x/books/b.pdf", "C:\\Users\\x\\Papers\\C.PDF" }) |p| {
+        rt.emit(.{ .event = .DocOpen, .path = p, .data = .{ .document = .{ .path = p, .title = p, .pages = 1 } } });
+    }
+    try testing.expect(rt.runString("check", "assert(papers == 2, papers) assert(all == 3)"));
+}
+
+test "globs match the way a file name needs them to" {
+    try testing.expect(matches("*", ""));
+    try testing.expect(matches("*", "/a/b.pdf"));
+    try testing.expect(matches("*.pdf", "/a/b.pdf"));
+    try testing.expect(matches("*.pdf", "b.pdf"));
+    try testing.expect(!matches("*.pdf", "b.pdfx"));
+    try testing.expect(matches("?.pdf", "b.pdf"));
+    try testing.expect(!matches("?.pdf", "ab.pdf"));
+    // A separator is a separator, and a name is a name, whichever machine
+    // wrote it down.
+    try testing.expect(matches("*/papers/*", "C:\\docs\\PAPERS\\x.pdf"));
+    try testing.expect(matches("/a/b", "\\a\\b"));
+    try testing.expect(!matches("/a/b", "/a/c"));
+    // The pathological one: many stars over a string with no match at the
+    // end, which a naive matcher takes exponential time over.
+    try testing.expect(!matches("*a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"));
+}
+
+test "a group goes away in one call" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\n, kept = 0, 0
+        \\fenrir.on("PageChanged", "*", function() n = n + 1 end, "mine")
+        \\fenrir.on("PageChanged", "*", function() n = n + 1 end, "mine")
+        \\fenrir.on("PageChanged", "*", function() kept = kept + 1 end)
+    ));
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 1 } });
+    try testing.expect(rt.runString("again",
+        \\assert(n == 2, n)
+        \\assert(fenrir.clear("mine") == 2)
+        \\assert(fenrir.clear("mine") == 0)
+    ));
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 2 } });
+    try testing.expect(rt.runString("check", "assert(n == 2, n) assert(kept == 2, kept)"));
+}
+
+test "a handler that yields is picked up again, with a fresh budget each time" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    // A budget too small for the whole loop in one go, so the only way the
+    // handler finishes is by being resumed.
+    const rt = try create(testing.allocator, fake.host(), .{ .step_limit = 20 });
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\total, rounds = 0, 0
+        \\fenrir.on("PageChanged", function()
+        \\  for _ = 1, 8 do
+        \\    for i = 1, 20000 do total = total + i end
+        \\    rounds = rounds + 1
+        \\    coroutine.yield()
+        \\  end
+        \\  done = true
+        \\end)
+    ));
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 1 } });
+    try testing.expectEqual(@as(usize, 1), rt.waiting());
+    try testing.expect(rt.runString("check", "assert(rounds == 1) assert(done == nil)"));
+
+    var frames: usize = 0;
+    while (rt.waiting() != 0 and frames < 100) : (frames += 1) rt.pump();
+    try testing.expectEqual(@as(usize, 0), rt.waiting());
+    try testing.expect(rt.runString("check", "assert(done, 'the handler never finished') assert(rounds == 8)"));
+    try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
+
+    // And one that never yields is still stopped at the limit, on its own
+    // coroutine, without taking the reader with it.
+    try testing.expect(rt.runString("more", "fenrir.on('Quit', function() while true do end end)"));
+    rt.emit(.{ .event = .Quit });
+    try testing.expectEqual(@as(usize, 0), rt.waiting());
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "too long") != null);
+}
+
+test "an error in a handler is one plugin's problem" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\after = 0
+        \\fenrir.on("PageChanged", function() error("from a handler") end)
+        \\fenrir.on("PageChanged", function() after = after + 1 end)
+    ));
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 1 } });
+    try testing.expectEqual(@as(usize, 1), rt.messages.items.len);
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "from a handler") != null);
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "PageChanged") != null);
+    try testing.expect(rt.runString("check", "assert(after == 1, 'the next handler was skipped')"));
 }
 
 test "a handler that causes its own event does not recurse forever" {
@@ -1742,13 +2221,17 @@ test "a handler that causes its own event does not recurse forever" {
     const rt = try start(&fake);
     defer rt.destroy();
 
-    // A host whose goTo emits `page` would loop; the depth limit ends it.
-    try testing.expect(rt.runString("init.lua", "count = 0 fenrir.on('page', function() count = count + 1 end)"));
-    for (0..3) |_| rt.emit(.{ .page = 1 });
+    // A host whose goTo emits `PageChanged` would loop; the depth limit ends
+    // it.
+    try testing.expect(rt.runString("init.lua",
+        \\count = 0
+        \\fenrir.on("PageChanged", function() count = count + 1 end)
+    ));
+    for (0..3) |_| rt.emit(.{ .event = .PageChanged, .data = .{ .page = 1 } });
     try testing.expect(rt.runString("check", "assert(count == 3)"));
 
     rt.emitting = max_event_depth;
-    rt.emit(.{ .page = 1 });
+    rt.emit(.{ .event = .PageChanged, .data = .{ .page = 1 } });
     rt.emitting = 0;
     try testing.expect(rt.runString("check", "assert(count == 3)"));
 }

@@ -87,6 +87,12 @@ pub const no_ref: c_int = -2;
 
 pub extern fn lua_newstate(f: Alloc, ud: ?*anyopaque) ?*State;
 pub extern fn lua_close(L: ?*State) void;
+pub extern fn lua_newthread(L: ?*State) ?*State;
+pub extern fn lua_resume(L: ?*State, from: ?*State, nargs: c_int, nresults: ?*c_int) c_int;
+pub extern fn lua_status(L: ?*State) c_int;
+pub extern fn lua_xmove(from: ?*State, to: ?*State, n: c_int) void;
+pub extern fn lua_checkstack(L: ?*State, n: c_int) c_int;
+pub extern fn lua_tothread(L: ?*State, idx: c_int) ?*State;
 
 pub extern fn lua_absindex(L: ?*State, idx: c_int) c_int;
 pub extern fn lua_gettop(L: ?*State) c_int;
