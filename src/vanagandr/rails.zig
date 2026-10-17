@@ -107,11 +107,27 @@ pub const Panel = enum {
 /// The panels the rail has a button for, in the order it draws them.
 pub const toggles = [_]Panel{ .annotations, .bookmarks };
 
+/// A button a plugin put here.
+///
+/// An icon *name* and a number, and nothing else: the rail does not know what
+/// a plugin is and does not resolve the picture -- `Icons.byName` does that,
+/// and a name it has never heard of draws as the hollow box, which is the
+/// registry's whole answer to a missing icon and is better than a rail with a
+/// hole in it.
+pub const Extra = struct {
+    id: u32,
+    label: []const u8,
+    icon: []const u8,
+};
+
 /// What the rail shows, as the reader knows it.
 pub const Right = struct {
     /// Numbered from one, as a person numbers them.
     page: u32 = 1,
     pages: u32 = 1,
+    /// The plugins' buttons, under the reader's own and under a rule: the
+    /// things this program does are above the things somebody added.
+    extra: []const Extra = &.{},
 };
 
 /// What the rail was asked for. A request and not an action, as
@@ -128,6 +144,10 @@ pub const Want = union(enum) {
     /// zero is `1`. What it *does* depends on the mode, which is a question
     /// `keys.paletteCommand` answers for the rail and the keyboard alike.
     colour: u8,
+    /// Run the plugin's button with this id. What it does is the plugin's to
+    /// say, exactly as a rail button of the reader's own goes through `keys`:
+    /// a rail names a thing and something else knows what the thing means.
+    plugin: u32,
 };
 
 /// One colour in the left rail's palette, as the reader names it.
@@ -142,6 +162,7 @@ pub const Left = struct {
     mode: keys.Mode = .normal,
     /// The colours a digit picks, in that order: the first is `1`.
     palette: []const Swatch = &.{},
+    extra: []const Extra = &.{},
 };
 
 /// The modes the rail has a button for, in the order it draws them.
@@ -300,10 +321,57 @@ pub fn rightRail(
         try w.spacer(ui, .px(2));
     }
 
+    if (try extras(ui, t, icons, tips, st.extra, "right")) |id| want = .{ .plugin = id };
+
     try w.fill(ui);
     if (try counter(ui, t, st, r)) |page| want = .{ .page = page };
 
     return want;
+}
+
+/// The plugins' buttons, under a rule that separates them from the reader's.
+///
+/// Keyed by the rail rather than by the plugin's id, because a rail full of
+/// buttons that come and go should still have one box per position -- an id
+/// in the key would give the second button a new box the moment the first was
+/// removed, and with it a new hover and a new animation.
+fn extras(
+    ui: *UI,
+    t: Theme,
+    icons: *const Icons,
+    tips: *w.Tips,
+    list: []const Extra,
+    side: []const u8,
+) Error!?u32 {
+    if (list.len == 0) return null;
+    try w.spacer(ui, .px(inset));
+    ui.next(.{
+        .w = .px(button - 6),
+        .h = .px(1),
+        .bg = t.border,
+        .flags = .{ .draw_background = true },
+    });
+    var rule_name: [24]u8 = undefined;
+    _ = try ui.box(std.fmt.bufPrint(&rule_name, "###{s} plugin rule", .{side}) catch "###plugin rule");
+    try w.spacer(ui, .px(inset));
+
+    var chosen: ?u32 = null;
+    for (list, 0..) |e, i| {
+        // `iconButton` goes through `boxText`, where the name is the key
+        // alone and the picture is the text -- so the label has no business
+        // in it, and a plugin renaming its button keeps the box it had.
+        var name: [24]u8 = undefined;
+        const sig = try w.iconButton(
+            ui,
+            std.fmt.bufPrint(&name, "plugin{d}", .{i}) catch "plugin",
+            icons.byName(e.icon, .sidebar),
+            .{ .accent = t.accent },
+        );
+        w.tool.hint(ui, tips, sig, e.label);
+        if (sig.clicked) chosen = e.id;
+        try w.spacer(ui, .px(2));
+    }
+    return chosen;
 }
 
 /// How much of the window a rail leaves alone at the bottom. The status bar
@@ -380,6 +448,8 @@ pub fn leftRail(
         if (try swatch(ui, t, tips, s, @intCast(i))) want = .{ .colour = @intCast(i) };
         try w.spacer(ui, .px(3));
     }
+
+    if (try extras(ui, t, icons, tips, st.extra, "left")) |id| want = .{ .plugin = id };
 
     try w.fill(ui);
     return want;
@@ -776,4 +846,52 @@ test "a rail with no palette draws the modes and no rule under them" {
     try testing.expect(rig.findLeft("Normal") != null);
     try testing.expect(rig.findLeft("rule") == null);
     try testing.expect(rig.findLeft("colour0") == null);
+}
+
+test "a plugin's buttons sit under the reader's own, with a rule between" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    const extra = [_]Extra{
+        .{ .id = 7, .label = "Reading list", .icon = "fenrir.bookmark" },
+        // An icon no theme has: it draws as the registry's hollow box rather
+        // than leaving a hole where a button should be.
+        .{ .id = 9, .label = "Sync", .icon = "nobody.has.this" },
+    };
+
+    var r: Rails = .{};
+    const st: Right = .{ .page = 1, .pages = 4, .extra = &extra };
+    _ = try rig.frame(st, &r, .{});
+
+    try testing.expect(rig.find("right plugin rule") != null);
+    const first = rig.find("plugin0").?;
+    const second = rig.find("plugin1").?;
+    // Under the reader's own toggles, in the order the plugins added them.
+    try testing.expect(first.rect.min_y > rig.find("Annotations").?.rect.max_y);
+    try testing.expect(second.rect.min_y > first.rect.max_y);
+
+    try testing.expectEqual(@as(u32, 7), (try rig.click(st, &r, middleOf(first))).?.plugin);
+    try testing.expectEqual(@as(u32, 9), (try rig.click(st, &r, middleOf(second))).?.plugin);
+
+    // And the left rail takes them too, under the swatches.
+    const left: Left = .{ .palette = &palette, .extra = extra[0..1] };
+    _ = try rig.frameLeft(left, .{});
+    try testing.expect(rig.findLeft("left plugin rule") != null);
+    try testing.expectEqual(@as(u32, 7), (try rig.clickLeft(left, middleOf(rig.findLeft("plugin0").?))).?.plugin);
+}
+
+test "no plugin buttons, no rule to separate them from" {
+    // Its own rig, because `UI.find` walks the tree the last frame left
+    // behind: a box that is not built this frame is still findable, so the
+    // absence of one can only be checked by a rail that never had it.
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    var r: Rails = .{};
+    _ = try rig.frame(.{ .page = 1, .pages = 4 }, &r, .{});
+    try testing.expect(rig.find("Annotations") != null);
+    try testing.expect(rig.find("right plugin rule") == null);
+    try testing.expect(rig.find("plugin0") == null);
 }

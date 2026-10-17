@@ -130,6 +130,18 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             }) catch {};
         }
     }
+    if (rt.rails.items.len != 0) {
+        ctx.out.print("rails:\n", .{}) catch {};
+        for (rt.railList()) |b| {
+            if (!b.live) continue;
+            ctx.out.print("  {s: <6} {s: <18} {s: <20} {s}\n", .{
+                @tagName(b.side),
+                b.label,
+                b.icon,
+                if (b.line.len != 0) b.line else "(function)",
+            }) catch {};
+        }
+    }
     if (rt.handlers.items.len != 0) {
         ctx.out.print("events:\n", .{}) catch {};
         for (rt.handlerList()) |h| {

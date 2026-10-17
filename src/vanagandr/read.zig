@@ -941,6 +941,12 @@ const Session = struct {
     /// which live on the buffer, so nothing here owns a string.
     panel: panels.State = .{},
     rows: std.ArrayList(panels.Row) = .empty,
+
+    /// The plugins' rail buttons, sorted by side. Filled from Galdr when its
+    /// revision changes and never per frame: see `fillRailButtons`.
+    rail_left: std.ArrayList(rails_mod.Extra) = .empty,
+    rail_right: std.ArrayList(rails_mod.Extra) = .empty,
+    rails_for: u32 = std.math.maxInt(u32),
     rows_for: struct {
         which: rails_mod.Panel = .none,
         buffer: u32 = 0,
@@ -1102,6 +1108,8 @@ const Session = struct {
         s.boxes.deinit(s.gpa);
         s.rows.deinit(s.gpa);
         s.palette_rows.deinit(s.gpa);
+        s.rail_left.deinit(s.gpa);
+        s.rail_right.deinit(s.gpa);
         s.tab_names.deinit(s.gpa);
         s.tab_text.deinit(s.gpa);
         s.tab_ends.deinit(s.gpa);
@@ -3896,7 +3904,35 @@ const Session = struct {
     /// What the right rail shows: where you are, and how far it goes.
     fn railLine(s: *Session) rails_mod.Right {
         const v = s.view();
-        return .{ .page = v.currentPage() + 1, .pages = @intCast(v.pages.len) };
+        s.fillRailButtons();
+        return .{
+            .page = v.currentPage() + 1,
+            .pages = @intCast(v.pages.len),
+            .extra = s.rail_right.items,
+        };
+    }
+
+    /// The plugins' rail buttons, split by side, rebuilt only when a plugin
+    /// has added or taken one away.
+    ///
+    /// `Runtime.revision` changes then and at no other time, so a reader with
+    /// three plugin buttons on screen sorts them into two lists once and
+    /// draws from the lists for the rest of the session. The labels and icon
+    /// names are Galdr's own bytes, borrowed: nothing here copies a string.
+    fn fillRailButtons(s: *Session) void {
+        const rt = s.plugins orelse return;
+        if (s.rails_for == rt.revision) return;
+        s.rails_for = rt.revision;
+        s.rail_left.clearRetainingCapacity();
+        s.rail_right.clearRetainingCapacity();
+        for (rt.railList()) |b| {
+            if (!b.live) continue;
+            const into = switch (b.side) {
+                .left => &s.rail_left,
+                .right => &s.rail_right,
+            };
+            into.append(s.gpa, .{ .id = b.id, .label = b.label, .icon = b.icon }) catch break;
+        }
     }
 
     /// What the left rail shows: the mode, and the colours a digit picks.
@@ -3914,7 +3950,8 @@ const Session = struct {
                 };
             }
         }
-        return .{ .mode = s.keymap.mode, .palette = &s.swatches };
+        s.fillRailButtons();
+        return .{ .mode = s.keymap.mode, .palette = &s.swatches, .extra = s.rail_left.items };
     }
 
     /// What a rail asked for, carried out.
@@ -3936,6 +3973,13 @@ const Session = struct {
             // frame. One place fills them, and it is `panelRows`.
             .panel => |p| c.rails.show(p),
             .page => |page| _ = s.goToPage(page),
+            // The plugin's to answer, exactly as a mode button's meaning is
+            // the keymap's: a rail names a thing and something else knows
+            // what the thing means.
+            .plugin => |id| if (s.plugins) |rt| {
+                rt.runRail(id);
+                s.applyEffects();
+            },
         }
         s.dirty_title = true;
     }
@@ -4669,6 +4713,8 @@ fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.palette_rows.deinit(s.gpa);
+    s.rail_left.deinit(s.gpa);
+    s.rail_right.deinit(s.gpa);
     s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);

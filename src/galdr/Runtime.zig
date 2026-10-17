@@ -312,6 +312,29 @@ pub const Handler = struct {
     live: bool = true,
 };
 
+/// Which rail a plugin's button goes on.
+pub const Side = enum { left, right };
+
+/// A button a plugin put on a rail.
+///
+/// The icon is a *name* in the reader's registry and never a path, so a
+/// plugin cannot reach the filesystem through a picture and a theme can
+/// restyle a plugin's button along with everything else. A name the registry
+/// does not have draws as its hollow box, which is a button saying something
+/// is missing rather than a button that is missing.
+pub const RailButton = struct {
+    id: u32,
+    side: Side,
+    icon: []u8,
+    label: []u8,
+    /// The Lua function, or `lua.no_ref` when the button is a command line.
+    ref: c_int,
+    line: []u8,
+    /// What `fenrir.clear` takes it away with. Owned, empty for none.
+    group: []u8,
+    live: bool = true,
+};
+
 /// A handler that yielded, waiting for the host to resume it.
 const Pending = struct {
     /// The coroutine, referenced in the registry so that it is not collected
@@ -353,6 +376,18 @@ handlers: std.ArrayList(Handler) = .empty,
 next_handler: u32 = 1,
 /// The handlers that are part way through, oldest first. See `pump`.
 pending: std.ArrayList(Pending) = .empty,
+
+/// What plugins have put in the interface, and a number that changes when
+/// any of it does.
+///
+/// The reader reads these back rather than being pushed them, which is what
+/// `lookup` and `commandNames` already do for keys and commands -- the
+/// strings live here and the reader borrows them, so nothing has to be
+/// copied into a window and nothing has a second owner. `revision` is what
+/// lets the reader do that once per change instead of once per frame.
+rails: std.ArrayList(RailButton) = .empty,
+revision: u32 = 0,
+next_contribution: u32 = 1,
 
 /// Every error a script has raised this session, oldest first, capped. What
 /// `:messages` shows.
@@ -412,6 +447,13 @@ pub fn destroy(rt: *Runtime) void {
     }
     rt.handlers.deinit(gpa);
     rt.pending.deinit(gpa);
+    for (rt.rails.items) |b| {
+        gpa.free(b.icon);
+        gpa.free(b.label);
+        gpa.free(b.line);
+        gpa.free(b.group);
+    }
+    rt.rails.deinit(gpa);
     for (rt.messages.items) |m| gpa.free(m);
     rt.messages.deinit(gpa);
     for (rt.plugins.items) |p| {
@@ -534,6 +576,8 @@ const api = [_]Api{
     .{ .name = "go", .func = apiGo, .cap = .ui },
     .{ .name = "zoom", .func = apiZoom, .cap = .ui },
     .{ .name = "mode", .func = apiMode, .cap = .ui },
+    .{ .name = "rail", .func = apiRail, .cap = .ui },
+    .{ .name = "unrail", .func = apiUnrail, .cap = .ui },
 
     .{ .name = "document", .func = apiDocument, .cap = .document_read },
     .{ .name = "page", .func = apiPage, .cap = .document_read },
@@ -1203,6 +1247,34 @@ pub fn handlerList(rt: *const Runtime) []const Handler {
     return rt.handlers.items;
 }
 
+/// Every button a plugin put on a rail, in the order they were added.
+pub fn railList(rt: *const Runtime) []const RailButton {
+    return rt.rails.items;
+}
+
+/// What a rail button was for, run.
+///
+/// The same two ways in a key binding has, for the same reason: a button that
+/// is a `:` line is the commonest kind and needs no function written round
+/// it, and a button that is a function reaches things the command line does
+/// not have a name for.
+pub fn runRail(rt: *Runtime, id: u32) void {
+    if (!lua.available) return;
+    for (rt.rails.items) |b| {
+        if (b.id != id or !b.live) continue;
+        if (b.ref == lua.no_ref) {
+            _ = rt.host.exec(b.line);
+            return;
+        }
+        var what: [128]u8 = undefined;
+        const label = std.fmt.bufPrint(&what, "rail {s}", .{
+            b.label[0..@min(b.label.len, 40)],
+        }) catch "rail";
+        _ = rt.invoke(.{ .ref = b.ref }, label);
+        return;
+    }
+}
+
 // -- the fenrir table ---------------------------------------------------------
 
 fn apiNotify(L: ?*lua.State) callconv(.c) c_int {
@@ -1553,8 +1625,13 @@ fn apiOff(L: ?*lua.State) callconv(.c) c_int {
     return 0;
 }
 
-/// `fenrir.clear(group)`: every handler registered under that name, gone.
-/// Returns how many there were, so a plugin reloading itself can say so.
+/// `fenrir.clear(group)`: every handler and every contribution registered
+/// under that name, gone. Returns how many there were, so a plugin reloading
+/// itself can say so.
+///
+/// One call for both because a plugin reloading itself wants one call. The
+/// group is the plugin's name by convention and nothing enforces that: a
+/// group is a label a plugin puts on its own work, not a namespace.
 fn apiClear(L: ?*lua.State) callconv(.c) c_int {
     const group = lua.checkString(L, 1);
     if (group.len == 0) lua.raise(L, "galdr: a group has a name");
@@ -1566,8 +1643,96 @@ fn apiClear(L: ?*lua.State) callconv(.c) c_int {
         lua.luaL_unref(L, lua.registry_index, h.ref);
         cleared += 1;
     }
+    for (rt.rails.items) |*b| {
+        if (!b.live or !std.mem.eql(u8, b.group, group)) continue;
+        b.live = false;
+        if (b.ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, b.ref);
+        b.ref = lua.no_ref;
+        rt.revision +%= 1;
+        cleared += 1;
+    }
     lua.lua_pushinteger(L, cleared);
     return 1;
+}
+
+/// `fenrir.rail{ side =, icon =, label =, action =, group = }`, returning an
+/// id for `fenrir.unrail`.
+///
+/// A table rather than four positional arguments because five of the six
+/// fields have sensible defaults and a call with three `nil`s in it is a call
+/// nobody can read. `action` is a function or a `:` command line.
+fn apiRail(L: ?*lua.State) callconv(.c) c_int {
+    lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
+
+    _ = lua.lua_getfield(L, 1, "side");
+    const side_text = lua.toString(L, -1) orelse "right";
+    const side = std.meta.stringToEnum(Side, side_text) orelse
+        lua.raise(L, "galdr: a rail is \"left\" or \"right\"");
+    lua.pop(L, 1);
+
+    _ = lua.lua_getfield(L, 1, "label");
+    const label = lua.toString(L, -1) orelse lua.raise(L, "galdr: a rail button needs a label");
+    if (label.len == 0 or label.len > 64) lua.raise(L, "galdr: a rail button's label is one to sixty-four bytes");
+
+    _ = lua.lua_getfield(L, 1, "icon");
+    const icon = lua.toString(L, -1) orelse "fenrir.unknown";
+
+    _ = lua.lua_getfield(L, 1, "group");
+    const group = lua.toString(L, -1) orelse "";
+
+    _ = lua.lua_getfield(L, 1, "action");
+    const kind = lua.typeOf(L, -1);
+    if (kind != .function and kind != .string) lua.raise(L, "galdr: a rail button needs a function or a command line");
+    const line = if (kind == .string) lua.toString(L, -1).? else "";
+
+    // Every argument is checked; from here Lua calls come before Zig
+    // allocations, as `apiKeymap` does and for the same reason.
+    //
+    // The strings stay on the stack until they have been copied: `line`
+    // borrows the very value `luaL_ref` would have popped.
+    var ref: c_int = lua.no_ref;
+    if (kind == .function) ref = lua.luaL_ref(L, lua.registry_index);
+
+    const rt = of(L);
+    const owned_icon = rt.gpa.dupe(u8, icon) catch null;
+    const owned_label = rt.gpa.dupe(u8, label) catch null;
+    const owned_line = rt.gpa.dupe(u8, line) catch null;
+    const owned_group = rt.gpa.dupe(u8, group) catch null;
+    const id = rt.next_contribution;
+    const added = owned_icon != null and owned_label != null and owned_line != null and owned_group != null and
+        (if (rt.rails.append(rt.gpa, .{
+            .id = id,
+            .side = side,
+            .icon = owned_icon.?,
+            .label = owned_label.?,
+            .ref = ref,
+            .line = owned_line.?,
+            .group = owned_group.?,
+        })) true else |_| false);
+    if (!added) {
+        if (owned_icon) |s| rt.gpa.free(s);
+        if (owned_label) |s| rt.gpa.free(s);
+        if (owned_line) |s| rt.gpa.free(s);
+        if (owned_group) |s| rt.gpa.free(s);
+        return rt.outOfMemory(L, ref);
+    }
+    rt.next_contribution += 1;
+    rt.revision +%= 1;
+    lua.lua_pushinteger(L, id);
+    return 1;
+}
+
+fn apiUnrail(L: ?*lua.State) callconv(.c) c_int {
+    const id = lua.luaL_checkinteger(L, 1);
+    const rt = of(L);
+    for (rt.rails.items) |*b| {
+        if (b.id != id or !b.live) continue;
+        b.live = false;
+        if (b.ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, b.ref);
+        b.ref = lua.no_ref;
+        rt.revision +%= 1;
+    }
+    return 0;
 }
 
 fn pushDocument(L: ?*lua.State, d: Host.Document) void {
@@ -2355,6 +2520,73 @@ test "a folder's plugin.lua says the same thing, and a bad one stops the plugin"
     try testing.expectEqualStrings("a folder", rt.plugins.items[0].manifest.about);
     try testing.expect(!rt.plugins.items[1].ok);
     try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "telepathy") != null);
+}
+
+test "a plugin puts buttons on the rails, and takes them away again" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\list = fenrir.rail{ icon = "fenrir.bookmark", label = "Reading list",
+        \\                    action = function() fenrir.notify("opened") end, group = "mine" }
+        \\fenrir.rail{ side = "left", icon = "fenrir.note", label = "Note", action = "vsplit", group = "mine" }
+        \\gone = fenrir.rail{ label = "Temporary", action = "q" }
+    ));
+
+    const before = rt.revision;
+    try testing.expect(rt.runString("drop", "fenrir.unrail(gone)"));
+    try testing.expect(rt.revision != before);
+
+    var live: usize = 0;
+    var sides: [2]Side = undefined;
+    for (rt.railList()) |b| {
+        if (!b.live) continue;
+        sides[live] = b.side;
+        live += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), live);
+    try testing.expectEqual(Side.right, sides[0]);
+    try testing.expectEqual(Side.left, sides[1]);
+    try testing.expectEqualStrings("Reading list", rt.railList()[0].label);
+    try testing.expectEqualStrings("fenrir.bookmark", rt.railList()[0].icon);
+
+    // Both ways in: a function, and a command line the host is asked to run.
+    rt.runRail(rt.railList()[0].id);
+    try testing.expectEqualStrings("opened", fake.notes.items[fake.notes.items.len - 1]);
+    rt.runRail(rt.railList()[1].id);
+    try testing.expectEqualStrings("vsplit", fake.execs.items[0]);
+
+    // A button that is gone does nothing rather than doing the wrong thing.
+    rt.runRail(rt.railList()[2].id);
+    try testing.expectEqual(@as(usize, 1), fake.execs.items.len);
+
+    // And a reloading plugin drops its own in one call.
+    try testing.expect(rt.runString("again", "assert(fenrir.clear('mine') == 2)"));
+    for (rt.railList()) |b| try testing.expect(!b.live);
+
+    try testing.expect(!rt.runString("bad", "fenrir.rail{ label = 'x' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.rail{ action = 'q' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.rail{ side = 'top', label = 'x', action = 'q' }"));
+}
+
+test "a rail button is behind the ui capability" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/quiet.lua",
+        \\fenrir.manifest{ capabilities = { "document.read" } }
+        \\has_rail = fenrir.rail ~= nil
+        },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.runString("check", "assert(has_rail == false)"));
+    try testing.expectEqual(@as(usize, 0), rt.railList().len);
 }
 
 test "every capability name survives the round trip" {
