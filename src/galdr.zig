@@ -24,6 +24,19 @@
 //! memory and time any one call can take. `Runtime.zig` says exactly what is
 //! in the sandbox; `Host.zig` says exactly what a plugin can reach.
 //!
+//! A plugin can narrow that further by declaring what it needs:
+//!
+//!     fenrir.manifest{
+//!       about = "keeps a reading list",
+//!       version = "1.0",
+//!       capabilities = { "document.read", "ui" },
+//!     }
+//!
+//! or, in a folder, the same table returned from `plugins/<name>/plugin.lua`.
+//! What it did not ask for is not in its `fenrir` table at all. See
+//! `Runtime.Capability` for the eight names and which of them have anything
+//! behind them yet.
+//!
 //! The configuration directory is the platform's, beside Mímir's database:
 //!
 //!   Windows   %APPDATA%\fenrir

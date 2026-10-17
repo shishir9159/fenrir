@@ -27,9 +27,9 @@ pub const usage =
     \\fenrir plugins [--config DIR] [--db FILE]
     \\
     \\    Loads init.lua and every plugin the way `fenrir read` does, with no
-    \\    window and no document, and prints what loaded, what failed and why,
-    \\    and the keys and commands they registered. Exits non-zero if any
-    \\    plugin failed.
+    \\    window and no document, and prints what loaded, what it asked to
+    \\    reach, what failed and why, and the keys and commands they
+    \\    registered. Exits non-zero if any plugin failed.
     \\
     \\    --config DIR  Read plugins from DIR instead of the configuration
     \\                  directory. $FENRIR_CONFIG does the same.
@@ -81,7 +81,27 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
 
     var failed: usize = 0;
     for (rt.plugins.items) |p| {
-        ctx.out.print("  {s}  {s}\n", .{ if (p.ok) "ok    " else "FAILED", p.name }) catch {};
+        ctx.out.print("  {s}  {s}", .{ if (p.ok) "ok    " else "FAILED", p.name }) catch {};
+        if (p.manifest.version.len != 0) ctx.out.print(" {s}", .{p.manifest.version}) catch {};
+        if (p.manifest.about.len != 0) ctx.out.print("  -- {s}", .{p.manifest.about}) catch {};
+        ctx.out.print("\n", .{}) catch {};
+        // What it can reach, which is the half of a manifest worth reading
+        // before installing something. A plugin that declared none says so
+        // rather than printing the whole list it was given by default.
+        if (p.manifest.declared) {
+            ctx.out.print("          asks for", .{}) catch {};
+            var any = false;
+            inline for (@typeInfo(galdr.Runtime.Capability).@"enum".fields) |f| {
+                const c: galdr.Runtime.Capability = @enumFromInt(f.value);
+                if (p.manifest.caps.has(c)) {
+                    ctx.out.print(" {s}{s}", .{ c.name(), if (c.reserved()) " (reserved)" else "" }) catch {};
+                    any = true;
+                }
+            }
+            ctx.out.print("{s}\n", .{if (any) "" else " nothing"}) catch {};
+        } else {
+            ctx.out.print("          no manifest, so everything\n", .{}) catch {};
+        }
         if (!p.ok) failed += 1;
     }
 

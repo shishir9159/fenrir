@@ -22,6 +22,27 @@
 //! No `io`, `os`, `package` or `debug`: no files, no processes, no native
 //! modules, no reaching into other functions' locals.
 //!
+//! ## Capabilities
+//!
+//! There is no global `fenrir`. Every chunk runs with an environment of its
+//! own -- an empty table whose metatable reads and writes through to `_G` --
+//! and `fenrir` is a field of *that* table. So a plugin that declares a
+//! manifest asking for less gets a smaller table, and the enforcement is
+//! structural rather than a check per call: **an ungranted function is not
+//! refused, it is `nil`**.
+//!
+//! A manifest is `plugins/<name>/plugin.lua` returning a table, or a
+//! `fenrir.manifest{...}` call at the top of a single-file plugin. A plugin
+//! that declares nothing keeps everything, which is what it had before there
+//! was a manifest to write; declaring one is opting in, and `fenrir health`
+//! says which plugins have.
+//!
+//! One state means one set of globals, so a plugin that asks for little can
+//! still be *handed* a function by one that asked for much. That is the price
+//! of Neovim's model and it is not worth a state per plugin: the manifest is
+//! a statement of what a plugin intends, checked against what it can reach,
+//! and it is read by a person before the plugin is installed.
+//!
 //! Two limits keep a script from taking the reader down with it. **Memory**:
 //! every byte Lua allocates is counted, and past `memory_limit` an allocation
 //! fails, which Lua turns into an ordinary error. **Time**: a count hook runs
@@ -69,6 +90,105 @@ pub const Payload = union(Event) {
     mode: []const u8,
     highlight: struct { action: []const u8, highlight: Host.Highlight },
     quit,
+};
+
+/// What a plugin may reach, as a manifest asks for it.
+///
+/// The names are the manifest's, with a dot, because `document.read` and
+/// `document.write` are two halves of one thing and a reader glancing at a
+/// manifest should see that they are.
+pub const Capability = enum {
+    /// Where the reader is and what is under it: the document, the page, the
+    /// cursor, the selection, the highlights that exist.
+    document_read,
+    /// Changing what is on the page: making and removing highlights.
+    document_write,
+    /// Saying things, binding keys, adding commands, moving the view, and
+    /// putting controls in the interface. The broadest of them, because
+    /// `fenrir.exec` runs any `:` command the reader has.
+    ui,
+    /// Reading files under the configuration directory. Reserved: nothing in
+    /// the `fenrir` table opens a file today, and `require` is not gated by
+    /// it because a plugin with no modules is not a plugin.
+    filesystem,
+    /// Reserved. Nothing behind it.
+    network,
+    /// Reserved. Nothing behind it.
+    clipboard,
+    /// Reserved. fenrir cannot sign a document.
+    signature,
+    /// Reserved. fenrir cannot redact one either.
+    redaction,
+
+    /// What a manifest writes.
+    pub fn name(c: Capability) []const u8 {
+        return switch (c) {
+            .document_read => "document.read",
+            .document_write => "document.write",
+            .ui => "ui",
+            .filesystem => "filesystem",
+            .network => "network",
+            .clipboard => "clipboard",
+            .signature => "signature",
+            .redaction => "redaction",
+        };
+    }
+
+    pub fn parse(text: []const u8) ?Capability {
+        inline for (@typeInfo(Capability).@"enum".fields) |f| {
+            const c: Capability = @enumFromInt(f.value);
+            if (std.mem.eql(u8, text, c.name())) return c;
+        }
+        return null;
+    }
+
+    /// Whether anything is behind it yet. `fenrir health` prints this, so a
+    /// reserved name is not mistaken for a granted power.
+    pub fn reserved(c: Capability) bool {
+        return switch (c) {
+            .document_read, .document_write, .ui => false,
+            .filesystem, .network, .clipboard, .signature, .redaction => true,
+        };
+    }
+};
+
+/// A set of them, in the enum's order so that a bit is a tag.
+pub const Caps = packed struct(u8) {
+    document_read: bool = false,
+    document_write: bool = false,
+    ui: bool = false,
+    filesystem: bool = false,
+    network: bool = false,
+    clipboard: bool = false,
+    signature: bool = false,
+    redaction: bool = false,
+
+    /// What a plugin that says nothing is trusted with.
+    pub const all: Caps = @bitCast(@as(u8, 0xff));
+
+    pub fn has(c: Caps, one: Capability) bool {
+        return @as(u8, @bitCast(c)) & bit(one) != 0;
+    }
+
+    pub fn add(c: *Caps, one: Capability) void {
+        c.* = @bitCast(@as(u8, @bitCast(c.*)) | bit(one));
+    }
+
+    fn bit(one: Capability) u8 {
+        return @as(u8, 1) << @intFromEnum(one);
+    }
+};
+
+/// What a plugin said about itself, or the defaults for one that said
+/// nothing.
+pub const Manifest = struct {
+    /// Whether there was a manifest at all. A plugin that declared none is
+    /// not a plugin that asked for none.
+    declared: bool = false,
+    caps: Caps = .all,
+    /// Owned. Empty when unsaid.
+    about: []u8 = &.{},
+    version: []u8 = &.{},
 };
 
 pub const Options = struct {
@@ -130,7 +250,11 @@ const Handler = struct {
 
 pub const Plugin = struct {
     name: []u8,
-    ok: bool,
+    /// Whether its chunk ran to the end. Set after it has, so a plugin that
+    /// is still loading -- which is when a manifest is declared -- is already
+    /// in the list for `fenrir.manifest` to find.
+    ok: bool = false,
+    manifest: Manifest = .{},
 };
 
 gpa: Allocator,
@@ -157,6 +281,15 @@ next_handler: u32 = 1,
 /// `:messages` shows.
 messages: std.ArrayList([]u8) = .empty,
 plugins: std.ArrayList(Plugin) = .empty,
+
+/// The environment `runString` and `:lua` use: everything granted, and the
+/// one that outlives any particular plugin.
+console_env: c_int = lua.no_ref,
+/// The environment of the chunk running now. What `require` gives a module,
+/// and what `fenrir.manifest` narrows.
+env_ref: c_int = lua.no_ref,
+/// Which of `plugins` is being loaded, for `fenrir.manifest` to write on.
+loading: ?usize = null,
 
 pub const max_messages = 100;
 pub const max_event_depth = 4;
@@ -199,7 +332,11 @@ pub fn destroy(rt: *Runtime) void {
     rt.handlers.deinit(gpa);
     for (rt.messages.items) |m| gpa.free(m);
     rt.messages.deinit(gpa);
-    for (rt.plugins.items) |p| gpa.free(p.name);
+    for (rt.plugins.items) |p| {
+        gpa.free(p.name);
+        gpa.free(p.manifest.about);
+        gpa.free(p.manifest.version);
+    }
     rt.plugins.deinit(gpa);
     gpa.destroy(rt);
 }
@@ -285,40 +422,44 @@ fn setup(L: ?*lua.State) callconv(.c) c_int {
     lua.newTable(L);
     lua.lua_setfield(L, lua.registry_index, "galdr.loaded");
 
-    lua.newTable(L);
-    lua.luaL_setfuncs(L, &api, 0);
-    lua.pushString(L, "0.0.1");
-    lua.lua_setfield(L, -2, "version");
-    lua.pushString(L, "Lua 5.4");
-    lua.lua_setfield(L, -2, "lua");
-
-    lua.newTable(L);
-    lua.luaL_setfuncs(L, &store_api, 0);
-    lua.lua_setfield(L, -2, "store");
-
-    lua.lua_setglobal(L, "fenrir");
+    const rt = of(L);
+    rt.console_env = newEnv(L, .all);
+    rt.env_ref = rt.console_env;
     return 0;
 }
 
-const api = [_]lua.Reg{
-    .{ .name = "notify", .func = apiNotify },
-    .{ .name = "exec", .func = apiExec },
-    .{ .name = "keymap", .func = apiKeymap },
-    .{ .name = "unmap", .func = apiUnmap },
-    .{ .name = "command", .func = apiCommand },
+/// One entry of the `fenrir` table.
+const Api = struct {
+    name: [:0]const u8,
+    func: lua.CFunction,
+    /// What a manifest has to ask for before this is in the table at all.
+    /// Null for the ones every plugin has, which are the ones that can do
+    /// nothing on their own: declaring itself, listening, and its own store.
+    cap: ?Capability = null,
+};
+
+const api = [_]Api{
+    .{ .name = "manifest", .func = apiManifest },
     .{ .name = "on", .func = apiOn },
     .{ .name = "off", .func = apiOff },
-    .{ .name = "document", .func = apiDocument },
-    .{ .name = "page", .func = apiPage },
-    .{ .name = "go", .func = apiGo },
-    .{ .name = "zoom", .func = apiZoom },
-    .{ .name = "mode", .func = apiMode },
-    .{ .name = "cursor", .func = apiCursor },
-    .{ .name = "selection", .func = apiSelection },
-    .{ .name = "highlights", .func = apiHighlights },
-    .{ .name = "highlight", .func = apiHighlight },
-    .{ .name = "unhighlight", .func = apiUnhighlight },
-    .{ .name = null, .func = null },
+
+    .{ .name = "notify", .func = apiNotify, .cap = .ui },
+    .{ .name = "exec", .func = apiExec, .cap = .ui },
+    .{ .name = "keymap", .func = apiKeymap, .cap = .ui },
+    .{ .name = "unmap", .func = apiUnmap, .cap = .ui },
+    .{ .name = "command", .func = apiCommand, .cap = .ui },
+    .{ .name = "go", .func = apiGo, .cap = .ui },
+    .{ .name = "zoom", .func = apiZoom, .cap = .ui },
+    .{ .name = "mode", .func = apiMode, .cap = .ui },
+
+    .{ .name = "document", .func = apiDocument, .cap = .document_read },
+    .{ .name = "page", .func = apiPage, .cap = .document_read },
+    .{ .name = "cursor", .func = apiCursor, .cap = .document_read },
+    .{ .name = "selection", .func = apiSelection, .cap = .document_read },
+    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read },
+
+    .{ .name = "highlight", .func = apiHighlight, .cap = .document_write },
+    .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write },
 };
 
 const store_api = [_]lua.Reg{
@@ -326,6 +467,75 @@ const store_api = [_]lua.Reg{
     .{ .name = "set", .func = apiStoreSet },
     .{ .name = null, .func = null },
 };
+
+/// The `fenrir` table a plugin with these capabilities sees.
+///
+/// The whole of the enforcement. A function that was not asked for is not in
+/// the table, so calling it is the error Lua already has a message for --
+/// "attempt to call a nil value" -- rather than a refusal this file would
+/// have to invent, and a plugin can ask `if fenrir.highlight then` without
+/// anything else being added for it to ask with.
+fn pushFenrir(L: ?*lua.State, caps: Caps) void {
+    lua.lua_createtable(L, 0, api.len + 3);
+    for (api) |entry| {
+        if (entry.cap) |c| {
+            if (!caps.has(c)) continue;
+        }
+        lua.lua_pushcclosure(L, entry.func, 0);
+        lua.lua_setfield(L, -2, entry.name.ptr);
+    }
+    lua.pushString(L, "0.0.1");
+    lua.lua_setfield(L, -2, "version");
+    lua.pushString(L, "Lua 5.4");
+    lua.lua_setfield(L, -2, "lua");
+
+    // A plugin's own values, always: the key space is the plugin's and
+    // nothing else can be reached through it.
+    lua.newTable(L);
+    lua.luaL_setfuncs(L, &store_api, 0);
+    lua.lua_setfield(L, -2, "store");
+}
+
+/// An environment for one chunk: `fenrir`, and `_G` behind it.
+///
+/// Reads fall through to the globals and so do writes, so `x = 1` in a plugin
+/// is still seen by the next one -- which is the shared state Neovim's model
+/// promises. Only `fenrir` is the chunk's own, which is the only thing that
+/// differs between two plugins. Returns the registry reference.
+fn newEnv(L: ?*lua.State, caps: Caps) c_int {
+    lua.newTable(L);
+    pushFenrir(L, caps);
+    lua.lua_setfield(L, -2, "fenrir");
+
+    lua.newTable(L);
+    _ = lua.lua_getglobal(L, "_G");
+    lua.lua_pushvalue(L, -1);
+    lua.lua_setfield(L, -3, "__index");
+    lua.lua_setfield(L, -2, "__newindex");
+    _ = lua.lua_setmetatable(L, -2);
+    return lua.luaL_ref(L, lua.registry_index);
+}
+
+const EnvJob = struct {
+    caps: Caps,
+    ref: c_int = lua.no_ref,
+};
+
+fn envTrampoline(L: ?*lua.State) callconv(.c) c_int {
+    const job: *EnvJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
+    job.ref = newEnv(L, job.caps);
+    return 0;
+}
+
+/// An environment, built inside a protected call because building one
+/// allocates. `lua.no_ref` when there was no memory for it.
+fn makeEnv(rt: *Runtime, caps: Caps) c_int {
+    var job: EnvJob = .{ .caps = caps };
+    lua.lua_pushcclosure(rt.L, envTrampoline, 0);
+    lua.lua_pushlightuserdata(rt.L, &job);
+    if (!rt.call(1, 0, "galdr")) return lua.no_ref;
+    return job.ref;
+}
 
 // -- calling into Lua ---------------------------------------------------------
 
@@ -413,9 +623,9 @@ fn report(rt: *Runtime, what: []const u8, message: []const u8) void {
     rt.host.notify(first);
 }
 
-/// Runs a chunk of Lua source. `name` is what errors call it.
-pub fn runString(rt: *Runtime, name: []const u8, source: []const u8) bool {
-    if (!lua.available) return false;
+/// Runs a chunk of Lua source in an environment. `name` is what errors call
+/// it.
+fn runChunk(rt: *Runtime, name: []const u8, source: []const u8, env: c_int) bool {
     var chunk: [256]u8 = undefined;
     const chunkname = std.fmt.bufPrintZ(&chunk, "@{s}", .{name}) catch "@?";
     if (lua.luaL_loadbufferx(rt.L, source.ptr, source.len, chunkname, "t") != lua.ok) {
@@ -423,7 +633,22 @@ pub fn runString(rt: *Runtime, name: []const u8, source: []const u8) bool {
         lua.pop(rt.L, 1);
         return false;
     }
+    // Upvalue one of a main chunk is `_ENV`, which is where every global it
+    // reads goes through -- so this is the whole of how a plugin gets its
+    // own `fenrir` without there being a global one.
+    _ = lua.lua_rawgeti(rt.L, lua.registry_index, env);
+    _ = lua.lua_setupvalue(rt.L, -2, 1);
+
+    const saved = rt.env_ref;
+    rt.env_ref = env;
+    defer rt.env_ref = saved;
     return rt.call(0, 0, name);
+}
+
+/// Runs a chunk with everything granted: `:lua`, and the tests.
+pub fn runString(rt: *Runtime, name: []const u8, source: []const u8) bool {
+    if (!lua.available) return false;
+    return rt.runChunk(name, source, rt.console_env);
 }
 
 /// Runs `init.lua`, then every plugin, in order of name.
@@ -435,31 +660,162 @@ pub fn loadConfig(rt: *Runtime) void {
     if (!lua.available) return;
     if (rt.host.readFile(rt.gpa, "init.lua")) |source| {
         defer rt.gpa.free(source);
-        rt.addPlugin("init.lua", rt.runString("init.lua", source));
+        rt.loadOne("init.lua", "init.lua", source, null);
     }
 
     const entries = rt.host.listDir(rt.gpa, "plugins") orelse return;
     defer Host.freeList(rt.gpa, entries);
 
     for (entries) |entry| {
+        const folder = std.mem.endsWith(u8, entry, "/");
         var buf: [512]u8 = undefined;
-        const path = if (std.mem.endsWith(u8, entry, "/"))
+        const path = if (folder)
             std.fmt.bufPrint(&buf, "plugins/{s}init.lua", .{entry}) catch continue
         else if (std.mem.endsWith(u8, entry, ".lua"))
             std.fmt.bufPrint(&buf, "plugins/{s}", .{entry}) catch continue
         else
             continue;
 
+        // A folder may carry its manifest beside its code. A single file has
+        // nowhere to put one, which is what `fenrir.manifest` is for.
+        var manifest_buf: [512]u8 = undefined;
+        const manifest = if (folder)
+            std.fmt.bufPrint(&manifest_buf, "plugins/{s}plugin.lua", .{entry}) catch null
+        else
+            null;
+
         const name = std.mem.trimEnd(u8, if (std.mem.endsWith(u8, entry, ".lua")) entry[0 .. entry.len - 4] else entry, "/");
         const source = rt.host.readFile(rt.gpa, path) orelse continue;
         defer rt.gpa.free(source);
-        rt.addPlugin(name, rt.runString(path, source));
+        rt.loadOne(name, path, source, manifest);
     }
 }
 
-fn addPlugin(rt: *Runtime, name: []const u8, ok: bool) void {
+/// One plugin: its entry, its environment, its manifest and its chunk.
+///
+/// The entry goes in before the chunk runs, because `fenrir.manifest` writes
+/// on it while the chunk is running.
+fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8, manifest: ?[]const u8) void {
     const owned = rt.gpa.dupe(u8, name) catch return;
-    rt.plugins.append(rt.gpa, .{ .name = owned, .ok = ok }) catch rt.gpa.free(owned);
+    rt.plugins.append(rt.gpa, .{ .name = owned }) catch {
+        rt.gpa.free(owned);
+        return;
+    };
+    const at = rt.plugins.items.len - 1;
+
+    const env = rt.makeEnv(.all);
+    if (env == lua.no_ref) return;
+    // The registry's hold, not the table's life: every closure the plugin
+    // makes keeps `_ENV` as an upvalue, so the environment lives exactly as
+    // long as the plugin's functions do.
+    defer lua.luaL_unref(rt.L, lua.registry_index, env);
+
+    rt.loading = at;
+    rt.env_ref = env;
+    defer {
+        rt.loading = null;
+        rt.env_ref = rt.console_env;
+    }
+
+    if (manifest) |rel| {
+        if (rt.host.readFile(rt.gpa, rel)) |text| {
+            defer rt.gpa.free(text);
+            // A manifest that does not parse is a plugin that does not load:
+            // it asked for something and the answer cannot be guessed.
+            if (!rt.runManifest(rel, text)) return;
+        }
+    }
+    rt.plugins.items[at].ok = rt.runChunk(path, source, env);
+}
+
+const ManifestJob = struct {
+    name: []const u8,
+    source: []const u8,
+};
+
+/// `plugins/<name>/plugin.lua`: a chunk that returns a table and nothing
+/// else.
+///
+/// It runs with an empty environment -- no `fenrir`, no `string`, no `_G` --
+/// because a manifest is data. A file that wants to compute what it asks for
+/// is a file asking for the answer not to be readable.
+fn manifestTrampoline(L: ?*lua.State) callconv(.c) c_int {
+    const job: *const ManifestJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
+    var chunk: [512]u8 = undefined;
+    const chunkname = std.fmt.bufPrintZ(&chunk, "@{s}", .{job.name}) catch "@plugin.lua";
+    if (lua.luaL_loadbufferx(L, job.source.ptr, job.source.len, chunkname, "t") != lua.ok) {
+        _ = lua.lua_error(L);
+    }
+    lua.newTable(L);
+    _ = lua.lua_setupvalue(L, -2, 1);
+    lua.lua_callk(L, 0, 1, 0, null);
+    if (lua.typeOf(L, -1) != .table) lua.raise(L, "galdr: a plugin.lua returns a table");
+    applyManifest(L, lua.lua_gettop(L));
+    return 0;
+}
+
+fn runManifest(rt: *Runtime, name: []const u8, source: []const u8) bool {
+    var job: ManifestJob = .{ .name = name, .source = source };
+    lua.lua_pushcclosure(rt.L, manifestTrampoline, 0);
+    lua.lua_pushlightuserdata(rt.L, &job);
+    return rt.call(1, 0, name);
+}
+
+const bad_capability = "galdr: capabilities are a list of names like \"document.read\"";
+
+/// Reads a manifest table and narrows the environment to what it asks for.
+fn applyManifest(L: ?*lua.State, index: c_int) void {
+    const rt = of(L);
+    const at = rt.loading orelse lua.raise(L, "galdr: a manifest belongs at the top of a plugin");
+
+    var caps: Caps = .{};
+    _ = lua.lua_getfield(L, index, "capabilities");
+    switch (lua.typeOf(L, -1)) {
+        // Asking for nothing is asking for nothing. The way to keep
+        // everything is to write no manifest at all.
+        .nil => {},
+        .table => {
+            const n: lua.Integer = @intCast(lua.lua_rawlen(L, -1));
+            var i: lua.Integer = 1;
+            while (i <= n) : (i += 1) {
+                _ = lua.lua_rawgeti(L, -1, i);
+                const text = lua.toString(L, -1) orelse lua.raise(L, bad_capability);
+                caps.add(Capability.parse(text) orelse {
+                    var msg: [160]u8 = undefined;
+                    lua.raise(L, std.fmt.bufPrint(&msg, "galdr: \"{s}\" is not a capability", .{
+                        text[0..@min(text.len, 40)],
+                    }) catch bad_capability);
+                });
+                lua.pop(L, 1);
+            }
+        },
+        else => lua.raise(L, bad_capability),
+    }
+    lua.pop(L, 1);
+
+    _ = lua.lua_getfield(L, index, "about");
+    const about = lua.toString(L, -1) orelse "";
+    _ = lua.lua_getfield(L, index, "version");
+    const version = lua.toString(L, -1) orelse "";
+
+    // Written down before the table is rebuilt: the plugin entry owns these
+    // bytes, so a raise from the rebuild below frees them at `destroy` rather
+    // than losing them.
+    const p = &rt.plugins.items[at];
+    rt.gpa.free(p.manifest.about);
+    rt.gpa.free(p.manifest.version);
+    p.manifest = .{
+        .declared = true,
+        .caps = caps,
+        .about = rt.gpa.dupe(u8, about) catch &.{},
+        .version = rt.gpa.dupe(u8, version) catch &.{},
+    };
+    lua.pop(L, 2);
+
+    _ = lua.lua_rawgeti(L, lua.registry_index, rt.env_ref);
+    pushFenrir(L, caps);
+    lua.lua_setfield(L, -2, "fenrir");
+    lua.pop(L, 1);
 }
 
 // -- what the reader asks of it -----------------------------------------------
@@ -642,6 +998,13 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
         rt.gpa.free(source);
         if (status != lua.ok) _ = lua.lua_error(L);
 
+        // The module runs in the environment of whoever required it, so a
+        // narrowed plugin's modules are narrowed too. Modules are cached, so
+        // the first requirer's environment is the one they keep -- the same
+        // wrinkle Neovim has, and for the same reason.
+        _ = lua.lua_rawgeti(L, lua.registry_index, rt.env_ref);
+        _ = lua.lua_setupvalue(L, -2, 1);
+
         // Marked loaded before it runs, so two modules that require each
         // other get `true` rather than recursing forever.
         lua.lua_pushvalue(L, 1);
@@ -662,6 +1025,19 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
 
     var msg: [600]u8 = undefined;
     lua.raise(L, std.fmt.bufPrint(&msg, "galdr: module '{s}' not found in lua/ of the configuration directory", .{name}) catch "galdr: module not found");
+}
+
+/// `fenrir.manifest{ about =, version =, capabilities = {...} }`.
+///
+/// What a single-file plugin writes instead of a `plugin.lua`. It takes
+/// effect from where it is called, which is why it belongs on the first line:
+/// a plugin that calls it halfway down has already had the whole table for
+/// half a file, and the manifest is a description of the plugin rather than a
+/// gate in front of it.
+fn apiManifest(L: ?*lua.State) callconv(.c) c_int {
+    lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
+    applyManifest(L, 1);
+    return 0;
 }
 
 fn apiExec(L: ?*lua.State) callconv(.c) c_int {
@@ -1437,4 +1813,76 @@ test "init.lua, then plugins by name, and require reads lua/" {
 
     try testing.expect(!rt.runString("bad", "require('../../etc/passwd')"));
     try testing.expect(!rt.runString("bad", "require('missing')"));
+}
+
+test "a manifest takes away what it did not ask for, and only from itself" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/reader.lua",
+        \\fenrir.manifest{ about = "reads", version = "1.2", capabilities = { "document.read" } }
+        \\reader_has = { page = fenrir.page ~= nil, mark = fenrir.highlight ~= nil, say = fenrir.notify ~= nil }
+        \\reader_page = fenrir.page()
+        },
+        .{ "plugins/writer.lua", "writer_has = { mark = fenrir.highlight ~= nil, say = fenrir.notify ~= nil }" },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.runString("check",
+        \\assert(reader_has.page, "document.read was asked for and is missing")
+        \\assert(not reader_has.mark, "document.write was not asked for and is there")
+        \\assert(not reader_has.say, "ui was not asked for and is there")
+        \\assert(reader_page == 3)
+        \\assert(writer_has.mark and writer_has.say, "a plugin with no manifest lost something")
+        \\assert(rawget(_G, "fenrir") == nil, "there is a global fenrir to reach around it")
+    ));
+
+    for (rt.plugins.items) |p| try testing.expect(p.ok);
+    const reader = rt.plugins.items[0];
+    try testing.expect(reader.manifest.declared);
+    try testing.expect(reader.manifest.caps.has(.document_read));
+    try testing.expect(!reader.manifest.caps.has(.ui));
+    try testing.expectEqualStrings("reads", reader.manifest.about);
+    try testing.expectEqualStrings("1.2", reader.manifest.version);
+
+    try testing.expect(!rt.plugins.items[1].manifest.declared);
+    try testing.expect(rt.plugins.items[1].manifest.caps.has(.redaction));
+}
+
+test "a folder's plugin.lua says the same thing, and a bad one stops the plugin" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/good/plugin.lua", "return { about = \"a folder\", capabilities = { \"ui\" } }" },
+        .{ "plugins/good/init.lua", "good_has = fenrir.notify ~= nil and fenrir.page == nil" },
+        .{ "plugins/wrong/plugin.lua", "return { capabilities = { \"telepathy\" } }" },
+        .{ "plugins/wrong/init.lua", "ran_anyway = true" },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.runString("check",
+        \\assert(good_has, "a folder's manifest was not applied")
+        \\assert(ran_anyway == nil, "a plugin ran with a manifest nobody could read")
+    ));
+    try testing.expect(rt.plugins.items[0].ok);
+    try testing.expectEqualStrings("a folder", rt.plugins.items[0].manifest.about);
+    try testing.expect(!rt.plugins.items[1].ok);
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "telepathy") != null);
+}
+
+test "every capability name survives the round trip" {
+    inline for (@typeInfo(Capability).@"enum".fields) |f| {
+        const c: Capability = @enumFromInt(f.value);
+        try testing.expectEqual(c, Capability.parse(c.name()).?);
+        var set: Caps = .{};
+        set.add(c);
+        try testing.expect(set.has(c));
+        try testing.expect(Caps.all.has(c));
+    }
+    try testing.expect(Capability.parse("document") == null);
+    try testing.expectEqual(@as(u8, 0), @as(u8, @bitCast(Caps{})));
 }
