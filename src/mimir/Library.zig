@@ -70,7 +70,10 @@ pub fn close(lib: *Library) void {
     lib.db.close();
 }
 
-fn userVersion(lib: Library) Error!i64 {
+/// What version the file on disk says it is. Public because `fenrir health`
+/// asks: a library that opened and a library at the version this build
+/// understands are two facts, and `open` has already migrated between them.
+pub fn userVersion(lib: Library) Error!i64 {
     var s = try lib.db.prepare("PRAGMA user_version");
     defer s.finalize();
     if (!try s.step()) return 0;
