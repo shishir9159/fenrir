@@ -947,6 +947,11 @@ const Session = struct {
     rail_left: std.ArrayList(rails_mod.Extra) = .empty,
     rail_right: std.ArrayList(rails_mod.Extra) = .empty,
     rails_for: u32 = std.math.maxInt(u32),
+
+    /// The plugins' settings as the page wants them. Same rule: filled when
+    /// Galdr's revision changes, and never on a frame path.
+    plugin_settings: std.ArrayList(settings_page.Option) = .empty,
+    settings_for: u32 = std.math.maxInt(u32),
     rows_for: struct {
         which: rails_mod.Panel = .none,
         buffer: u32 = 0,
@@ -1110,6 +1115,7 @@ const Session = struct {
         s.palette_rows.deinit(s.gpa);
         s.rail_left.deinit(s.gpa);
         s.rail_right.deinit(s.gpa);
+        s.plugin_settings.deinit(s.gpa);
         s.tab_names.deinit(s.gpa);
         s.tab_text.deinit(s.gpa);
         s.tab_ends.deinit(s.gpa);
@@ -1226,15 +1232,57 @@ const Session = struct {
     /// which is the truth -- there is nowhere for a setting to have been
     /// written.
     fn readSettings(s: *Session) void {
-        for (settings_page.options, 0..) |opt, i| {
+        s.fillPluginSettings();
+        var i: usize = 0;
+        while (i < s.settings.count()) : (i += 1) {
             const lib = s.library orelse {
                 s.settings.put(i, null);
                 continue;
             };
-            const got = lib.get(opt.key) catch null;
+            var buf: [256]u8 = undefined;
+            const key = s.settingKey(&buf, i) orelse {
+                s.settings.put(i, null);
+                continue;
+            };
+            const got = lib.get(key) catch null;
             defer if (got) |g| s.gpa.free(g);
             s.settings.put(i, got);
         }
+    }
+
+    /// Where a row's value lives in the library.
+    ///
+    /// A plugin's is under `galdr.`, which is where `fenrir.store` already
+    /// puts it -- so a setting declared and a setting stored are the same
+    /// bytes, and a plugin goes on reading its own value with
+    /// `fenrir.store.get` whether a person has ever opened this page.
+    fn settingKey(s: *Session, buf: []u8, index: usize) ?[]const u8 {
+        const opt = s.settings.optionAt(index);
+        if (!s.settings.isPlugin(index)) return opt.key;
+        return std.fmt.bufPrint(buf, "galdr.{s}", .{opt.key}) catch null;
+    }
+
+    /// The plugins' settings, borrowed from Galdr, rebuilt on a change.
+    ///
+    /// The `Option` the page draws and the `Setting` a plugin declared are
+    /// the same fields under two names, and this is the one place they are
+    /// copied across: the page does not import Galdr and Galdr does not know
+    /// there is a page.
+    fn fillPluginSettings(s: *Session) void {
+        const rt = s.plugins orelse return;
+        if (s.settings_for == rt.revision) return;
+        s.settings_for = rt.revision;
+        s.plugin_settings.clearRetainingCapacity();
+        for (rt.settingList()) |row| {
+            if (!row.live) continue;
+            s.plugin_settings.append(s.gpa, .{
+                .key = row.key,
+                .about = row.about,
+                .choices = row.choices.items,
+                .unset = if (row.unset.len != 0) row.unset else "not set",
+            }) catch break;
+        }
+        s.settings.extra = s.plugin_settings.items;
     }
 
     /// One row of the settings page, written down and acted on.
@@ -1270,7 +1318,9 @@ const Session = struct {
             s.say("nowhere to keep {s}: this reader has no library", .{c.key});
             return;
         };
-        if (c.value.len == 0) lib.remove(c.key) catch {} else lib.set(c.key, c.value) catch {};
+        var buf: [256]u8 = undefined;
+        const where = s.settingKey(&buf, c.index) orelse return;
+        if (c.value.len == 0) lib.remove(where) catch {} else lib.set(where, c.value) catch {};
         s.readSettings();
         s.say("{s} = {s}", .{ c.key, if (c.value.len == 0) "unset" else c.value });
     }
@@ -2515,18 +2565,47 @@ const Session = struct {
         _ = palette_mod.builtins(s.palette_rows.items);
 
         if (s.plugins) |rt| {
+            // A key a plugin has bound is no longer the way to the command
+            // that used to own it, and a palette that goes on saying so is
+            // the palette lying about the reader. Only normal mode is
+            // checked, which is the mode every binding in the table is
+            // written for.
+            const look = rt.lookup();
+            for (s.palette_rows.items) |*row| {
+                if (row.binding.len == 0) continue;
+                const k = galdr.keyspec.parse(row.binding) catch continue;
+                if (look.find(look.ptr, .normal, k) != null) row.binding = "";
+            }
             for (rt.commandNames()) |c| {
                 s.palette_rows.append(s.gpa, .{
                     .name = c.name,
                     .about = c.description,
-                    // A plugin's command has no icon of its own until phase
-                    // eight lets a manifest name one, and the reader is the
-                    // wrong place to invent one per plugin.
-                    .icon = "fenrir.menu",
+                    .binding = bindingFor(rt, c.name),
+                    // The plugin's, when it named one. A registry name it got
+                    // wrong draws as the hollow box, which is the answer
+                    // everywhere else an icon is asked for by name.
+                    .icon = if (c.icon.len != 0) c.icon else "fenrir.menu",
                 }) catch break;
             }
         }
         s.palette.show();
+    }
+
+    /// The keys that reach a plugin's command without the palette.
+    ///
+    /// The design language asks for a command's binding to be drawn beside
+    /// it, and a plugin's binding is one it made itself: a `fenrir.keymap`
+    /// whose action is the command line. A binding that is a *function*
+    /// cannot be found this way and is not claimed to be -- two things that
+    /// happen to do the same is not a binding for one of them.
+    fn bindingFor(rt: *galdr.Runtime, name: []const u8) []const u8 {
+        for (rt.keymapList()) |k| {
+            if (!k.live or k.line.len < name.len) continue;
+            if (!std.mem.eql(u8, k.line[0..name.len], name)) continue;
+            if (k.line.len != name.len and k.line[name.len] != ' ') continue;
+            return k.spec;
+        }
+        return "";
     }
 
     // -- search ---------------------------------------------------------------
@@ -4715,6 +4794,7 @@ fn closeSession(s: *Session) void {
     s.palette_rows.deinit(s.gpa);
     s.rail_left.deinit(s.gpa);
     s.rail_right.deinit(s.gpa);
+    s.plugin_settings.deinit(s.gpa);
     s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
@@ -5714,7 +5794,7 @@ test "with no library every setting is unset, and saying so is not a crash" {
     defer closeSession(&s);
 
     s.readSettings();
-    for (settings_page.options, 0..) |_, i| {
+    for (settings_page.builtin, 0..) |_, i| {
         try testing.expectEqual(@as(usize, 0), s.settings.valueOf(i).len);
     }
     // The theme still changes; there is simply nowhere to keep it.
@@ -5738,6 +5818,67 @@ test "the palette holds the keyboard, and opens from the key and the command" {
     s.palette.hide();
     try testing.expect(s.exec("commands"));
     try testing.expect(s.palette.open);
+}
+
+test "a plugin's commands and settings arrive in the palette and the page" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    s.plugins = rt;
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.command("Read", function() end, "open the reading list", "fenrir.bookmark")
+        \\fenrir.command("Sync", function() end, "fetch what is new")
+        \\fenrir.keymap("n", "<C-r>", "Read", "the reading list")
+        \\fenrir.setting{ key = "reading.list", about = "where the list is kept", unset = "nowhere" }
+    ));
+
+    _ = s.apply(.show_commands);
+    const rows = s.palette_rows.items;
+    try testing.expectEqual(commands.table.len + 2, rows.len);
+    const read_row = rows[commands.table.len];
+    try testing.expectEqualStrings("Read", read_row.name);
+    try testing.expectEqualStrings("open the reading list", read_row.about);
+    try testing.expectEqualStrings("fenrir.bookmark", read_row.icon);
+    // The binding the plugin made itself, found through the command line it
+    // bound -- so the palette draws it beside the row like any other.
+    try testing.expectEqualStrings("<C-r>", read_row.binding);
+    // A command nobody bound claims no binding, and falls back to the menu
+    // icon rather than to nothing.
+    try testing.expectEqual(@as(usize, 0), rows[commands.table.len + 1].binding.len);
+    try testing.expectEqualStrings("fenrir.menu", rows[commands.table.len + 1].icon);
+
+    // And the settings page lists the plugin's row after the reader's own.
+    s.readSettings();
+    try testing.expectEqual(settings_page.builtin.len + 1, s.settings.count());
+    const at = settings_page.builtin.len;
+    try testing.expectEqualStrings("reading.list", s.settings.optionAt(at).key);
+    try testing.expect(s.settings.isPlugin(at));
+    // Which is where `fenrir.store` already keeps it: one key, not two.
+    var key_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("galdr.reading.list", s.settingKey(&key_buf, at).?);
+    try testing.expectEqualStrings("theme", s.settingKey(&key_buf, 0).?);
+
+    // A key a plugin took is no longer the built-in's, and the palette says
+    // so: `<C-r>` was redo's and the plugin has it now. Found by a picture --
+    // the two rows sat one above the other claiming the same chord.
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.name, "redo")) continue;
+        try testing.expectEqual(@as(usize, 0), row.binding.len);
+    }
+    // And a key nobody took keeps the binding the table gives it.
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.name, "quit")) continue;
+        try testing.expectEqualStrings("q", row.binding);
+    }
 }
 
 test "a row chosen in the palette runs the command it names" {

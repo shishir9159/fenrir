@@ -60,9 +60,12 @@ pub const Option = struct {
 /// The settings the reader keeps, in the order the page lists them.
 ///
 /// Not every key in the database -- a plugin's store lives in the same table
-/// and is that plugin's business, not a person's. This is the list
-/// `fenrir config` documents, in one place so the two agree.
-pub const options = [_]Option{
+/// and most of it is that plugin's business and not a person's. This is the
+/// list `fenrir config` documents, in one place so the two agree; a plugin
+/// adds to it by declaring a setting, and those are drawn after these with a
+/// heading, because they are the same kind of thing kept in the same place
+/// and the only difference worth drawing is who put them there.
+pub const builtin = [_]Option{
     .{
         .key = "theme",
         .about = "the colours the interface is drawn in",
@@ -90,11 +93,21 @@ pub const options = [_]Option{
 /// name; anything longer than this belongs in a file, not in a panel.
 pub const value_max = 64;
 
+/// How many rows the page will draw. The reader's four and room for a
+/// configuration full of plugins; past this the page stops listing rather
+/// than growing, because a settings page longer than a screen is a list and
+/// not a page.
+pub const max_options = 28;
+
 /// What the page was asked to change. The reader writes it down and applies
 /// it; nothing here does either.
 pub const Change = struct {
     key: []const u8,
     value: []const u8,
+    /// Which row it was. The key alone is not enough to write it back: a
+    /// plugin's value lives under a name of its own, and the row is the one
+    /// thing that says which kind this is.
+    index: usize = 0,
 };
 
 pub const State = struct {
@@ -116,9 +129,30 @@ pub const State = struct {
     /// asks for focus rather than being given it.
     focus_next: bool = false,
 
+    /// The settings plugins declared, after the reader's own. Borrowed from
+    /// Galdr, which owns the bytes and outlives any frame drawn from them.
+    extra: []const Option = &.{},
+
     /// The current values, as the reader last read them. Empty means unset.
-    values: [options.len][value_max]u8 = @splat(@splat(0)),
-    lens: [options.len]u8 = @splat(0),
+    values: [max_options][value_max]u8 = @splat(@splat(0)),
+    lens: [max_options]u8 = @splat(0),
+
+    /// How many rows there are: the reader's, then the plugins'.
+    pub fn count(st: *const State) usize {
+        return @min(builtin.len + st.extra.len, max_options);
+    }
+
+    pub fn optionAt(st: *const State, index: usize) Option {
+        if (index < builtin.len) return builtin[index];
+        return st.extra[index - builtin.len];
+    }
+
+    /// Whether the row at `index` is a plugin's. The reader asks, because a
+    /// plugin's value is written under a different name.
+    pub fn isPlugin(st: *const State, index: usize) bool {
+        _ = st;
+        return index >= builtin.len;
+    }
 
     pub fn show(st: *State) void {
         st.open = true;
@@ -150,7 +184,7 @@ pub const State = struct {
     /// none, and a value nobody recognises starts again at the first -- which
     /// is what a database edited by hand deserves.
     fn nextChoice(st: *const State, index: usize) []const u8 {
-        const choices = options[index].choices;
+        const choices = st.optionAt(index).choices;
         if (choices.len == 0) return "";
         const now = st.valueOf(index);
         for (choices, 0..) |c, i| {
@@ -201,7 +235,9 @@ pub fn page(ui: *UI, face: u16, t: Theme, st: *State) !?Change {
     ui.pushStyle(.{ .font = face, .font_size = 13, .fg = t.text });
     defer ui.popStyle();
 
-    const height = pad * 3 + 24 + @as(f32, options.len) * row_height + 22;
+    const plugin_rows = st.count() - builtin.len;
+    const heading: f32 = if (plugin_rows == 0) 0 else row_height;
+    const height = pad * 3 + 24 + @as(f32, @floatFromInt(st.count())) * row_height + heading + 22;
     const p = try w.popup.open(ui, "settings", .{
         .at = .{
             .x = @round((ui.viewport.width() - page_width) * 0.5),
@@ -235,8 +271,21 @@ pub fn page(ui: *UI, face: u16, t: Theme, st: *State) !?Change {
     try w.spacer(ui, .px(pad));
 
     var change: ?Change = null;
-    for (options, 0..) |opt, i| {
-        if (try optionRow(ui, t, st, i, opt)) |c| change = c;
+    var i: usize = 0;
+    while (i < st.count()) : (i += 1) {
+        // The one line that says whose settings the rest of the page is.
+        // Not a second panel and not a tab: they are kept in the same place
+        // and changed the same way, so they are one list with a rule in it.
+        if (i == builtin.len) {
+            ui.next(.{ .w = .fill, .h = .px(row_height), .axis = .x, .child_align = .center });
+            const head = try ui.open("###plugins");
+            defer ui.close(head);
+            try w.spacer(ui, .px(pad));
+            ui.next(.{ .fg = t.text_dim, .font_size = 11 });
+            _ = try w.label(ui, "from plugins");
+            try w.fill(ui);
+        }
+        if (try optionRow(ui, t, st, i, st.optionAt(i))) |c| change = c;
     }
 
     try w.spacer(ui, .px(pad));
@@ -308,7 +357,7 @@ fn valueCell(ui: *UI, t: Theme, st: *State, index: usize, opt: Option) !?Change 
             st.editing = null;
             // The bytes belong to the state and outlive this frame, which is
             // what lets a `Change` be a slice rather than a copy.
-            return .{ .key = opt.key, .value = st.field.slice() };
+            return .{ .key = opt.key, .value = st.field.slice(), .index = index };
         }
         return null;
     }
@@ -341,7 +390,7 @@ fn valueCell(ui: *UI, t: Theme, st: *State, index: usize, opt: Option) !?Change 
 
     if (!sig.clicked) return null;
 
-    if (opt.choices.len != 0) return .{ .key = opt.key, .value = st.nextChoice(index) };
+    if (opt.choices.len != 0) return .{ .key = opt.key, .value = st.nextChoice(index), .index = index };
 
     // Into the field, with what is there already selected: the first thing
     // typed replaces it, which is what every settings row anywhere does.
@@ -406,7 +455,7 @@ test "every setting the page lists has a row, in order" {
     st.show();
 
     _ = try frame(&ui, &st, .{});
-    for (options, 0..) |opt, i| {
+    for (builtin, 0..) |opt, i| {
         var name: [24]u8 = undefined;
         const row = key.make(
             key.make(ui.root.key, "settings"),
@@ -528,4 +577,42 @@ test "a page state survives being copied, field and all" {
     second.field.set("after");
     try testing.expectEqualStrings("after", second.field.slice());
     try testing.expect(second.field.bytes.ptr == &second.edit_buf);
+}
+
+test "a plugin's settings come after the reader's own, under a heading" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+
+    const extra = [_]Option{
+        .{ .key = "reading.list", .about = "where the list is kept", .unset = "nowhere" },
+        .{ .key = "reading.sort", .about = "how it is ordered", .choices = &.{ "added", "title" } },
+    };
+    var st: State = .{ .extra = &extra };
+    st.show();
+    try testing.expectEqual(builtin.len + 2, st.count());
+
+    _ = try frame(&ui, &st, .{});
+    const first = builtin.len;
+    try testing.expect(ui.find(key.make(key.make(ui.root.key, "settings"), "plugins")) != null);
+
+    var name: [24]u8 = undefined;
+    const row = key.make(
+        key.make(ui.root.key, "settings"),
+        std.fmt.bufPrint(&name, "row{d}", .{first}) catch unreachable,
+    );
+    try testing.expectEqualStrings("reading.list", ui.find(key.make(row, "key")).?.text);
+    try testing.expectEqualStrings("nowhere", ui.find(key.make(key.make(row, "value"), "shown")).?.text);
+
+    // Clicking a plugin's row works the way the reader's own does: a list
+    // cycles, a bare one becomes a field -- and the change names the row, so
+    // the reader knows which store to write it to.
+    const cycled = (try clickAt(&ui, &st, middleOf(cellOf(&ui, first + 1)))).?;
+    try testing.expectEqualStrings("reading.sort", cycled.key);
+    try testing.expectEqualStrings("added", cycled.value);
+    try testing.expectEqual(first + 1, cycled.index);
+    try testing.expect(st.isPlugin(cycled.index));
+    try testing.expect(!st.isPlugin(0));
+
+    _ = try clickAt(&ui, &st, middleOf(cellOf(&ui, first)));
+    try testing.expectEqual(@as(?usize, first), st.editing);
 }

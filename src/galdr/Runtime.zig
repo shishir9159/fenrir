@@ -281,7 +281,8 @@ const ModeSet = packed struct(u8) {
     }
 };
 
-const Keymap = struct {
+/// One `fenrir.keymap`, as the runtime keeps it.
+pub const Keymap = struct {
     modes: ModeSet,
     key: keys.Key,
     /// The Lua function, or `lua.no_ref` when the binding is a command line.
@@ -293,10 +294,13 @@ const Keymap = struct {
     live: bool = true,
 };
 
-const UserCommand = struct {
+pub const UserCommand = struct {
     name: []u8,
     ref: c_int,
     description: []u8,
+    /// A registered icon name, or empty. The palette draws a picture beside
+    /// every row and a plugin's rows all looked the same without one.
+    icon: []u8,
 };
 
 /// One `fenrir.on`, as the runtime keeps it.
@@ -331,6 +335,26 @@ pub const RailButton = struct {
     ref: c_int,
     line: []u8,
     /// What `fenrir.clear` takes it away with. Owned, empty for none.
+    group: []u8,
+    live: bool = true,
+};
+
+/// A setting a plugin declared, so that the settings page can list it.
+///
+/// A plugin's value has always lived in `fenrir.store`, which is a key and
+/// some bytes and no way for a person to find out that either exists. This is
+/// the other half: the same bytes, with a sentence saying what they are for
+/// and the values they may take, so that the page can draw a row for it and
+/// the plugin can go on reading it with `fenrir.store.get`.
+pub const Setting = struct {
+    /// The store key. Owned.
+    key: []u8,
+    about: []u8,
+    /// The values it cycles through on a click, each owned. Empty for a row
+    /// that is typed into instead.
+    choices: std.ArrayList([]const u8) = .empty,
+    /// What happens when it is not set, in words.
+    unset: []u8,
     group: []u8,
     live: bool = true,
 };
@@ -386,6 +410,7 @@ pending: std.ArrayList(Pending) = .empty,
 /// copied into a window and nothing has a second owner. `revision` is what
 /// lets the reader do that once per change instead of once per frame.
 rails: std.ArrayList(RailButton) = .empty,
+settings: std.ArrayList(Setting) = .empty,
 revision: u32 = 0,
 next_contribution: u32 = 1,
 
@@ -439,6 +464,7 @@ pub fn destroy(rt: *Runtime) void {
     for (rt.commands.items) |c| {
         gpa.free(c.name);
         gpa.free(c.description);
+        gpa.free(c.icon);
     }
     rt.commands.deinit(gpa);
     for (rt.handlers.items) |h| {
@@ -454,6 +480,8 @@ pub fn destroy(rt: *Runtime) void {
         gpa.free(b.group);
     }
     rt.rails.deinit(gpa);
+    for (rt.settings.items) |*s| freeSetting(gpa, s);
+    rt.settings.deinit(gpa);
     for (rt.messages.items) |m| gpa.free(m);
     rt.messages.deinit(gpa);
     for (rt.plugins.items) |p| {
@@ -578,6 +606,7 @@ const api = [_]Api{
     .{ .name = "mode", .func = apiMode, .cap = .ui },
     .{ .name = "rail", .func = apiRail, .cap = .ui },
     .{ .name = "unrail", .func = apiUnrail, .cap = .ui },
+    .{ .name = "setting", .func = apiSetting, .cap = .ui },
 
     .{ .name = "document", .func = apiDocument, .cap = .document_read },
     .{ .name = "page", .func = apiPage, .cap = .document_read },
@@ -1252,6 +1281,11 @@ pub fn railList(rt: *const Runtime) []const RailButton {
     return rt.rails.items;
 }
 
+/// Every setting a plugin declared, for the page that lists them.
+pub fn settingList(rt: *const Runtime) []const Setting {
+    return rt.settings.items;
+}
+
 /// What a rail button was for, run.
 ///
 /// The same two ways in a key binding has, for the same reason: a button that
@@ -1528,11 +1562,17 @@ fn addMode(L: ?*lua.State, set: *ModeSet, c: u8) void {
     }
 }
 
-/// `fenrir.command(name, function, description)`: a `:name args` command.
+/// `fenrir.command(name, function, description, icon)`: a `:name args`
+/// command.
+///
+/// The description and the icon are what the palette draws, and they are the
+/// whole difference between a plugin's command being findable and being
+/// something you have to already know the name of.
 fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
     const name = lua.checkString(L, 1);
     lua.luaL_checktype(L, 2, @intFromEnum(lua.Type.function));
     const description = lua.optString(L, 3) orelse "";
+    const icon = lua.optString(L, 4) orelse "";
 
     const valid = name.len > 0 and name.len <= 64 and std.ascii.isAlphabetic(name[0]) and for (name) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') break false;
@@ -1545,21 +1585,40 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
     const rt = of(L);
     for (rt.commands.items) |*c| {
         if (!std.mem.eql(u8, c.name, name)) continue;
-        // Redefining a command replaces it, as `:command!` does.
+        // Redefining a command replaces it, as `:command!` does -- all of
+        // it, because a plugin that changed what a command *does* and was
+        // left with the old sentence beside it in the palette would be the
+        // palette lying about the reader.
         lua.luaL_unref(L, lua.registry_index, c.ref);
         c.ref = ref;
+        if (rt.gpa.dupe(u8, description)) |d| {
+            rt.gpa.free(c.description);
+            c.description = d;
+        } else |_| {}
+        if (rt.gpa.dupe(u8, icon)) |p| {
+            rt.gpa.free(c.icon);
+            c.icon = p;
+        } else |_| {}
+        rt.revision +%= 1;
         return 0;
     }
-    const owned = rt.gpa.dupe(u8, name) catch return rt.outOfMemory(L, ref);
-    const desc = rt.gpa.dupe(u8, description) catch {
-        rt.gpa.free(owned);
+    const owned = rt.gpa.dupe(u8, name) catch null;
+    const desc = rt.gpa.dupe(u8, description) catch null;
+    const picture = rt.gpa.dupe(u8, icon) catch null;
+    const added = owned != null and desc != null and picture != null and
+        (if (rt.commands.append(rt.gpa, .{
+            .name = owned.?,
+            .ref = ref,
+            .description = desc.?,
+            .icon = picture.?,
+        })) true else |_| false);
+    if (!added) {
+        if (owned) |s| rt.gpa.free(s);
+        if (desc) |s| rt.gpa.free(s);
+        if (picture) |s| rt.gpa.free(s);
         return rt.outOfMemory(L, ref);
-    };
-    rt.commands.append(rt.gpa, .{ .name = owned, .ref = ref, .description = desc }) catch {
-        rt.gpa.free(owned);
-        rt.gpa.free(desc);
-        return rt.outOfMemory(L, ref);
-    };
+    }
+    rt.revision +%= 1;
     return 0;
 }
 
@@ -1651,6 +1710,12 @@ fn apiClear(L: ?*lua.State) callconv(.c) c_int {
         rt.revision +%= 1;
         cleared += 1;
     }
+    for (rt.settings.items) |*s| {
+        if (!s.live or !std.mem.eql(u8, s.group, group)) continue;
+        s.live = false;
+        rt.revision +%= 1;
+        cleared += 1;
+    }
     lua.lua_pushinteger(L, cleared);
     return 1;
 }
@@ -1720,6 +1785,81 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
     rt.revision +%= 1;
     lua.lua_pushinteger(L, id);
     return 1;
+}
+
+/// `fenrir.setting{ key =, about =, choices = {...}, unset = }`.
+///
+/// Declaring one does not store anything and does not read anything back:
+/// the value is `fenrir.store.get(key)` before and after, and this only says
+/// what the key means so the settings page can draw a row for it. A plugin
+/// that wants a default gives `unset` the words for it and keeps treating an
+/// absent value as that default -- which it had to do anyway, because a
+/// person can always clear the row.
+fn apiSetting(L: ?*lua.State) callconv(.c) c_int {
+    lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
+
+    _ = lua.lua_getfield(L, 1, "key");
+    const key = lua.toString(L, -1) orelse lua.raise(L, "galdr: a setting needs a key");
+    const fine = key.len > 0 and key.len <= 48 and for (key) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') break false;
+    } else true;
+    if (!fine) lua.raise(L, "galdr: a setting's key is letters, digits, _ - or .");
+
+    _ = lua.lua_getfield(L, 1, "about");
+    const about = lua.toString(L, -1) orelse "";
+    _ = lua.lua_getfield(L, 1, "unset");
+    const unset = lua.toString(L, -1) orelse "not set";
+    _ = lua.lua_getfield(L, 1, "group");
+    const group = lua.toString(L, -1) orelse "";
+
+    const rt = of(L);
+    var row: Setting = .{
+        .key = rt.gpa.dupe(u8, key) catch lua.raise(L, "galdr: out of memory"),
+        .about = rt.gpa.dupe(u8, about) catch &.{},
+        .unset = rt.gpa.dupe(u8, unset) catch &.{},
+        .group = rt.gpa.dupe(u8, group) catch &.{},
+    };
+
+    _ = lua.lua_getfield(L, 1, "choices");
+    if (lua.typeOf(L, -1) == .table) {
+        const n: lua.Integer = @intCast(lua.lua_rawlen(L, -1));
+        var i: lua.Integer = 1;
+        while (i <= n) : (i += 1) {
+            _ = lua.lua_rawgeti(L, -1, i);
+            const text = lua.toString(L, -1) orelse "";
+            const owned = rt.gpa.dupe(u8, text) catch break;
+            row.choices.append(rt.gpa, owned) catch {
+                rt.gpa.free(owned);
+                break;
+            };
+            lua.pop(L, 1);
+        }
+    }
+
+    // Declaring the same key twice replaces it, as redefining a command does:
+    // a plugin reloaded should not leave two rows behind.
+    for (rt.settings.items) |*existing| {
+        if (!existing.live or !std.mem.eql(u8, existing.key, key)) continue;
+        freeSetting(rt.gpa, existing);
+        existing.* = row;
+        rt.revision +%= 1;
+        return 0;
+    }
+    rt.settings.append(rt.gpa, row) catch {
+        freeSetting(rt.gpa, &row);
+        lua.raise(L, "galdr: out of memory");
+    };
+    rt.revision +%= 1;
+    return 0;
+}
+
+fn freeSetting(gpa: Allocator, s: *Setting) void {
+    gpa.free(s.key);
+    gpa.free(s.about);
+    gpa.free(s.unset);
+    gpa.free(s.group);
+    for (s.choices.items) |c| gpa.free(c);
+    s.choices.deinit(gpa);
 }
 
 fn apiUnrail(L: ?*lua.State) callconv(.c) c_int {
@@ -2570,6 +2710,64 @@ test "a plugin puts buttons on the rails, and takes them away again" {
     try testing.expect(!rt.runString("bad", "fenrir.rail{ label = 'x' }"));
     try testing.expect(!rt.runString("bad", "fenrir.rail{ action = 'q' }"));
     try testing.expect(!rt.runString("bad", "fenrir.rail{ side = 'top', label = 'x', action = 'q' }"));
+}
+
+test "a plugin declares a setting, and its value is the store's" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.setting{ key = "reading.list", about = "where the list is kept",
+        \\                unset = "nowhere", group = "mine" }
+        \\fenrir.setting{ key = "reading.sort", about = "how it is ordered",
+        \\                choices = { "added", "title" }, group = "mine" }
+    ));
+    try testing.expectEqual(@as(usize, 2), rt.settingList().len);
+    try testing.expectEqualStrings("reading.list", rt.settingList()[0].key);
+    try testing.expectEqualStrings("nowhere", rt.settingList()[0].unset);
+    try testing.expectEqual(@as(usize, 0), rt.settingList()[0].choices.items.len);
+    try testing.expectEqualStrings("title", rt.settingList()[1].choices.items[1]);
+    // Declaring one stores nothing: the value is the store's, before and
+    // after, and `fenrir.store` is still how a plugin reads it.
+    try testing.expect(fake.stored == null);
+
+    // The same key twice replaces the row rather than adding a second.
+    try testing.expect(rt.runString("again",
+        \\fenrir.setting{ key = "reading.list", about = "somewhere else" }
+    ));
+    try testing.expectEqual(@as(usize, 2), rt.settingList().len);
+    try testing.expectEqualStrings("somewhere else", rt.settingList()[0].about);
+    // ...and it is no longer in the group, so a reload clears one, not two.
+    try testing.expect(rt.runString("clear", "assert(fenrir.clear('mine') == 1)"));
+
+    try testing.expect(!rt.runString("bad", "fenrir.setting{ about = 'no key' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.setting{ key = 'has spaces' }"));
+}
+
+test "a command carries its icon into the palette, and redefining replaces both" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.command("Read", function() end, "open the reading list", "fenrir.bookmark")
+        \\fenrir.command("Plain", function() end)
+    ));
+    try testing.expectEqualStrings("fenrir.bookmark", rt.commandNames()[0].icon);
+    try testing.expectEqualStrings("open the reading list", rt.commandNames()[0].description);
+    try testing.expectEqual(@as(usize, 0), rt.commandNames()[1].icon.len);
+
+    try testing.expect(rt.runString("again",
+        \\fenrir.command("Read", function() end, "close it again", "fenrir.close")
+    ));
+    try testing.expectEqual(@as(usize, 2), rt.commandNames().len);
+    try testing.expectEqualStrings("close it again", rt.commandNames()[0].description);
+    try testing.expectEqualStrings("fenrir.close", rt.commandNames()[0].icon);
 }
 
 test "a rail button is behind the ui capability" {
