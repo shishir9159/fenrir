@@ -130,6 +130,20 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             }) catch {};
         }
     }
+    if (rt.panels.items.len != 0) {
+        ctx.out.print("panels:\n", .{}) catch {};
+        for (rt.panelList()) |p| {
+            if (!p.live) continue;
+            ctx.out.print("  {s: <14} {s: <18} {s}\n", .{ p.name, p.title, p.icon }) catch {};
+        }
+    }
+    if (rt.settings.items.len != 0) {
+        ctx.out.print("settings:\n", .{}) catch {};
+        for (rt.settingList()) |row| {
+            if (!row.live) continue;
+            ctx.out.print("  {s: <20} {s}\n", .{ row.key, row.about }) catch {};
+        }
+    }
     if (rt.rails.items.len != 0) {
         ctx.out.print("rails:\n", .{}) catch {};
         for (rt.railList()) |b| {

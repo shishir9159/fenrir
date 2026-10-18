@@ -76,6 +76,10 @@ const indent: f32 = 12;
 pub const Row = struct {
     /// What it says. Borrowed, and must outlive the frame it is drawn in.
     label: []const u8 = "",
+    /// The small dim thing at the far end: a date, a count, a note about
+    /// where this came from. Takes the place of the page number when both
+    /// are given, because a row has one right-hand end.
+    detail: []const u8 = "",
     /// Where it points, numbered from one. Zero for a row that points at no
     /// page, which is drawn without the number rather than with a zero.
     page: u32 = 0,
@@ -279,15 +283,28 @@ fn line(ui: *UI, t: Theme, l: w.List, index: u32, r: Row, selected: bool) Error!
         ui.next(.{
             .w = .text(0),
             .h = .text(0),
-            .fg = if (r.label.len == 0) t.text_dim else t.text,
+            .fg = t.text,
             .flags = .{ .draw_text = true },
         });
         // `boxText` and not `box`: the label is a document's, and a note with
         // `###` typed into it would otherwise split and key on its own tail.
-        _ = try ui.boxText("label", if (r.label.len == 0) "no note" else r.label);
+        _ = try ui.boxText("label", r.label);
     }
 
-    if (r.page != 0) {
+    if (r.detail.len != 0) {
+        try w.spacer(ui, .px(pad));
+        // Sized to its own text, like the page number beside it: a box with
+        // no size draws nothing at all, which is how this first shipped and
+        // what the picture of a plugin's panel found.
+        ui.next(.{
+            .w = .text(0),
+            .h = .text(0),
+            .fg = t.text_dim,
+            .font_size = 11,
+            .flags = .{ .draw_text = true },
+        });
+        _ = try ui.boxText("detail", r.detail);
+    } else if (r.page != 0) {
         try w.spacer(ui, .px(pad));
         ui.next(.{ .fg = t.text_dim, .font_size = 11 });
         _ = try w.labelf(ui, "{d}###page", .{r.page});
@@ -363,7 +380,7 @@ fn middleOf(b: *thviti.Box) Point {
 
 const three = [_]Row{
     .{ .label = "worth checking", .page = 2, .id = 11, .swatch = .{ .r = 1, .g = 0.9, .b = 0.2 } },
-    .{ .label = "", .page = 5, .id = 12 },
+    .{ .label = "chapter three", .detail = "3 days ago", .page = 5, .id = 12 },
     .{ .label = "the whole argument", .page = 9, .id = 13 },
 };
 
@@ -390,7 +407,7 @@ test "the panel docks against the rail and stops above the status bar" {
     try testing.expect(!st.holds(.{ .x = 40, .y = 40 }));
 }
 
-test "a row says what is written on it, or that nothing is" {
+test "a row says what it was given, and a detail takes the page's place" {
     var rig: Rig = undefined;
     try rig.init();
     defer rig.deinit();
@@ -403,10 +420,13 @@ test "a row says what is written on it, or that nothing is" {
         "worth checking",
         rig.ui.find(key.make(key.make(key.make(rows.key, "row0"), "room"), "label")).?.text,
     );
+    // A row has one right-hand end: a detail is what goes in it, and the
+    // page number is what goes there when there is no detail.
     try testing.expectEqualStrings(
-        "no note",
-        rig.ui.find(key.make(key.make(key.make(rows.key, "row1"), "room"), "label")).?.text,
+        "3 days ago",
+        rig.ui.find(key.make(key.make(rows.key, "row1"), "detail")).?.text,
     );
+    try testing.expect(rig.ui.find(key.make(key.make(rows.key, "row1"), "page")) == null);
     try testing.expectEqualStrings(
         "9",
         rig.ui.find(key.make(key.make(rows.key, "row2"), "page")).?.text,

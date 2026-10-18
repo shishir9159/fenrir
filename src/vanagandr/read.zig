@@ -946,6 +946,7 @@ const Session = struct {
     /// revision changes and never per frame: see `fillRailButtons`.
     rail_left: std.ArrayList(rails_mod.Extra) = .empty,
     rail_right: std.ArrayList(rails_mod.Extra) = .empty,
+    rail_panels: std.ArrayList(rails_mod.PanelToggle) = .empty,
     rails_for: u32 = std.math.maxInt(u32),
 
     /// The plugins' settings as the page wants them. Same rule: filled when
@@ -956,6 +957,7 @@ const Session = struct {
         which: rails_mod.Panel = .none,
         buffer: u32 = 0,
         revision: u64 = 0,
+        contributions: u32 = 0,
     } = .{},
 
     /// What is written on the tabs, and the bytes those names point into.
@@ -1116,6 +1118,7 @@ const Session = struct {
         s.rail_left.deinit(s.gpa);
         s.rail_right.deinit(s.gpa);
         s.plugin_settings.deinit(s.gpa);
+        s.rail_panels.deinit(s.gpa);
         s.tab_names.deinit(s.gpa);
         s.tab_text.deinit(s.gpa);
         s.tab_ends.deinit(s.gpa);
@@ -3987,6 +3990,7 @@ const Session = struct {
         return .{
             .page = v.currentPage() + 1,
             .pages = @intCast(v.pages.len),
+            .panels = s.rail_panels.items,
             .extra = s.rail_right.items,
         };
     }
@@ -4004,6 +4008,15 @@ const Session = struct {
         s.rails_for = rt.revision;
         s.rail_left.clearRetainingCapacity();
         s.rail_right.clearRetainingCapacity();
+        s.rail_panels.clearRetainingCapacity();
+        for (rt.panelList()) |p| {
+            if (!p.live) continue;
+            s.rail_panels.append(s.gpa, .{
+                .id = p.id,
+                .label = p.title,
+                .icon = p.icon,
+            }) catch break;
+        }
         for (rt.railList()) |b| {
             if (!b.live) continue;
             const into = switch (b.side) {
@@ -4076,6 +4089,10 @@ const Session = struct {
             .which = which,
             .buffer = v.buffer,
             .revision = b.marks.revision,
+            // A plugin's list changes when the plugin says it does, and
+            // `fenrir.refresh` is how it says so. Without this a declared
+            // panel would be asked once and then never again.
+            .contributions = if (s.plugins) |rt| rt.revision else 0,
         };
         if (std.meta.eql(s.rows_for, stamp)) return s.rows.items;
         s.rows_for = stamp;
@@ -4097,10 +4114,29 @@ const Session = struct {
                     }) catch break;
                 }
             },
+            .plugin => |id| {
+                const rt = s.plugins orelse return s.rows.items;
+                // Borrowed from Galdr, which holds the strings until the next
+                // time a panel is asked -- and that is here, so they outlive
+                // every frame drawn from them.
+                for (rt.panelRows(id)) |r| {
+                    s.rows.append(s.gpa, .{
+                        .label = r.label,
+                        .detail = r.detail,
+                        .page = r.page,
+                        .swatch = if (r.color.len == 0) null else Library.parseColor(r.color),
+                        .depth = r.depth,
+                        .id = r.id,
+                    }) catch break;
+                }
+            },
             .annotations => {
                 for (b.marks.items()) |m| {
                     s.rows.append(s.gpa, .{
-                        .label = m.note,
+                        // A row with nothing written on it still has to say
+                        // something, and what it says is this panel's to
+                        // decide -- `panels.Row` draws what it is given.
+                        .label = if (m.note.len == 0) "no note" else m.note,
                         .page = m.page + 1,
                         .swatch = m.color,
                         .id = m.key,
@@ -4161,15 +4197,21 @@ const Session = struct {
         }
         s.panel.chosen = s.focus_mark orelse 0;
 
+        // A plugin's panel names itself; the reader's own are named here.
+        // Both are one call, because a panel declared in Lua is a title, a
+        // sentence for when it is empty, and a list of rows -- which is all
+        // the annotations panel ever was.
+        const declared = s.declaredPanel(which);
         const chosen = try panels.panel(
             &c.ui,
             c.face,
             c.theme,
             &c.icons,
-            which.label(),
-            switch (which) {
+            if (declared) |p| p.title else which.label(),
+            if (declared) |p| p.empty else switch (which) {
                 .none, .annotations => "no highlights yet",
                 .bookmarks => "this document has no outline",
+                .plugin => "",
             },
             s.panelRows(which),
             &s.panel,
@@ -4187,8 +4229,30 @@ const Session = struct {
             // view scrolls to it, so clicking a row and pressing `d` deletes
             // the one that was clicked.
             .annotations => s.focusMark(chosen.id),
+            // A plugin's row means whatever the plugin says it means, and a
+            // row with a page on it also goes there -- which is what every
+            // other panel row in this reader does, so a plugin gets it
+            // without having to write it.
+            .plugin => |id| if (s.plugins) |rt| {
+                if (chosen.page != 0) _ = s.goToPage(chosen.page);
+                rt.choosePanelRow(id, chosen.id);
+                s.applyEffects();
+            },
         }
         s.dirty_title = true;
+    }
+
+    /// The plugin panel `which` names, or null for one of the reader's own.
+    fn declaredPanel(s: *Session, which: rails_mod.Panel) ?galdr.Runtime.Panel {
+        const id = switch (which) {
+            .plugin => |i| i,
+            else => return null,
+        };
+        const rt = s.plugins orelse return null;
+        for (rt.panelList()) |p| {
+            if (p.id == id and p.live) return p;
+        }
+        return null;
     }
 
     fn updateTitle(s: *Session, window: lyngvi.Window) void {
@@ -4795,6 +4859,8 @@ fn closeSession(s: *Session) void {
     s.rail_left.deinit(s.gpa);
     s.rail_right.deinit(s.gpa);
     s.plugin_settings.deinit(s.gpa);
+    s.rail_panels.deinit(s.gpa);
+    s.rows.deinit(s.gpa);
     s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
@@ -5818,6 +5884,59 @@ test "the palette holds the keyboard, and opens from the key and the command" {
     s.palette.hide();
     try testing.expect(s.exec("commands"));
     try testing.expect(s.palette.open);
+}
+
+test "a panel a plugin declared latches on the rail and lists what it says" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    s.plugins = rt;
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    try testing.expect(rt.runString("init.lua",
+        \\opened = nil
+        \\titles = { "Chapter one", "Chapter two" }
+        \\fenrir.panel{
+        \\  id = "reading", title = "Reading list", icon = "fenrir.bookmark",
+        \\  empty = "nothing saved yet",
+        \\  rows = function()
+        \\    local out = {}
+        \\    for i, t in ipairs(titles) do
+        \\      out[i] = { label = t, detail = "kept", page = i * 3, id = 100 + i }
+        \\    end
+        \\    return out
+        \\  end,
+        \\  choose = function(row) opened = row end,
+        \\}
+    ));
+
+    s.fillRailButtons();
+    try testing.expectEqual(@as(usize, 1), s.rail_panels.items.len);
+    const id = s.rail_panels.items[0].id;
+    try testing.expectEqualStrings("Reading list", s.rail_panels.items[0].label);
+    try testing.expectEqualStrings("fenrir.bookmark", s.rail_panels.items[0].icon);
+
+    const which: rails_mod.Panel = .{ .plugin = id };
+    const rows = s.panelRows(which);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("Chapter two", rows[1].label);
+    try testing.expectEqualStrings("kept", rows[1].detail);
+    try testing.expectEqual(@as(u32, 6), rows[1].page);
+    try testing.expectEqualStrings("Reading list", s.declaredPanel(which).?.title);
+    try testing.expect(s.declaredPanel(.annotations) == null);
+
+    // Cached until the plugin says otherwise, and rebuilt when it does.
+    try testing.expect(rt.runString("more", "titles[3] = 'Chapter three'"));
+    try testing.expectEqual(@as(usize, 2), s.panelRows(which).len);
+    try testing.expect(rt.runString("refresh", "fenrir.refresh()"));
+    try testing.expectEqual(@as(usize, 3), s.panelRows(which).len);
 }
 
 test "a plugin's commands and settings arrive in the palette and the page" {

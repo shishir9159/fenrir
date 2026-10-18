@@ -78,17 +78,29 @@ const page_digits = 7;
 
 /// Which overlay is showing. One at a time: they dock to the same edge and
 /// two of them would be a second split tree nobody asked for.
-pub const Panel = enum {
+///
+/// A union rather than an enum since a plugin can declare one: its variant
+/// carries the contribution's id, because the rail cannot have a name for
+/// something it has never heard of. The label and the icon of one come from
+/// `Right.panels` beside it, for the same reason.
+pub const Panel = union(enum) {
     none,
     /// The highlights in this document, and what is written on them.
     annotations,
     /// The document's own outline, and the places a reader has kept.
     bookmarks,
+    /// A plugin's, by its contribution id.
+    plugin: u32,
+
+    pub fn eql(a: Panel, b: Panel) bool {
+        return std.meta.eql(a, b);
+    }
 
     /// What the rail's button for it is called, and what its tooltip says.
+    /// Empty for a plugin's, which the rail is told separately.
     pub fn label(p: Panel) []const u8 {
         return switch (p) {
-            .none => "",
+            .none, .plugin => "",
             .annotations => "Annotations",
             .bookmarks => "Bookmarks",
         };
@@ -97,7 +109,7 @@ pub const Panel = enum {
     /// The icon id, resolved through the registry like every other.
     pub fn icon(p: Panel) []const u8 {
         return switch (p) {
-            .none => "fenrir.unknown",
+            .none, .plugin => "fenrir.unknown",
             .annotations => "fenrir.highlight",
             .bookmarks => "fenrir.bookmark",
         };
@@ -106,6 +118,17 @@ pub const Panel = enum {
 
 /// The panels the rail has a button for, in the order it draws them.
 pub const toggles = [_]Panel{ .annotations, .bookmarks };
+
+/// A panel a plugin declared: a latch on the rail, beside the reader's own.
+///
+/// Above the rule and not below it, unlike `Extra`: a panel *is* one of the
+/// things this rail is for, and a reader looking for the list of panels
+/// should find them all in one column.
+pub const PanelToggle = struct {
+    id: u32,
+    label: []const u8,
+    icon: []const u8,
+};
 
 /// A button a plugin put here.
 ///
@@ -125,6 +148,8 @@ pub const Right = struct {
     /// Numbered from one, as a person numbers them.
     page: u32 = 1,
     pages: u32 = 1,
+    /// The panels plugins declared, latching beside the reader's own.
+    panels: []const PanelToggle = &.{},
     /// The plugins' buttons, under the reader's own and under a rule: the
     /// things this program does are above the things somebody added.
     extra: []const Extra = &.{},
@@ -239,7 +264,7 @@ pub const Rails = struct {
     /// The same button twice closes what it opened, which is what a latch on
     /// a rail is for.
     pub fn toggle(r: *Rails, p: Panel) void {
-        r.panel = if (r.panel == p) .none else p;
+        r.panel = if (r.panel.eql(p)) .none else p;
     }
 
     /// Whether the rails are holding this frame's keyboard, which they are
@@ -313,11 +338,26 @@ pub fn rightRail(
     try w.spacer(ui, .px(inset));
     for (toggles) |p| {
         const sig = try w.iconButton(ui, p.label(), icons.byName(p.icon(), .sidebar), .{
-            .on = r.panel == p,
+            .on = r.panel.eql(p),
             .accent = t.accent,
         });
         w.tool.hint(ui, tips, sig, p.label());
-        if (sig.clicked) want = .{ .panel = if (r.panel == p) .none else p };
+        if (sig.clicked) want = .{ .panel = if (r.panel.eql(p)) .none else p };
+        try w.spacer(ui, .px(2));
+    }
+    for (st.panels, 0..) |p, i| {
+        const which: Panel = .{ .plugin = p.id };
+        // Keyed by position, not by the plugin's id, for the reason `extras`
+        // gives: a panel removed should not hand the next one a new box.
+        var name: [24]u8 = undefined;
+        const sig = try w.iconButton(
+            ui,
+            std.fmt.bufPrint(&name, "panel{d}", .{i}) catch "panel",
+            icons.byName(p.icon, .sidebar),
+            .{ .on = r.panel.eql(which), .accent = t.accent },
+        );
+        w.tool.hint(ui, tips, sig, p.label);
+        if (sig.clicked) want = .{ .panel = if (r.panel.eql(which)) .none else which };
         try w.spacer(ui, .px(2));
     }
 
@@ -894,4 +934,35 @@ test "no plugin buttons, no rule to separate them from" {
     try testing.expect(rig.find("Annotations") != null);
     try testing.expect(rig.find("right plugin rule") == null);
     try testing.expect(rig.find("plugin0") == null);
+}
+
+test "a plugin's panel latches beside the reader's own" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+
+    const declared = [_]PanelToggle{
+        .{ .id = 5, .label = "Reading list", .icon = "fenrir.bookmark" },
+    };
+    var r: Rails = .{};
+    const st: Right = .{ .page = 1, .pages = 4, .panels = &declared };
+    _ = try rig.frame(st, &r, .{});
+
+    // Above the rule, with the reader's own: a panel is one of the things
+    // this rail is for, wherever it was declared.
+    const toggle = rig.find("panel0").?;
+    try testing.expect(toggle.rect.min_y > rig.find("Bookmarks").?.rect.max_y);
+
+    const want = (try rig.click(st, &r, middleOf(toggle))).?;
+    try testing.expectEqual(@as(u32, 5), want.panel.plugin);
+
+    // And it latches: the same button again closes what it opened, which is
+    // the rule every other panel toggle here follows.
+    r.toggle(want.panel);
+    try testing.expect(r.panel.eql(.{ .plugin = 5 }));
+    r.toggle(want.panel);
+    try testing.expect(r.panel.eql(.none));
+    r.toggle(.{ .plugin = 5 });
+    r.toggle(.annotations);
+    try testing.expect(r.panel.eql(.annotations));
 }

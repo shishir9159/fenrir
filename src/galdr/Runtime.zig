@@ -339,6 +339,45 @@ pub const RailButton = struct {
     live: bool = true,
 };
 
+/// A panel a plugin declared.
+///
+/// The rows are not kept here: a plugin's list is made of whatever the plugin
+/// knows, and a copy this file held would be stale the moment anything
+/// changed. `rows` is a function the reader calls when it needs the list --
+/// when the panel is opened, and when the plugin says with `fenrir.refresh`
+/// that it is different now.
+pub const Panel = struct {
+    id: u32,
+    /// The plugin's own name for it. For the commands that print panels; the
+    /// reader addresses one by `id`.
+    name: []u8,
+    title: []u8,
+    icon: []u8,
+    /// What the panel says when the list comes back empty.
+    empty: []u8,
+    rows_ref: c_int,
+    /// Called with a row's id when one is chosen, or `lua.no_ref`.
+    choose_ref: c_int,
+    group: []u8,
+    live: bool = true,
+};
+
+/// One row of a plugin's panel, as `panelRows` leaves it.
+///
+/// The same five things `panels.Row` draws, in the vocabulary a plugin writes
+/// them in: a colour is `#rrggbb` here and a `Color` there, because Galdr
+/// does not import Gelgja and a plugin should not have to write three floats.
+/// The slices point into `rows_arena` and are good until the next build.
+pub const PanelRow = struct {
+    label: []const u8 = "",
+    detail: []const u8 = "",
+    icon: []const u8 = "",
+    color: []const u8 = "",
+    page: u32 = 0,
+    depth: u8 = 0,
+    id: u64 = 0,
+};
+
 /// A setting a plugin declared, so that the settings page can list it.
 ///
 /// A plugin's value has always lived in `fenrir.store`, which is a key and
@@ -411,8 +450,17 @@ pending: std.ArrayList(Pending) = .empty,
 /// lets the reader do that once per change instead of once per frame.
 rails: std.ArrayList(RailButton) = .empty,
 settings: std.ArrayList(Setting) = .empty,
+panels: std.ArrayList(Panel) = .empty,
 revision: u32 = 0,
 next_contribution: u32 = 1,
+
+/// The last list of rows a panel gave back, and the bytes it points into.
+///
+/// One buffer for whichever panel was asked last, because one panel is open
+/// at a time -- and reset rather than freed, so a list rebuilt when a plugin
+/// says it changed costs no allocator traffic after the first time.
+rows: std.ArrayList(PanelRow) = .empty,
+rows_arena: std.heap.ArenaAllocator,
 
 /// Every error a script has raised this session, oldest first, capped. What
 /// `:messages` shows.
@@ -438,7 +486,13 @@ pub fn create(gpa: Allocator, host: Host, options: Options) Error!*Runtime {
 
     const rt = try gpa.create(Runtime);
     errdefer gpa.destroy(rt);
-    rt.* = .{ .gpa = gpa, .host = host, .L = undefined, .options = options };
+    rt.* = .{
+        .gpa = gpa,
+        .host = host,
+        .L = undefined,
+        .options = options,
+        .rows_arena = .init(gpa),
+    };
 
     rt.L = lua.lua_newstate(allocate, rt) orelse return error.CannotCreate;
     errdefer lua.lua_close(rt.L);
@@ -482,6 +536,16 @@ pub fn destroy(rt: *Runtime) void {
     rt.rails.deinit(gpa);
     for (rt.settings.items) |*s| freeSetting(gpa, s);
     rt.settings.deinit(gpa);
+    for (rt.panels.items) |p| {
+        gpa.free(p.name);
+        gpa.free(p.title);
+        gpa.free(p.icon);
+        gpa.free(p.empty);
+        gpa.free(p.group);
+    }
+    rt.panels.deinit(gpa);
+    rt.rows.deinit(gpa);
+    rt.rows_arena.deinit();
     for (rt.messages.items) |m| gpa.free(m);
     rt.messages.deinit(gpa);
     for (rt.plugins.items) |p| {
@@ -607,6 +671,8 @@ const api = [_]Api{
     .{ .name = "rail", .func = apiRail, .cap = .ui },
     .{ .name = "unrail", .func = apiUnrail, .cap = .ui },
     .{ .name = "setting", .func = apiSetting, .cap = .ui },
+    .{ .name = "panel", .func = apiPanel, .cap = .ui },
+    .{ .name = "refresh", .func = apiRefresh, .cap = .ui },
 
     .{ .name = "document", .func = apiDocument, .cap = .document_read },
     .{ .name = "page", .func = apiPage, .cap = .document_read },
@@ -1286,6 +1352,122 @@ pub fn settingList(rt: *const Runtime) []const Setting {
     return rt.settings.items;
 }
 
+/// Every panel a plugin declared, for the rail that latches them.
+pub fn panelList(rt: *const Runtime) []const Panel {
+    return rt.panels.items;
+}
+
+/// Asks a panel for its rows.
+///
+/// The result lives until the next call and belongs to the runtime, which is
+/// what lets it be a list of borrowed slices rather than a list the reader
+/// has to free. Called when a panel is opened and when `fenrir.refresh` says
+/// the list has changed, and never on a frame path: a plugin's `rows`
+/// function is Lua and Lua does not run sixty times a second here.
+pub fn panelRows(rt: *Runtime, id: u32) []const PanelRow {
+    rt.rows.clearRetainingCapacity();
+    if (!lua.available) return &.{};
+    _ = rt.rows_arena.reset(.retain_capacity);
+
+    for (rt.panels.items) |p| {
+        if (p.id != id or !p.live) continue;
+        var what: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&what, "panel {s}", .{
+            p.name[0..@min(p.name.len, 40)],
+        }) catch "panel";
+        var job: RowJob = .{ .ref = p.rows_ref };
+        lua.lua_pushcclosure(rt.L, rowsTrampoline, 0);
+        lua.lua_pushlightuserdata(rt.L, &job);
+        _ = rt.call(1, 0, label);
+        return rt.rows.items;
+    }
+    return &.{};
+}
+
+/// Tells a panel that one of its rows was chosen.
+pub fn choosePanelRow(rt: *Runtime, id: u32, row: u64) void {
+    if (!lua.available) return;
+    for (rt.panels.items) |p| {
+        if (p.id != id or !p.live or p.choose_ref == lua.no_ref) continue;
+        var what: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&what, "panel {s}", .{
+            p.name[0..@min(p.name.len, 40)],
+        }) catch "panel";
+        var job: ChooseJob = .{ .ref = p.choose_ref, .row = row };
+        lua.lua_pushcclosure(rt.L, chooseTrampoline, 0);
+        lua.lua_pushlightuserdata(rt.L, &job);
+        _ = rt.call(1, 0, label);
+        return;
+    }
+}
+
+const RowJob = struct { ref: c_int };
+const ChooseJob = struct { ref: c_int, row: u64 };
+
+fn chooseTrampoline(L: ?*lua.State) callconv(.c) c_int {
+    const job: *const ChooseJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
+    _ = lua.lua_rawgeti(L, lua.registry_index, job.ref);
+    lua.lua_pushinteger(L, @intCast(job.row));
+    lua.lua_callk(L, 1, 0, 0, null);
+    return 0;
+}
+
+/// Calls a panel's `rows` function and reads the list it returns.
+///
+/// Every string is copied out into the arena before this returns, because the
+/// table it came from is Lua's and is collectable the moment the call is
+/// over. Copying is the price of the reader being able to hold the list
+/// across frames without a Lua reference of its own.
+fn rowsTrampoline(L: ?*lua.State) callconv(.c) c_int {
+    const job: *const RowJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
+    const rt = of(L);
+    _ = lua.lua_rawgeti(L, lua.registry_index, job.ref);
+    lua.lua_callk(L, 0, 1, 0, null);
+    if (lua.typeOf(L, -1) != .table) lua.raise(L, "galdr: a panel's rows function returns a list of rows");
+
+    const arena = rt.rows_arena.allocator();
+    const n: lua.Integer = @intCast(lua.lua_rawlen(L, -1));
+    var i: lua.Integer = 1;
+    while (i <= n and i <= max_panel_rows) : (i += 1) {
+        _ = lua.lua_rawgeti(L, -1, i);
+        if (lua.typeOf(L, -1) != .table) lua.raise(L, "galdr: a panel row is a table");
+        var row: PanelRow = .{};
+        inline for (.{ "label", "detail", "icon", "color" }) |field| {
+            _ = lua.lua_getfield(L, -1, field);
+            if (lua.toString(L, -1)) |text| {
+                @field(row, field) = arena.dupe(u8, text[0..@min(text.len, 512)]) catch "";
+            }
+            lua.pop(L, 1);
+        }
+        _ = lua.lua_getfield(L, -1, "page");
+        row.page = clampTo(u32, lua.lua_tointegerx(L, -1, null));
+        lua.pop(L, 1);
+        _ = lua.lua_getfield(L, -1, "depth");
+        row.depth = clampTo(u8, lua.lua_tointegerx(L, -1, null));
+        lua.pop(L, 1);
+        // From one, because zero is the panel's "nothing chosen". A row that
+        // gave none gets its place in the list, which is a number a plugin
+        // can use as well as any it would have invented.
+        _ = lua.lua_getfield(L, -1, "id");
+        const given = lua.lua_tointegerx(L, -1, null);
+        row.id = if (given > 0) @intCast(given) else @intCast(i);
+        lua.pop(L, 1);
+
+        rt.rows.append(rt.gpa, row) catch break;
+        lua.pop(L, 1);
+    }
+    return 0;
+}
+
+fn clampTo(comptime T: type, value: lua.Integer) T {
+    return @intCast(std.math.clamp(value, 0, std.math.maxInt(T)));
+}
+
+/// The most rows a panel will show. Long enough for a chapter list or a
+/// session's worth of notes, short enough that a plugin with a bug does not
+/// take the reader's memory with it.
+pub const max_panel_rows = 4096;
+
 /// What a rail button was for, run.
 ///
 /// The same two ways in a key binding has, for the same reason: a button that
@@ -1716,6 +1898,16 @@ fn apiClear(L: ?*lua.State) callconv(.c) c_int {
         rt.revision +%= 1;
         cleared += 1;
     }
+    for (rt.panels.items) |*p| {
+        if (!p.live or !std.mem.eql(u8, p.group, group)) continue;
+        p.live = false;
+        if (p.rows_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, p.rows_ref);
+        if (p.choose_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, p.choose_ref);
+        p.rows_ref = lua.no_ref;
+        p.choose_ref = lua.no_ref;
+        rt.revision +%= 1;
+        cleared += 1;
+    }
     lua.lua_pushinteger(L, cleared);
     return 1;
 }
@@ -1860,6 +2052,84 @@ fn freeSetting(gpa: Allocator, s: *Setting) void {
     gpa.free(s.group);
     for (s.choices.items) |c| gpa.free(c);
     s.choices.deinit(gpa);
+}
+
+/// `fenrir.panel{ id =, title =, icon =, empty =, rows = fn, choose = fn }`.
+///
+/// The rail grows a latch for it beside the reader's own, and choosing a row
+/// calls `choose` with that row's id. A plugin never touches a box: it says
+/// what its rows *are* and Þviti lays them out, which is the same division
+/// the annotations panel and the outline already work under.
+fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
+    lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
+
+    _ = lua.lua_getfield(L, 1, "id");
+    const name = lua.toString(L, -1) orelse lua.raise(L, "galdr: a panel needs an id");
+    if (name.len == 0 or name.len > 64) lua.raise(L, "galdr: a panel's id is one to sixty-four bytes");
+
+    _ = lua.lua_getfield(L, 1, "title");
+    const title = lua.toString(L, -1) orelse name;
+    _ = lua.lua_getfield(L, 1, "icon");
+    const icon = lua.toString(L, -1) orelse "fenrir.panel";
+    _ = lua.lua_getfield(L, 1, "empty");
+    const empty = lua.toString(L, -1) orelse "nothing here";
+    _ = lua.lua_getfield(L, 1, "group");
+    const group = lua.toString(L, -1) orelse "";
+
+    // Referenced last of the two, and both after every check: a reference
+    // taken before a raise is a reference nothing will ever release.
+    _ = lua.lua_getfield(L, 1, "choose");
+    const has_choose = lua.typeOf(L, -1) == .function;
+    if (!has_choose and lua.typeOf(L, -1) != .nil) lua.raise(L, "galdr: a panel's choose is a function");
+    _ = lua.lua_getfield(L, 1, "rows");
+    if (lua.typeOf(L, -1) != .function) lua.raise(L, "galdr: a panel needs a rows function");
+
+    const rows_ref = lua.luaL_ref(L, lua.registry_index);
+    const choose_ref = if (has_choose) lua.luaL_ref(L, lua.registry_index) else lua.no_ref;
+
+    const rt = of(L);
+    const owned_name = rt.gpa.dupe(u8, name) catch null;
+    const owned_title = rt.gpa.dupe(u8, title) catch null;
+    const owned_icon = rt.gpa.dupe(u8, icon) catch null;
+    const owned_empty = rt.gpa.dupe(u8, empty) catch null;
+    const owned_group = rt.gpa.dupe(u8, group) catch null;
+    const id = rt.next_contribution;
+    const added = owned_name != null and owned_title != null and owned_icon != null and
+        owned_empty != null and owned_group != null and
+        (if (rt.panels.append(rt.gpa, .{
+            .id = id,
+            .name = owned_name.?,
+            .title = owned_title.?,
+            .icon = owned_icon.?,
+            .empty = owned_empty.?,
+            .rows_ref = rows_ref,
+            .choose_ref = choose_ref,
+            .group = owned_group.?,
+        })) true else |_| false);
+    if (!added) {
+        if (owned_name) |s| rt.gpa.free(s);
+        if (owned_title) |s| rt.gpa.free(s);
+        if (owned_icon) |s| rt.gpa.free(s);
+        if (owned_empty) |s| rt.gpa.free(s);
+        if (owned_group) |s| rt.gpa.free(s);
+        if (choose_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, choose_ref);
+        return rt.outOfMemory(L, rows_ref);
+    }
+    rt.next_contribution += 1;
+    rt.revision +%= 1;
+    lua.lua_pushinteger(L, id);
+    return 1;
+}
+
+/// `fenrir.refresh()`: the lists a plugin declared are out of date.
+///
+/// One call for all of them rather than one per panel, because a plugin that
+/// changed something usually changed the thing two of its lists are drawn
+/// from -- and rebuilding a list nobody has open costs nothing, since the
+/// reader only asks the panel that is showing.
+fn apiRefresh(L: ?*lua.State) callconv(.c) c_int {
+    of(L).revision +%= 1;
+    return 0;
 }
 
 fn apiUnrail(L: ?*lua.State) callconv(.c) c_int {
@@ -2768,6 +3038,82 @@ test "a command carries its icon into the palette, and redefining replaces both"
     try testing.expectEqual(@as(usize, 2), rt.commandNames().len);
     try testing.expectEqualStrings("close it again", rt.commandNames()[0].description);
     try testing.expectEqualStrings("fenrir.close", rt.commandNames()[0].icon);
+}
+
+test "a panel is a list a plugin builds, asked for when it is wanted" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\asked, chose = 0, nil
+        \\titles = { "Chapter one", "Chapter two" }
+        \\id = fenrir.panel{
+        \\  id = "reading", title = "Reading list", icon = "fenrir.bookmark",
+        \\  empty = "nothing saved yet", group = "mine",
+        \\  rows = function()
+        \\    asked = asked + 1
+        \\    local out = {}
+        \\    for i, t in ipairs(titles) do
+        \\      out[i] = { label = t, detail = i .. " days ago", page = i * 4,
+        \\                 color = "#ffcc00", depth = i - 1, id = 100 + i }
+        \\    end
+        \\    return out
+        \\  end,
+        \\  choose = function(row) chose = row end,
+        \\}
+    ));
+
+    try testing.expectEqual(@as(usize, 1), rt.panelList().len);
+    const panel = rt.panelList()[0];
+    try testing.expectEqualStrings("reading", panel.name);
+    try testing.expectEqualStrings("Reading list", panel.title);
+    try testing.expectEqualStrings("nothing saved yet", panel.empty);
+
+    const rows = rt.panelRows(panel.id);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("Chapter one", rows[0].label);
+    try testing.expectEqualStrings("1 days ago", rows[0].detail);
+    try testing.expectEqualStrings("#ffcc00", rows[0].color);
+    try testing.expectEqual(@as(u32, 8), rows[1].page);
+    try testing.expectEqual(@as(u8, 1), rows[1].depth);
+    try testing.expectEqual(@as(u64, 102), rows[1].id);
+
+    // Asked again, the list is what the plugin says it is now.
+    try testing.expect(rt.runString("more", "titles[3] = 'Chapter three'"));
+    try testing.expectEqual(@as(usize, 3), rt.panelRows(panel.id).len);
+    try testing.expect(rt.runString("check", "assert(asked == 2, asked)"));
+
+    rt.choosePanelRow(panel.id, 102);
+    try testing.expect(rt.runString("check", "assert(chose == 102, tostring(chose))"));
+
+    // A panel that is gone gives no rows rather than the ones it used to.
+    try testing.expect(rt.runString("clear", "assert(fenrir.clear('mine') == 1)"));
+    try testing.expectEqual(@as(usize, 0), rt.panelRows(panel.id).len);
+
+    try testing.expect(!rt.runString("bad", "fenrir.panel{ title = 'no id', rows = function() end }"));
+    try testing.expect(!rt.runString("bad", "fenrir.panel{ id = 'x' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.panel{ id = 'x', rows = 3 }"));
+}
+
+test "a panel whose rows are wrong reports and gives none" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\a = fenrir.panel{ id = "a", rows = function() return 7 end }
+        \\b = fenrir.panel{ id = "b", rows = function() error("broken") end }
+    ));
+    try testing.expectEqual(@as(usize, 0), rt.panelRows(rt.panelList()[0].id).len);
+    try testing.expectEqual(@as(usize, 0), rt.panelRows(rt.panelList()[1].id).len);
+    try testing.expectEqual(@as(usize, 2), rt.messages.items.len);
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "list of rows") != null);
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[1], "broken") != null);
 }
 
 test "a rail button is behind the ui capability" {
