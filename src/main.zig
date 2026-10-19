@@ -19,6 +19,7 @@ const pages = @import("vanagandr/pages.zig");
 const rects = @import("vanagandr/rects.zig");
 const raster = @import("vanagandr/raster.zig");
 const read = @import("vanagandr/read.zig");
+const run_cmd = @import("vanagandr/run.zig");
 const trace = @import("vanagandr/trace.zig");
 const ui = @import("vanagandr/ui.zig");
 const library = @import("vanagandr/library.zig");
@@ -46,6 +47,7 @@ const commands = [_]Command{
     .{ .name = "marks", .summary = "the highlights made in a document", .usage = library.marks_usage, .run = library.marksRun },
     .{ .name = "plugins", .summary = "load init.lua and the plugins, and report", .usage = plugins.usage, .run = plugins.run },
     .{ .name = "health", .summary = "what this build can do, and what it found", .usage = health.usage, .run = health.run },
+    .{ .name = "run", .summary = "run a Lua script over a document, with no window", .usage = run_cmd.usage, .run = run_cmd.run },
     .{ .name = "commands", .summary = "list the reader's `:` commands", .usage = commands_cmd.usage, .run = commands_cmd.run },
     .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
     .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },

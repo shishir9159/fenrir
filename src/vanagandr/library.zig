@@ -276,7 +276,11 @@ fn toByte(v: f32) u8 {
 /// The path a document is keyed under. Must match `read.zig`'s
 /// `absolutePath` exactly, which is why it is the same call: a highlight
 /// added here under a relative path would be invisible to the reader.
-fn absolute(ctx: *Context, file: []const u8) std.mem.Allocator.Error![]u8 {
+/// The key every command uses for a document in the library: its real path,
+/// or what was typed when the filesystem will not resolve it. Public because
+/// `fenrir run` writes highlights too, and two commands that keyed a
+/// document differently would never find each other's.
+pub fn absolute(ctx: *Context, file: []const u8) std.mem.Allocator.Error![]u8 {
     if (Io.Dir.cwd().realPathFileAlloc(ctx.io, file, ctx.gpa)) |real| {
         defer ctx.gpa.free(real);
         return ctx.gpa.dupe(u8, real);

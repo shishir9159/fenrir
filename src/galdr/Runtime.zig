@@ -964,7 +964,7 @@ pub fn loadConfig(rt: *Runtime) void {
     if (!lua.available) return;
     if (rt.host.readFile(rt.gpa, "init.lua")) |source| {
         defer rt.gpa.free(source);
-        rt.loadOne("init.lua", "init.lua", source, null);
+        _ = rt.loadOne("init.lua", "init.lua", source, null);
     }
 
     const entries = rt.host.listDir(rt.gpa, "plugins") orelse return;
@@ -991,7 +991,7 @@ pub fn loadConfig(rt: *Runtime) void {
         const name = std.mem.trimEnd(u8, if (std.mem.endsWith(u8, entry, ".lua")) entry[0 .. entry.len - 4] else entry, "/");
         const source = rt.host.readFile(rt.gpa, path) orelse continue;
         defer rt.gpa.free(source);
-        rt.loadOne(name, path, source, manifest);
+        _ = rt.loadOne(name, path, source, manifest);
     }
 }
 
@@ -999,16 +999,16 @@ pub fn loadConfig(rt: *Runtime) void {
 ///
 /// The entry goes in before the chunk runs, because `fenrir.manifest` writes
 /// on it while the chunk is running.
-fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8, manifest: ?[]const u8) void {
-    const owned = rt.gpa.dupe(u8, name) catch return;
+fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8, manifest: ?[]const u8) bool {
+    const owned = rt.gpa.dupe(u8, name) catch return false;
     rt.plugins.append(rt.gpa, .{ .name = owned }) catch {
         rt.gpa.free(owned);
-        return;
+        return false;
     };
     const at = rt.plugins.items.len - 1;
 
     const env = rt.makeEnv(.all);
-    if (env == lua.no_ref) return;
+    if (env == lua.no_ref) return false;
     // The registry's hold, not the table's life: every closure the plugin
     // makes keeps `_ENV` as an upvalue, so the environment lives exactly as
     // long as the plugin's functions do.
@@ -1026,10 +1026,23 @@ fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8,
             defer rt.gpa.free(text);
             // A manifest that does not parse is a plugin that does not load:
             // it asked for something and the answer cannot be guessed.
-            if (!rt.runManifest(rel, text)) return;
+            if (!rt.runManifest(rel, text)) return false;
         }
     }
     rt.plugins.items[at].ok = rt.runChunk(path, source, env);
+    return rt.plugins.items[at].ok;
+}
+
+/// Runs a chunk *as a plugin*: its own environment, its own entry in
+/// `plugins`, and `fenrir.manifest` working.
+///
+/// What `fenrir run` uses for the script it was handed, so that a file which
+/// works as a plugin works the same way when it is named on a command line --
+/// including the manifest, which `runString` cannot honour because there is
+/// no plugin for it to be the manifest of.
+pub fn runPlugin(rt: *Runtime, name: []const u8, source: []const u8) bool {
+    if (!lua.available) return false;
+    return rt.loadOne(name, name, source, null);
 }
 
 const ManifestJob = struct {
