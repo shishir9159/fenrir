@@ -644,50 +644,134 @@ fn setup(L: ?*lua.State) callconv(.c) c_int {
     return 0;
 }
 
-/// One entry of the `fenrir` table.
-const Api = struct {
+/// One entry of the `fenrir` table: what Lua calls it, what a manifest has to
+/// ask for before it is there at all, and the two lines of prose a person
+/// needs to use it.
+///
+/// The prose is here rather than in a manual because a manual is a second
+/// copy: this table is what builds the table Lua sees, so a function added
+/// without a sentence is a compile error and a function whose arguments
+/// changed is a diff in the line that documents it. `fenrir plugins --api`
+/// prints it, which makes the whole reference a thing the binary knows rather
+/// than a file somebody remembers to update.
+pub const Entry = struct {
     name: [:0]const u8,
-    func: lua.CFunction,
+    /// Null for the globals, which are set up by hand rather than from here.
+    func: ?lua.CFunction = null,
     /// What a manifest has to ask for before this is in the table at all.
     /// Null for the ones every plugin has, which are the ones that can do
     /// nothing on their own: declaring itself, listening, and its own store.
     cap: ?Capability = null,
+    /// The arguments as a person writes them, braces and all.
+    args: []const u8 = "",
+    /// What comes back, or empty for nothing.
+    returns: []const u8 = "",
+    about: []const u8,
 };
 
-const api = [_]Api{
-    .{ .name = "manifest", .func = apiManifest },
-    .{ .name = "on", .func = apiOn },
-    .{ .name = "off", .func = apiOff },
-    .{ .name = "clear", .func = apiClear },
+pub const api = [_]Entry{
+    .{
+        .name = "manifest",
+        .func = apiManifest,
+        .args = "{ about =, version =, capabilities = {...} }",
+        .about = "declares what a plugin is, and narrows its fenrir table to what it asks for",
+    },
+    .{
+        .name = "on",
+        .func = apiOn,
+        .args = "(event, pattern, fn, group)",
+        .returns = "id",
+        .about = "runs fn on a coroutine when event happens to a path matching pattern",
+    },
+    .{ .name = "off", .func = apiOff, .args = "(id)", .about = "stops one handler, by the id fenrir.on gave back" },
+    .{
+        .name = "clear",
+        .func = apiClear,
+        .args = "(group)",
+        .returns = "n",
+        .about = "stops every handler and removes every contribution in a group",
+    },
 
-    .{ .name = "notify", .func = apiNotify, .cap = .ui },
-    .{ .name = "exec", .func = apiExec, .cap = .ui },
-    .{ .name = "keymap", .func = apiKeymap, .cap = .ui },
-    .{ .name = "unmap", .func = apiUnmap, .cap = .ui },
-    .{ .name = "command", .func = apiCommand, .cap = .ui },
-    .{ .name = "go", .func = apiGo, .cap = .ui },
-    .{ .name = "zoom", .func = apiZoom, .cap = .ui },
-    .{ .name = "mode", .func = apiMode, .cap = .ui },
-    .{ .name = "rail", .func = apiRail, .cap = .ui },
-    .{ .name = "unrail", .func = apiUnrail, .cap = .ui },
-    .{ .name = "setting", .func = apiSetting, .cap = .ui },
-    .{ .name = "panel", .func = apiPanel, .cap = .ui },
-    .{ .name = "refresh", .func = apiRefresh, .cap = .ui },
+    .{ .name = "notify", .func = apiNotify, .cap = .ui, .args = "(message)", .about = "says a line where the reader says things" },
+    .{ .name = "exec", .func = apiExec, .cap = .ui, .args = "(line)", .returns = "ok", .about = "runs a : command line" },
+    .{
+        .name = "keymap",
+        .func = apiKeymap,
+        .cap = .ui,
+        .args = "(modes, key, action, description)",
+        .about = "binds a key in normal, visual or edit mode; action is a function or a : line",
+    },
+    .{ .name = "unmap", .func = apiUnmap, .cap = .ui, .args = "(modes, key)", .about = "takes a binding away" },
+    .{
+        .name = "command",
+        .func = apiCommand,
+        .cap = .ui,
+        .args = "(name, fn, description, icon)",
+        .about = "adds a :name args command, which the palette then lists and ranks",
+    },
+    .{ .name = "go", .func = apiGo, .cap = .ui, .args = "(page, offset)", .returns = "ok", .about = "scrolls the focused window to a page, numbered from 1" },
+    .{ .name = "zoom", .func = apiZoom, .cap = .ui, .args = "(percent)", .returns = "percent", .about = "reads the zoom, or sets it" },
+    .{ .name = "mode", .func = apiMode, .cap = .ui, .returns = "name", .about = "which mode the keymap is in" },
+    .{
+        .name = "rail",
+        .func = apiRail,
+        .cap = .ui,
+        .args = "{ side =, icon =, label =, action =, group = }",
+        .returns = "id",
+        .about = "puts a button on a rail; the icon is a registry name, never a path",
+    },
+    .{ .name = "unrail", .func = apiUnrail, .cap = .ui, .args = "(id)", .about = "takes a rail button away, by the id fenrir.rail gave back" },
+    .{
+        .name = "setting",
+        .func = apiSetting,
+        .cap = .ui,
+        .args = "{ key =, about =, choices = {...}, unset =, group = }",
+        .about = "lists one of this plugin's store keys on the settings page",
+    },
+    .{
+        .name = "panel",
+        .func = apiPanel,
+        .cap = .ui,
+        .args = "{ id =, title =, icon =, empty =, rows =, choose =, group = }",
+        .returns = "id",
+        .about = "declares a panel: a latch on the rail, and a rows function that builds its list",
+    },
+    .{ .name = "refresh", .func = apiRefresh, .cap = .ui, .about = "the lists this plugin declared are out of date" },
 
-    .{ .name = "document", .func = apiDocument, .cap = .document_read },
-    .{ .name = "page", .func = apiPage, .cap = .document_read },
-    .{ .name = "cursor", .func = apiCursor, .cap = .document_read },
-    .{ .name = "selection", .func = apiSelection, .cap = .document_read },
-    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read },
+    .{ .name = "document", .func = apiDocument, .cap = .document_read, .returns = "{ path, title, pages }", .about = "the document in the focused window, or nil" },
+    .{ .name = "page", .func = apiPage, .cap = .document_read, .returns = "n", .about = "the page it is showing, from 1" },
+    .{ .name = "cursor", .func = apiCursor, .cap = .document_read, .returns = "{ page, line, column }", .about = "where the caret is, or nil" },
+    .{ .name = "selection", .func = apiSelection, .cap = .document_read, .returns = "{ from, to }", .about = "what is selected, either way it was made, or nil" },
+    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read, .returns = "list", .about = "every highlight in the focused document" },
 
-    .{ .name = "highlight", .func = apiHighlight, .cap = .document_write },
-    .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write },
+    .{
+        .name = "highlight",
+        .func = apiHighlight,
+        .cap = .document_write,
+        .args = "{ page =, x0 =, y0 =, x1 =, y1 =, color =, note = }",
+        .returns = "id",
+        .about = "makes one, in PDF points, so it survives zoom and reopening",
+    },
+    .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write, .args = "(id)", .returns = "ok", .about = "removes one, by the id fenrir.highlight gave back" },
 };
 
-const store_api = [_]lua.Reg{
-    .{ .name = "get", .func = apiStoreGet },
-    .{ .name = "set", .func = apiStoreSet },
-    .{ .name = null, .func = null },
+/// `fenrir.store`, which every plugin has: its own key space in the library,
+/// and the place a declared setting's value lives.
+pub const store = [_]Entry{
+    .{ .name = "get", .func = apiStoreGet, .args = "(key)", .returns = "value", .about = "a value this plugin kept, or nil" },
+    .{ .name = "set", .func = apiStoreSet, .args = "(key, value)", .returns = "ok", .about = "keeps one, or with nil removes it" },
+};
+
+/// What the sandbox leaves in the globals that is not stock Lua's, and the
+/// two fields of the table that are not functions. Listed for the same
+/// reason as the rest: a person writing a plugin needs to know what `require`
+/// can reach as much as what `fenrir.go` does.
+pub const globals = [_]Entry{
+    .{ .name = "print", .args = "(...)", .about = "stock print, onto the reader's message line" },
+    .{ .name = "require", .args = "(name)", .returns = "module", .about = "loads lua/<name>.lua under the configuration directory, and nothing else" },
+    .{ .name = "load", .args = "(source, name, mode, env)", .returns = "fn", .about = "stock load, refusing bytecode whatever mode is asked for" },
+    .{ .name = "fenrir.version", .about = "this reader's plugin API version" },
+    .{ .name = "fenrir.lua", .about = "the Lua the sandbox is built on" },
 };
 
 /// The `fenrir` table a plugin with these capabilities sees.
@@ -703,7 +787,7 @@ fn pushFenrir(L: ?*lua.State, caps: Caps) void {
         if (entry.cap) |c| {
             if (!caps.has(c)) continue;
         }
-        lua.lua_pushcclosure(L, entry.func, 0);
+        lua.lua_pushcclosure(L, entry.func.?, 0);
         lua.lua_setfield(L, -2, entry.name.ptr);
     }
     lua.pushString(L, "0.0.1");
@@ -713,8 +797,11 @@ fn pushFenrir(L: ?*lua.State, caps: Caps) void {
 
     // A plugin's own values, always: the key space is the plugin's and
     // nothing else can be reached through it.
-    lua.newTable(L);
-    lua.luaL_setfuncs(L, &store_api, 0);
+    lua.lua_createtable(L, 0, store.len);
+    for (store) |entry| {
+        lua.lua_pushcclosure(L, entry.func.?, 0);
+        lua.lua_setfield(L, -2, entry.name.ptr);
+    }
     lua.lua_setfield(L, -2, "store");
 }
 
