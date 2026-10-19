@@ -819,18 +819,18 @@ out is the whole of why `read --frames 1200` came in at 0.692s against
 0.734s: the phase added a Unicode lookup per glyph and still ran six per cent
 faster than the phase before it. Measured interleaved, best of five.
 
-### Phase 8 — what a plugin may contribute
+### Phase 8 — what a plugin may contribute ✅
 
-| Commit | Files | ~ |
-|---|---|---|
-| a plugin manifest, and the capabilities it asks for | `galdr/Runtime.zig`, `Host.zig` | 280 |
-| an event bus, with patterns and async handlers | `galdr/Runtime.zig` | 300 |
-| plugins put icons and buttons on the rails | `Runtime.zig`, `Host.zig`, `read.zig` | 250 |
-| plugin commands in the palette, settings in the page | `Runtime.zig`, `read.zig` | 220 |
-| panels declared by a plugin | `Runtime.zig`, `read.zig` | 300 |
-| `fenrir health` | `src/vanagandr/health.zig` | 200 |
-| the plugin api, written out of the api table | `Runtime.zig`, `plugins.zig` | 180 |
-| headless: run a plugin over a document with no window | `src/vanagandr/run.zig` | 200 |
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | a plugin manifest, and the capabilities it asks for | `galdr/Runtime.zig`, `lua.zig`, `galdr.zig`, `plugins.zig` | 525 |
+| ✅ | an event bus, with patterns and async handlers | `galdr/Runtime.zig`, `lua.zig`, `read.zig`, `plugins.zig` | 626 |
+| ✅ | plugins put icons and buttons on the rails | `Runtime.zig`, `rails.zig`, `read.zig`, `plugins.zig` | 412 |
+| ✅ | plugin commands in the palette, settings in the page | `Runtime.zig`, `settings.zig`, `read.zig` | 459 |
+| ✅ | panels declared by a plugin | `Runtime.zig`, `panels.zig`, `rails.zig`, `read.zig` | 587 |
+| ✅ | `fenrir health` | `src/vanagandr/health.zig`, `main.zig`, `Library.zig` | 494 |
+| ✅ | the plugin api, written out of the api table | `Runtime.zig`, `plugins.zig` | 251 |
+| ✅ | headless: run a plugin over a document with no window | `src/vanagandr/run.zig`, `Runtime.zig`, `library.zig` | 538 |
 
 **Capabilities.** A manifest — `plugins/<name>/plugin.lua` returning a table,
 or a `fenrir.manifest{…}` call at the top of a single-file plugin — declares
@@ -868,6 +868,90 @@ vtable entries, so Galdr still knows nothing about windows. A panel is
 declared as a list of typed rows — `{kind, icon, label, detail, action}` — a
 vocabulary Lua can build and Þviti can lay out without a plugin ever touching
 a box. The status line uses the same rows.
+
+### What phase 8 cost, against what it was budgeted
+
+Eight commits at 1930 became eight at 3892, which is twice the estimate and a
+shade better than phase seven's two and a half. Every one is over 250 lines
+and three are over 500. The pattern from phase six holds and has not been
+beaten: **estimate the file, not the feature** — and this phase added five
+registries, a coroutine scheduler, two commands and a contribution type per
+half of the interface, each of which arrives with its paragraph, its test and
+the command that prints it.
+
+**There is no global `fenrir`, and that is the whole of the sandbox.** The
+plan said "build that plugin's `fenrir` table with only the granted functions
+in it", and the half it did not say is where the table goes: a global one is a
+global one, and a narrowed plugin that could write `_G.fenrir` would have been
+narrowed in name only. So every chunk runs with an environment of its own —
+an empty table whose metatable reads and writes through to `_G`, with
+`fenrir` as its one real field. That is four lines in `newEnv`, it costs one
+table per plugin, and it makes the enforcement structural: **an ungranted
+function is not refused, it is `nil`.** The knock-on is that `require` has to
+load a module into *the requiring chunk's* environment, which is one line and
+would have been a silent hole otherwise.
+
+**A coroutine's hook is not the state's hook.** Lua 5.4 keeps the debug hook
+per thread and a new thread inherits none, so the step limit — the whole of
+what stops `while true do end` — was simply absent on every handler the moment
+handlers became coroutines. Nothing failed: the tests passed, the reader ran,
+and a runaway handler would have hung the window with no message. `lua_sethook`
+on each coroutine as it is made is the fix, and it is one line that is
+invisible until the day it is not there. **A limit that is enforced per thread
+has to be installed per thread, and a test that only proves the good case
+proves nothing about it.**
+
+**`lua_resume` counts the arguments and not the function.** The first run of
+the event bus had every handler silently not running: the coroutine was made,
+the function and its table were moved onto it, and the resume said two
+arguments when there was one argument and a function under it. Three tests
+failed and all three said "the handler never ran", which is the symptom and
+not the cause. **When a boundary takes a count, write down what is being
+counted beside it** — the comment is now there, and it is the only thing that
+makes the number readable.
+
+**A picture found a bug that eleven tests could not see.** `panels.Row` grew a
+`detail` field, the tests checked that a row with a detail had no page number
+beside it, and they passed — because the box the detail drew into had no size
+and drew nothing, which is also "no page number". The shot of a plugin's panel
+is what showed four rows with three empty right-hand ends. **`.w` and `.h` are
+not optional and a box without them is not a small box, it is no box**, which
+is a thing this interface has now learned in two phases running from two
+directions.
+
+**A second picture found a lie the reader had been telling.** The palette's
+shot with a plugin's command in it showed `redo <C-r>` and `Read <C-r>` one
+above the other: the plugin had bound the chord and the built-in table's
+`binding` string is a constant that cannot know. Nothing crashed, both rows
+were correct in isolation, and the pair was wrong. The palette now parses each
+built-in's binding back through `keyspec` and asks the plugin keymap whether
+that key is still theirs. **A binding drawn beside a command is a claim about
+the keyboard, and the keyboard is the thing that has to be asked.**
+
+**Two commands that write to the same table have to key it the same way.** A
+script's highlights went into the library under the path as typed, and
+`fenrir marks` and `fenrir read` both key on the *real* path — so `fenrir run`
+wrote highlights that no other command in the program could ever find. The
+round trip is two commands and was ten seconds to check, and nothing short of
+running both would have shown it. `library.absolute` is public now with that
+argument written on it.
+
+**A `--shot` runs with no plugins, on purpose, and that is the one thing that
+makes a plugin hard to photograph.** A picture has to be the same picture
+whatever is in somebody's configuration directory, so `read.zig` skips Galdr
+for a shot — which means the three pictures this phase needed were taken by
+deleting that condition, taking them, and putting it back. That is the same
+two lines the popups need, from the other side, and it belongs in the list
+with `menu.show(…)`.
+
+**Performance is unchanged, and that was the point.** `fenrir read F
+--frames 1200 --vsync off` came in at 0.717s before and 0.724s after, measured
+interleaved, best of twelve — a one per cent difference on a machine whose two
+batches disagreed by eight. Nothing was expected to move: the reader with no
+plugins does not enter `pump` at all, and with plugins it compares one
+revision number per frame and rebuilds the rail lists only when a plugin has
+changed them. `fenrir raster --all` is 1.979s against 1.984s and **all ten
+pages hash identically**, which is what the rule asks for.
 
 ### Phase 9 — freehand ink
 
@@ -1102,6 +1186,45 @@ Things that cost time once and should not cost it again.
   to begin. The picture was of a bar saying `searching` over a page with
   nothing on it. Seeding one page's results before the window opens is what
   made the shot, and it comes out again with the `menu.show(…)` lines.
+- **A sandbox that leaves a global is not a sandbox.** Capabilities narrow the
+  `fenrir` table a plugin is handed, and a *global* `fenrir` beside it would
+  have made that narrowing decorative: `local f = _G.fenrir` and it is gone.
+  Every chunk gets an environment of its own — one table, a metatable that
+  reads and writes through to `_G`, and `fenrir` as its single real field —
+  and there is no global one at all. The check is one line of Lua in a test:
+  `assert(rawget(_G, "fenrir") == nil)`.
+- **A limit enforced per thread has to be installed per thread.** Lua 5.4's
+  debug hook is per coroutine and a new one inherits none, so the instruction
+  limit vanished the day handlers became coroutines — silently, with every
+  test still green, because a test of the *good* case proves nothing about a
+  runaway. `lua_sethook` goes on each coroutine as it is made, and the test
+  that matters is the one that hangs without it.
+- **When a boundary takes a count, write down what is being counted.**
+  `lua_resume` counts arguments, not the function under them, and passing two
+  where one was meant made every event handler not run — reported by three
+  tests as "the handler never ran", which is the symptom three times over. The
+  number is now next to a sentence saying what it is.
+- **A box with no size is not a small box, it is no box.** A panel row's new
+  `detail` drew nothing because its `ui.next` had no `.w` and no `.h`, and the
+  test that should have caught it asked whether the *page number* was absent —
+  which it also was. A shot of the panel is what showed three empty right-hand
+  ends. The same lesson as the clipping one, from the other side.
+- **A binding drawn beside a command is a claim about the keyboard.** The
+  built-in table's `binding` is a constant, a plugin can bind the same chord,
+  and the palette then draws two rows claiming `<C-r>`. Parse the string back
+  through `keyspec` and ask the live keymap who owns the key. Nothing crashes
+  and nothing looks wrong until two rows sit one above the other in a picture.
+- **Two commands that write to one table have to key it the same way.**
+  `fenrir run` stored highlights under the path as typed; `read` and `marks`
+  key on the real path. Both worked, and neither could see the other's work.
+  The check is the round trip -- write with one, list with the other -- and it
+  is ten seconds.
+- **A shot runs with no plugins on purpose, so a contribution has to be
+  photographed by hand.** `read.zig` skips Galdr for `--shot` so that a
+  picture is the same picture whatever is in somebody's configuration
+  directory. Every picture this phase needed came from deleting that condition
+  and putting it back, which is the `menu.show(…)` rule in a second place and
+  is worth knowing before spending an hour wondering where the rails went.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
@@ -1130,6 +1253,11 @@ fenrir commands [--match QUERY]         # every `:` command, and how it ranks
 fenrir trace F --text                   # the page as the words it came out as
 fenrir trace F --lines                  # the same, with the geometry beside it
 fenrir trace F --all --find Q           # every match, and the boxes it covers
+
+fenrir health                           # what this build has, and what it found
+fenrir plugins                          # what a configuration registered
+fenrir plugins --api                    # the whole `fenrir` table, out of the table
+fenrir run S.lua F.pdf                  # a plugin over a document, no window
 ```
 
 Most of the new code is testable with no window, no device and no font —
@@ -1138,9 +1266,13 @@ Most of the new code is testable with no window, no device and no font —
 
 **A popup cannot be photographed by a shot, so open it by hand.** `--shot`
 draws one frame of a reader nobody has clicked in, which is every menu and
-every panel closed. Two lines at the top of the session — `menu.show(…)`, or
-`settings.show()` — and a `--device` shot is the picture, and both come out
-again before the commit. That is *draw the thing before committing the thing*
+every panel closed — and, since phase eight, no plugins either, because a
+picture has to be the same picture whatever is in somebody's configuration
+directory. Two or three lines at the top of the session — `menu.show(…)`,
+`settings.show()`, or `startPlugins` without its `shot == null` — and a
+`--device` shot is the picture, and all of them come out again before the
+commit. Note also that `--shot --path cpu` alone draws the *page* and no
+chrome at all: a rail, a panel or a palette needs `--device`. That is *draw the thing before committing the thing*
 applied to the half of the interface a shot cannot reach, and it is how the
 zoom menu and the settings page were each found to be a few pixels out.
 
@@ -1155,4 +1287,7 @@ must not move at all — nothing in this plan touches the page rasteriser.
 
 Every new registry gets a command that prints it — `fenrir icons`,
 `fenrir commands`, `fenrir health` — so a wrong table is a diff rather than
-something to find by clicking.
+something to find by clicking. Phase eight added five registries and they are
+all in two places: `fenrir health` prints the registries themselves, whether
+or not anybody has written a plugin, and `fenrir plugins` prints what one
+configuration did with them.
