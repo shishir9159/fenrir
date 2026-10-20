@@ -150,19 +150,23 @@ pub fn recentRun(ctx: *Context, argv: []const []const u8) !void {
 // -- fenrir marks ------------------------------------------------------------
 
 pub const marks_usage =
-    \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]] [--db FILE]
+    \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
+    \\                    [--ink PAGE X Y X Y ... [COLOUR]] [--db FILE]
     \\
-    \\    The highlights made in a document, which `fenrir read` draws and
-    \\    keeps here rather than writing into the PDF.
+    \\    The marks made on a document, which `fenrir read` draws and keeps
+    \\    here rather than writing into the PDF: the highlights dragged over
+    \\    its text, and the ink drawn on it in draw mode.
     \\
     \\    fenrir marks paper.pdf              list them
-    \\    fenrir marks paper.pdf --clear      remove every one
+    \\    fenrir marks paper.pdf --clear      remove every one, ink included
     \\    fenrir marks paper.pdf --add 3 72 700 300 712 yellow
-    \\                                        add one, for scripting
+    \\                                        add a highlight, for scripting
+    \\    fenrir marks paper.pdf --ink 3 72 700 120 690 160 705 red
+    \\                                        draw a stroke, the same way
     \\
-    \\    Pages are numbered from 1. Boxes are in PDF points on the page as it
-    \\    is displayed, measured from its bottom-left corner -- the same
-    \\    numbers `read` stores when you drag over text.
+    \\    Pages are numbered from 1. Boxes and strokes alike are in PDF points
+    \\    on the page as it is displayed, measured from its bottom-left corner
+    \\    -- the same numbers `read` stores when you drag over text.
 ;
 
 pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
@@ -171,6 +175,9 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var clear = false;
     var add: ?Library.Highlight = null;
     var colour: []const u8 = "";
+    var ink_page: ?u32 = null;
+    var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
+    defer ink.deinit(ctx.gpa);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -207,6 +214,34 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
                     return ctx.fail("{s} is not a colour: try a name or #rrggbb", .{colour});
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--ink")) {
+            // A page and then every number until the next option, in pairs.
+            // Variadic because a stroke has no fixed length, which is the
+            // whole difference between ink and a highlight.
+            if (i + 1 >= argv.len) return ctx.fail("--ink needs PAGE X Y X Y ...", .{});
+            i += 1;
+            const page = std.fmt.parseInt(u32, argv[i], 10) catch
+                return ctx.fail("--ink wants a page number, not '{s}'", .{argv[i]});
+            if (page == 0) return ctx.fail("pages are numbered from 1", .{});
+            ink_page = page - 1;
+            while (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+                // A word that is not a number ends the stroke and is the
+                // colour, as it is for `--add`.
+                const x = std.fmt.parseFloat(f32, argv[i + 1]) catch break;
+                if (i + 2 == argv.len) return ctx.fail("--ink wants x and y in pairs", .{});
+                const y = std.fmt.parseFloat(f32, argv[i + 2]) catch
+                    return ctx.fail("--ink wants x and y in pairs, not '{s}'", .{argv[i + 2]});
+                try ink.append(ctx.gpa, .{ .x = x, .y = y });
+                i += 2;
+            }
+            if (ink.items.len < 2) return ctx.fail("a stroke is at least two points", .{});
+            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+                i += 1;
+                colour = argv[i];
+                if (Library.parseColor(colour) == null) {
+                    return ctx.fail("{s} is not a colour: try a name or #rrggbb", .{colour});
+                }
+            }
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ctx.fail("unknown option {s}", .{arg});
         } else if (file == null) {
@@ -229,8 +264,15 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     defer ctx.gpa.free(key);
 
     if (clear) {
+        // Both tables, because `--clear` means the document goes back to
+        // being unmarked, and a reader who cleared their marks and still
+        // found ink on page four would rightly call that a bug.
         const n = lib.clearHighlights(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
-        ctx.out.print("removed {d} highlight{s}\n", .{ n, if (n == 1) "" else "s" }) catch {};
+        const k = lib.clearStrokes(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
+        ctx.out.print("removed {d} highlight{s} and {d} stroke{s}\n", .{
+            n, if (n == 1) "" else "s",
+            k, if (k == 1) "" else "s",
+        }) catch {};
         return;
     }
 
@@ -252,11 +294,34 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         return;
     }
 
+    if (ink_page) |page| {
+        var hex: [8]u8 = undefined;
+        var text: []const u8 = "";
+        if (colour.len != 0) {
+            const c = Library.parseColor(colour).?;
+            text = std.fmt.bufPrint(&hex, "#{x:0>2}{x:0>2}{x:0>2}", .{
+                toByte(c.r), toByte(c.g), toByte(c.b),
+            }) catch unreachable;
+        }
+        const id = lib.addStroke(key, .{
+            .page = page,
+            .color = @constCast(text),
+            .points = ink.items,
+        }, now(ctx.io)) catch |err| return ctx.fail("cannot add: {t}", .{err});
+        ctx.out.print("added stroke {d} of {d} points on page {d}\n", .{
+            id, ink.items.len, page + 1,
+        }) catch {};
+        return;
+    }
+
     const list = lib.highlights(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeHighlights(list, list.len);
 
-    if (list.len == 0) {
-        ctx.out.print("no highlights in {s}\n", .{name}) catch {};
+    const strokes = lib.strokes(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeStrokes(strokes, strokes.len);
+
+    if (list.len == 0 and strokes.len == 0) {
+        ctx.out.print("no marks in {s}\n", .{name}) catch {};
         return;
     }
     for (list) |h| {
@@ -265,6 +330,20 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         }) catch {};
         if (h.color.len != 0) ctx.out.print("  {s}", .{h.color}) catch {};
         if (h.note.len != 0) ctx.out.print("  \"{s}\"", .{h.note}) catch {};
+        ctx.out.print("\n", .{}) catch {};
+    }
+    // The box a stroke covers rather than the points it is made of: a line
+    // of forty coordinates is not something anybody reads off a terminal,
+    // and where it is and how long it is are the two facts worth printing.
+    // The file itself is where the points are, and it is readable on purpose.
+    for (strokes) |k| {
+        var box: fenrir.gelgja.Bounds = .empty;
+        for (k.points) |p| box = box.add(p);
+        ctx.out.print("page {d: >4}  ink {d} points  ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})", .{
+            k.page + 1, k.points.len, box.min_x, box.min_y, box.max_x, box.max_y,
+        }) catch {};
+        if (k.color.len != 0) ctx.out.print("  {s}", .{k.color}) catch {};
+        if (k.width != 0) ctx.out.print("  w{d:.2}", .{k.width}) catch {};
         ctx.out.print("\n", .{}) catch {};
     }
 }

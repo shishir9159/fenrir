@@ -17,12 +17,19 @@
 //! been moved or deleted is not noticed until it is opened; `forget` and
 //! `--clear` are how a list is trimmed.
 //!
-//! Highlights are the one thing here that is a *change to a document* rather
-//! than a note about reading it, and they are still kept here rather than
-//! written into the PDF: writing an annotation back means rewriting the file,
-//! and a reader should not modify what it was asked to display until someone
-//! asks it to. `fenrir` will grow a command that exports them as real
+//! Highlights and ink are the things here that are a *change to a document*
+//! rather than a note about reading it, and they are still kept here rather
+//! than written into the PDF: writing an annotation back means rewriting the
+//! file, and a reader should not modify what it was asked to display until
+//! someone asks it to. `fenrir` will grow a command that exports them as real
 //! `/Annots`; until then they live beside the document and not in it.
+//!
+//! Ink is the same kind of fact as a highlight and is kept the same way: a
+//! page, a colour, and geometry in that page's own user-space points. It has
+//! a table of its own rather than more columns on `highlight` because the
+//! two differ in what geometry *is* -- a box is four numbers and a stroke is
+//! a list of them -- and a table whose meaning depends on which of its
+//! columns are null is a table nobody can read.
 //!
 //! Settings are key and value, both text, because every one of them is
 //! either a name, a colour or a number that a person may want to read in the
@@ -33,9 +40,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Db = @import("Db.zig");
+const geom = @import("../gelgja/geom.zig");
 const paint = @import("../gelgja/paint.zig");
 
 const Color = paint.Color;
+const Point = geom.Point;
 const Library = @This();
 
 pub const Error = Db.Error;
@@ -44,7 +53,7 @@ pub const Error = Db.Error;
 /// forward on open; one from a *newer* version is left alone and opened
 /// read-only in effect, because a later fenrir may have added a column this
 /// one would drop on write.
-pub const schema_version: i64 = 2;
+pub const schema_version: i64 = 3;
 
 gpa: Allocator,
 db: Db,
@@ -135,6 +144,35 @@ fn migrate(lib: *Library, from: i64) Error!void {
             \\    created_at INTEGER NOT NULL DEFAULT 0
             \\);
             \\CREATE INDEX IF NOT EXISTS highlight_by_doc ON highlight (path, page);
+            \\COMMIT;
+        );
+    }
+
+    if (from < 3) {
+        // Ink. The same shape as `highlight` -- a path, a page, a colour --
+        // with the box replaced by the two things a pen has that a
+        // highlighter does not: where it went, and how wide it was.
+        //
+        // `points` is text and not a blob, which is the one decision in this
+        // table worth arguing. A blob of f32 pairs is eight bytes a point
+        // against about twelve, and it round-trips exactly. Text keeps the
+        // promise the rest of this file makes -- that this is a file a person
+        // can open and read -- and what it costs is a hundredth of a point,
+        // which is a three-thousandth of a millimetre and is not a thing
+        // anybody can draw. Size is `Marks.simplify`'s to worry about, and it
+        // has far more of it to give than an encoding does.
+        try lib.db.exec(
+            \\BEGIN;
+            \\CREATE TABLE IF NOT EXISTS ink (
+            \\    id         INTEGER PRIMARY KEY,
+            \\    path       TEXT NOT NULL,
+            \\    page       INTEGER NOT NULL,
+            \\    color      TEXT NOT NULL DEFAULT '',
+            \\    width      REAL NOT NULL DEFAULT 0,
+            \\    points     TEXT NOT NULL DEFAULT '',
+            \\    created_at INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\CREATE INDEX IF NOT EXISTS ink_by_doc ON ink (path, page);
             \\COMMIT;
         );
     }
@@ -519,6 +557,174 @@ pub fn freeHighlights(lib: Library, list: []Highlight, n: usize) void {
     if (list.len != 0) lib.gpa.free(list);
 }
 
+// -- ink ----------------------------------------------------------------------
+
+/// One freehand stroke, as the file holds it.
+///
+/// The points are in the page's own user-space points, for the reason a
+/// highlight's box is: a stroke is a fact about the document, and a stroke
+/// stored in device pixels would land somewhere else at the next zoom.
+///
+/// `width` is in those same points, so the pen keeps its thickness relative
+/// to the type it was drawn over however far the page is scaled. A width of
+/// zero means the reader's default, the way an empty `color` means its
+/// accent.
+pub const Stroke = struct {
+    id: i64 = 0,
+    page: u32 = 0,
+    /// `#rrggbb`, or empty for the reader's pen colour.
+    color: []u8 = &.{},
+    width: f32 = 0,
+    points: []Point = &.{},
+};
+
+/// How many characters a point takes at the precision `writePoints` uses,
+/// with room for a page-sized coordinate and the space after it.
+const point_chars = 24;
+
+/// The most points a stroke may hold.
+///
+/// A cap and not a warning, because the thing on the other side of it is a
+/// reader who held the button down for a minute: `simplify` gets a normal
+/// stroke to a few dozen points, so anything near this is a runaway rather
+/// than a drawing, and a row too large to read back is worse than a stroke
+/// that stopped.
+pub const max_points = 4096;
+
+/// Writes a stroke and returns the row it was given.
+pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 {
+    if (lib.future) return 0;
+    if (k.points.len < 2 or k.points.len > max_points) return error.Failed;
+
+    const text = try lib.gpa.alloc(u8, k.points.len * point_chars);
+    defer lib.gpa.free(text);
+    const encoded = writePoints(text, k.points);
+
+    var s = try lib.db.prepare(
+        \\INSERT INTO ink (path, page, color, width, points, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindInt(2, k.page);
+    s.bindText(3, k.color);
+    s.bindFloat(4, k.width);
+    s.bindText(5, encoded);
+    s.bindInt(6, now);
+    try s.exec();
+    return lib.db.lastInsertRowId();
+}
+
+/// Rewrites what can change about a stroke once it exists: its colour. Where
+/// the pen went is not editable -- a line drawn somewhere else is a different
+/// line, and is removed and drawn again as one.
+pub fn updateStroke(lib: Library, id: i64, color: []const u8) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("UPDATE ink SET color = ?2 WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    s.bindText(2, color);
+    try s.exec();
+}
+
+pub fn removeStroke(lib: Library, id: i64) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("DELETE FROM ink WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    try s.exec();
+}
+
+pub fn clearStrokes(lib: Library, path: []const u8) Error!u32 {
+    if (lib.future) return 0;
+    var s = try lib.db.prepare("DELETE FROM ink WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    try s.exec();
+    return lib.db.changes();
+}
+
+/// Every stroke on a document, oldest first, so they are drawn in the order
+/// they were made -- which for opaque ink is the order they overlap in.
+pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
+    var out: std.ArrayList(Stroke) = .empty;
+    errdefer lib.freeStrokes(out.items, out.items.len);
+
+    var s = try lib.db.prepare(
+        \\SELECT id, page, color, width, points FROM ink
+        \\WHERE path = ?1 ORDER BY id
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const color = try lib.gpa.dupe(u8, s.columnText(2));
+        errdefer lib.gpa.free(color);
+        // A row whose points will not parse is dropped rather than returned
+        // half-read: it can only have come from a hand-edit, and half a
+        // stroke on the page would be a worse answer than none.
+        const points = readPoints(lib.gpa, s.columnText(4)) catch {
+            lib.gpa.free(color);
+            continue;
+        };
+        if (points.len < 2) {
+            lib.gpa.free(color);
+            lib.gpa.free(points);
+            continue;
+        }
+        try out.append(lib.gpa, .{
+            .id = s.columnInt(0),
+            .page = @intCast(@max(0, s.columnInt(1))),
+            .color = color,
+            .width = @floatCast(s.columnFloat(3)),
+            .points = points,
+        });
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freeStroke(lib: Library, k: Stroke) void {
+    lib.gpa.free(k.color);
+    lib.gpa.free(k.points);
+}
+
+pub fn freeStrokes(lib: Library, list: []Stroke, n: usize) void {
+    for (list[0..n]) |k| lib.freeStroke(k);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
+/// `x y x y ...`, two decimals, which is a hundredth of a point. See the
+/// migration for why this is text at all.
+///
+/// Takes its buffer rather than allocating: the caller knows how many points
+/// there are and `point_chars` says what each costs, so the one allocation
+/// happens once at the call site instead of growing here.
+fn writePoints(buf: []u8, points: []const Point) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    for (points, 0..) |p, i| {
+        if (i != 0) w.writeByte(' ') catch break;
+        w.print("{d:.2} {d:.2}", .{ p.x, p.y }) catch break;
+    }
+    return w.buffered();
+}
+
+/// The inverse. Errors on anything that is not a whole number of coordinates,
+/// because a stroke with a coordinate missing is not a stroke.
+fn readPoints(gpa: Allocator, text: []const u8) Error![]Point {
+    var out: std.ArrayList(Point) = .empty;
+    errdefer out.deinit(gpa);
+
+    var it = std.mem.tokenizeScalar(u8, text, ' ');
+    while (it.next()) |xs| {
+        const ys = it.next() orelse return error.Failed;
+        if (out.items.len == max_points) return error.Failed;
+        try out.append(gpa, .{
+            .x = std.fmt.parseFloat(f32, xs) catch return error.Failed,
+            .y = std.fmt.parseFloat(f32, ys) catch return error.Failed,
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 pub fn freeRecent(lib: Library, r: Recent) void {
     lib.gpa.free(r.path);
     lib.gpa.free(r.title);
@@ -816,4 +1022,103 @@ test "a highlight's colour and note can be changed in place" {
     try testing.expectEqual(id, list[0].id);
     try testing.expectEqualStrings("#3fa34d", list[0].color);
     try testing.expectEqualStrings("see lemma 3", list[0].note);
+}
+
+test "a stroke round-trips through the file, points and all" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    var points = [_]Point{
+        .{ .x = 72.5, .y = 700.25 },
+        .{ .x = 90, .y = 690 },
+        .{ .x = 110.75, .y = 705.5 },
+    };
+    const id = try lib.addStroke("a.pdf", .{
+        .page = 2,
+        .color = @constCast("#c04040"),
+        .width = 1.5,
+        .points = &points,
+    }, 7);
+
+    const list = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(list, list.len);
+    try testing.expectEqual(@as(usize, 1), list.len);
+    try testing.expectEqual(id, list[0].id);
+    try testing.expectEqual(@as(u32, 2), list[0].page);
+    try testing.expectEqualStrings("#c04040", list[0].color);
+    try testing.expectApproxEqAbs(@as(f32, 1.5), list[0].width, 0.001);
+    try testing.expectEqual(points.len, list[0].points.len);
+    for (points, list[0].points) |want, got| {
+        try testing.expectApproxEqAbs(want.x, got.x, 0.01);
+        try testing.expectApproxEqAbs(want.y, got.y, 0.01);
+    }
+
+    try lib.removeStroke(id);
+    const gone = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(gone, gone.len);
+    try testing.expectEqual(@as(usize, 0), gone.len);
+}
+
+test "ink and highlights are two tables and are cleared separately" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    var points = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 } };
+    _ = try lib.addStroke("a.pdf", .{ .page = 0, .points = &points }, 1);
+    _ = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+
+    try testing.expectEqual(@as(u32, 1), try lib.clearStrokes("a.pdf"));
+
+    const marks = try lib.highlights("a.pdf");
+    defer lib.freeHighlights(marks, marks.len);
+    try testing.expectEqual(@as(usize, 1), marks.len);
+}
+
+test "a stroke of one point, or one whose points will not parse, is not a stroke" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    // A pen put down and lifted without moving. Refused on the way in, so
+    // nothing downstream has to draw a line between one point and itself.
+    var one = [_]Point{.{ .x = 5, .y = 5 }};
+    try testing.expectError(error.Failed, lib.addStroke("a.pdf", .{ .points = &one }, 1));
+
+    // A row somebody edited by hand into nonsense: dropped on the way out,
+    // rather than returned as the half of it that did parse.
+    try lib.db.exec(
+        \\INSERT INTO ink (path, page, color, width, points, created_at)
+        \\VALUES ('a.pdf', 0, '', 1, '10 20 30', 0);
+    );
+    const list = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(list, list.len);
+    try testing.expectEqual(@as(usize, 0), list.len);
+}
+
+test "a version-2 file gains the ink table without losing its highlights" {
+    if (!Db.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var lib = try memory();
+    defer lib.close();
+    _ = try lib.addHighlight("old.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+
+    // Wound back to where the previous release left it, then opened again.
+    try lib.db.exec("DROP TABLE ink");
+    try lib.db.exec("PRAGMA user_version = 2");
+    try lib.migrate(2);
+    try testing.expectEqual(schema_version, try lib.userVersion());
+
+    const marks = try lib.highlights("old.pdf");
+    defer lib.freeHighlights(marks, marks.len);
+    try testing.expectEqual(@as(usize, 1), marks.len);
+
+    var points = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 1, .y = 1 } };
+    _ = try lib.addStroke("old.pdf", .{ .points = &points }, 1);
+    const ink = try lib.strokes("old.pdf");
+    defer lib.freeStrokes(ink, ink.len);
+    try testing.expectEqual(@as(usize, 1), ink.len);
+    _ = gpa;
 }
