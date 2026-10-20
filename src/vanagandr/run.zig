@@ -37,6 +37,7 @@ const library = @import("library.zig");
 const galdr = fenrir.galdr;
 const Host = galdr.Host;
 const Library = library.Library;
+const Marks = fenrir.hlidskjalf.Marks;
 
 pub const usage =
     \\fenrir run <script.lua> [file...] [--config DIR] [--db FILE] [--plugins]
@@ -175,9 +176,15 @@ const Driver = struct {
     /// Which document is the focused one. A window has one; this has the
     /// first, until a plugin's handler is being told about another.
     at: usize = 0,
-    /// Highlights read for the document being asked about, so that
-    /// `highlightAt` can answer by index the way the reader's does.
+    /// Marks read for the document being asked about, so that `highlightAt`
+    /// can answer by index the way the reader's does.
+    ///
+    /// Two lists and one index space, highlights then ink -- which is the
+    /// order the reader's `Marks` holds them in, and it has to be the same
+    /// order or `fenrir.highlights()` would mean one thing in a window and
+    /// another in a script.
     marks: []Library.Highlight = &.{},
+    ink: []Library.Stroke = &.{},
     marks_for: []const u8 = "",
     /// A highlight's colour as text, for the one call being answered.
     hex: [7]u8 = undefined,
@@ -189,6 +196,7 @@ const Driver = struct {
         const gpa = d.ctx.gpa;
         if (d.library) |lib| {
             lib.freeHighlights(d.marks, d.marks.len);
+            lib.freeStrokes(d.ink, d.ink.len);
             var l = lib;
             l.close();
         }
@@ -360,36 +368,42 @@ const Driver = struct {
         o.zoom = percent;
     }
 
-    /// The highlights of the focused document, read once and kept until the
-    /// focus moves or one is written.
+    /// The marks of the focused document, read once and kept until the focus
+    /// moves or one is written.
     ///
     /// Read rather than held from the start because a script may add one and
     /// then ask for the list, and the list it gets should have it in.
-    fn loadMarks(d: *Driver) []Library.Highlight {
-        const lib = d.library orelse return &.{};
-        const o = d.current() orelse return &.{};
-        if (std.mem.eql(u8, d.marks_for, o.path) and d.marks.len != 0) return d.marks;
+    fn loadMarks(d: *Driver) void {
+        const lib = d.library orelse return;
+        const o = d.current() orelse return;
+        if (std.mem.eql(u8, d.marks_for, o.path) and d.marks_for.len != 0) return;
         lib.freeHighlights(d.marks, d.marks.len);
+        lib.freeStrokes(d.ink, d.ink.len);
         d.marks = lib.highlights(o.path) catch &.{};
+        d.ink = lib.strokes(o.path) catch &.{};
         d.marks_for = o.path;
-        return d.marks;
     }
 
     fn forget(d: *Driver) void {
         const lib = d.library orelse return;
         lib.freeHighlights(d.marks, d.marks.len);
+        lib.freeStrokes(d.ink, d.ink.len);
         d.marks = &.{};
+        d.ink = &.{};
         d.marks_for = "";
     }
 
     fn highlightCount(ptr: *anyopaque) usize {
-        return of(ptr).loadMarks().len;
+        const d = of(ptr);
+        d.loadMarks();
+        return d.marks.len + d.ink.len;
     }
 
     fn highlightAt(ptr: *anyopaque, index: usize) ?Host.Highlight {
         const d = of(ptr);
-        const list = d.loadMarks();
-        if (index >= list.len) return null;
+        d.loadMarks();
+        if (index >= d.marks.len) return d.strokeAt(index - d.marks.len);
+        const list = d.marks;
         const h = list[index];
         return .{
             .id = @intCast(h.id),
@@ -406,6 +420,29 @@ const Driver = struct {
                 break :blk d.hex[0..h.color.len];
             } else "",
             .note = h.note,
+        };
+    }
+
+    /// A stroke, as an annotation: the box it covers, and `kind` to say that
+    /// the box is not what it is. Where the pen went is not offered -- the
+    /// API has no shape for a point list, and a plugin that wants one should
+    /// have it added rather than inferred from a bounding box.
+    fn strokeAt(d: *Driver, index: usize) ?Host.Highlight {
+        if (index >= d.ink.len) return null;
+        const k = d.ink[index];
+        const box = Marks.inkBounds(k.points, k.width);
+        return .{
+            .id = @intCast(k.id),
+            .page = k.page + 1,
+            .x0 = box.min_x,
+            .y0 = box.min_y,
+            .x1 = box.max_x,
+            .y1 = box.max_y,
+            .color = if (k.color.len <= d.hex.len) blk: {
+                @memcpy(d.hex[0..k.color.len], k.color);
+                break :blk d.hex[0..k.color.len];
+            } else "",
+            .kind = "ink",
         };
     }
 

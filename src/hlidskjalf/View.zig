@@ -422,8 +422,19 @@ pub fn pageBox(v: View, index: usize) Bounds {
 /// A point in the window, in the user space of `page`, or null if it is not
 /// over that page. The inverse of `placement`, which is what a click needs.
 pub fn userSpaceAt(v: View, index: usize, p: Point) ?Point {
+    if (!v.pageRect(index).contains(p)) return null;
+    return v.pageSpaceAt(index, p);
+}
+
+/// The same, without asking whether the point is on the page.
+///
+/// A click has to land on something and gets the nullable one. A *drag* does
+/// not: a pen dragged past the margin is still drawing, and the honest answer
+/// there is the user-space point outside the page rather than nothing at all.
+/// Whoever asks for this is saying they have a reason to be off the page, and
+/// clipping is the drawing's job rather than the coordinate's.
+pub fn pageSpaceAt(v: View, index: usize, p: Point) Point {
     const rect = v.pageRect(index);
-    if (!rect.contains(p)) return null;
     // Window to page pixels, then page pixels to user space: the same flip
     // `replay.pageTransform` applies, undone.
     return .{
@@ -435,12 +446,20 @@ pub fn userSpaceAt(v: View, index: usize, p: Point) ?Point {
 /// A point in the user space of `page`, in the window, or null if it is not
 /// on screen. The inverse of `userSpaceAt`.
 pub fn windowPoint(v: View, index: usize, p: Point) ?Point {
+    const at = v.windowPointOf(index, p);
+    return if (v.pageRect(index).contains(at)) at else null;
+}
+
+/// The same, without asking whether it lands on the page: the inverse of
+/// `pageSpaceAt`, and the pair with the same argument behind it. A stroke
+/// drawn past the margin has points off the page, and they are placed and
+/// then clipped rather than dropped.
+pub fn windowPointOf(v: View, index: usize, p: Point) Point {
     const rect = v.pageRect(index);
-    const at: Point = .{
+    return .{
         .x = rect.min_x + p.x * v.zoom,
         .y = rect.min_y + (v.pageBox(index).max_y - p.y) * v.zoom,
     };
-    return if (rect.contains(at)) at else null;
 }
 
 /// The page under a window point, if any.

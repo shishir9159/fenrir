@@ -51,6 +51,15 @@ pub const Highlight = struct {
     /// `#rrggbb`, or empty for the accent colour.
     color: []const u8 = "",
     note: []const u8 = "",
+    /// `"block"` for a highlight over words, `"ink"` for a freehand stroke.
+    ///
+    /// The box of a stroke is the box it covers, which is a true answer to
+    /// "where is it" and a misleading one to "what is it" -- a plugin
+    /// counting what a reader marked should be able to tell a line drawn
+    /// round a figure from a highlight over its caption. A word rather than
+    /// a flag because this crosses into Lua, where a table field reading
+    /// `kind = "ink"` needs no documentation to understand.
+    kind: []const u8 = "block",
 };
 
 pub const VTable = struct {

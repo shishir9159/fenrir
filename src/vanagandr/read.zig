@@ -254,6 +254,12 @@ const max_page_pixels: u64 = 64 << 20;
 /// Frames a device shot waits for the visible pages before taking what it has.
 const shot_patience: u32 = 3000;
 
+/// How wide a stroke is, in PDF points, when nothing says otherwise: a row
+/// stored with no width, and the pen the reader starts with. About the weight
+/// of a fineliner against ten-point type, which is what somebody underlining
+/// a line of a paper is holding.
+const default_pen_width: f32 = 1.6;
+
 pub fn run(ctx: *Context, args: []const []const u8) !void {
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(ctx.gpa);
@@ -1372,6 +1378,23 @@ const Session = struct {
                 .note = h.note,
             }, true) catch return;
         }
+
+        // The ink after the highlights, so a stroke drawn over a highlight is
+        // on top of it -- which is the order they were made in and the order
+        // an opaque pen over a wash has to be drawn in to look right.
+        const ink = lib.strokes(b.path) catch return;
+        defer lib.freeStrokes(ink, ink.len);
+
+        for (ink) |k| {
+            _ = b.marks.add(s.gpa, .{
+                .id = k.id,
+                .kind = .ink,
+                .page = k.page,
+                .points = k.points,
+                .width = if (k.width > 0) k.width else default_pen_width,
+                .color = Library.parseColor(k.color) orelse ink_colour,
+            }, true) catch return;
+        }
     }
 
     /// Writes down that a document was opened, and where.
@@ -2060,8 +2083,16 @@ const Session = struct {
     fn clearMarks(s: *Session) void {
         const b = s.buffer(s.view().buffer);
         b.marks.clear(s.gpa) catch {};
-        s.status = if (b.marks.canUndo()) "highlights cleared -- u to bring them back" else "";
+        s.status = if (b.marks.canUndo()) "marks cleared -- u to bring them back" else "";
     }
+
+    /// The colour a stroke is drawn in when the library holds none for it.
+    ///
+    /// Not `highlight`, which is a wash meant to be seen through: ink is
+    /// opaque and goes *on* the page, so the default is a dark grey-blue that
+    /// reads as a pen against white paper and is still visible against a
+    /// figure.
+    const ink_colour: Color = .{ .r = 0.13, .g = 0.19, .b = 0.35, .a = 1 };
 
     /// What is selected right now, from the keyboard or from the mouse.
     ///
@@ -2289,29 +2320,49 @@ const Session = struct {
         }
     }
 
+    /// One queued change, written.
+    ///
+    /// The kind is read off the mark rather than carried on the effect: an
+    /// `Effect` says *what happened* to a mark, and which table that is is a
+    /// fact about the mark. A delete carries the whole mark for this reason,
+    /// so a row can still be found after the mark has left the list.
     fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
         const lib = s.library orelse return;
         switch (e) {
             .insert => |key| {
                 const mark = b.marks.byKey(key) orelse return;
                 var hex: [7]u8 = undefined;
-                const id = lib.addHighlight(b.path, .{
-                    .page = mark.page,
-                    .x0 = mark.box.min_x,
-                    .y0 = mark.box.min_y,
-                    .x1 = mark.box.max_x,
-                    .y1 = mark.box.max_y,
-                    .color = @constCast(hexOf(mark.color, &hex)),
-                    .note = @constCast(mark.note),
-                }, s.now()) catch return;
+                const id = switch (mark.kind) {
+                    .block => lib.addHighlight(b.path, .{
+                        .page = mark.page,
+                        .x0 = mark.box.min_x,
+                        .y0 = mark.box.min_y,
+                        .x1 = mark.box.max_x,
+                        .y1 = mark.box.max_y,
+                        .color = @constCast(hexOf(mark.color, &hex)),
+                        .note = @constCast(mark.note),
+                    }, s.now()) catch return,
+                    .ink => lib.addStroke(b.path, .{
+                        .page = mark.page,
+                        .color = @constCast(hexOf(mark.color, &hex)),
+                        .width = mark.width,
+                        .points = @constCast(mark.points),
+                    }, s.now()) catch return,
+                };
                 b.marks.setId(key, id);
             },
-            .delete => |mark| if (mark.saved()) lib.removeHighlight(mark.id) catch {},
+            .delete => |mark| if (mark.saved()) switch (mark.kind) {
+                .block => lib.removeHighlight(mark.id) catch {},
+                .ink => lib.removeStroke(mark.id) catch {},
+            },
             .update => |key| {
                 const mark = b.marks.byKey(key) orelse return;
                 if (!mark.saved()) return;
                 var hex: [7]u8 = undefined;
-                lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note) catch {};
+                switch (mark.kind) {
+                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note) catch {},
+                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex)) catch {},
+                }
             },
         }
     }
@@ -2336,7 +2387,16 @@ const Session = struct {
             .y1 = mark.box.max_y,
             .color = hexOf(mark.color, &hex),
             .note = mark.note,
+            .kind = kindName(mark.kind),
         } } });
+    }
+
+    /// What a mark's kind is called on the other side of the plugin API.
+    fn kindName(k: Marks.Kind) []const u8 {
+        return switch (k) {
+            .block => "block",
+            .ink => "ink",
+        };
     }
 
     fn hexOf(c: Color, buf: *[7]u8) []const u8 {
@@ -2872,6 +2932,7 @@ const Session = struct {
             // has copied this one into Lua.
             .color = hexOf(m.color, &s.hex_buf),
             .note = m.note,
+            .kind = kindName(m.kind),
         };
     }
 
@@ -3556,6 +3617,7 @@ const Session = struct {
         }
 
         try s.drawMarks(v, b, range, over);
+        try s.drawInk(v, b, range, over);
         try s.drawSearchHits(v, range, over);
 
         v.marks_seen = b.marks.revision;
@@ -3590,6 +3652,7 @@ const Session = struct {
         const editing = s.keymap.mode == .edit or s.keymap.mode == .note;
         const in_focus = v == s.layout().current();
         for (b.marks.items()) |mark| {
+            if (mark.kind != .block) continue;
             if (mark.page < range.first or mark.page >= range.end) continue;
             const page = mark.page;
             const box = v.windowBox(page, mark.box);
@@ -3617,6 +3680,110 @@ const Session = struct {
                 );
             }
         }
+    }
+
+    /// The ink on the pages a window can see, and the stroke being drawn.
+    ///
+    /// ## Why this is a row of discs
+    ///
+    /// `gleipnir/stroke.zig` already turns a pen dragged along a path into an
+    /// outline -- caps, joins, miters -- and this does not call it, which
+    /// needs saying. What that file produces is a *path*, and the only path
+    /// pipeline in this reader draws the page: it runs on the worker thread,
+    /// behind a `Scene` recorded once per page per zoom, and ink has to
+    /// appear under the pointer this frame. The overlay these marks share
+    /// with the highlights is the instance pipeline, and an instance is an
+    /// axis-aligned rounded box by design -- see the note at the top of
+    /// `DrawList.zig` about why it has no rotation.
+    ///
+    /// So the stroke is drawn the way `stroke.zig` itself says it thinks
+    /// about strokes: **stamping, not offsetting.** A rounded box whose
+    /// radius is half its side is a disc, a row of overlapping discs along a
+    /// segment is that segment stroked with round caps, and a disc at each
+    /// joint is the round join. It is the same algorithm reaching the screen
+    /// through the pipeline that is available, and it has the same property
+    /// that made it the choice there: no case analysis. A stroke that doubles
+    /// back, a corner tighter than the pen, a segment of no length -- none of
+    /// them is a special case, because overlapping opaque discs are their own
+    /// union.
+    ///
+    /// The cost is instances, proportional to the visible length of stroke
+    /// rather than to the number of points, which is why the spacing is tied
+    /// to the radius and why pages out of view are skipped before any of it.
+    fn drawInk(
+        s: *Session,
+        v: *View,
+        b: *Buffer,
+        range: View.Visible,
+        over: *DrawList,
+    ) !void {
+        for (b.marks.items()) |mark| {
+            if (mark.kind != .ink) continue;
+            if (mark.page < range.first or mark.page >= range.end) continue;
+            try s.strokePoints(v, mark.page, mark.points, mark.width, mark.color, over);
+        }
+    }
+
+    /// One polyline in user space, stamped into the overlay. See `drawInk`.
+    fn strokePoints(
+        s: *Session,
+        v: *View,
+        page: u32,
+        points: []const Point,
+        width: f32,
+        color: Color,
+        over: *DrawList,
+    ) !void {
+        _ = s;
+        if (points.len == 0) return;
+
+        // Never thinner than a pixel: a hairline at a fitted zoom is what
+        // makes ink look like it failed to load rather than like a fine pen.
+        const radius = @max(0.5, width * v.zoom * 0.5);
+        // Half a radius between stamps. The union of discs that far apart is
+        // scalloped by about two per cent of the radius, which is under a
+        // pixel at every width this reader allows, and it is the spacing at
+        // which two overlapping antialiased edges still leave the inside of
+        // the stroke fully covered.
+        const step = @max(0.5, radius * 0.5);
+
+        var previous = v.windowPointOf(page, points[0]);
+        try disc(over, previous, radius, color);
+        for (points[1..]) |p| {
+            const at = v.windowPointOf(page, p);
+            const dx = at.x - previous.x;
+            const dy = at.y - previous.y;
+            const length = @sqrt(dx * dx + dy * dy);
+            // The segment's own stamps, then the joint. `n` is how many fit;
+            // the endpoint is the next iteration's `previous` and is stamped
+            // there, so it is not stamped twice here.
+            const n: u32 = @intFromFloat(@min(@floor(length / step), max_stamps));
+            var i: u32 = 1;
+            while (i <= n) : (i += 1) {
+                const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n + 1));
+                try disc(over, .{ .x = previous.x + dx * t, .y = previous.y + dy * t }, radius, color);
+            }
+            try disc(over, at, radius, color);
+            previous = at;
+        }
+    }
+
+    /// A ceiling on the stamps one segment may cost.
+    ///
+    /// A segment is one frame of pointer movement, so it is short unless the
+    /// window was behind -- a frame after a breakpoint, or a drag that ran
+    /// across the screen while the reader was busy. The line is still drawn
+    /// in that case; it is drawn with a gap in it rather than with ten
+    /// thousand instances, which is the better of the two failures and is the
+    /// same argument `keys.max_commands` makes.
+    const max_stamps: f32 = 512;
+
+    fn disc(over: *DrawList, at: Point, radius: f32, color: Color) !void {
+        try over.rounded(
+            .fromRect(at.x - radius, at.y - radius, at.x + radius, at.y + radius),
+            .all(radius),
+            color,
+        );
     }
 
     /// The search's matches on the pages a window can see.
@@ -4135,8 +4302,12 @@ const Session = struct {
                     s.rows.append(s.gpa, .{
                         // A row with nothing written on it still has to say
                         // something, and what it says is this panel's to
-                        // decide -- `panels.Row` draws what it is given.
-                        .label = if (m.note.len == 0) "no note" else m.note,
+                        // decide -- `panels.Row` draws what it is given. A
+                        // stroke says what it is rather than "no note",
+                        // because nothing ever writes a note on one.
+                        .label = if (m.note.len != 0)
+                            m.note
+                        else if (m.kind == .ink) "ink" else "no note",
                         .page = m.page + 1,
                         .swatch = m.color,
                         .id = m.key,
@@ -6217,4 +6388,62 @@ test "a query that matches nothing says so rather than saying nothing" {
     const was = s.view().scroll;
     _ = s.apply(.{ .search_step = false });
     try testing.expectEqual(was, s.view().scroll);
+}
+
+test "a click erases a stroke it is on, and not one it is merely inside" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // Two sides of a box, drawn with the pen.
+    const drawn = [_]Point{
+        .{ .x = 100, .y = 400 },
+        .{ .x = 300, .y = 400 },
+        .{ .x = 300, .y = 600 },
+    };
+    _ = try s.buffer(0).marks.add(gpa, .{
+        .kind = .ink,
+        .page = 0,
+        .points = &drawn,
+        .width = 2,
+    }, false);
+
+    const v = s.view();
+    // In normal mode a press on a mark takes it away -- the eraser on the end
+    // of the highlighter, which ink gets for nothing by being a mark. A press
+    // in the middle of the box is not on the line and takes nothing.
+    const inside = v.windowPoint(0, .{ .x = 200, .y = 500 }).?;
+    s.pointer(.{ .mouse = inside, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = inside, .buttons = .{} });
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+
+    const on_line = v.windowPoint(0, .{ .x = 200, .y = 400 }).?;
+    s.pointer(.{ .mouse = on_line, .buttons = .{ .left = true } });
+    try testing.expectEqual(@as(usize, 0), s.buffer(0).marks.count());
+}
+
+test "ink is drawn over the page, and only on the pages a window can see" {
+    const gpa = testing.allocator;
+    var buf: [12]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const drawn = [_]Point{ .{ .x = 100, .y = 700 }, .{ .x = 300, .y = 700 } };
+    const b = s.buffer(0);
+    _ = try b.marks.add(gpa, .{ .kind = .ink, .page = 0, .points = &drawn, .width = 2 }, true);
+    // The same stroke far down the document, which should cost nothing.
+    _ = try b.marks.add(gpa, .{ .kind = .ink, .page = 8, .points = &drawn, .width = 2 }, true);
+
+    var over: DrawList = .init(gpa, .fromRect(0, 0, 1000, 800));
+    defer over.deinit();
+    const v = s.view();
+    try s.drawInk(v, b, v.visiblePages(), &over);
+    try testing.expect(over.count() > 0);
+
+    // With nothing in range, nothing is drawn at all: an off-screen stroke
+    // costs one compare, not a walk of its points.
+    over.reset(.fromRect(0, 0, 1000, 800));
+    try s.drawInk(v, b, .{ .first = 0, .end = 0 }, &over);
+    try testing.expectEqual(@as(u32, 0), over.count());
 }

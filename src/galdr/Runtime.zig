@@ -1373,20 +1373,10 @@ fn pushPayload(L: ?*lua.State, payload: Payload) void {
             pushPosition(L, sel[1]);
             lua.lua_setfield(L, -2, "to");
         },
-        .highlight => |h| {
-            lua.lua_pushinteger(L, @intCast(h.id));
-            lua.lua_setfield(L, -2, "id");
-            lua.lua_pushinteger(L, h.page);
-            lua.lua_setfield(L, -2, "page");
-            inline for (.{ "x0", "y0", "x1", "y1" }) |field| {
-                lua.lua_pushnumber(L, @field(h, field));
-                lua.lua_setfield(L, -2, field);
-            }
-            lua.pushString(L, h.color);
-            lua.lua_setfield(L, -2, "color");
-            lua.pushString(L, h.note);
-            lua.lua_setfield(L, -2, "note");
-        },
+        // The same fields an annotation has anywhere else in this API, from
+        // the same function: an event's table and `fenrir.highlights`' rows
+        // that disagreed about a field would be a bug nobody could read.
+        .highlight => |h| fillHighlight(L, h),
     }
 }
 
@@ -2325,7 +2315,14 @@ fn apiSelection(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn pushHighlight(L: ?*lua.State, h: Host.Highlight) void {
-    lua.lua_createtable(L, 0, 8);
+    lua.lua_createtable(L, 0, 9);
+    fillHighlight(L, h);
+}
+
+/// Writes an annotation's fields into the table on top of the stack. Split
+/// from `pushHighlight` because an event fills a table it was already given
+/// and a row makes its own, and the fields have to be the same either way.
+fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
     lua.lua_pushinteger(L, @intCast(h.id));
     lua.lua_setfield(L, -2, "id");
     lua.lua_pushinteger(L, h.page);
@@ -2338,6 +2335,8 @@ fn pushHighlight(L: ?*lua.State, h: Host.Highlight) void {
     lua.lua_setfield(L, -2, "color");
     lua.pushString(L, h.note);
     lua.lua_setfield(L, -2, "note");
+    lua.pushString(L, h.kind);
+    lua.lua_setfield(L, -2, "kind");
 }
 
 fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {

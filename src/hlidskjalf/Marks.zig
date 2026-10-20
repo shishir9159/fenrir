@@ -1,4 +1,13 @@
-//! The highlights on a document, the one copy of them, and their history.
+//! The marks on a document, the one copy of them, and their history.
+//!
+//! Two kinds, and one list. A highlight is a box over some words; a stroke is
+//! where a pen went. They are the same kind of *fact* -- something a person
+//! put on a page, in the page's own coordinates, which the reader keeps
+//! beside the document rather than writing into it -- and everything this
+//! file does to one it does to the other: one revision number, one undo
+//! history, one order, one panel. A `kind` and a point list is what that
+//! costs, against a second list with a second history that `u` would have had
+//! to choose between.
 //!
 //! This is the whole of "the same document in two windows". A mark belongs to
 //! the *buffer*, never to a view, so there is exactly one list however many
@@ -48,26 +57,151 @@ const Point = gelgja.Point;
 
 const Marks = @This();
 
-/// One highlight.
+/// What a mark is: a box over words, or a line a pen drew.
+///
+/// A tag on the struct rather than a union, because every field but two is
+/// shared and the parts that walk this list -- undo, the effects queue,
+/// reading order, the panel -- want a `Mark` and not a switch. The two that
+/// are not shared are `points` and `width`, and both are empty on a block for
+/// the same reason `note` usually is.
+pub const Kind = enum { block, ink };
+
+/// One mark.
 pub const Mark = struct {
     /// This session's name for it. Stable across undo and redo; see the note
     /// at the top of the file.
     key: u64 = 0,
     /// The row it is stored as in Mímir, or `unsaved`.
     id: i64 = unsaved,
+    kind: Kind = .block,
     page: u32 = 0,
-    /// In PDF user space.
+    /// In PDF user space. For ink this is where the pen went, bounded -- see
+    /// `inkBounds` -- so that everything asking *where* a mark is can ask one
+    /// field whichever kind it is.
     box: Bounds = .empty,
     color: Color = .{ .r = 1, .g = 0.9, .b = 0.2, .a = 1 },
-    /// A note on it. Owned by the `Marks` it belongs to; see `strings`.
+    /// A note on it. Owned by the `Marks` it belongs to; see `owned`.
     note: []const u8 = &.{},
+    /// Where the pen went, in PDF user space, or empty for a block. Owned
+    /// the same way `note` is.
+    points: []const Point = &.{},
+    /// The pen's width in those same points, so a stroke keeps its weight
+    /// against the type it was drawn over at every zoom. Zero on a block.
+    width: f32 = 0,
 
     pub const unsaved: i64 = 0;
 
     pub fn saved(m: Mark) bool {
         return m.id != unsaved;
     }
+
+    /// Whether a point is *on* this mark, which is a different question from
+    /// whether it is in its box.
+    ///
+    /// For a block the two are the same. For ink they are not, and taking the
+    /// box for the answer is what would make a circle drawn round a figure
+    /// swallow every click inside the figure: a stroke is a line, so the test
+    /// is the distance to that line. `slack` is how far off it a pointer may
+    /// still be, in user-space points, since nobody can hit a hairline.
+    pub fn hits(m: Mark, p: Point, slack: f32) bool {
+        if (m.kind != .ink) return m.box.contains(p);
+        // The box first: it rejects most of the list for the cost of four
+        // compares, and a point outside it cannot be near the line inside.
+        const reach = m.width * 0.5 + slack;
+        if (!Bounds.fromRect(
+            m.box.min_x - reach,
+            m.box.min_y - reach,
+            m.box.max_x + reach,
+            m.box.max_y + reach,
+        ).contains(p)) return false;
+
+        const limit = reach * reach;
+        var i: usize = 1;
+        while (i < m.points.len) : (i += 1) {
+            if (distanceSquared(m.points[i - 1], m.points[i], p) <= limit) return true;
+        }
+        return false;
+    }
 };
+
+/// How far `p` is from the segment `a`-`b`, squared. Squared because every
+/// caller compares it against a squared limit, and a square root per segment
+/// per click is a root nobody reads.
+fn distanceSquared(a: Point, b: Point, p: Point) f32 {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = dx * dx + dy * dy;
+    // A segment of no length is a point, which is the case a stroke of
+    // repeated samples is made of.
+    var t: f32 = 0;
+    if (len > 0) {
+        t = std.math.clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / len, 0, 1);
+    }
+    const qx = a.x + t * dx - p.x;
+    const qy = a.y + t * dy - p.y;
+    return qx * qx + qy * qy;
+}
+
+/// The box a stroke covers, the pen's width included: what goes in `box`.
+///
+/// Half the width on every side, because the pen is a circle centred on the
+/// path and the ink reaches that far past the last point. Without it the
+/// bounds of a horizontal stroke would be a line of zero height, which every
+/// `Bounds` test in this program would report as empty.
+pub fn inkBounds(points: []const Point, width: f32) Bounds {
+    if (points.len == 0) return .empty;
+    var b: Bounds = .empty;
+    for (points) |p| b = b.add(p);
+    const r = @max(width * 0.5, 0.5);
+    return .fromRect(b.min_x - r, b.min_y - r, b.max_x + r, b.max_y + r);
+}
+
+/// Thins a stroke down to the points that are actually a shape, in place,
+/// returning the prefix that is left.
+///
+/// The pointer is sampled once a frame, so a slow careful line arrives as
+/// hundreds of points a fraction of a point apart, nearly all of them on a
+/// line between their neighbours. Two passes over them, both cheap:
+///
+///   * a point closer to the last kept one than `tolerance` is a sample of
+///     the same place and is dropped;
+///   * a point whose distance from the line between its neighbours is under
+///     `tolerance` is on that line, and the line is already being drawn.
+///
+/// Not Douglas-Peucker, which would take a recursion and a stack to find a
+/// slightly better subset of an input that is already at pointer resolution.
+/// The first and last points are always kept: they are where the pen went
+/// down and came up, which is the one thing about a stroke a reader aimed.
+pub fn simplify(points: []Point, tolerance: f32) []Point {
+    if (points.len < 3) return points;
+
+    var out: usize = 1;
+    const limit = tolerance * tolerance;
+    for (points[1 .. points.len - 1]) |p| {
+        const last = points[out - 1];
+        const dx = p.x - last.x;
+        const dy = p.y - last.y;
+        if (dx * dx + dy * dy <= limit) continue;
+        points[out] = p;
+        out += 1;
+    }
+    points[out] = points[points.len - 1];
+    out += 1;
+
+    if (out < 3) return points[0..out];
+
+    // The second pass, over what the first left: a point still between two
+    // that describe it is not describing anything.
+    var kept: usize = 1;
+    var i: usize = 1;
+    while (i < out - 1) : (i += 1) {
+        if (distanceSquared(points[kept - 1], points[i + 1], points[i]) <= limit) continue;
+        points[kept] = points[i];
+        kept += 1;
+    }
+    points[kept] = points[out - 1];
+    return points[0 .. kept + 1];
+}
 
 /// What the library has to do to catch up with the list.
 pub const Effect = union(enum) {
@@ -85,7 +219,7 @@ pub const Effect = union(enum) {
 /// thing to get wrong.
 const Change = struct {
     group: u32,
-    kind: Kind,
+    kind: Action,
     /// The mark as it was. Unused for an add.
     before: Mark = .{},
     /// The mark as it became. Unused for a remove.
@@ -94,7 +228,8 @@ const Change = struct {
     /// place in the drawing order rather than on top of everything.
     index: usize = 0,
 
-    const Kind = enum { added, removed, changed };
+    /// Named for the edit and not `Kind`, which is now what a mark is.
+    const Action = enum { added, removed, changed };
 };
 
 list: std.ArrayList(Mark) = .empty,
@@ -112,11 +247,16 @@ effects: std.ArrayList(Effect) = .empty,
 undo_stack: std.ArrayList(Change) = .empty,
 redo_stack: std.ArrayList(Change) = .empty,
 
-/// Note text. An arena, because a note that is edited leaves its old text
-/// behind in the undo history, and freeing it would leave history pointing
-/// at nothing. A document collects kilobytes of notes in a long session, not
-/// megabytes, and all of it goes when the document is closed.
-strings: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+/// Note text, and the points of every stroke. An arena, because a mark that
+/// is edited leaves its old bytes behind in the undo history, and freeing
+/// them would leave history pointing at nothing. A document collects
+/// kilobytes of these in a long session, not megabytes, and all of it goes
+/// when the document is closed.
+///
+/// It was `strings` when notes were the only thing in it. A stroke's points
+/// are here for the same argument and under the same lifetime, so the field
+/// is named for what it does rather than for what was first put in it.
+owned: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
 
 next_key: u64 = 1,
 group: u32 = 0,
@@ -133,7 +273,7 @@ pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.effects.deinit(gpa);
     m.undo_stack.deinit(gpa);
     m.redo_stack.deinit(gpa);
-    m.strings.deinit();
+    m.owned.deinit();
     m.* = .{};
 }
 
@@ -181,11 +321,20 @@ pub fn clearEffects(m: *Marks) void {
 /// `loading` is for marks coming back out of the library on open: they are
 /// not a change to the document, so they are not dirty, not undoable, and
 /// need nothing written.
+///
+/// A stroke may be handed in with the caller's own points and an empty box:
+/// both are copied and computed here, so that the one place a mark is made
+/// is also the one place its bounds are worked out and nothing downstream
+/// can be holding the scratch buffer the pointer was sampled into.
 pub fn add(m: *Marks, gpa: Allocator, mark: Mark, loading: bool) Allocator.Error!usize {
     var fresh = mark;
     fresh.key = m.next_key;
     m.next_key += 1;
     fresh.note = try m.own(mark.note);
+    if (mark.kind == .ink) {
+        fresh.points = try m.ownPoints(mark.points);
+        fresh.box = inkBounds(fresh.points, fresh.width);
+    }
 
     try m.list.append(gpa, fresh);
     const index = m.list.items.len - 1;
@@ -341,12 +490,22 @@ fn record(m: *Marks, gpa: Allocator, change: Change) Allocator.Error!void {
 
 fn own(m: *Marks, text: []const u8) Allocator.Error![]const u8 {
     if (text.len == 0) return &.{};
-    return m.strings.allocator().dupe(u8, text);
+    return m.owned.allocator().dupe(u8, text);
+}
+
+fn ownPoints(m: *Marks, points: []const Point) Allocator.Error![]const Point {
+    if (points.len == 0) return &.{};
+    return m.owned.allocator().dupe(Point, points);
 }
 
 // -- asking about it ----------------------------------------------------------
 
-/// The topmost mark containing `p` on `page`, which is the one a click means:
+/// How far off a stroke a pointer may be and still be taken to have hit it,
+/// in user-space points. About a millimetre, which is the slack every
+/// interface gives a line you are asked to click on.
+pub const ink_slack: f32 = 3;
+
+/// The topmost mark under `p` on `page`, which is the one a click means:
 /// later marks are drawn over earlier ones, so the last match is the one
 /// under the pointer.
 pub fn at(m: Marks, page: u32, p: Point) ?usize {
@@ -354,7 +513,7 @@ pub fn at(m: Marks, page: u32, p: Point) ?usize {
     while (i > 0) {
         i -= 1;
         const mark = m.list.items[i];
-        if (mark.page == page and mark.box.contains(p)) return i;
+        if (mark.page == page and mark.hits(p, ink_slack)) return i;
     }
     return null;
 }
@@ -639,4 +798,106 @@ test "an empty group is not an undo step" {
     m.beginGroup();
     m.beginGroup();
     try testing.expect(!try m.undo(gpa));
+}
+
+test "a stroke is a mark, and its box is where the pen went plus the pen" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    const drawn = [_]Point{
+        .{ .x = 100, .y = 500 },
+        .{ .x = 140, .y = 520 },
+        .{ .x = 180, .y = 500 },
+    };
+    // Handed in with no box: `add` works it out, so nothing above has to.
+    const i = try m.add(gpa, .{
+        .kind = .ink,
+        .page = 1,
+        .points = &drawn,
+        .width = 4,
+    }, false);
+
+    const mark = m.items()[i];
+    try testing.expectEqual(drawn.len, mark.points.len);
+    try testing.expectApproxEqAbs(@as(f32, 98), mark.box.min_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 182), mark.box.max_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 498), mark.box.min_y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 522), mark.box.max_y, 0.001);
+
+    // Copied, not borrowed: the caller's buffer is scratch and is about to be
+    // used for the next stroke.
+    try testing.expect(mark.points.ptr != &drawn);
+}
+
+test "a click hits the line a stroke is, not the box around it" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    // Three sides of a box, as somebody ringing a figure would draw it. The
+    // middle is inside the bounds and is not on the ink.
+    const ring = [_]Point{
+        .{ .x = 100, .y = 400 },
+        .{ .x = 300, .y = 400 },
+        .{ .x = 300, .y = 600 },
+        .{ .x = 100, .y = 600 },
+    };
+    _ = try m.add(gpa, .{ .kind = .ink, .page = 0, .points = &ring, .width = 2 }, false);
+
+    try testing.expectEqual(@as(?usize, 0), m.at(0, .{ .x = 200, .y = 400 }));
+    try testing.expectEqual(@as(?usize, 0), m.at(0, .{ .x = 300, .y = 500 }));
+    // Well inside the bounds, nowhere near the line.
+    try testing.expectEqual(@as(?usize, null), m.at(0, .{ .x = 200, .y = 500 }));
+    // And a hair off the line is still a hit; nobody can click a hairline.
+    try testing.expectEqual(@as(?usize, 0), m.at(0, .{ .x = 200, .y = 402 }));
+}
+
+test "simplify keeps the shape, the ends, and throws the samples away" {
+    // What a frame-sampled drag of a straight line looks like: fifty points
+    // where two would do.
+    var line: [50]Point = undefined;
+    for (&line, 0..) |*p, i| p.* = .{ .x = @floatFromInt(i), .y = 0 };
+    const straight = simplify(&line, 0.5);
+    try testing.expectEqual(@as(usize, 2), straight.len);
+    try testing.expectApproxEqAbs(@as(f32, 0), straight[0].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 49), straight[straight.len - 1].x, 0.001);
+
+    // A corner is a shape and survives.
+    var bent: [21]Point = undefined;
+    for (bent[0..11], 0..) |*p, i| p.* = .{ .x = @floatFromInt(i), .y = 0 };
+    for (bent[11..], 0..) |*p, i| p.* = .{ .x = 10, .y = @floatFromInt(i + 1) };
+    const corner = simplify(&bent, 0.5);
+    try testing.expectEqual(@as(usize, 3), corner.len);
+    try testing.expectApproxEqAbs(@as(f32, 10), corner[1].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), corner[1].y, 0.001);
+
+    // Two points are already a stroke and are left alone.
+    var pair = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 1, .y = 1 } };
+    try testing.expectEqual(@as(usize, 2), simplify(&pair, 0.5).len);
+}
+
+test "ink and highlights undo through one history, in the order they were made" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    const drawn = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 } };
+    m.beginGroup();
+    _ = try m.add(gpa, .{ .page = 0, .box = box(10, 10, 60, 24) }, false);
+    m.beginGroup();
+    _ = try m.add(gpa, .{ .kind = .ink, .page = 0, .points = &drawn, .width = 2 }, false);
+    try testing.expectEqual(@as(usize, 2), m.count());
+
+    // One `u` takes the stroke back and leaves the highlight, because there
+    // is one history and the stroke was the last thing in it.
+    try testing.expect(try m.undo(gpa));
+    try testing.expectEqual(@as(usize, 1), m.count());
+    try testing.expectEqual(Kind.block, m.items()[0].kind);
+
+    // And the redo brings it back with its points, which outlived the undo
+    // because they are in the arena and not in the caller's buffer.
+    try testing.expect(try m.redo(gpa));
+    try testing.expectEqual(Kind.ink, m.items()[1].kind);
+    try testing.expectEqual(@as(usize, 2), m.items()[1].points.len);
 }
