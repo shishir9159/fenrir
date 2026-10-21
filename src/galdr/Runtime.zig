@@ -265,13 +265,15 @@ const ModeSet = packed struct(u8) {
     normal: bool = false,
     visual: bool = false,
     edit: bool = false,
-    _: u5 = 0,
+    draw: bool = false,
+    _: u4 = 0,
 
     fn has(s: ModeSet, mode: keys.Mode) bool {
         return switch (mode) {
             .normal => s.normal,
             .visual, .visual_line => s.visual,
             .edit => s.edit,
+            .draw => s.draw,
             .note, .command => false,
         };
     }
@@ -699,7 +701,7 @@ pub const api = [_]Entry{
         .func = apiKeymap,
         .cap = .ui,
         .args = "(modes, key, action, description)",
-        .about = "binds a key in normal, visual or edit mode; action is a function or a : line",
+        .about = "binds a key in normal, visual, edit or draw mode; action is a function or a : line",
     },
     .{ .name = "unmap", .func = apiUnmap, .cap = .ui, .args = "(modes, key)", .about = "takes a binding away" },
     .{
@@ -742,7 +744,7 @@ pub const api = [_]Entry{
     .{ .name = "page", .func = apiPage, .cap = .document_read, .returns = "n", .about = "the page it is showing, from 1" },
     .{ .name = "cursor", .func = apiCursor, .cap = .document_read, .returns = "{ page, line, column }", .about = "where the caret is, or nil" },
     .{ .name = "selection", .func = apiSelection, .cap = .document_read, .returns = "{ from, to }", .about = "what is selected, either way it was made, or nil" },
-    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read, .returns = "list", .about = "every highlight in the focused document" },
+    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read, .returns = "list", .about = "every mark in the focused document; kind is \"block\" or \"ink\"" },
 
     .{
         .name = "highlight",
@@ -1814,12 +1816,12 @@ fn checkModes(L: ?*lua.State, arg: c_int) ModeSet {
             var i: lua.Integer = 1;
             while (i <= n) : (i += 1) {
                 _ = lua.lua_rawgeti(L, arg, i);
-                const s = lua.toString(L, -1) orelse lua.raise(L, "galdr: modes are \"n\", \"v\" and \"e\"");
+                const s = lua.toString(L, -1) orelse lua.raise(L, "galdr: modes are \"n\", \"v\", \"e\" and \"d\"");
                 for (s) |c| addMode(L, &set, c);
                 lua.pop(L, 1);
             }
         },
-        else => lua.raise(L, "galdr: modes are \"n\", \"v\" and \"e\", or a table of them"),
+        else => lua.raise(L, "galdr: modes are \"n\", \"v\", \"e\" and \"d\", or a table of them"),
     }
     if (@as(u8, @bitCast(set)) == 0) lua.raise(L, "galdr: a binding needs at least one mode");
     return set;
@@ -1830,7 +1832,8 @@ fn addMode(L: ?*lua.State, set: *ModeSet, c: u8) void {
         'n' => set.normal = true,
         'v', 'x' => set.visual = true,
         'e' => set.edit = true,
-        else => lua.raise(L, "galdr: modes are \"n\" (normal), \"v\" (visual) and \"e\" (edit)"),
+        'd' => set.draw = true,
+        else => lua.raise(L, "galdr: modes are \"n\" (normal), \"v\" (visual), \"e\" (edit) and \"d\" (draw)"),
     }
 }
 
@@ -2708,6 +2711,24 @@ test "keymaps: a function, a command line, a replacement, and unmapping one mode
     // A key Galdr cannot bind is an error in the script, not a silent no-op.
     try testing.expect(!rt.runString("bad", "fenrir.keymap('n', 'gg', function() end)"));
     try testing.expect(std.mem.indexOf(u8, rt.messages.items[0], "sequence") != null);
+}
+
+test "a plugin can bind a key in draw mode, and only there" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    // `d` is the letter, as `n`, `v` and `e` are: a shape tool, say, that
+    // wants a key while the pen is out and nowhere else.
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.keymap("d", "s", function() fenrir.notify("shape") end)
+    ));
+    const look = rt.lookup();
+    try testing.expect(look.find(look.ptr, .draw, .{ .char = 's' }) != null);
+    try testing.expect(look.find(look.ptr, .normal, .{ .char = 's' }) == null);
+    try testing.expect(look.find(look.ptr, .edit, .{ .char = 's' }) == null);
 }
 
 test "commands take their arguments, and unknown ones are left to the reader" {

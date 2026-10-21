@@ -161,8 +161,8 @@ pub const usage =
     \\    :tabonly             close every other tabpage
     \\    :tabn, :tabp         next / previous tabpage; with N, that one
     \\    :q, :qa              close the window, close the reader
-    \\    :undo, :redo         highlight history
-    \\    :marks, :marks clear how many highlights, or remove them all
+    \\    :undo, :redo         the history of the marks
+    \\    :marks, :marks clear how many marks, or remove them all
     \\    :lua CODE            run Lua, with the fenrir table
     \\    :plugins, :messages  what loaded, and what went wrong
     \\    :echo TEXT           show TEXT
@@ -198,13 +198,14 @@ pub const usage =
     \\    drag over text       select it; a click puts the selection away
     \\    m                    highlight the selection, or the cursor's line,
     \\                         or remove the highlight under the cursor
-    \\    M                    remove every highlight in this document
-    \\    u / ctrl+r           undo / redo a highlight change
+    \\    click on a mark      remove it: a highlight, or a line of ink
+    \\    M                    remove every mark in this document
+    \\    u / ctrl+r           undo / redo a change to the marks
     \\    + / -                zoom in and out
     \\    0 / 1                fit the width / one hundred per cent
     \\    q                    close this window, then the reader
     \\    Q                    close the reader
-    \\    v / V / i            visual, visual line, and edit mode
+    \\    v / V / i / d        visual, visual line, edit and draw mode
     \\    :                    the command line
     \\
     \\visual mode (selecting), from v or V:
@@ -225,6 +226,15 @@ pub const usage =
     \\                         escape throws it away
     \\    u / ctrl+r           undo / redo
     \\    escape, q            back to normal mode
+    \\
+    \\draw mode (freehand ink), from d:
+    \\    drag on a page       draw; the line is kept when the button comes
+    \\                         up, and stays on the page it was begun on
+    \\    1 .. 8               the pen's colour, from the same eight
+    \\    [ / ]                a thinner / thicker pen
+    \\    wheel, page keys     scroll while drawing
+    \\    u / ctrl+r           undo / redo the last line
+    \\    d, q, escape         back to normal mode; a click there erases
     \\
     \\    The title bar shows the mode, the highlight in hand, its note, the
     \\    note or command as it is being typed, and messages from plugins.
@@ -259,6 +269,17 @@ const shot_patience: u32 = 3000;
 /// of a fineliner against ten-point type, which is what somebody underlining
 /// a line of a paper is holding.
 const default_pen_width: f32 = 1.6;
+
+/// What `[` and `]` may take the pen to. A stroke under the thin end would
+/// disappear at a fitted zoom and one over the thick end is a redaction.
+const min_pen_width: f32 = 0.4;
+const max_pen_width: f32 = 24;
+
+/// How far apart two samples of the pointer have to be, in user-space points,
+/// before the second is a place the pen went rather than the same place
+/// reported again. Also `simplify`'s tolerance, because they are the same
+/// question asked before and after the stroke.
+const pen_tolerance: f32 = 0.4;
 
 pub fn run(ctx: *Context, args: []const []const u8) !void {
     var files: std.ArrayList([]const u8) = .empty;
@@ -1017,6 +1038,14 @@ const Session = struct {
     /// The selection made with the mouse, or null when there is none.
     drag: ?Drag = null,
 
+    /// The pen, and the stroke it is in the middle of.
+    pen: Pen = .{},
+    /// Where the pen has been since the button went down, in the user space
+    /// of `pen.page`. Held on the session and cleared rather than freed: a
+    /// reader drawing on a page makes a stroke a second and the buffer it
+    /// needs is the same buffer every time.
+    stroking: std.ArrayList(Point) = .empty,
+
     /// The line between two windows, while it is being dragged.
     split_drag: ?Layout.Divider = null,
 
@@ -1096,6 +1125,28 @@ const Session = struct {
         held: bool = true,
     };
 
+    /// The pen: what the next stroke will look like, and the one being drawn.
+    ///
+    /// The colour is a palette *index* rather than a `Color`, the way the
+    /// highlight digits are, so that a reader who changes their accent finds
+    /// the pen changed with it. Null is the reader's own ink colour.
+    ///
+    /// `page` and `buffer` are which document and which page the stroke in
+    /// hand belongs to, and they are fixed when the button goes down: a drag
+    /// that wanders onto the next page keeps drawing on the page it started
+    /// on, because a stroke is a thing on one page and the alternative is a
+    /// line that is cut in half by a gap nobody drew.
+    const Pen = struct {
+        colour: ?u8 = null,
+        /// In PDF points, which is what a `Mark` stores and what keeps the
+        /// pen the same weight against the type at every zoom.
+        width: f32 = default_pen_width,
+        buffer: u32 = 0,
+        page: u32 = 0,
+        /// True while the button is down and points are being collected.
+        down: bool = false,
+    };
+
     pub const Image = struct { pixels: []u8, width: u32, height: u32 };
 
     fn deinit(s: *Session) void {
@@ -1119,6 +1170,7 @@ const Session = struct {
         s.order.deinit(s.gpa);
         s.borders.deinit(s.gpa);
         s.boxes.deinit(s.gpa);
+        s.stroking.deinit(s.gpa);
         s.rows.deinit(s.gpa);
         s.palette_rows.deinit(s.gpa);
         s.rail_left.deinit(s.gpa);
@@ -2086,13 +2138,92 @@ const Session = struct {
         s.status = if (b.marks.canUndo()) "marks cleared -- u to bring them back" else "";
     }
 
-    /// The colour a stroke is drawn in when the library holds none for it.
+    // -- the pen ---------------------------------------------------------------
+
+    /// The colour the next stroke comes out in.
     ///
     /// Not `highlight`, which is a wash meant to be seen through: ink is
     /// opaque and goes *on* the page, so the default is a dark grey-blue that
     /// reads as a pen against white paper and is still visible against a
-    /// figure.
+    /// figure. A digit replaces it with a palette colour, and those are the
+    /// same eight the highlighter uses -- one palette, two tools, which is
+    /// what makes the swatch under the pointer mean what it says.
+    fn penColor(s: *const Session) Color {
+        if (s.pen.colour) |i| return s.paletteColor(i);
+        return ink_colour;
+    }
+
     const ink_colour: Color = .{ .r = 0.13, .g = 0.19, .b = 0.35, .a = 1 };
+
+    /// The pen goes down on `page` at `at`, in that page's user space.
+    fn penDown(s: *Session, v: *View, page: u32, at: Point) void {
+        s.stroking.clearRetainingCapacity();
+        s.pen.buffer = v.buffer;
+        s.pen.page = page;
+        s.pen.down = true;
+        s.stroking.append(s.gpa, at) catch {};
+    }
+
+    /// One more sample of where the pen is, if it has moved far enough to be
+    /// a different place. `at` is in the page the stroke began on, which is
+    /// why it may be off that page: a drag that runs past the edge keeps
+    /// drawing, and the stroke is clipped to the page when it is shown.
+    fn penMove(s: *Session, at: Point) void {
+        if (!s.pen.down) return;
+        const last = s.stroking.getLastOrNull() orelse return;
+        const dx = at.x - last.x;
+        const dy = at.y - last.y;
+        if (dx * dx + dy * dy < pen_tolerance * pen_tolerance) return;
+        if (s.stroking.items.len >= Library.max_points) return;
+        s.stroking.append(s.gpa, at) catch {};
+    }
+
+    /// The pen comes up: what was drawn becomes a mark, or nothing does.
+    ///
+    /// A stroke of one point is a click and not a drawing, and is dropped --
+    /// which also means a press in draw mode that was meant to be a press
+    /// leaves nothing behind. Everything else goes through `Marks.add` like
+    /// any other mark, so it is in the same undo history and the same list.
+    fn penUp(s: *Session) void {
+        if (!s.pen.down) return;
+        s.pen.down = false;
+        const points = Marks.simplify(s.stroking.items, pen_tolerance);
+        if (points.len < 2) {
+            s.stroking.clearRetainingCapacity();
+            return;
+        }
+        if (s.pen.buffer >= s.buffers.items.len) return;
+        const b = s.buffer(s.pen.buffer);
+        b.marks.beginGroup();
+        _ = b.marks.add(s.gpa, .{
+            .kind = .ink,
+            .page = s.pen.page,
+            .points = points,
+            .width = s.pen.width,
+            .color = s.penColor(),
+        }, false) catch {};
+        s.stroking.clearRetainingCapacity();
+        s.applyEffects();
+        s.dirty_title = true;
+    }
+
+    /// The stroke in hand is abandoned: escape, or leaving draw mode with the
+    /// button still down.
+    fn penCancel(s: *Session) void {
+        s.pen.down = false;
+        s.stroking.clearRetainingCapacity();
+    }
+
+    fn setPenWidth(s: *Session, factor: f32) void {
+        s.pen.width = std.math.clamp(s.pen.width * factor, min_pen_width, max_pen_width);
+        s.say("pen {d:.1}pt", .{s.pen.width});
+    }
+
+    fn setPenColour(s: *Session, index: u8) void {
+        if (index >= keys.palette_size) return;
+        s.pen.colour = index;
+        s.say("pen {s}", .{paletteName(index)});
+    }
 
     /// What is selected right now, from the keyboard or from the mouse.
     ///
@@ -2568,7 +2699,15 @@ const Session = struct {
                 if (std.mem.eql(u8, args, "clear")) {
                     s.clearMarks();
                 } else {
-                    s.say("{d} highlights in this document", .{s.buffer(v.buffer).marks.count()});
+                    // Counted apart, because "7 marks" does not say whether
+                    // somebody highlighted seven sentences or drew seven
+                    // lines, and those are the question being asked.
+                    var ink: usize = 0;
+                    for (s.buffer(v.buffer).marks.items()) |m| {
+                        if (m.kind == .ink) ink += 1;
+                    }
+                    const all = s.buffer(v.buffer).marks.count();
+                    s.say("{d} highlights and {d} lines of ink in this document", .{ all - ink, ink });
                 }
             },
             .lua => {
@@ -3189,9 +3328,17 @@ const Session = struct {
                 if (v.anchor == null) v.beginSelection();
             },
             .enter_edit => s.enterEdit(),
+            .enter_draw => {
+                // Whatever was selected is not selected any more: the next
+                // drag is a stroke, so a selection left on screen would be a
+                // thing the mouse could no longer change.
+                s.clearSelection();
+                s.say("pen {d:.1}pt -- drag to draw, d or escape to stop", .{s.pen.width});
+            },
             .enter_note => s.beginNote(),
             .leave_mode => {
                 s.clearSelection();
+                s.penCancel();
                 s.note.clearRetainingCapacity();
                 s.cmdline.clearRetainingCapacity();
                 if (s.keymap.mode == .normal) s.focus_mark = null;
@@ -3212,6 +3359,9 @@ const Session = struct {
             .previous_mark => s.stepMark(false),
             .recolour_mark => |colour| s.recolourMark(colour),
             .delete_mark => s.deleteMark(),
+
+            .pen_colour => |colour| s.setPenColour(colour),
+            .pen_width => |factor| s.setPenWidth(factor),
 
             .note_char => |c| s.noteChar(c),
             .note_backspace => s.noteBackspace(),
@@ -3304,6 +3454,15 @@ const Session = struct {
         // windows belongs to that line until it is let go.
         if (s.dragSplit(in, down, pressed)) return;
 
+        // Then the pen, which claims the whole gesture the way a divider
+        // does -- a stroke that stopped because the pointer crossed a mark or
+        // ran off the page would be a line with a hole in it.
+        if (s.keymap.mode == .draw or s.pen.down) {
+            s.drawPointer(in, down, pressed);
+            s.view().was_down = down;
+            return;
+        }
+
         // A press begins a new gesture, so whatever was selected stops being
         // selected -- and it happens here, before anything below can read
         // `s.drag` and take the last gesture's selection for this one's.
@@ -3370,6 +3529,35 @@ const Session = struct {
         const p = s.positionAt(v, in.mouse) orelse return;
         s.drag = .{ .buffer = v.buffer, .from = p, .to = p };
         s.carryCursor(v, p);
+    }
+
+    /// The pointer in draw mode: down is the pen down, moving is the stroke,
+    /// up is a mark.
+    ///
+    /// The scrollbars are not consulted, unlike everywhere else, and that is
+    /// deliberate: in draw mode the pointer is a pen over the whole window,
+    /// and a stroke that began by grabbing a thumb somebody could not see
+    /// under their hand would be worse than a thumb that has to be reached
+    /// with the wheel. Scrolling is the wheel and the keys, both of which
+    /// still work while the pen is down.
+    fn drawPointer(s: *Session, in: lyngvi.Input, down: bool, pressed: bool) void {
+        if (!down) return s.penUp();
+
+        const v = s.view();
+        if (pressed) {
+            _ = s.layout().focusAt(in.mouse);
+            const focused = s.view();
+            const page = focused.pageAt(in.mouse) orelse return;
+            const at = focused.userSpaceAt(page, in.mouse) orelse return;
+            s.penDown(focused, page, at);
+            return;
+        }
+        if (!s.pen.down or v.buffer != s.pen.buffer) return;
+        // In the space of the page the stroke started on, whether or not the
+        // pointer is still over it -- `userSpaceAt` answers null off the
+        // page, and a stroke that stopped at the margin would be a line with
+        // its end cut off.
+        s.penMove(v.pageSpaceAt(s.pen.page, in.mouse));
     }
 
     /// How far either side of the line a press still counts as taking hold
@@ -3722,6 +3910,14 @@ const Session = struct {
             if (mark.page < range.first or mark.page >= range.end) continue;
             try s.strokePoints(v, mark.page, mark.points, mark.width, mark.color, over);
         }
+
+        // The stroke in hand, in this window only. It is not a mark yet --
+        // it becomes one when the button comes up -- so it is drawn from the
+        // session's buffer and not from the list.
+        if (!s.pen.down or v.buffer != s.pen.buffer) return;
+        if (s.pen.page < range.first or s.pen.page >= range.end) return;
+        if (v != s.layout().current()) return;
+        try s.strokePoints(v, s.pen.page, s.stroking.items, s.pen.width, s.penColor(), over);
     }
 
     /// One polyline in user space, stamped into the overlay. See `drawInk`.
@@ -5025,6 +5221,7 @@ fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !S
 /// `Session.deinit` frees documents, and a test session has none.
 fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
+    s.stroking.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.palette_rows.deinit(s.gpa);
     s.rail_left.deinit(s.gpa);
@@ -6388,6 +6585,130 @@ test "a query that matches nothing says so rather than saying nothing" {
     const was = s.view().scroll;
     _ = s.apply(.{ .search_step = false });
     try testing.expectEqual(was, s.view().scroll);
+}
+
+test "a drag in draw mode is a stroke, and it is a mark like any other" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(keys.enter(&s.keymap, .draw));
+    const v = s.view();
+    const b = s.buffer(0);
+
+    // Down on the page, across it, and up.
+    const from = v.windowPoint(0, .{ .x = 100, .y = 700 }).?;
+    s.pointer(.{ .mouse = from, .buttons = .{ .left = true } });
+    try testing.expect(s.pen.down);
+    try testing.expectEqual(@as(usize, 0), b.marks.count());
+
+    var x: f32 = 110;
+    while (x <= 300) : (x += 10) {
+        const at = v.windowPoint(0, .{ .x = x, .y = 700 }).?;
+        s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    }
+    // Nothing is written until the pen comes up: a stroke half drawn is not
+    // a mark, it is a gesture.
+    try testing.expectEqual(@as(usize, 0), b.marks.count());
+    try testing.expect(s.stroking.items.len > 2);
+
+    s.pointer(.{ .mouse = v.windowPoint(0, .{ .x = 300, .y = 700 }).?, .buttons = .{} });
+    try testing.expect(!s.pen.down);
+    try testing.expectEqual(@as(usize, 1), b.marks.count());
+
+    const mark = b.marks.items()[0];
+    try testing.expectEqual(Marks.Kind.ink, mark.kind);
+    // A straight drag is two points once it has been simplified, whatever it
+    // was sampled as.
+    try testing.expectEqual(@as(usize, 2), mark.points.len);
+    try testing.expectApproxEqAbs(@as(f32, 100), mark.points[0].x, 1);
+    try testing.expectApproxEqAbs(@as(f32, 300), mark.points[1].x, 1);
+    try testing.expectApproxEqAbs(s.pen.width, mark.width, 0.001);
+
+    // And it undoes with `u`, through the one history, like a highlight.
+    try testing.expect(b.marks.canUndo());
+    s.undoMarks(false);
+    try testing.expectEqual(@as(usize, 0), b.marks.count());
+}
+
+test "a press in draw mode that goes nowhere leaves nothing behind" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(keys.enter(&s.keymap, .draw));
+    const at = s.view().windowPoint(0, .{ .x = 100, .y = 700 }).?;
+    s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = at, .buttons = .{} });
+    try testing.expectEqual(@as(usize, 0), s.buffer(0).marks.count());
+}
+
+test "a stroke keeps to the page it began on, however far the drag goes" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(keys.enter(&s.keymap, .draw));
+    const v = s.view();
+    const on_page = v.windowPoint(0, .{ .x = 100, .y = 40 }).?;
+    s.pointer(.{ .mouse = on_page, .buttons = .{ .left = true } });
+    try testing.expectEqual(@as(u32, 0), s.pen.page);
+
+    // Down past the bottom of page one, into the gap and towards page two.
+    // The stroke is still page one's, with points below its edge.
+    const below: Point = .{ .x = on_page.x, .y = v.pageRect(0).max_y + 30 };
+    s.pointer(.{ .mouse = below, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = below, .buttons = .{} });
+
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+    const mark = s.buffer(0).marks.items()[0];
+    try testing.expectEqual(@as(u32, 0), mark.page);
+    try testing.expect(mark.points[mark.points.len - 1].y < 0);
+}
+
+test "leaving draw mode with the pen down throws the stroke away" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(keys.enter(&s.keymap, .draw));
+    const v = s.view();
+    s.pointer(.{ .mouse = v.windowPoint(0, .{ .x = 100, .y = 700 }).?, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = v.windowPoint(0, .{ .x = 300, .y = 700 }).?, .buttons = .{ .left = true } });
+
+    _ = s.apply(keys.enter(&s.keymap, .normal));
+    try testing.expect(!s.pen.down);
+    try testing.expectEqual(@as(usize, 0), s.stroking.items.len);
+    try testing.expectEqual(@as(usize, 0), s.buffer(0).marks.count());
+}
+
+test "the pen takes the palette colours and a width that compounds" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    _ = s.apply(keys.enter(&s.keymap, .draw));
+    // The digit picks the same swatch it would pick in any other mode.
+    _ = s.apply(keys.paletteCommand(.draw, 2).?);
+    try testing.expectEqual(s.paletteColor(2), s.penColor());
+
+    const started = s.pen.width;
+    _ = s.apply(.{ .pen_width = 1.4 });
+    try testing.expect(s.pen.width > started);
+    _ = s.apply(.{ .pen_width = 1.0 / 1.4 });
+    try testing.expectApproxEqAbs(started, s.pen.width, 0.0001);
+
+    // And it is clamped: a pen thinner than a hair or wider than a page is
+    // not a pen.
+    for (0..40) |_| _ = s.apply(.{ .pen_width = 1.4 });
+    try testing.expectApproxEqAbs(max_pen_width, s.pen.width, 0.001);
+    for (0..80) |_| _ = s.apply(.{ .pen_width = 1.0 / 1.4 });
+    try testing.expectApproxEqAbs(min_pen_width, s.pen.width, 0.001);
 }
 
 test "a click erases a stroke it is on, and not one it is merely inside" {

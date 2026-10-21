@@ -42,22 +42,25 @@ const keys = @import("keys.zig");
 /// The modes a command is *offered* in. Typing it always works: this is what
 /// a list of commands filters by, not what `exec` enforces.
 ///
-/// The same three the plugin runtime's keymaps use, and deliberately not the
-/// four of `keys.Mode` -- note mode is somebody typing a word into a
-/// highlight, and nothing is offered there.
+/// The same four the plugin runtime's keymaps use, and deliberately not the
+/// six of `keys.Mode` -- note mode and the command line are somebody typing,
+/// and a command offered under the keys being typed into is not offered, it
+/// is in the way.
 pub const ModeSet = packed struct(u8) {
     normal: bool = false,
     visual: bool = false,
     edit: bool = false,
-    _: u5 = 0,
+    draw: bool = false,
+    _: u4 = 0,
 
-    pub const any: ModeSet = .{ .normal = true, .visual = true, .edit = true };
+    pub const any: ModeSet = .{ .normal = true, .visual = true, .edit = true, .draw = true };
 
     pub fn has(m: ModeSet, mode: keys.Mode) bool {
         return switch (mode) {
             .normal => m.normal,
             .visual, .visual_line => m.visual,
             .edit => m.edit,
+            .draw => m.draw,
             .note, .command => false,
         };
     }
@@ -158,9 +161,9 @@ pub const table = [_]Entry{
     .{ .id = .set, .name = "set", .args = "[NAME=VALUE]", .icon = "fenrir.settings", .about = "a setting, by name" },
     .{ .id = .settings, .name = "settings", .icon = "fenrir.settings", .about = "the settings page, which lists them all" },
     .{ .id = .palette, .name = "commands", .icon = "fenrir.menu", .binding = "<C-p>", .about = "every command there is, filtered as you type" },
-    .{ .id = .undo, .name = "undo", .icon = "fenrir.chevron_left", .binding = "u", .about = "undo the last change to the highlights" },
+    .{ .id = .undo, .name = "undo", .icon = "fenrir.chevron_left", .binding = "u", .about = "undo the last change to the marks" },
     .{ .id = .redo, .name = "redo", .icon = "fenrir.chevron_right", .binding = "<C-r>", .about = "redo what was undone" },
-    .{ .id = .marks, .name = "marks", .args = "[clear]", .icon = "fenrir.highlight", .about = "how many highlights this document has, or clear them" },
+    .{ .id = .marks, .name = "marks", .args = "[clear]", .icon = "fenrir.highlight", .about = "how many highlights and lines of ink there are, or clear them" },
 
     .{ .id = .lua, .name = "lua", .args = "CODE", .needs_argument = true, .icon = "fenrir.menu", .about = "run a line of Lua in the plugin runtime" },
     .{ .id = .messages, .name = "messages", .icon = "fenrir.note", .about = "what the plugins have said, and why one failed" },
@@ -251,6 +254,7 @@ test "the modes a command is offered in" {
     try testing.expect(ModeSet.any.has(.normal));
     try testing.expect(ModeSet.any.has(.visual_line));
     try testing.expect(ModeSet.any.has(.edit));
+    try testing.expect(ModeSet.any.has(.draw));
     // Nothing is offered while a note or a command line is being typed.
     try testing.expect(!ModeSet.any.has(.note));
     try testing.expect(!ModeSet.any.has(.command));

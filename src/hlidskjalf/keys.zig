@@ -17,14 +17,21 @@
 //!   motion extends the selection from it; `V` selects whole lines. `m` or
 //!   enter highlights the selection, `d` removes highlights under it, a digit
 //!   highlights it in that colour.
-//! * **edit** -- changing highlights that exist. `i` walks to the highlight at
-//!   or after the cursor; `n` and `N` go between them; a digit recolours, `d`
-//!   deletes, `a` starts a note.
+//! * **edit** -- changing marks that exist. `i` walks to the mark at or after
+//!   the cursor; `n` and `N` go between them; a digit recolours, `d` deletes,
+//!   `a` starts a note.
+//! * **draw** -- freehand ink. `d` enters it and the pointer is a pen; a digit
+//!   picks the colour, `[` and `]` change its width. Nothing is bound to a
+//!   motion here because the hand is on the mouse, which is the argument for
+//!   it being a mode at all: a drag over the page means a stroke here and a
+//!   selection everywhere else, and there is no way to say which but to say
+//!   which.
 //! * **note** -- typing. Every printable key is text, enter keeps it, escape
 //!   throws it away.
 //!
-//! `u` and `<C-r>` undo and redo in normal, visual and edit modes alike: an
-//! undo is not a thing that should need a mode change first.
+//! `u` and `<C-r>` undo and redo in every mode that is not typing: an undo is
+//! not a thing that should need a mode change first, and a stroke drawn wrong
+//! is undone from draw mode without leaving it.
 //!
 //! Search is not a mode. `/` opens a bar that takes the keyboard by having
 //! focus, the way the palette does, so the keymap stands aside while it is
@@ -66,6 +73,8 @@ pub const Mode = enum {
     visual,
     visual_line,
     edit,
+    /// Freehand ink: the pointer is a pen, and a drag is a stroke.
+    draw,
     note,
     /// The `:` line: a command typed out, run on enter. Built-in commands and
     /// the ones plugins register both live here.
@@ -82,6 +91,7 @@ pub const Mode = enum {
             .visual => "-- VISUAL --",
             .visual_line => "-- VISUAL LINE --",
             .edit => "-- EDIT --",
+            .draw => "-- DRAW --",
             .note => "-- NOTE --",
             .command => ":",
         };
@@ -149,6 +159,7 @@ pub const Command = union(enum) {
     enter_visual,
     enter_visual_line,
     enter_edit,
+    enter_draw,
     enter_note,
     /// Back to normal from any mode, abandoning what was in progress.
     leave_mode,
@@ -171,6 +182,15 @@ pub const Command = union(enum) {
     previous_mark,
     recolour_mark: u8,
     delete_mark,
+
+    // -- draw
+    /// The pen's colour, by its place in the palette. The same index a digit
+    /// means everywhere else; see `paletteCommand`.
+    pen_colour: u8,
+    /// The pen's width, as a factor on what it is now -- the shape `zoom_by`
+    /// has, and for the same reason: `[` and `]` are pressed repeatedly and
+    /// the steps should compound rather than march.
+    pen_width: f32,
 
     // -- note
     note_char: u21,
@@ -420,6 +440,7 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
             .normal => normalKey(state, c, &out),
             .visual, .visual_line => visualKey(state, c, &out),
             .edit => editKey(state, c, &out),
+            .draw => drawKey(state, c, &out),
             .note, .command => unreachable,
         }
     }
@@ -470,6 +491,10 @@ pub fn paletteCommand(mode: Mode, index: u8) ?Command {
     return switch (mode) {
         .visual, .visual_line => .{ .highlight_selection = index },
         .edit, .note => .{ .recolour_mark = index },
+        // Not a mark being recoloured: the pen is, and the next stroke comes
+        // out in it. The swatch a digit points at is the same either way,
+        // which is the whole reason this table is one table.
+        .draw => .{ .pen_colour = index },
         .normal, .command => null,
     };
 }
@@ -488,6 +513,7 @@ pub fn enter(state: *State, mode: Mode) Command {
         .visual => .enter_visual,
         .visual_line => .enter_visual_line,
         .edit => .enter_edit,
+        .draw => .enter_draw,
         .note => .enter_note,
         .command => .enter_command,
     };
@@ -521,6 +547,10 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
         'i' => blk: {
             state.mode = .edit;
             break :blk .enter_edit;
+        },
+        'd' => blk: {
+            state.mode = .draw;
+            break :blk .enter_draw;
         },
         ':' => blk: {
             state.mode = .command;
@@ -594,6 +624,36 @@ fn editKey(state: *State, c: u21, out: *Result) void {
             break :blk .enter_note;
         },
         'q' => blk: {
+            state.mode = .normal;
+            break :blk .leave_mode;
+        },
+        else => return,
+    };
+    out.push(cmd);
+}
+
+/// Draw mode, where the keyboard's job is to set the pen down and get out of
+/// the way: a colour, a width, undo, and how to leave.
+///
+/// No motions. The hand that is drawing is on the pointer, and `j` under it
+/// would be a key nobody could reach without stopping -- so the letters that
+/// are motions everywhere else are left unbound rather than given a second
+/// meaning here.
+fn drawKey(state: *State, c: u21, out: *Result) void {
+    if (digit(c)) |d| {
+        if (paletteCommand(state.mode, d)) |cmd| return out.push(cmd);
+        return;
+    }
+    const cmd: Command = switch (c) {
+        // A factor, not a step: three presses of `]` take a hairline to a
+        // marker pen and three of `[` bring it back to exactly where it was.
+        '[' => .{ .pen_width = 1.0 / 1.4 },
+        ']' => .{ .pen_width = 1.4 },
+        'u' => .undo,
+        // The same key again leaves, as `v` does in visual mode. `q` too,
+        // because that is how edit mode is left and a reader should not have
+        // to remember which of the two they are in to get out.
+        'd', 'q' => blk: {
             state.mode = .normal;
             break :blk .leave_mode;
         },
@@ -750,8 +810,9 @@ test "the same key means one thing in normal mode and another in visual" {
     var state: State = .{};
     // `m` in normal mode is the line highlight...
     try testing.expectEqual(Command.toggle_highlight, command(&state, typing("m")).items()[0]);
-    // ...`d` does nothing...
-    try testing.expectEqual(@as(usize, 0), command(&state, typing("d")).items().len);
+    // ...`d` goes to the pen...
+    try testing.expectEqual(Command.enter_draw, command(&state, typing("d")).items()[0]);
+    try testing.expectEqual(Mode.draw, state.mode);
 
     // ...and in visual mode `m` highlights the selection and `d` removes.
     state.mode = .visual;
@@ -1020,4 +1081,45 @@ test "slash opens a search, and n and N step it while space still turns the page
     // things without anybody losing one of them.
     try testing.expectEqual(Command.next_page, stepping.items()[2]);
     try testing.expectEqual(Command.previous_page, command(&state, typing("p")).items()[0]);
+}
+
+test "draw mode is entered by d, left by d, q or escape, and takes the digits" {
+    var state: State = .{};
+    try testing.expectEqual(Command.enter_draw, command(&state, typing("d")).items()[0]);
+    try testing.expectEqual(Mode.draw, state.mode);
+
+    // A digit picks the pen's colour rather than recolouring anything, and
+    // it is the same index it would be in any other mode.
+    try testing.expectEqual(@as(u8, 2), command(&state, typing("3")).items()[0].pen_colour);
+    try testing.expectEqual(Mode.draw, state.mode);
+
+    // The width compounds: `]` three times and `[` three times is where it
+    // started, which is what makes it a factor rather than a step.
+    const wider = command(&state, typing("]")).items()[0].pen_width;
+    const thinner = command(&state, typing("[")).items()[0].pen_width;
+    try testing.expectApproxEqAbs(@as(f32, 1), wider * thinner, 0.0001);
+
+    // Undo works here, as it does everywhere but the two typing modes.
+    try testing.expectEqual(Command.undo, command(&state, typing("u")).items()[0]);
+
+    try testing.expectEqual(Command.leave_mode, command(&state, typing("d")).items()[0]);
+    try testing.expectEqual(Mode.normal, state.mode);
+
+    state.mode = .draw;
+    try testing.expectEqual(Command.leave_mode, command(&state, typing("q")).items()[0]);
+    try testing.expectEqual(Mode.normal, state.mode);
+
+    state.mode = .draw;
+    _ = command(&state, frame(&.{keyDown(.escape)}));
+    try testing.expectEqual(Mode.normal, state.mode);
+}
+
+test "draw mode binds no motions, because the hand that is drawing is not on the keyboard" {
+    var state: State = .{ .mode = .draw };
+    // Every letter that is a motion in normal and visual mode.
+    for ("hjklwbe^$") |c| {
+        const out = command(&state, typing(&[_]u8{c}));
+        try testing.expectEqual(@as(usize, 0), out.items().len);
+        try testing.expectEqual(Mode.draw, state.mode);
+    }
 }

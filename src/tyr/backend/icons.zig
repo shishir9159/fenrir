@@ -90,7 +90,16 @@ pub const builtin = [_]Icon{
         .d = "M3 3h7v2H5v5H3z M21 3v7h-2V5h-5V3z M3 21v-7h2v5h5v2z M21 21h-7v-2h5v-5h2z",
     },
     .{ .name = "edit", .d = "M3 17.2 14.8 5.4l3.8 3.8L6.8 21H3z M16.2 4 18 2.2 21.8 6 20 7.8z" },
-    .{ .name = "draw", .d = "M3 21 4.5 15.5 9.5 20.5z M6 13.5 16.5 3 21 7.5 10.5 18z" },
+    // A squiggle and not a pen. The pen it used to be sat one button below
+    // `edit`, which is a pencil, and at sixteen pixels the two were the same
+    // diagonal shape with the same nib -- a picture of the left rail is what
+    // said so. An icon has to be different from the one beside it, not merely
+    // correct about what it names.
+    .{
+        .name = "draw",
+        .d = "M3 17 C6 9 9 9 12 14 C15 19 18 19 21 11 L21 14" ++
+            " C18 22 15 22 12 17 C9 12 6 12 3 20 Z",
+    },
 
     // Chevrons, as one shape rotated four ways. Written out rather than
     // rotated at run time: a matrix per icon would be a second way to say

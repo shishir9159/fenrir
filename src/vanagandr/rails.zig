@@ -194,14 +194,14 @@ pub const Left = struct {
 ///
 /// Not every mode. `visual_line` is `V` and is the same button as `v` with a
 /// different gesture behind it; `note` and `command` are things you are in
-/// the middle of rather than places you go; `draw` has no commands behind it
-/// yet and a button that does nothing is worse than no button.
-pub const mode_buttons = [_]keys.Mode{ .normal, .visual, .edit };
+/// the middle of rather than places you go.
+pub const mode_buttons = [_]keys.Mode{ .normal, .visual, .edit, .draw };
 
 fn modeLabel(m: keys.Mode) []const u8 {
     return switch (m) {
         .visual, .visual_line => "Visual",
         .edit, .note => "Edit",
+        .draw => "Draw",
         .command => "Command",
         .normal => "Normal",
     };
@@ -211,6 +211,7 @@ fn modeIcon(m: keys.Mode) []const u8 {
     return switch (m) {
         .visual, .visual_line => "fenrir.visual",
         .edit, .note => "fenrir.edit",
+        .draw => "fenrir.draw",
         .normal, .command => "fenrir.normal",
     };
 }
@@ -223,6 +224,7 @@ fn modeKey(m: keys.Mode) []const u8 {
     return switch (m) {
         .visual, .visual_line => "v",
         .edit, .note => "i",
+        .draw => "d",
         .command => ":",
         .normal => "escape",
     };
@@ -230,11 +232,12 @@ fn modeKey(m: keys.Mode) []const u8 {
 
 /// Which rail button is lit for a mode. Note mode is edit mode with a note
 /// half typed, and visual-line is visual with whole lines; neither is a
-/// fourth button.
+/// button of its own.
 fn buttonFor(m: keys.Mode) keys.Mode {
     return switch (m) {
         .visual, .visual_line => .visual,
         .edit, .note => .edit,
+        .draw => .draw,
         .normal, .command => .normal,
     };
 }
