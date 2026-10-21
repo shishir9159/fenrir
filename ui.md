@@ -953,18 +953,93 @@ revision number per frame and rebuilds the rail lists only when a plugin has
 changed them. `fenrir raster --all` is 1.979s against 1.984s and **all ten
 pages hash identically**, which is what the rule asks for.
 
-### Phase 9 — freehand ink
+### Phase 9 — freehand ink ✅
 
-| Commit | Files | ~ |
-|---|---|---|
-| an ink table in mímir | `mimir/Library.zig` schema v3 | 150 |
-| draw mode | `keys.zig`, `read.zig` | 300 |
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | an ink table in mímir, and `fenrir marks --ink` | `mimir/Library.zig` schema v3, `library.zig` | 418 |
+| ✅ | ink as a mark: stored, drawn on the page, erased with a click | `Marks.zig`, `View.zig`, `read.zig`, `run.zig`, `Host.zig` | 672 |
+| ✅ | draw mode: the pointer is a pen, and a left-rail button | `keys.zig`, `commands.zig`, `rails.zig`, `read.zig`, `icons.zig` | 526 |
 
 A stroke is a page, a colour, a width and a point list in PDF user space — the
-space highlights already use, so it survives zoom and reopening. Render
-through `gleipnir/stroke.zig`, which already does caps, joins and miters.
-Draw becomes a `keys.Mode` and a left-rail button like the others; undo goes
-through `Marks`' existing history rather than a second one.
+space highlights already use, so it survives zoom and reopening. Draw is a
+`keys.Mode` and a left-rail button like the others, and undo goes through
+`Marks`' existing history rather than a second one: a stroke **is** a mark,
+with a `kind`, so the history, the effects queue, the revision number, the
+annotations panel, `n`/`N` in edit mode and the eraser on a click all took ink
+without a line of their own.
+
+`d` enters draw mode from normal — it was the one free letter that says what
+it does. A digit picks the pen's colour from the same eight swatches the
+highlighter uses (`keys.paletteCommand` answers for `.draw` too), `[` and `]`
+make it thinner and thicker as a factor, the way `zoom_by` is, and `d`, `q`
+or escape leave. A plugin binds in draw mode with the letter `"d"`, and every
+annotation a plugin is handed carries `kind = "block"` or `"ink"`.
+
+### What phase 9 cost, against what it was budgeted
+
+Two commits at 450 became three at 1616, which is three and a half times the
+estimate and the worst ratio since phase six. The plan named two files and the
+work touched eleven. What it did not count: the model half (`kind`, a hit test
+that is a distance to a line, `simplify`), the command that prints the table,
+the plugin surface in three places, the reader's help, and a test for each —
+which is *estimate the file* for the fifth phase running, and the plan for
+this one was written before that rule was.
+
+**The plan's rendering line was wrong, and the algorithm under it was
+right.** "Render through `gleipnir/stroke.zig`" assumed a pipeline that is not
+there. `stroke.zig` produces a path; the only path pipeline in the reader draws
+*the page*, on the worker thread, behind a `Scene` recorded once per zoom; and
+the overlay ink has to share with the highlights is the instance pipeline, whose
+file explains at length why an instance is never rotated. What transferred was
+the idea `stroke.zig` is built on — stamping, not offsetting, and round is a
+whole circle — so a stroke is a row of discs half a radius apart, each a
+rounded box whose radius is half its side. Same algorithm, reached through the
+pipeline that exists, with the same property that chose it: no case analysis.
+
+**A box is where a mark is, and not what it is.** A stroke's `box` is its
+bounds, so everything that asks *where* — the visible range, reading order,
+the panel — asks one field for both kinds. But a click asks *what*, and a
+circle drawn round a figure would have swallowed every click inside the figure.
+`Mark.hits` is a distance to the polyline for ink and the box for a block. The
+same argument is why a plugin is told `kind`: a bounding box is a true answer to
+the wrong question.
+
+**The draw icon was a pencil, and so was the one above it.** `fenrir.draw` had
+been in the icon table since phase two, a pen with a nib. The first shot of the
+rail showed it directly under `fenrir.edit`, a pencil with a nib, and at
+sixteen pixels they were the same diagonal. It is a squiggle now. Both icons
+were correct about what they named, which is not what an icon is for.
+
+**The regression was a button.** `read --frames 1200` with an empty library
+came in at 785ms against 758ms, best of eight, and after was slower in seven
+of the eight rounds — so not noise. Nothing on the ink path runs without ink:
+the walks are over an empty list. Taking the fourth mode button off the rail
+and measuring again gave 793ms against 812ms, and putting it back gave 782ms
+against 815ms in the next batch, which is this machine's drift between batches
+— the same size as the difference being chased. So: the cost is one more
+`iconButton` a frame, it is smaller than what this machine can measure between
+two batches, and the reader has one more mode to have a button for. What made
+it an answer rather than a shrug was taking the button out, not reading the
+diff. `fenrir raster --all` is 1.825s against 1.833s, best of five, and **all
+ten pages hash identically**.
+
+**The largest commit split along the seam that compiles.** The draw-mode work
+was 1053 lines as it was written. The seam this document names — the model
+from the thing that draws it — was not where it could be cut, because adding
+`.draw` to `keys.Mode` makes every exhaustive switch on it fail to compile
+until each is answered, and those switches are in the reader. The seam that
+does compile is one step earlier: ink as a *mark* first, with nothing in the
+keymap, drawn from rows `fenrir marks --ink` wrote; then the mode that makes
+them. Each half builds, has its tests, and has its picture.
+
+**A picture's temporary lines can write to the library.** A stroke seeded
+with the pen down, for a shot of a stroke being drawn, was committed on the
+first frame — the shot's pointer had no button held, so the pen came up — and
+it is in the scratch database that shot used. `--shot` does not remember a
+place, but a change to the marks is written whoever made it. Shoot against a
+scratch `--db`, which is also what made this the round trip the phase eight
+rule asks for: the reader wrote a stroke and `fenrir marks` listed it.
 
 ### Phase 10 — comparing documents
 
@@ -1225,6 +1300,35 @@ Things that cost time once and should not cost it again.
   directory. Every picture this phase needed came from deleting that condition
   and putting it back, which is the `menu.show(…)` rule in a second place and
   is worth knowing before spending an hour wondering where the rails went.
+- **A plan that names a file for the drawing is naming a pipeline, so check
+  the pipeline is there.** Phase nine was to "render through `stroke.zig`",
+  which makes paths, and the only path pipeline draws the page on another
+  thread. The overlay has instances and no rotation. The algorithm crossed
+  over (stamp discs, as `stroke.zig` itself does) and the file did not.
+  Anything that has to appear under the pointer this frame goes through the
+  overlay, whatever shape it is.
+- **A box is where a mark is, not what it is.** Bounds are the right answer
+  for the visible range, reading order and a panel, and the wrong one for a
+  click: a circle drawn round a figure would take every click inside it. Ask
+  the mark (`Mark.hits`), and tell a plugin `kind` for the same reason.
+- **An icon has to differ from the one beside it.** The draw pen and the edit
+  pencil each named the right thing and were the same shape at sixteen pixels.
+  The icon sheet shows each icon alone; only a shot of the rail shows them
+  next to each other, so take that shot whenever a button is added to a rail.
+- **Take the suspect out and measure again.** Three and a half per cent on a
+  path with nothing to draw was one more rail button a frame. Reading the diff
+  would not have found that, because the diff for ink does nothing without ink.
+  A run with the button removed found it in one build.
+- **Add a variant to an exhaustive enum in the commit that answers it.** Every
+  `switch` on `keys.Mode` stops compiling the moment `.draw` exists, so the
+  mode and everything that switches on it land together. When that is too
+  large, split *before* the enum grows: ink as a mark first, with nothing in
+  the keymap, then the mode. A split after the enum grows only makes a commit
+  that does not build.
+- **Shoot against a scratch `--db`.** `--shot` does not remember a place, but
+  a mark changed during a shot is written. The temporary lines that set up a
+  picture can change marks, and that change goes into whichever library the
+  shot opened.
 - **Commits here have been running large, and should not.** `CLAUDE.md` asks
   for under about three hundred lines, and the repository's own code commits
   before this work ran 60–272. The interface commits have landed between 30
@@ -1253,6 +1357,9 @@ fenrir commands [--match QUERY]         # every `:` command, and how it ranks
 fenrir trace F --text                   # the page as the words it came out as
 fenrir trace F --lines                  # the same, with the geometry beside it
 fenrir trace F --all --find Q           # every match, and the boxes it covers
+
+fenrir marks F [--db D]                 # every highlight and line of ink, as stored
+fenrir marks F --ink P X Y X Y ...      # a stroke with no mouse: seed one for a shot
 
 fenrir health                           # what this build has, and what it found
 fenrir plugins                          # what a configuration registered
