@@ -90,6 +90,10 @@ pub const Id = enum {
     undo,
     redo,
     marks,
+    mnext,
+    mprevious,
+    cnext,
+    cprevious,
     lua,
     messages,
     plugins,
@@ -113,8 +117,8 @@ pub const Entry = struct {
     /// shows. Lower case and no full stop, like every other listing here.
     about: []const u8,
     /// The registered icon name, or empty for a command with no picture
-    /// worth drawing. Empty and not `fenrir.unknown`: a list of twenty-five
-    /// commands under twenty-five hollow boxes says less than a blank
+    /// worth drawing. Empty and not `fenrir.unknown`: a list of thirty
+    /// commands under thirty hollow boxes says less than a blank
     /// gutter, and the hollow box is for an icon that was *meant* to resolve.
     ///
     /// A name and not an `Icons.Id`, because the registry is Hliðskjálf's and
@@ -133,7 +137,7 @@ pub const Entry = struct {
 /// then the plugins.
 ///
 /// Written as a table and kept as one -- one entry a line or two, not eight
-/// -- because the thing being checked by eye is that twenty-five rows agree
+/// -- because the thing being checked by eye is that thirty rows agree
 /// with each other, and a column somebody has to scroll past a page of
 /// braces to compare is a column nobody compares.
 pub const table = [_]Entry{
@@ -164,6 +168,10 @@ pub const table = [_]Entry{
     .{ .id = .undo, .name = "undo", .icon = "fenrir.chevron_left", .binding = "u", .about = "undo the last change to the marks" },
     .{ .id = .redo, .name = "redo", .icon = "fenrir.chevron_right", .binding = "<C-r>", .about = "redo what was undone" },
     .{ .id = .marks, .name = "marks", .args = "[clear]", .icon = "fenrir.highlight", .about = "how many highlights and lines of ink there are, or clear them" },
+    .{ .id = .mnext, .name = "mnext", .aliases = &.{"mn"}, .icon = "fenrir.chevron_right", .binding = "]a", .about = "the next mark in reading order, highlight or ink" },
+    .{ .id = .mprevious, .name = "mprevious", .aliases = &.{"mp"}, .icon = "fenrir.chevron_left", .binding = "[a", .about = "the previous mark in reading order" },
+    .{ .id = .cnext, .name = "cnext", .aliases = &.{"cn"}, .icon = "fenrir.chevron_right", .binding = "]c", .about = "the next comment: a mark with a note on it" },
+    .{ .id = .cprevious, .name = "cprevious", .aliases = &.{"cp"}, .icon = "fenrir.chevron_left", .binding = "[c", .about = "the previous comment" },
 
     .{ .id = .lua, .name = "lua", .args = "CODE", .needs_argument = true, .icon = "fenrir.menu", .about = "run a line of Lua in the plugin runtime" },
     .{ .id = .messages, .name = "messages", .icon = "fenrir.note", .about = "what the plugins have said, and why one failed" },
@@ -173,7 +181,7 @@ pub const table = [_]Entry{
 
 /// The entry a name or an abbreviation reaches, or null.
 ///
-/// A walk over twenty-five entries with a length compare first, which is
+/// A walk over thirty entries with a length compare first, which is
 /// faster than a hash for a table this size and is run once per `:` line
 /// anyway -- never on a frame path.
 pub fn find(name: []const u8) ?*const Entry {

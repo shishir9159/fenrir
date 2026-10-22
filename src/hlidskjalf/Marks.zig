@@ -564,6 +564,45 @@ pub fn step(m: Marks, from: ?u64, forwards: bool) ?u64 {
     return (best orelse wrap.?).key;
 }
 
+/// Where `jump` landed, and where that is among the marks it could have.
+pub const Jumped = struct {
+    key: u64,
+    /// It went past the last (or the first) and came round again.
+    wrapped: bool,
+    /// From 1, in reading order, among the marks that qualified.
+    place: usize,
+    of: usize,
+};
+
+/// The mark after (or before) `from` in reading order, wrapping; with
+/// `noted`, only a mark with a note on it. Null when none qualifies.
+///
+/// `from` is a place, not necessarily a mark: a point is a mark with a key of
+/// zero, which no mark has, and a box of no size -- the probe `atOrAfter`
+/// makes. A real mark is skipped as itself, so stepping from one never lands
+/// on it again unless it is the only one.
+pub fn jump(m: Marks, from: Mark, forwards: bool, noted: bool) ?Jumped {
+    var best: ?Mark = null;
+    var wrap: ?Mark = null;
+    var of: usize = 0;
+    for (m.list.items) |mark| {
+        if (noted and mark.note.len == 0) continue;
+        of += 1;
+        if (wrap == null or (if (forwards) readsBefore(mark, wrap.?) else readsBefore(wrap.?, mark))) wrap = mark;
+        if (mark.key == from.key) continue;
+        const ahead = if (forwards) readsBefore(from, mark) else readsBefore(mark, from);
+        if (!ahead) continue;
+        if (best == null or (if (forwards) readsBefore(mark, best.?) else readsBefore(best.?, mark))) best = mark;
+    }
+    const to = best orelse wrap orelse return null;
+    var place: usize = 1;
+    for (m.list.items) |mark| {
+        if (noted and mark.note.len == 0) continue;
+        if (readsBefore(mark, to)) place += 1;
+    }
+    return .{ .key = to.key, .wrapped = best == null, .place = place, .of = of };
+}
+
 /// The first mark at or after a point in reading order: where edit mode
 /// starts when it is entered from the cursor.
 pub fn atOrAfter(m: Marks, page: u32, p: Point) ?u64 {
@@ -788,6 +827,48 @@ test "marks are walked in reading order, and wrap" {
     try testing.expectEqual(bottom, m.atOrAfter(1, .{ .x = 5, .y = 400 }).?);
     // And from past the end, it wraps to the start.
     try testing.expectEqual(top, m.atOrAfter(9, .{ .x = 5, .y = 400 }).?);
+}
+
+test "a jump goes to the next mark from a point or a mark, and can ask for a note" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    _ = try m.add(gpa, .{ .page = 1, .box = box(0, 700, 10, 710) }, true);
+    _ = try m.add(gpa, .{ .page = 1, .box = box(0, 400, 10, 410), .note = "why?" }, true);
+    _ = try m.add(gpa, .{ .page = 2, .box = box(0, 700, 10, 710) }, true);
+    const top = m.items()[0];
+    const noted = m.items()[1];
+    const p2 = m.items()[2];
+
+    // From a point between the first two: forwards is the middle one,
+    // backwards the top one, and neither wrapped.
+    const between: Mark = .{ .page = 1, .box = box(5, 500, 5, 500) };
+    const fwd = m.jump(between, true, false).?;
+    try testing.expectEqual(noted.key, fwd.key);
+    try testing.expect(!fwd.wrapped);
+    try testing.expectEqual(@as(usize, 2), fwd.place);
+    try testing.expectEqual(@as(usize, 3), fwd.of);
+    try testing.expectEqual(top.key, m.jump(between, false, false).?.key);
+
+    // From a mark it never lands on itself, and past the end it wraps.
+    try testing.expectEqual(p2.key, m.jump(noted, true, false).?.key);
+    const round = m.jump(p2, true, false).?;
+    try testing.expectEqual(top.key, round.key);
+    try testing.expect(round.wrapped);
+
+    // Only the noted one counts for a comment, whichever way and from where.
+    const c = m.jump(p2, true, true).?;
+    try testing.expectEqual(noted.key, c.key);
+    try testing.expect(c.wrapped);
+    try testing.expectEqual(@as(usize, 1), c.of);
+    try testing.expectEqual(noted.key, m.jump(noted, false, true).?.key);
+
+    // And with no note anywhere there is nothing to go to.
+    var bare: Marks = .{};
+    defer bare.deinit(gpa);
+    _ = try bare.add(gpa, .{ .page = 0, .box = box(0, 0, 10, 10) }, true);
+    try testing.expect(bare.jump(between, true, true) == null);
 }
 
 test "an empty group is not an undo step" {

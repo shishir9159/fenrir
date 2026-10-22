@@ -200,6 +200,8 @@ pub const usage =
     \\                         or remove the highlight under the cursor
     \\    click on a mark      remove it: a highlight, or a line of ink
     \\    M                    remove every mark in this document
+    \\    ]a / [a              the next / previous mark, in reading order
+    \\    ]c / [c              the next / previous comment: a mark with a note
     \\    u / ctrl+r           undo / redo a change to the marks
     \\    + / -                zoom in and out
     \\    0 / 1                fit the width / one hundred per cent
@@ -220,6 +222,7 @@ pub const usage =
     \\
     \\edit mode (changing highlights), from i:
     \\    n / N, j / k, tab    the next and previous highlight
+    \\    ]a [a, ]c [c         the same, or only the ones with a note
     \\    1 .. 8               recolour it
     \\    d, x, delete         delete it, and take the next
     \\    a, enter             write a note on it; enter keeps the note,
@@ -1051,6 +1054,8 @@ const Session = struct {
 
     /// The highlight in hand in edit mode, by its session key.
     focus_mark: ?u64 = null,
+    /// The mark `]a` or `]c` last landed on, and the caret that left.
+    last_jump: ?Jumped = null,
     /// The note being typed in note mode. Written to the highlight on enter.
     note: std.ArrayList(u8) = .empty,
     /// Whether the last visual mode entered was `V`. Read after the key that
@@ -2346,6 +2351,62 @@ const Session = struct {
         s.focusMark(b.marks.step(s.focus_mark, forwards));
     }
 
+    const Jumped = struct { buffer: u32, key: u64, caret: Bounds };
+
+    /// `]a`, `[a`, `]c`, `[c`. In edit mode from the highlight in hand, which
+    /// the jump then replaces. Otherwise from where the reader is: the mark
+    /// jumped to last while the caret has stayed where that left it, else the
+    /// caret, else the top of the page in front of the window.
+    ///
+    /// The first of those is not a nicety. A stroke of ink has no text for the
+    /// caret to land on, so a jump from the caret alone would find the same
+    /// stroke again, every time.
+    fn jumpMark(s: *Session, j: keys.Command.Jump) void {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        const from: Marks.Mark = from: {
+            if (s.keymap.mode == .edit) {
+                if (s.focus_mark) |k| if (b.marks.byKey(k)) |m| break :from m.*;
+            }
+            if (s.last_jump) |last| {
+                if (last.buffer == v.buffer and std.meta.eql(last.caret, v.cursor.caret)) {
+                    if (b.marks.byKey(last.key)) |m| break :from m.*;
+                }
+            }
+            if (v.cursor.visible and !v.cursor.caret.isEmpty()) {
+                const c = v.cursor.caret;
+                const y = (c.min_y + c.max_y) * 0.5;
+                break :from .{ .page = v.cursor.page, .box = .fromRect(c.min_x, y, c.min_x, y) };
+            }
+            const page = v.currentPage();
+            const top = v.pageBox(page).max_y;
+            break :from .{ .page = page, .box = .fromRect(0, top, 0, top) };
+        };
+
+        const to = b.marks.jump(from, j.forwards, j.comments) orelse {
+            s.status = if (j.comments)
+                "no comments in this document -- a in edit mode writes one"
+            else
+                "no marks in this document";
+            return;
+        };
+
+        // Normal mode has no highlight in hand, and landing on one must not
+        // give it one: `focus_mark` is what edit mode outlines and deletes.
+        const held = s.focus_mark;
+        s.focusMark(to.key);
+        if (s.keymap.mode != .edit) s.focus_mark = held;
+        s.last_jump = .{ .buffer = v.buffer, .key = to.key, .caret = v.cursor.caret };
+
+        const round: []const u8 = if (!to.wrapped) "" else if (j.forwards) ", from the top" else ", from the end";
+        if (j.comments) {
+            const note = b.marks.byKey(to.key).?.note;
+            s.say("comment {d}/{d}{s}: {s}", .{ to.place, to.of, round, note });
+        } else {
+            s.say("mark {d}/{d}{s}", .{ to.place, to.of, round });
+        }
+    }
+
     fn recolourMark(s: *Session, colour: u8) void {
         const i = s.focusedMarkIndex() orelse return;
         const b = s.buffer(s.view().buffer);
@@ -2710,6 +2771,10 @@ const Session = struct {
                     s.say("{d} highlights and {d} lines of ink in this document", .{ all - ink, ink });
                 }
             },
+            .mnext => s.jumpMark(.{ .forwards = true }),
+            .mprevious => s.jumpMark(.{ .forwards = false }),
+            .cnext => s.jumpMark(.{ .forwards = true, .comments = true }),
+            .cprevious => s.jumpMark(.{ .forwards = false, .comments = true }),
             .lua => {
                 const rt = s.plugins orelse {
                     s.say("plugins are off in this reader", .{});
@@ -3357,6 +3422,7 @@ const Session = struct {
 
             .next_mark => s.stepMark(true),
             .previous_mark => s.stepMark(false),
+            .jump_mark => |j| s.jumpMark(j),
             .recolour_mark => |colour| s.recolourMark(colour),
             .delete_mark => s.deleteMark(),
 
@@ -5593,6 +5659,63 @@ test "edit mode on a document with no highlights says so and stays in normal" {
     _ = s.apply(.enter_edit);
     try testing.expectEqual(keys.Mode.normal, s.keymap.mode);
     try testing.expect(s.status.len != 0);
+}
+
+test "]a and ]c walk the marks from where the reader is, and come round again" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // Nothing to go to says so, rather than doing nothing.
+    _ = s.apply(.{ .jump_mark = .{ .forwards = true } });
+    try testing.expect(s.status.len != 0);
+    try testing.expect(s.last_jump == null);
+
+    // These pages have no text, so the caret never moves: the case a stroke
+    // of ink is, and the one a jump from the caret alone would get stuck on.
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 300, 200, 312) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 1, .box = .fromRect(100, 500, 200, 512) }}, s.accent);
+    const marks = &s.buffer(0).marks;
+    var top: u64 = 0;
+    var mid: u64 = 0;
+    var p1: u64 = 0;
+    for (marks.items()) |m| {
+        if (m.page == 1) p1 = m.key else if (m.box.min_y > 600) top = m.key else mid = m.key;
+    }
+    try marks.setNote(gpa, marks.indexOf(mid).?, "why?");
+
+    // From the top of the page in front of the window, in reading order.
+    const next: keys.Command = .{ .jump_mark = .{ .forwards = true } };
+    _ = s.apply(next);
+    try testing.expectEqual(top, s.last_jump.?.key);
+    _ = s.apply(next);
+    try testing.expectEqual(mid, s.last_jump.?.key);
+    _ = s.apply(next);
+    try testing.expectEqual(p1, s.last_jump.?.key);
+    // Past the last it comes round, and the status line says it did.
+    _ = s.apply(next);
+    try testing.expectEqual(top, s.last_jump.?.key);
+    try testing.expect(std.mem.indexOf(u8, s.status, "from the top") != null);
+    // Normal mode lands on a mark without taking hold of it.
+    try testing.expect(s.focus_mark == null);
+
+    // A comment passes over the marks with no note, and reads the note out.
+    _ = s.apply(.{ .jump_mark = .{ .forwards = true, .comments = true } });
+    try testing.expectEqual(mid, s.last_jump.?.key);
+    try testing.expect(std.mem.endsWith(u8, s.status, "why?"));
+    _ = s.apply(.{ .jump_mark = .{ .forwards = false, .comments = true } });
+    try testing.expectEqual(mid, s.last_jump.?.key);
+
+    // In edit mode the jump moves the highlight in hand, and the : line
+    // reaches the same place the keys do.
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    const held = s.focus_mark.?;
+    try testing.expect(s.exec("mprevious"));
+    try testing.expect(s.focus_mark.? != held);
+    try testing.expectEqual(s.last_jump.?.key, s.focus_mark.?);
 }
 
 test "backspace in a note removes a character, not a byte" {

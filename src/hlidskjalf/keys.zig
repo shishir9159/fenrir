@@ -46,15 +46,18 @@
 //! ## Prefixes
 //!
 //! Window commands are `<C-w>` followed by a key, and tabpages are `g`
-//! followed by one, both in normal mode. A prefix that is never completed
-//! times out after `prefix_timeout`, the way a terminal's escape sequences do.
+//! followed by one, both in normal mode. `]` and `[` are the next and
+//! previous of whatever the key after them names -- `a` a mark, `c` a
+//! comment -- in normal and edit mode, the way Vim has `]s` and `[c`. A
+//! prefix that is never completed times out after `prefix_timeout`, the way a
+//! terminal's escape sequences do.
 //!
 //! The two are read from different places and have to be. `<C-w>` cannot come
 //! from typed text -- no platform sends text for a key held with ctrl -- which
-//! is what `Input.chorded` and the `char` on a key event exist for. `g` is a
-//! letter somebody typed, so it is read where the letters are, in the loop
-//! over the frame's text; that is also what keeps `gt` and `gT` apart, since
-//! `typedKey` folds case on purpose and a codepoint does not.
+//! is what `Input.chorded` and the `char` on a key event exist for. `g`, `]`
+//! and `[` are keys somebody typed, so they are read where the letters are,
+//! in the loop over the frame's text; that is also what keeps `gt` and `gT`
+//! apart, since `typedKey` folds case on purpose and a codepoint does not.
 //! See `thviti/input.zig`.
 
 const std = @import("std");
@@ -180,6 +183,10 @@ pub const Command = union(enum) {
     // -- edit
     next_mark,
     previous_mark,
+    /// `]a`, `[a`, `]c`, `[c`: the next or previous mark in reading order,
+    /// from wherever the reader is -- in normal mode as well as edit, because
+    /// reading through what was marked is reading, not changing it.
+    jump_mark: Jump,
     recolour_mark: u8,
     delete_mark,
 
@@ -227,6 +234,12 @@ pub const Command = union(enum) {
     // -- history
     undo,
     redo,
+
+    pub const Jump = struct {
+        forwards: bool,
+        /// Only the marks with a note on them: `]c` rather than `]a`.
+        comments: bool = false,
+    };
 };
 
 /// A key that has been pressed and is waiting for the one after it.
@@ -236,6 +249,15 @@ pub const Prefix = enum {
     window,
     /// `g`: tabpages.
     g,
+    /// `]`: the next of something.
+    next,
+    /// `[`: the previous of something.
+    previous,
+
+    /// Completed from the typed text rather than from key events.
+    fn typed(p: Prefix) bool {
+        return p == .g or p == .next or p == .previous;
+    }
 };
 
 /// What survives between frames.
@@ -396,9 +418,9 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
     }
 
     if (in.pressedOnce(.escape)) {
-        // A half-typed `g` goes first, so escape abandons the prefix rather
-        // than the cursor somebody was about to move with it.
-        if (state.pending == .g) {
+        // A half-typed `g`, `]` or `[` goes first, so escape abandons the
+        // prefix rather than the cursor somebody was about to move with it.
+        if (state.pending.typed()) {
             state.pending = .none;
         } else if (state.mode == .normal) {
             out.push(.hide_cursor);
@@ -430,6 +452,12 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
         if (state.pending == .g) {
             state.pending = .none;
             if (tabKey(c)) |cmd| out.push(cmd);
+            continue;
+        }
+        if (state.pending == .next or state.pending == .previous) {
+            const forwards = state.pending == .next;
+            state.pending = .none;
+            if (bracketKey(c, forwards)) |cmd| out.push(cmd);
             continue;
         }
         if (Lookup.get(plugins, state.mode, .{ .char = c })) |id| {
@@ -561,9 +589,15 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
             state.waited = 0;
             return;
         },
+        ']', '[' => return armBracket(state, c),
         else => return,
     };
     out.push(cmd);
+}
+
+fn armBracket(state: *State, c: u21) void {
+    state.pending = if (c == ']') .next else .previous;
+    state.waited = 0;
 }
 
 fn visualKey(state: *State, c: u21, out: *Result) void {
@@ -627,6 +661,7 @@ fn editKey(state: *State, c: u21, out: *Result) void {
             state.mode = .normal;
             break :blk .leave_mode;
         },
+        ']', '[' => return armBracket(state, c),
         else => return,
     };
     out.push(cmd);
@@ -738,6 +773,15 @@ fn tabKey(c: u21) ?Command {
     return switch (c) {
         't' => .{ .go_tab = 1 },
         'T' => .{ .go_tab = -1 },
+        else => null,
+    };
+}
+
+/// The key after `]` or `[`: what to go to the next or previous one of.
+fn bracketKey(c: u21, forwards: bool) ?Command {
+    return switch (c) {
+        'a' => .{ .jump_mark = .{ .forwards = forwards } },
+        'c' => .{ .jump_mark = .{ .forwards = forwards, .comments = true } },
         else => null,
     };
 }
@@ -979,6 +1023,42 @@ test "an abandoned g is escaped away without also hiding the cursor" {
 
     // Escape with nothing pending is the cursor again, as it always was.
     try testing.expectEqual(Command.hide_cursor, command(&state, frame(&.{keyDown(.escape)})).items()[0]);
+}
+
+test "]a and [c step marks and comments, in normal mode and in edit" {
+    var state: State = .{};
+    _ = command(&state, typing("]"));
+    try testing.expectEqual(Prefix.next, state.pending);
+    const next = command(&state, typing("a")).items()[0].jump_mark;
+    try testing.expect(next.forwards and !next.comments);
+    try testing.expectEqual(Prefix.none, state.pending);
+
+    // Typed inside one frame, as `gT` is.
+    const back = command(&state, typing("[c"));
+    try testing.expectEqual(@as(usize, 1), back.items().len);
+    try testing.expect(!back.items()[0].jump_mark.forwards and back.items()[0].jump_mark.comments);
+
+    // Edit mode walks the same way, and stays in edit.
+    state.mode = .edit;
+    try testing.expect(command(&state, typing("]c")).items()[0].jump_mark.comments);
+    try testing.expectEqual(Mode.edit, state.mode);
+}
+
+test "a letter ] does not name does nothing, and escape abandons the prefix" {
+    var state: State = .{};
+    // Not `j` after it either: half a jump is not a motion.
+    try testing.expectEqual(@as(usize, 0), command(&state, typing("]j")).items().len);
+    try testing.expectEqual(Prefix.none, state.pending);
+
+    _ = command(&state, typing("["));
+    const out = command(&state, frame(&.{keyDown(.escape)}));
+    try testing.expectEqual(Prefix.none, state.pending);
+    try testing.expectEqual(@as(usize, 0), out.items().len);
+
+    // Draw mode keeps the brackets for the pen, and no prefix is armed.
+    state.mode = .draw;
+    try testing.expect(command(&state, typing("]")).items()[0] == .pen_width);
+    try testing.expectEqual(Prefix.none, state.pending);
 }
 
 test "ctrl-w T moves the window to a tabpage of its own" {
