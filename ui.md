@@ -363,16 +363,90 @@ what to plan with.
 
 ### Phase 10 — comparing documents
 
+This follows [diff-pdf](https://github.com/vslavik/diff-pdf): its options,
+with the defaults its users reach for (`--per-page-pixel-tolerance=10
+--skip-identical --channel-tolerance=0 --view`). `fenrir diff a.pdf b.pdf`
+opens the two side by side at the first difference. `--report` opens no
+window; scripts and the tests use it.
+
+| Option | Default | |
+|---|---|---|
+| `--per-page-pixel-tolerance N` | `10` | A page differs only when more than N pixels do. |
+| `--channel-tolerance N` | `0` | A pixel differs when any channel moves by more than N of 255. |
+| `--skip-identical` | on | Only differing pages are shown and written. `--all-pages` turns it off. |
+| `--dpi N` | `150` | diff-pdf uses 300, but two `f32` canvases at 300 dpi are 270 MB per page pair per thread, and 150 still resolves a changed glyph. `--dpi 300` gives diff-pdf's pixel counts. |
+| `--mark-differences` | off | A change bar in the margin of each output image. The view always has them. |
+| `--grayscale` | off | Unchanged ink in grey, only the differences in colour. |
+| `--output-diff DIR` | | The overlay as a PNG per differing page. fenrir writes no PDF. |
+| `--pair number\|text` | `number` | Pairs pages by number, as diff-pdf does, or by text, so an inserted page does not mark every page after it. |
+| `--jobs N` | `1` | Pages on threads, as in `raster`. |
+| `--report` | off | Print and exit. |
+
+The exit codes are diff-pdf's: 0 identical, 1 different, 2 bad arguments,
+3 a file would not open.
+
+```
+$ fenrir diff v1.pdf v2.pdf --report
+page  3 ≠  3    1,204 px in 3 regions
+page  7 +       only in v2.pdf
+2 of 12 pages differ
+```
+
+**Cheap first, pixels last.**
+1. Pair the pages. Pages of different sizes compare over the union of both
+   boxes, as diff-pdf does. An unpaired page is added or removed without
+   being rasterised.
+2. **Equal display-list hashes mean identical pages**, and nothing is
+   rasterised. `DisplayList.hash` is new: computed once per page, over the
+   commands and their arrays. Two exports of the same source usually stop
+   here.
+3. Otherwise, rasterise both at `--dpi` on `--jobs` threads and compare 16
+   pixels at a time. With `--report` and no images, stop counting a page the
+   moment it passes the tolerance.
+4. Gather changed pixels into 16×16 tiles and merge them into rectangles in
+   page space. These are the regions the view washes and `]d` steps.
+
+**The view.**
+- Two panes, A and B, with scroll locked through the pairing.
+- Changed regions are washed in fixed colours, red on A and green on B,
+  because the page's colours belong to the document, not the theme.
+- `gd` cycles side by side → overlay → A only → B only, which are diff-pdf's
+  `Ctrl+D`, `Ctrl+<` and `Ctrl+>`.
+  - The overlay is diff-pdf's: ink only in A is red, only in B blue, shared
+    ink dark. It is the comparison's own image uploaded as a page texture, so
+    the GPU path needs no new blend mode.
+  - Flipping between A only and B only at one place is a blink comparator:
+    the eye catches what moved.
+- `<C-arrows>` nudge B against A by a point, as diff-pdf's offset does, for a
+  document whose margins moved. `:diff offset X Y` sets the offset exactly
+  and `:diff offset` clears it. The comparison reruns with it.
+- `]d` / `[d` step through the changed regions across pages, the way `]a`
+  steps marks.
+- The scrollbar carries a tick at each changed region, as diff-pdf's
+  thumbnail gutter marks pages. A *changes* panel lists the pages and their
+  counts as `panels.Row`s.
+
+**Words, not only pixels.** Pixels can only say that a paragraph moved.
+- A Myers diff over each paired page's text (phase 7) washes deleted words
+  red on A and inserted words green on B, and lists them as the changes
+  panel's detail. That makes a revised paper readable as a revision.
+- `--pair text` uses the same machinery: pages are aligned by the longest
+  common subsequence of their text hashes.
+
 | Commit | Files | ~ |
 |---|---|---|
-| `fenrir diff`, page by page | `src/vanagandr/diff.zig` | 300 |
-| two documents side by side, with the changes washed | `read.zig` | 280 |
-| a word-level diff over the text | `hlidskjalf/search.zig` neighbours | 280 |
+| `fenrir diff --report`: pages by display list, then by pixel | `src/vanagandr/diff.zig`, `gelgja/DisplayList.zig` | 550 |
+| changed regions, and the images diff-pdf writes | `diff.zig` | 400 |
+| two documents side by side, scrolled together, changes washed | `read.zig`, `Layout.zig`, `keys.zig` | 600 |
+| the overlay, the blink, and nudging one against the other | `read.zig`, `keys.zig`, `commands.zig` | 400 |
+| a word diff over the text, and pages paired by it | `src/hlidskjalf/diff.zig`, `vanagandr/diff.zig` | 500 |
 
-Build the CLI first, so it is testable with no window. Pair pages, compare
-their display lists, and report added, removed and moved regions the way
-`raster --path both` reports. Then comes the side-by-side view with
-synchronised scrolling. The word diff is cheap once a page is a string.
+**Budget.** `fenrir diff X X --report` on one file rasterises nothing, which
+checks that the hash path is taken. On documents that differ, the compare must
+be a rounding error beside rasterising the two pages; `--time` shows it.
+
+**Not taken from diff-pdf:** a PDF of the differences (fenrir writes no PDF
+yet, so it writes PNGs), and the 300 dpi default.
 
 ---
 
