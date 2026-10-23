@@ -448,20 +448,290 @@ be a rounding error beside rasterising the two pages; `--time` shows it.
 **Not taken from diff-pdf:** a PDF of the differences (fenrir writes no PDF
 yet, so it writes PNGs), and the 300 dpi default.
 
+### Phase 11 — marks you can step through
+
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | `]a and ]c: the next mark, and the next comment` | `keys.zig`, `Marks.zig`, `commands.zig`, `read.zig` | 318 |
+| | underline, strike-through and squiggle as mark styles | `Marks.zig`, `mimir/Library.zig` schema v4, `keys.zig`, `read.zig` | 500 |
+| | the annotations panel filters, and `]a` follows it | `panels.zig`, `read.zig` | 350 |
+
+- **`]` and `[` are a third prefix**, completed from typed text like `g`.
+  `]a`/`[a` go to the next/previous mark of any kind and `]c`/`[c` to the
+  next/previous comment, in normal and edit mode. Draw mode keeps `[`/`]` for
+  the pen. `:mnext`, `:mprevious`, `:cnext` and `:cprevious` do the same.
+- **Where a jump starts.** In normal mode:
+  1. from the mark it last landed on, while the caret has not moved;
+  2. otherwise from the caret;
+  3. otherwise from the top of the page.
+
+  In edit mode it starts from the mark in hand. Ink has no text for the caret
+  to land on, so without the first rule a jump from a stroke finds the same
+  stroke again. The status line reads `comment 2/5: <note>` or `mark 3/9`,
+  and says when a jump wraps round.
+- **Styles are PDF's four text-markup subtypes** (Highlight, Underline,
+  StrikeOut, Squiggly), so writing them into a PDF (phase 16) maps one to one.
+  - In visual mode `_` underlines, `-` strikes through and `~` squiggles; `m`
+    still highlights. In edit mode the same keys restyle the mark in hand.
+  - Underline and strike-through are one rect each. The squiggle is ink's
+    disc stamping along a sine.
+- **The filter** selects by colour, style, kind, `#tag` in a comment, and
+  "has a comment". `]a` walks what the panel shows, so filtering to
+  `#question` makes `]a` step through the questions.
+
 ---
 
-## Decisions taken for the canvas
+## Comments and the canvas
 
-An embedded canvas beside the page, in the manner of LiquidText, is intended.
-Three choices keep it cheap:
+LiquidText was built for a touch screen. This is for a keyboard and a mouse,
+and for people who read in order to work: researchers, educators and
+students. Touch can come later, because `Session.apply` takes commands, not
+keystrokes.
 
-1. **`Layout`'s leaf is a `Pane` union** (done in phase 5). A canvas is
-   another variant, not a second layout system.
-2. **Panels are overlays**, so a canvas can be a real pane without competing
-   with them.
-3. **An excerpt is a clipped replay of a page's `Scene`**, which `Recorded` in
-   `read.zig` already caches per page. New Mímir tables take an
-   `id INTEGER PRIMARY KEY` and name documents by `path`, as `highlight` does.
+**Already decided.**
+- `Layout`'s leaf is a `Pane` union (phase 5), so a canvas is another
+  variant, not a second layout system.
+- Panels are overlays, so a canvas pane does not compete with them.
+- Anything shown from a page is a clipped replay of the `Scene` that
+  `Recorded` in `read.zig` caches.
+- New Mímir tables take an `id INTEGER PRIMARY KEY` and name documents by
+  `path`.
+
+### The model
+
+- **Every node is a comment.** There are no free-standing cards and no
+  groups. Every thought on the canvas is about something in a document, and
+  can always be traced back to it.
+- **A comment is made on a selection.** Select with `v`, `V`, a drag, or
+  `<C-v>` for a rectangle; press `c`; type. The selection becomes the
+  comment's **anchor**. The anchor is highlighted by default, or marked with
+  an arrow when the `comment_anchor` setting is `arrow`, for readers who want
+  no colour on the text.
+- **One anchor, many comments.** Each comment is its own node, and all of
+  them tie back to the same anchor. `c` on an anchor in edit mode adds
+  another.
+- **A comment may carry an image.** Either a snip of a page, replayed from
+  the recorded scene and so sharp at any zoom, or an image file.
+- **Comments link to comments.** A link is two comments and an optional label
+  (`supports`, `contradicts`). There is no other kind of node to link.
+
+### Where it is stored
+
+Each document is either `library` (the default) or `pdf`. The user chooses
+with `:set store=library|pdf`; the global default and each document's choice
+are kept in the library, beside the other preferences.
+
+| | `library` | `pdf` |
+|---|---|---|
+| anchor | a mark row, with its `style` | `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly` or `/Ink`; an arrow is a `/Line` with an arrowhead |
+| comment | a `comment` row: anchor, text, image, canvas position | a `/Text` annotation replying to its anchor through `/IRT`, so other readers show a thread; an image comment is a `/Stamp` whose appearance is the image |
+| link | a `link` row: two comment ids and a label | the linked comments' `/NM` names, in an array under a private key on the comment's annotation |
+| canvas position | on the `comment` row | a private key on the annotation |
+| links across documents | yes | no: a PDF cannot safely name another file's annotation, so these stay in the library |
+| when written | as each change settles | journaled in the library as it settles, then written into the PDF as one incremental update on `:w` or on close |
+
+**Links live beside the comments, in whichever store holds them.** A link
+costs one name in an array: no object of its own, and other readers ignore
+the key.
+
+- **An incremental update, not a rewrite.** New and changed objects are
+  appended after `%%EOF` with their own xref section and `/Prev`. The
+  original bytes stay untouched, the write is proportional to the change, and
+  a signature over the earlier revision stays valid.
+- **The library is the journal.** A reader killed before `:w` loses nothing:
+  the next open finds the unwritten rows and offers them.
+- **`pdf` is refused, and the library used, with a message**, when the file
+  is encrypted (not supported yet), forbids changes (DocMDP `/Perms`), or is
+  read-only.
+- **Everything fenrir writes carries:**
+  - `/NM`, its identity in links;
+  - `/T`, the `author` setting;
+  - `/M`, when it was changed;
+  - an `/AP` appearance stream, because other readers draw only that.
+- **Reading `/Annots` back is the other half.** Comments made in Acrobat or
+  Zotero become fenrir comments, with `/IRT` threads kept.
+
+### The arrangement
+
+The PDF is always centred in its pane.
+
+- **Canvas off (the default).** Comments are cards in the side margins beside
+  their anchors, stacked so that none overlaps, scrolling with the page. When
+  a margin is narrower than a card, the tab at the anchor's corner stays.
+- **`gc`** splits the window. The PDF moves to the left pane, still centred
+  in it, and the canvas takes the right, with its own pan and zoom.
+  `:canvas left|right|off` sets it directly, and the divider drags like any
+  other.
+- A leader line runs from each card to its anchor, crossing the divider when
+  both are on screen.
+
+### What to take, and from where
+
+From LiquidText, adapted to a keyboard and a mouse:
+
+| LiquidText | here |
+|---|---|
+| comments tied to passages | the model above |
+| excerpts dragged out of the page | a comment carrying a snip of its anchor |
+| pinching a document to bring distant passages together | folds: `zM`, `zR`, `zf` |
+| gestures | keys and the mouse |
+
+From Obsidian Canvas, including what it lacks without plugins:
+
+| Obsidian Canvas | here |
+|---|---|
+| nodes, labelled edges, colours | comments, links, the eight swatches |
+| mostly mouse-driven | `hjkl` moves to the nearest card in that direction |
+| a card copied from a PDF forgets where it came from | every comment has an anchor |
+| no automatic layout | `:arrange` |
+| no linear export | Markdown, in reading order |
+| slows with hundreds of cards | the instance pipeline, culled against the camera |
+| the JSON Canvas file | not taken: it would be a second copy of the data beside a document that can hold it, and its vocabulary has no anchors |
+
+Who each part is for:
+- **Researchers:** comments across papers linked into an argument, tags, a
+  diff between revisions (phase 10), and export with page citations.
+- **Educators:** snips and comments exported as handouts, ink, and arrange.
+- **Students:** `]c` to review, folds to reread only what was marked,
+  `#question` tags, and flashcards as a plugin.
+
+### Phase 12 — comments as their own records
+
+| Commit | Files | ~ |
+|---|---|---|
+| comments and links in mímir, many to an anchor | `mimir/Library.zig` schema v5, `vanagandr/library.zig` | 500 |
+| a comment made on a selection with c | `Marks.zig`, `keys.zig`, `read.zig` | 450 |
+| the arrow anchor, as a setting | `settings.zig`, `read.zig` | 300 |
+
+- A mark's `note` migrates into its first `comment` row. `fenrir marks`
+  prints the comments and links.
+- In visual mode, `c` makes the anchor and opens a comment. In edit mode, `c`
+  adds another comment to the mark in hand, and `a` edits the comment in
+  hand.
+- `]c` now walks each comment rather than each anchor.
+- Plugins: `fenrir.comments()` and `fenrir.comment{anchor, text}` under the
+  document capabilities, and `CommentAdd`/`Remove`/`Change` events.
+
+### Phase 13 — the canvas pane and the margins
+
+| Commit | Files | ~ |
+|---|---|---|
+| a canvas model: cards on a plane, a camera, a hit test | `src/hlidskjalf/Canvas.zig` | 450 |
+| the canvas beside the document, on gc | `Layout.zig` (`Pane.canvas`), `read.zig` | 450 |
+| moving about a canvas from the keyboard | `keys.zig`, `Canvas.zig`, `read.zig` | 400 |
+| a text field over several lines, for comments | `thviti/widgets/field.zig` | 450 |
+| leader lines, and following either way | `Canvas.zig`, `read.zig` | 350 |
+| comments in the margins of a centred page | `Canvas.zig`, `read.zig` | 400 |
+
+- **Keys in the canvas pane:**
+  - `hjkl` selects the nearest card in that direction, and `HJKL` moves it;
+  - enter edits the card, `o` goes to its anchor, `x` deletes it;
+  - `0` fits every card, and `+`/`-` zoom.
+
+  With the mouse, drag a card to move it, or drag with the middle button to
+  pan.
+- **Following.** Clicking a card scrolls the PDF to its anchor, and `]c` in
+  the PDF pans the canvas to the card. `:canvas follow` toggles it.
+- **Placement.** A new card goes beside the previous card from the same page,
+  or else at the first free spot near the camera's centre. It never lands on
+  another card.
+
+### Phase 14 — links
+
+| Commit | Files | ~ |
+|---|---|---|
+| links between comments, drawn and stored | `Canvas.zig`, `Library.zig`, `read.zig` | 450 |
+| labels on links, and `:arrange` | `Canvas.zig`, `read.zig` | 400 |
+
+- To link two comments, press `L` on a card, move to the target with `hjkl`,
+  and press enter; or drag from a card's edge to the other card.
+- **Links are orthogonal**: horizontal and vertical runs with rounded elbows,
+  three rect instances each. The instance pipeline does not rotate, and a
+  capsule primitive is a shader change no profile has asked for.
+- `:arrange reading` lays cards out in their anchors' reading order;
+  `:arrange column` and `:arrange grid` are the other two.
+
+### Phase 15 — images in comments
+
+| Commit | Files | ~ |
+|---|---|---|
+| a rectangle selection, on ctrl-v | `View.zig`, `keys.zig`, `read.zig` | 350 |
+| a snip of the page in a comment | `Canvas.zig`, `read.zig` | 450 |
+| a png decoder, and an image file in a comment | `gleipnir/png.zig`, `read.zig` | 400 |
+
+- `<C-v>` is Vim's visual block, and on a page a block is a rectangle: a
+  figure, an equation, a table. `m` highlights the area and `c` comments on
+  it.
+- **A snip is the anchor's rectangle replayed from the recorded `Scene`**:
+  vector, sharp at any zoom, never re-interpreted. Stored in a PDF, it is an
+  image XObject in the `/Stamp`'s appearance.
+- **Image files:** JPEG goes through `gjoll/filter/jpeg.zig`. PNG needs a
+  decoder of about 250 lines on `std.compress.flate` and
+  `filter/predictor.zig`, which is the real need "recommended against" said
+  to wait for.
+
+### Phase 16 — where marks live: the library or the PDF
+
+| Commit | Files | ~ |
+|---|---|---|
+| annotations read back as marks and comments | `src/gjoll/annots.zig`, `read.zig` | 550 |
+| an incremental update, as bytes | `src/gjoll/Writer.zig` | 600 |
+| appearance streams for what fenrir writes | `gjoll/annots.zig` | 450 |
+| the store setting, the journal, and :w | `mimir/Library.zig`, `settings.zig`, `commands.zig`, `read.zig` | 450 |
+
+- **Reading:** `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly`,
+  `/Ink`, `/Line`, `/Text`, `/Stamp` and `/FreeText`. An `/IRT` thread becomes
+  the comments on one anchor, and `/NM` is each annotation's identity.
+- **Writing:** `Writer` returns bytes and the CLI writes the file, because
+  the library layer opens no files. `DocSave`, reserved in phase 8, fires.
+- **Moving a document:** `fenrir marks F --store pdf` moves its marks into the
+  PDF. `--store library` moves them out, with an update that drops them from
+  `/Annots`.
+
+### Phase 17 — getting work out
+
+| Commit | Files | ~ |
+|---|---|---|
+| searching comments, on / in the canvas | `Canvas.zig`, `find.zig` | 250 |
+| comments as markdown, in reading order | `src/vanagandr/canvas.zig` | 450 |
+| folds: a document reduced to its marks | `View.zig`, `keys.zig`, `read.zig` | 450 |
+| comments and links for plugins | `galdr/Runtime.zig`, `Host.zig` | 350 |
+
+- **`fenrir canvas F --export md [--images DIR]`** writes:
+  - a heading per document;
+  - anchors in reading order, each quoted with (title, p. N);
+  - each anchor's comments beneath it;
+  - links as references;
+  - snips as PNGs, through the existing writer.
+- **Folds are LiquidText's collapse, done with keys.**
+  - `zM` shows only the anchored passages, stacked as clipped replays in
+    reading order.
+  - `zR` opens everything again.
+  - `zf` folds a selected range away, and `zo`/`zc` open and close one fold.
+- **Plugins** get `link{}` and `LinkAdd`/`LinkRemove` events: enough for a
+  flashcard plugin to turn `#question` comments into cards.
+
+### Canvas performance rules
+
+- Cards are culled against the camera before a box is built, as `list.zig`
+  culls rows.
+- Canvas text sizes are quantised to eighth-octave steps, so zooming does not
+  fill the atlas with every size. Below about 6px, a card's text is drawn as
+  grey bars.
+- On the GPU a snip is a matrix and a clip on the recorded scene. On the CPU
+  only visible snips are rasterised, on the worker thread, and they stay
+  blank until ready, as pages do.
+- A card's layout is rebuilt when its text changes, and link routes when a
+  card moves. Nothing is rebuilt per frame.
+- **Budget:** seed 1,000 comments and 1,000 links with `fenrir run`, dock the
+  canvas, and `read --frames 1200 --vsync off` must stay within noise of the
+  reader without the canvas.
+
+**Not in these phases:**
+- presenting a canvas as a path, for lectures;
+- the clipboard, for copying a comment with its citation (Lyngvi has none);
+- maths in comments;
+- touch.
 
 ## Recommended against
 
@@ -469,9 +739,8 @@ Three choices keep it cheap:
   do better.
 - **Full inline SVG.** The `d=` subset covers every icon set worth having.
   Groups, transforms, gradients and CSS would be a second document format.
-- **PNG icons, for now.** There is no PNG decoder. One would be about 250
-  lines on `std.compress.flate` and `gjoll/filter/predictor.zig`; add it when
-  something real needs it.
+- **PNG icons.** The PNG decoder arrives with phase 15, for images in
+  comments. `.path` and `.glyph` still do icons better at every size.
 - **A `PageRender` hook per frame.** It would allocate per frame and put a Lua
   state on the rasterising thread, which owns the `Document`.
 
