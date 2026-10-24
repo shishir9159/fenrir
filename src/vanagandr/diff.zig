@@ -14,6 +14,11 @@
 //!    itself always does.
 //! 3. Otherwise both are rasterised at `--dpi` and compared sixteen pixels at
 //!    a time, over the union of the two pages.
+//! 4. The differing pixels' 16x16 tiles are gathered into rectangles: the
+//!    regions a view washes and steps through, and what `--report` counts.
+//!
+//! `--output-diff` writes diff-pdf's picture of each pair as a PNG rather
+//! than a PDF, because fenrir writes no PDF yet.
 //!
 //! The hash is only worth having if it never calls a changed page identical,
 //! so it digests what every object *holds* rather than its number -- a file
@@ -64,6 +69,15 @@ pub const usage =
     \\                                 Defaults to 150; diff-pdf uses 300.
     \\    --jobs N                     Compare N pairs of pages at once. 0 is
     \\                                 one per core. Defaults to 1.
+    \\    --output-diff DIR            A PNG of each pair listed, in DIR: ink
+    \\                                 only in the first document red, only
+    \\                                 in the second blue, in both dark.
+    \\                                 Named a3-b3.png, or a7.png and b7.png
+    \\                                 for a page one of them has alone.
+    \\    --mark-differences           A bar in each picture's left margin
+    \\                                 beside the rows that changed.
+    \\    --grayscale                  Unchanged ink in grey, so only the
+    \\                                 differences are in colour.
     \\    --time                       Where the time went, on stderr.
     \\
     \\    Exits 0 when the documents are the same, 1 when they differ, 2 for
@@ -86,6 +100,12 @@ pub const Options = struct {
     /// Device pixels per inch, for the pages that have to be drawn.
     dpi: f32 = 150,
     jobs: u32 = 1,
+    /// Where to write a picture of each pair listed, or nowhere.
+    output_dir: ?[]const u8 = null,
+    /// A bar in each picture's left margin beside the rows that changed.
+    mark_differences: bool = false,
+    /// Unchanged ink drawn grey, so only the differences carry colour.
+    grayscale: bool = false,
 };
 
 /// Which page of each document is compared with which. Zero-based, and null
@@ -102,6 +122,12 @@ pub const Result = struct {
     pixels: u64 = 0,
     /// Why a pair could not be compared, when it could not.
     err: ?anyerror = null,
+    /// Where the pages differ, in reading order, when they do. Allocated
+    /// with `smp_allocator`, because a worker thread made them; see
+    /// `freeResults`.
+    regions: []const Region = &.{},
+    /// Why its picture was not written, when one was asked for and was not.
+    unwritten: ?anyerror = null,
 
     pub const Kind = enum {
         /// The display lists hash the same: nothing was drawn.
@@ -124,6 +150,11 @@ pub const Result = struct {
         };
     }
 };
+
+pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
+    for (results) |r| std.heap.smp_allocator.free(r.regions);
+    gpa.free(results);
+}
 
 /// Pages by number, as diff-pdf pairs them: the first with the first, and
 /// whatever one document has past the other's end on its own.
@@ -174,6 +205,14 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             if (i == argv.len) return bad(ctx, "--jobs needs a number of threads", .{});
             options.jobs = std.fmt.parseInt(u32, argv[i], 10) catch
                 return bad(ctx, "not a thread count: {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--output-diff")) {
+            i += 1;
+            if (i == argv.len) return bad(ctx, "--output-diff needs a directory", .{});
+            options.output_dir = argv[i];
+        } else if (std.mem.eql(u8, arg, "--mark-differences")) {
+            options.mark_differences = true;
+        } else if (std.mem.eql(u8, arg, "--grayscale")) {
+            options.grayscale = true;
         } else if (std.mem.eql(u8, arg, "--time")) {
             timing = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -186,6 +225,10 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     }
     if (given != 2) return bad(ctx, "diff needs two files", .{});
     if (options.jobs == 0) options.jobs = cpuCount();
+    if (options.output_dir) |dir| {
+        Io.Dir.cwd().createDirPath(ctx.io, dir) catch |err|
+            return bad(ctx, "cannot make {s}: {t}", .{ dir, err });
+    }
 
     var wall: Lap = .start(ctx.io);
 
@@ -207,6 +250,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const pairs = try pairByNumber(ctx.gpa, counts[0], counts[1]);
     var clocked: Timing = .{};
     const results = try compare(ctx.gpa, ctx.io, bytes, pairs, options, &clocked);
+    defer freeResults(ctx.gpa, results);
 
     const names: [2][]const u8 = .{ std.fs.path.basename(files[0]), std.fs.path.basename(files[1]) };
     var differing: usize = 0;
@@ -240,7 +284,7 @@ fn cpuCount() u32 {
 /// One line per pair worth listing, and a count.
 ///
 /// ```
-/// page  3 ≠  3    1,204 px
+/// page  3 ≠  3    1,204 px in 3 regions
 /// page  7 +       only in v2.pdf
 /// 2 of 12 pages differ
 /// ```
@@ -276,14 +320,20 @@ pub fn report(
 
         switch (r.kind) {
             .same_list => try w.writeAll("same display list"),
-            .same_pixels, .differ => {
+            .same_pixels => {
                 var buf: [32]u8 = undefined;
                 try w.print("{s} px", .{grouped(r.pixels, &buf)});
+            },
+            .differ => {
+                var buf: [32]u8 = undefined;
+                const n = r.regions.len;
+                try w.print("{s} px in {d} region{s}", .{ grouped(r.pixels, &buf), n, if (n == 1) "" else "s" });
             },
             .only_a => try w.print("only in {s}", .{names[0]}),
             .only_b => try w.print("only in {s}", .{names[1]}),
             .failed => try w.print("could not be compared: {t}", .{r.err orelse error.Unexpected}),
         }
+        if (r.unwritten) |err| try w.print("; its picture was not written: {t}", .{err});
         try w.writeByte('\n');
     }
     try w.print("{d} of {d} pages differ\n", .{ differing, pairs.len });
@@ -437,38 +487,108 @@ const Worker = struct {
     fn comparePair(w: *Worker, pair: Pair, options: Options) Result {
         // First, so it runs last: the lists and canvases below are all in it.
         defer _ = w.scratch.reset(.retain_capacity);
-
-        const a = pair.a orelse return .{ .kind = .only_b };
-        const b = pair.b orelse return .{ .kind = .only_a };
-
-        var clock: Lap = .start(w.io);
         const gpa = w.scratch.allocator();
+        var clock: Lap = .start(w.io);
 
-        const list_a = w.sides[0].interpret(gpa, a) catch |err| return .{ .err = err };
-        const list_b = w.sides[1].interpret(gpa, b) catch |err| return .{ .err = err };
+        const pages = [2]?u32{ pair.a, pair.b };
+        var lists: [2]?gelgja.DisplayList = .{ null, null };
+        for (pages, &lists, &w.sides) |page, *list, *side| {
+            list.* = side.interpret(gpa, page orelse continue) catch |err| return .{ .err = err };
+        }
         w.time.interpret += clock.lap();
 
-        const hash_a = list_a.hash(w.sides[0].digests.objects());
-        const hash_b = list_b.hash(w.sides[1].digests.objects());
-        w.time.hash += clock.lap();
-        w.time.pairs += 1;
-        if (hash_a) |x| if (hash_b) |y| if (x == y) return .{ .kind = .same_list };
+        var result: Result = if (pair.a == null)
+            .{ .kind = .only_b }
+        else if (pair.b == null)
+            .{ .kind = .only_a }
+        else sure: {
+            const hash_a = lists[0].?.hash(w.sides[0].digests.objects());
+            const hash_b = lists[1].?.hash(w.sides[1].digests.objects());
+            w.time.hash += clock.lap();
+            w.time.pairs += 1;
+            if (hash_a) |x| if (hash_b) |y| if (x == y) break :sure .{ .kind = .same_list };
+            break :sure .{ .kind = .differ };
+        };
+
+        // Drawn to be counted, or to be written: a page only one document
+        // has is drawn only for its picture, and an identical one only when
+        // every page's picture was asked for.
+        const measure = result.kind == .differ;
+        const picture = options.output_dir != null and
+            (result.differs() or !options.skip_identical);
+        if (!measure and !picture) return result;
 
         const factor = options.dpi / 72.0;
-        var canvas_a = w.draw(gpa, &w.sides[0], a, list_a, factor) catch |err| return .{ .err = err };
-        defer canvas_a.deinit(gpa);
-        var canvas_b = w.draw(gpa, &w.sides[1], b, list_b, factor) catch |err| return .{ .err = err };
-        defer canvas_b.deinit(gpa);
+        var fbs: [2]?Framebuffer = .{ null, null };
+        for (pages, lists, &w.sides, &fbs) |page, list, *side, *fb| {
+            // Identical pages are one page drawn once.
+            if (fbs[0] != null and result.kind == .same_list) break;
+            const canvas = w.draw(gpa, side, page orelse continue, list.?, factor) catch |err|
+                return .{ .err = err };
+            fb.* = canvas.fb;
+        }
         w.time.render += clock.lap();
         w.time.drawn += 1;
 
-        const pixels = countDifferences(canvas_a.fb, canvas_b.fb, options.channel_tolerance);
+        // A missing page is blank paper, so that everything on the one that
+        // is there shows as added or removed.
+        const a = fbs[0] orelse (blank(gpa, fbs[1].?) catch |err| return .{ .err = err });
+        const b = fbs[1] orelse if (result.kind == .same_list)
+            a
+        else
+            (blank(gpa, a) catch |err| return .{ .err = err });
+
+        var tiles = Tiles.init(gpa, @max(a.width, b.width), @max(a.height, b.height)) catch |err|
+            return .{ .err = err };
+        const pixels = countDifferences(a, b, options.channel_tolerance, &tiles);
+        if (measure) {
+            result.pixels = pixels;
+            if (pixels > options.pixel_tolerance) {
+                result.regions = regionsOf(w.heap, gpa, tiles) catch |err| return .{ .err = err };
+            } else {
+                result.kind = .same_pixels;
+            }
+        }
         w.time.compare += clock.lap();
 
-        return .{
-            .kind = if (pixels > options.pixel_tolerance) .differ else .same_pixels,
-            .pixels = pixels,
-        };
+        if (options.output_dir) |dir| {
+            if (result.differs() or !options.skip_identical) {
+                w.writePicture(gpa, dir, pair, a, b, tiles, options) catch |err| {
+                    result.unwritten = err;
+                };
+            }
+        }
+        return result;
+    }
+
+    /// diff-pdf's picture of a pair, as a PNG in `dir`: `a3-b3.png` for a
+    /// pair, `a7.png` or `b7.png` for a page one document has alone.
+    fn writePicture(
+        w: *Worker,
+        gpa: std.mem.Allocator,
+        dir: []const u8,
+        pair: Pair,
+        a: Framebuffer,
+        b: Framebuffer,
+        tiles: Tiles,
+        options: Options,
+    ) !void {
+        // From the pair's arena, like everything else the pair made.
+        const out = try Framebuffer.init(gpa, @max(a.width, b.width), @max(a.height, b.height), .srgb);
+        overlay(out, a, b, options.channel_tolerance, options.grayscale);
+        if (options.mark_differences) markRows(out, tiles, @max(3, @as(u32, @intFromFloat(options.dpi / 25))));
+
+        var name: [64]u8 = undefined;
+        var path: [4096]u8 = undefined;
+        const file_name = pictureName(&name, pair);
+        const full = try std.fmt.bufPrint(&path, "{s}{c}{s}", .{ dir, std.fs.path.sep, file_name });
+
+        var file = try Io.Dir.cwd().createFile(w.io, full, .{});
+        defer file.close(w.io);
+        var buf: [64 * 1024]u8 = undefined;
+        var writer = file.writer(w.io, &buf);
+        try out.writePng(gpa, &writer.interface);
+        try writer.interface.flush();
     }
 
     /// One page on a white canvas, drawn as `raster` draws it.
@@ -549,10 +669,14 @@ const Lanes = @Vector(chunk * 4, f32);
 /// Sixteen pixels a step, and most steps are one comparison: runs of
 /// untouched paper and unchanged type are bit-for-bit equal, and only a chunk
 /// that is not pays for the rounding.
-pub fn countDifferences(a: Framebuffer, b: Framebuffer, tolerance: u8) u64 {
+///
+/// Every differing pixel's tile is marked in `tiles`, which must cover the
+/// union.
+pub fn countDifferences(a: Framebuffer, b: Framebuffer, tolerance: u8, tiles: *Tiles) u64 {
     const width = @max(a.width, b.width);
     const common_w = @min(a.width, b.width);
     const common_h = @min(a.height, b.height);
+    const wider = if (a.width > b.width) a else b;
     const tol: f32 = @floatFromInt(tolerance);
 
     var count: u64 = 0;
@@ -561,20 +685,238 @@ pub fn countDifferences(a: Framebuffer, b: Framebuffer, tolerance: u8) u64 {
         const row_a = a.pixels[@as(usize, y) * a.width * 4 ..][0 .. @as(usize, common_w) * 4];
         const row_b = b.pixels[@as(usize, y) * b.width * 4 ..][0 .. @as(usize, common_w) * 4];
 
-        var x: usize = 0;
+        var x: u32 = 0;
         while (x + chunk <= common_w) : (x += chunk) {
-            count += @popCount(chunkMask(row_a[x * 4 ..][0 .. chunk * 4], row_b[x * 4 ..][0 .. chunk * 4], tol));
+            const mask = chunkMask(row_a[x * 4 ..][0 .. chunk * 4], row_b[x * 4 ..][0 .. chunk * 4], tol);
+            if (mask == 0) continue;
+            count += @popCount(mask);
+            tiles.mark(x / tile, y / tile);
         }
         while (x < common_w) : (x += 1) {
-            if (pixelDiffers(row_a[x * 4 ..][0..4], row_b[x * 4 ..][0..4], tol)) count += 1;
+            if (!pixelDiffers(row_a[x * 4 ..][0..4], row_b[x * 4 ..][0..4], tol)) continue;
+            count += 1;
+            tiles.mark(x / tile, y / tile);
         }
         // Past the narrower page's right edge.
         count += width - common_w;
+        tiles.markSpan(common_w, wider.width, y);
     }
     // Below the shorter page: only the taller one is there.
     const taller = if (a.height > b.height) a else b;
     count += @as(u64, taller.width) * (taller.height - common_h);
+    if (taller.height > common_h) {
+        var row = common_h / tile;
+        while (row <= (taller.height - 1) / tile) : (row += 1) tiles.markSpan(0, taller.width, row * tile);
+    }
     return count;
+}
+
+/// The side of a tile, and the width of a chunk: one chunk of a row is one
+/// tile's row, so marking the tile costs nothing past the chunk's own mask.
+const tile = chunk;
+
+/// Which tiles of the union of two pages hold a differing pixel.
+pub const Tiles = struct {
+    cols: u32,
+    rows: u32,
+    marked: []bool,
+
+    pub fn init(gpa: std.mem.Allocator, width: u32, height: u32) !Tiles {
+        const cols = (width + tile - 1) / tile;
+        const rows = (height + tile - 1) / tile;
+        const marked = try gpa.alloc(bool, @as(usize, cols) * rows);
+        @memset(marked, false);
+        return .{ .cols = cols, .rows = rows, .marked = marked };
+    }
+
+    pub fn at(t: Tiles, col: u32, row: u32) bool {
+        return t.marked[@as(usize, row) * t.cols + col];
+    }
+
+    fn mark(t: *Tiles, col: u32, row: u32) void {
+        t.marked[@as(usize, row) * t.cols + col] = true;
+    }
+
+    /// The tiles under pixels `x0..x1` of row `y`.
+    fn markSpan(t: *Tiles, x0: u32, x1: u32, y: u32) void {
+        if (x0 >= x1) return;
+        var col = x0 / tile;
+        while (col <= (x1 - 1) / tile) : (col += 1) t.mark(col, y / tile);
+    }
+};
+
+/// A changed area, in pixels of the union of the two pages, from the top
+/// left.
+pub const Region = struct {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+
+    /// The same area in a page's user space -- points, y upwards -- which is
+    /// what a mark is stored in and what `View.windowBox` takes. Each
+    /// document's page has its own height, so each gets its own answer.
+    pub fn inPage(r: Region, factor: f32, page_height: f32) gelgja.Bounds {
+        const f = @as(f32, 1) / factor;
+        return .fromRect(
+            @as(f32, @floatFromInt(r.x0)) * f,
+            page_height - @as(f32, @floatFromInt(r.y1)) * f,
+            @as(f32, @floatFromInt(r.x1)) * f,
+            page_height - @as(f32, @floatFromInt(r.y0)) * f,
+        );
+    }
+
+    fn overlaps(r: Region, o: Region) bool {
+        return r.x0 < o.x1 and o.x0 < r.x1 and r.y0 < o.y1 and o.y0 < r.y1;
+    }
+
+    fn merge(r: Region, o: Region) Region {
+        return .{ .x0 = @min(r.x0, o.x0), .y0 = @min(r.y0, o.y0), .x1 = @max(r.x1, o.x1), .y1 = @max(r.y1, o.y1) };
+    }
+
+    fn readsBefore(_: void, r: Region, o: Region) bool {
+        return if (r.y0 != o.y0) r.y0 < o.y0 else r.x0 < o.x0;
+    }
+};
+
+/// The marked tiles gathered into rectangles, in reading order.
+///
+/// Tiles one empty tile apart are one region. A tile is 16 pixels, under
+/// eight points at 150 dpi: more than a word space and less than a line's
+/// pitch, so a reworded sentence that wraps is one region and two edits a
+/// paragraph apart are two. Boxes that then overlap are merged, so no part
+/// of the page is washed twice.
+pub fn regionsOf(gpa: std.mem.Allocator, scratch: std.mem.Allocator, tiles: Tiles) ![]Region {
+    var found: std.ArrayList(Region) = .empty;
+    defer found.deinit(scratch);
+    const seen = try scratch.alloc(bool, tiles.marked.len);
+    defer scratch.free(seen);
+    @memset(seen, false);
+    var stack: std.ArrayList([2]u32) = .empty;
+    defer stack.deinit(scratch);
+
+    for (0..tiles.rows) |row| for (0..tiles.cols) |col| {
+        const start = row * tiles.cols + col;
+        if (!tiles.marked[start] or seen[start]) continue;
+        seen[start] = true;
+
+        var box: [4]u32 = .{ @intCast(col), @intCast(row), @intCast(col), @intCast(row) };
+        try stack.append(scratch, .{ @intCast(col), @intCast(row) });
+        while (stack.pop()) |at| {
+            box = .{ @min(box[0], at[0]), @min(box[1], at[1]), @max(box[2], at[0]), @max(box[3], at[1]) };
+            const r0 = at[1] -| 2;
+            const r1 = @min(tiles.rows - 1, at[1] + 2);
+            const c0 = at[0] -| 2;
+            const c1 = @min(tiles.cols - 1, at[0] + 2);
+            var r = r0;
+            while (r <= r1) : (r += 1) {
+                var c = c0;
+                while (c <= c1) : (c += 1) {
+                    const i = @as(usize, r) * tiles.cols + c;
+                    if (!tiles.marked[i] or seen[i]) continue;
+                    seen[i] = true;
+                    try stack.append(scratch, .{ c, r });
+                }
+            }
+        }
+        try found.append(scratch, .{
+            .x0 = box[0] * tile,
+            .y0 = box[1] * tile,
+            .x1 = (box[2] + 1) * tile,
+            .y1 = (box[3] + 1) * tile,
+        });
+    };
+
+    // Merge until nothing overlaps: a box that grew can reach one already
+    // passed over, so a pass that merged anything is followed by another.
+    // Components are few, and each merge removes one.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = 0;
+        while (i < found.items.len) : (i += 1) {
+            var j = i + 1;
+            while (j < found.items.len) {
+                if (found.items[i].overlaps(found.items[j])) {
+                    found.items[i] = found.items[i].merge(found.swapRemove(j));
+                    changed = true;
+                } else j += 1;
+            }
+        }
+    }
+
+    std.mem.sort(Region, found.items, {}, Region.readsBefore);
+    return gpa.dupe(Region, found.items);
+}
+
+/// White paper the size of `like`.
+fn blank(gpa: std.mem.Allocator, like: Framebuffer) !Framebuffer {
+    var fb = try Framebuffer.init(gpa, like.width, like.height, .srgb);
+    fb.clear(.white);
+    return fb;
+}
+
+/// diff-pdf's overlay of two pages: ink only in `a` red, only in `b` blue,
+/// and ink both share dark.
+///
+/// Each document's luminance goes into the channels the other one's colour
+/// is not: red is `b`'s paper showing where `a` has ink, blue the other way
+/// round, and green is dark wherever either is. Shared ink is dark in all
+/// three. With `grayscale`, a pixel within the tolerance is drawn as a grey
+/// of `a` instead, so the colour is only where something changed.
+fn overlay(out: Framebuffer, a: Framebuffer, b: Framebuffer, tolerance: u8, grayscale: bool) void {
+    const tol: f32 = @floatFromInt(tolerance);
+    for (0..out.height) |yy| for (0..out.width) |xx| {
+        const x: u32 = @intCast(xx);
+        const y: u32 = @intCast(yy);
+        const in_a = x < a.width and y < a.height;
+        const in_b = x < b.width and y < b.height;
+        const la = if (in_a) luminance(a, x, y) else 1;
+        const lb = if (in_b) luminance(b, x, y) else 1;
+
+        const same = in_a and in_b and !pixelDiffers(texel(a, x, y), texel(b, x, y), tol);
+        const rgb: [3]f32 = if (grayscale and same)
+            @splat(0.5 + 0.5 * la)
+        else
+            .{ lb, @min(la, lb), la };
+
+        const o = (@as(usize, y) * out.width + x) * 4;
+        out.pixels[o..][0..4].* = .{ rgb[0], rgb[1], rgb[2], 1 };
+    };
+}
+
+/// A change bar down the left margin beside every row of tiles with a
+/// difference in it, so a page of small changes shows where to look.
+fn markRows(out: Framebuffer, tiles: Tiles, bar: u32) void {
+    for (0..tiles.rows) |row| {
+        const changed = for (0..tiles.cols) |col| {
+            if (tiles.at(@intCast(col), @intCast(row))) break true;
+        } else false;
+        if (!changed) continue;
+        const y0 = row * tile;
+        const y1 = @min(out.height, y0 + tile);
+        for (y0..y1) |y| for (0..@min(bar, out.width)) |x| {
+            out.pixels[(y * out.width + x) * 4 ..][0..4].* = .{ 0.85, 0.1, 0.1, 1 };
+        };
+    }
+}
+
+fn texel(fb: Framebuffer, x: u32, y: u32) *const [4]f32 {
+    return fb.pixels[(@as(usize, y) * fb.width + x) * 4 ..][0..4];
+}
+
+fn luminance(fb: Framebuffer, x: u32, y: u32) f32 {
+    const p = texel(fb, x, y);
+    return 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+}
+
+fn pictureName(buf: []u8, pair: Pair) []const u8 {
+    return if (pair.a != null and pair.b != null)
+        std.fmt.bufPrint(buf, "a{d}-b{d}.png", .{ pair.a.? + 1, pair.b.? + 1 }) catch unreachable
+    else if (pair.a) |a|
+        std.fmt.bufPrint(buf, "a{d}.png", .{a + 1}) catch unreachable
+    else
+        std.fmt.bufPrint(buf, "b{d}.png", .{pair.b.? + 1}) catch unreachable;
 }
 
 /// One bit per differing pixel, at bit `4 * i` for the `i`th, which is where
@@ -654,6 +996,21 @@ fn ink(fb: Framebuffer, x: u32, y: u32, level: f32) void {
     fb.pixels[o..][0..3].* = .{ level, level, level };
 }
 
+/// The count alone, for the tests that want nothing else.
+fn counted(a: Framebuffer, b: Framebuffer, tolerance: u8) !u64 {
+    var tiles = try Tiles.init(testing.allocator, @max(a.width, b.width), @max(a.height, b.height));
+    defer testing.allocator.free(tiles.marked);
+    return countDifferences(a, b, tolerance, &tiles);
+}
+
+/// The regions two pages differ in.
+fn regionsBetween(a: Framebuffer, b: Framebuffer) ![]Region {
+    var tiles = try Tiles.init(testing.allocator, @max(a.width, b.width), @max(a.height, b.height));
+    defer testing.allocator.free(tiles.marked);
+    _ = countDifferences(a, b, 0, &tiles);
+    return regionsOf(testing.allocator, testing.allocator, tiles);
+}
+
 test "pages are paired by number, and the longer document's tail stands alone" {
     const pairs = try pairByNumber(testing.allocator, 3, 5);
     defer testing.allocator.free(pairs);
@@ -668,7 +1025,7 @@ test "identical pages have no differing pixels, however wide" {
     defer a.deinit(testing.allocator);
     var b = try paper(37, 5);
     defer b.deinit(testing.allocator);
-    try testing.expectEqual(@as(u64, 0), countDifferences(a, b, 0));
+    try testing.expectEqual(@as(u64, 0), try counted(a, b, 0));
 }
 
 test "a pixel differs in the vector loop and in the tail alike" {
@@ -679,9 +1036,9 @@ test "a pixel differs in the vector loop and in the tail alike" {
     ink(b, 3, 1, 0); // in the first chunk
     ink(b, 20, 2, 0); // in the second
     ink(b, 35, 4, 0); // in the tail
-    try testing.expectEqual(@as(u64, 3), countDifferences(a, b, 0));
+    try testing.expectEqual(@as(u64, 3), try counted(a, b, 0));
     // Symmetric: which page is first does not matter.
-    try testing.expectEqual(@as(u64, 3), countDifferences(b, a, 0));
+    try testing.expectEqual(@as(u64, 3), try counted(b, a, 0));
 }
 
 test "the channel tolerance is in levels of 255, and a float wobble is no level at all" {
@@ -693,13 +1050,13 @@ test "the channel tolerance is in levels of 255, and a float wobble is no level 
     // Not bit-equal, but the same eight-bit value: a PNG of either page is
     // the same file, so the pages are the same.
     ink(b, 0, 0, 1.0 - 1e-6);
-    try testing.expectEqual(@as(u64, 0), countDifferences(a, b, 0));
+    try testing.expectEqual(@as(u64, 0), try counted(a, b, 0));
 
     // Four levels down.
     ink(b, 5, 0, (255.0 - 4.0) / 255.0);
-    try testing.expectEqual(@as(u64, 1), countDifferences(a, b, 0));
-    try testing.expectEqual(@as(u64, 1), countDifferences(a, b, 3));
-    try testing.expectEqual(@as(u64, 0), countDifferences(a, b, 4));
+    try testing.expectEqual(@as(u64, 1), try counted(a, b, 0));
+    try testing.expectEqual(@as(u64, 1), try counted(a, b, 3));
+    try testing.expectEqual(@as(u64, 0), try counted(a, b, 4));
 }
 
 test "pages of different sizes differ where only one of them is" {
@@ -709,7 +1066,75 @@ test "pages of different sizes differ where only one of them is" {
     defer b.deinit(testing.allocator);
     // Eight rows are 4 pixels wider in b; two rows are in a only, 20 wide;
     // the corner below b and right of a is on neither and does not count.
-    try testing.expectEqual(@as(u64, 8 * 4 + 2 * 20), countDifferences(a, b, 0));
+    try testing.expectEqual(@as(u64, 8 * 4 + 2 * 20), try counted(a, b, 0));
+}
+
+test "changes a line apart are one region, and changes far apart are two, in reading order" {
+    var a = try paper(200, 200);
+    defer a.deinit(testing.allocator);
+    var b = try paper(200, 200);
+    defer b.deinit(testing.allocator);
+    // Two edits a tile and a half apart: one sentence that wrapped.
+    ink(b, 20, 20, 0);
+    ink(b, 22, 44, 0);
+    // One far below and to the right of them, and one above it.
+    ink(b, 180, 180, 0);
+    ink(b, 150, 100, 0);
+
+    const regions = try regionsBetween(a, b);
+    defer testing.allocator.free(regions);
+    try testing.expectEqual(@as(usize, 3), regions.len);
+    try testing.expectEqual(Region{ .x0 = 16, .y0 = 16, .x1 = 32, .y1 = 48 }, regions[0]);
+    try testing.expectEqual(@as(u32, 144), regions[1].x0);
+    try testing.expectEqual(@as(u32, 176), regions[2].y0);
+}
+
+test "a region is a box in each page's own user space" {
+    const r: Region = .{ .x0 = 150, .y0 = 300, .x1 = 300, .y1 = 450 };
+    // 150 dpi: a pixel is 72/150 of a point, and y turns upwards from the
+    // page's own height.
+    const box = r.inPage(150.0 / 72.0, 792);
+    try testing.expectApproxEqAbs(@as(f32, 72), box.min_x, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 792 - 216), box.min_y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 792 - 144), box.max_y, 1e-3);
+}
+
+test "a page longer than its partner has its tail marked to the last tile" {
+    var a = try paper(20, 14);
+    defer a.deinit(testing.allocator);
+    var b = try paper(20, 33);
+    defer b.deinit(testing.allocator);
+    var tiles = try Tiles.init(testing.allocator, 20, 33);
+    defer testing.allocator.free(tiles.marked);
+    _ = countDifferences(a, b, 0, &tiles);
+    // Rows 14..32 are b's alone, and reach into the third row of tiles by
+    // one pixel. Stepping a tile at a time from row 14 lands on 14 and 30,
+    // and misses it.
+    try testing.expect(tiles.at(0, 0) and tiles.at(1, 1));
+    try testing.expect(tiles.at(0, 2) and tiles.at(1, 2));
+}
+
+test "the overlay: a's ink red, b's blue, both dark, and grey where nothing changed" {
+    var a = try paper(3, 1);
+    defer a.deinit(testing.allocator);
+    var b = try paper(3, 1);
+    defer b.deinit(testing.allocator);
+    ink(a, 0, 0, 0); // only in a
+    ink(b, 1, 0, 0); // only in b
+    ink(a, 2, 0, 0); // in both
+    ink(b, 2, 0, 0);
+
+    var out = try Framebuffer.init(testing.allocator, 3, 1, .srgb);
+    defer out.deinit(testing.allocator);
+    overlay(out, a, b, 0, false);
+    try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, out.pixels[0..4]);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 1, 1 }, out.pixels[4..8]);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 0, 1 }, out.pixels[8..12]);
+
+    // The shared ink is unchanged, so in grey; the changes keep colour.
+    overlay(out, a, b, 0, true);
+    try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, out.pixels[0..4]);
+    try testing.expectEqualSlices(f32, &.{ 0.5, 0.5, 0.5, 1 }, out.pixels[8..12]);
 }
 
 test "the report lists what differs and counts it" {
@@ -721,7 +1146,7 @@ test "the report lists what differs and counts it" {
     };
     const results = [_]Result{
         .{ .kind = .same_list },
-        .{ .kind = .differ, .pixels = 1204 },
+        .{ .kind = .differ, .pixels = 1204, .regions = &.{ .{ .x0 = 0, .y0 = 0, .x1 = 16, .y1 = 16 }, .{ .x0 = 0, .y0 = 64, .x1 = 16, .y1 = 80 } } },
         .{ .kind = .same_pixels, .pixels = 3 },
         .{ .kind = .only_b },
     };
@@ -729,7 +1154,7 @@ test "the report lists what differs and counts it" {
     defer out.deinit();
     try report(&out.writer, &pairs, &results, .{ "v1.pdf", "v2.pdf" }, 12, .{});
     try testing.expectEqualStrings(
-        \\page  2 ≠  2    1,204 px
+        \\page  2 ≠  2    1,204 px in 2 regions
         \\page  4 +       only in v2.pdf
         \\2 of 4 pages differ
         \\
