@@ -18,6 +18,12 @@ err: *Io.Writer,
 /// its database lives, and by nothing else: a command that wants a setting
 /// asks the library for it rather than the environment.
 environ: ?*std.process.Environ.Map = null,
+/// The process's exit status, for a command whose status is an answer and
+/// not only a verdict on whether it ran. `fenrir diff` exits 1 for "these
+/// differ" and 3 for "a file would not open", as diff-pdf does, and a script
+/// branching on that cannot be handed the same 1 for both. Null is the usual
+/// rule: 0 for success and 1 for any error.
+exit: ?u8 = null,
 
 /// The value of an environment variable, or null.
 pub fn env(ctx: *const Context, name: []const u8) ?[]const u8 {

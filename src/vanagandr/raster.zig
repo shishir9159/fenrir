@@ -320,15 +320,15 @@ fn ms(ns: u64) f64 {
 ///
 /// `awake` rather than `real` for the same reason the frame clock uses it: a
 /// wall clock corrected by NTP mid-run would report a negative page.
-const Lap = struct {
+pub const Lap = struct {
     io: Io,
     last: Io.Timestamp,
 
-    fn start(io: Io) Lap {
+    pub fn start(io: Io) Lap {
         return .{ .io = io, .last = Io.Clock.awake.now(io) };
     }
 
-    fn lap(l: *Lap) u64 {
+    pub fn lap(l: *Lap) u64 {
         const now = Io.Clock.awake.now(l.io);
         const ns = l.last.durationTo(now).nanoseconds;
         l.last = now;

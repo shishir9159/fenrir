@@ -9,6 +9,7 @@ const Io = std.Io;
 
 const Context = @import("vanagandr/Context.zig");
 const commands_cmd = @import("vanagandr/commands.zig");
+const diff = @import("vanagandr/diff.zig");
 const dump = @import("vanagandr/dump.zig");
 const extract = @import("vanagandr/extract.zig");
 const fonts = @import("vanagandr/fonts.zig");
@@ -42,6 +43,7 @@ const commands = [_]Command{
     .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run },
     .{ .name = "raster", .summary = "rasterise a page to a PNG on the CPU", .usage = raster.usage, .run = raster.run },
     .{ .name = "read", .summary = "open the document in a window and scroll through it", .usage = read.usage, .run = read.run },
+    .{ .name = "diff", .summary = "which pages of two documents differ", .usage = diff.usage, .run = diff.run },
     .{ .name = "recent", .summary = "the documents opened before, and where you were", .usage = library.recent_usage, .run = library.recentRun },
     .{ .name = "config", .summary = "the settings the reader remembers", .usage = library.config_usage, .run = library.configRun },
     .{ .name = "marks", .summary = "the highlights made in a document", .usage = library.marks_usage, .run = library.marksRun },
@@ -85,7 +87,8 @@ pub fn main(init: std.process.Init) !void {
     ctx.out.flush() catch {};
     ctx.err.flush() catch {};
 
-    status catch std.process.exit(1);
+    status catch std.process.exit(ctx.exit orelse 1);
+    if (ctx.exit) |code| std.process.exit(code);
 }
 
 fn dispatch(ctx: *Context, args: []const []const u8) !void {
