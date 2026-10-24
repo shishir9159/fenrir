@@ -440,6 +440,201 @@ pub fn stats(l: DisplayList) Stats {
     return s;
 }
 
+/// What an `ObjectId` stands for, as a number that does not depend on it.
+///
+/// A list names its images, fonts, shadings and soft masks by object number,
+/// and object numbers are the producer's bookkeeping: two exports of one
+/// source number the same font differently, and one file revised in place
+/// keeps a number while replacing the figure behind it. So `hash` asks the
+/// producer, which can still see the objects, to digest what each one
+/// holds. A pointer and a function, as `Face` and `Sampler` are.
+///
+/// Null is "cannot say": no object behind the id, or one that would not
+/// read. Either way the hash cannot vouch for the page.
+pub const Objects = struct {
+    ptr: *anyopaque,
+    digest: *const fn (ptr: *anyopaque, id: ObjectId) ?u64,
+
+    pub fn of(o: Objects, id: ObjectId) ?u64 {
+        if (id == paint.no_object) return null;
+        return o.digest(o.ptr, id);
+    }
+};
+
+/// A digest of what the list draws, equal for two lists that draw the same
+/// page. Null when the list draws something it cannot vouch for.
+///
+/// Built for `fenrir diff`, which uses equal hashes to skip rasterising two
+/// pages at all. That makes a false match the one failure that matters -- a
+/// changed page reported identical -- and every choice here leans the other
+/// way:
+///
+/// - Everything a backend reads is hashed, contents rather than ranges, so
+///   the pools can be laid out differently and still agree.
+/// - Resource names (`/F1`, `/Im3`) are left out. A backend never draws by
+///   name, and two exports of one source rarely name alike.
+/// - An object is hashed by its digest, never its number.
+/// - A font, image, shading or pattern with no object behind it -- a font
+///   dictionary written inline in `/Resources` -- has nothing to digest, and
+///   its glyphs are chosen through that dictionary at draw time. Rather than
+///   guess, the hash gives up and the caller rasterises.
+pub fn hash(l: DisplayList, objects: Objects) ?u64 {
+    var h: std.hash.Wyhash = .init(0);
+    feed(&h, l.page);
+    feed(&h, l.unbalanced);
+
+    for (l.fonts) |f| {
+        feedBytes(&h, l.stringOf(f.base_font));
+        feed(&h, objects.of(f.object) orelse return null);
+        feed(&h, f.composite);
+        const spans = f.unicode.slice(l.unicode);
+        feed(&h, spans.len);
+        for (spans) |s| {
+            feed(&h, s.low);
+            feed(&h, s.high);
+            feed(&h, s.step);
+            feedBytes(&h, unicodeText(l, s));
+        }
+    }
+
+    for (l.cmds) |cmd| {
+        feed(&h, std.meta.activeTag(cmd));
+        switch (cmd) {
+            .fill_path => |c| {
+                feedPath(&h, l, c.path);
+                feed(&h, c.rule);
+                if (!feedPaint(&h, c.paint, objects)) return null;
+            },
+            .stroke_path => |c| {
+                feedPath(&h, l, c.path);
+                feed(&h, c.stroke.width);
+                feed(&h, c.stroke.cap);
+                feed(&h, c.stroke.join);
+                feed(&h, c.stroke.miter_limit);
+                feedFloats(&h, l.dashOf(c.stroke));
+                feed(&h, c.stroke.dash_phase);
+                if (!feedPaint(&h, c.paint, objects)) return null;
+                feed(&h, c.ctm);
+            },
+            .clip_push => |c| {
+                feedPath(&h, l, c.path);
+                feed(&h, c.rule);
+            },
+            .text => |t| {
+                feed(&h, t.font);
+                feed(&h, t.transform);
+                feed(&h, t.size);
+                feed(&h, t.mode);
+                if (!feedPaint(&h, t.fill, objects)) return null;
+                feed(&h, t.stroke != null);
+                if (t.stroke) |s| {
+                    feed(&h, s.width);
+                    feed(&h, s.cap);
+                    feed(&h, s.join);
+                    feed(&h, s.miter_limit);
+                    feedFloats(&h, l.dashOf(s));
+                    feed(&h, s.dash_phase);
+                }
+                feed(&h, t.advance);
+                const glyphs = l.glyphsOf(t);
+                feed(&h, glyphs.len);
+                for (glyphs) |g| {
+                    feed(&h, g.code);
+                    feed(&h, g.id);
+                    feed(&h, g.offset);
+                }
+            },
+            .image => |img| {
+                if (img.isInline()) {
+                    feedBytes(&h, l.bytesOf(img.data));
+                    feed(&h, img.bits_per_component);
+                    feed(&h, img.components);
+                    feed(&h, img.inverted);
+                } else {
+                    feed(&h, objects.of(img.object) orelse return null);
+                }
+                feed(&h, img.width);
+                feed(&h, img.height);
+                feed(&h, img.transform);
+                feed(&h, img.is_mask);
+                if (!feedPaint(&h, img.fill, objects)) return null;
+                feed(&h, img.interpolate);
+            },
+            .shading => |sh| if (!feedPaint(&h, .{ .shading = sh }, objects)) return null,
+            .layer_push => |layer| {
+                feed(&h, layer.alpha);
+                feed(&h, layer.blend);
+                const mask: u64 = if (layer.soft_mask == paint.no_object)
+                    0
+                else
+                    objects.of(layer.soft_mask) orelse return null;
+                feed(&h, mask);
+                feed(&h, layer.isolated);
+                feed(&h, layer.knockout);
+            },
+            .marked_begin => |tag| feedBytes(&h, l.stringOf(tag)),
+            .clip_pop, .layer_pop, .marked_end => {},
+        }
+    }
+    return h.final();
+}
+
+fn feedPath(h: *std.hash.Wyhash, l: DisplayList, path: Path) void {
+    const verbs = l.verbsOf(path);
+    feed(h, verbs.len);
+    h.update(std.mem.sliceAsBytes(verbs));
+    const points = l.pointsOf(path);
+    feed(h, points.len);
+    h.update(std.mem.sliceAsBytes(points));
+}
+
+/// False for a paint whose shading or pattern cannot be digested.
+fn feedPaint(h: *std.hash.Wyhash, p: Paint, objects: Objects) bool {
+    feed(h, std.meta.activeTag(p));
+    switch (p) {
+        .solid => |c| feed(h, c),
+        .shading => |s| {
+            feed(h, objects.of(s.object) orelse return false);
+            feed(h, s.kind);
+            feed(h, s.transform);
+        },
+        .tiling => |t| {
+            feed(h, objects.of(t.object) orelse return false);
+            feed(h, t.transform);
+        },
+    }
+    return true;
+}
+
+fn feedFloats(h: *std.hash.Wyhash, values: []const f32) void {
+    feed(h, values.len);
+    h.update(std.mem.sliceAsBytes(values));
+}
+
+/// A length first, so that `"ab" ++ "c"` and `"a" ++ "bc"` differ.
+fn feedBytes(h: *std.hash.Wyhash, bytes: []const u8) void {
+    feed(h, bytes.len);
+    h.update(bytes);
+}
+
+/// One value's bytes, field by field: a struct's padding is undefined and
+/// would make two equal values hash apart.
+fn feed(h: *std.hash.Wyhash, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| inline for (s.fields) |f| feed(h, @field(value, f.name)),
+        .@"enum" => feed(h, @intFromEnum(value)),
+        .bool => h.update(&.{@intFromBool(value)}),
+        .int, .float => h.update(std.mem.asBytes(&value)),
+        else => @compileError("cannot hash a " ++ @typeName(T)),
+    }
+}
+
+fn unicodeText(l: DisplayList, s: UnicodeSpan) []const u8 {
+    const from = @min(s.at, l.unicode_text.len);
+    return l.unicode_text[from..][0..@min(s.len, l.unicode_text.len - from)];
+}
+
 pub fn deinit(l: *DisplayList, gpa: Allocator) void {
     gpa.free(l.cmds);
     gpa.free(l.verbs);
@@ -533,6 +728,90 @@ test "an unmapped code in a simple font falls back to ASCII, and in a CID font d
     const fonts = [_]FontInfo{.{ .composite = true }};
     const cid: DisplayList = .{ .fonts = &fonts };
     try testing.expectEqualStrings("", cid.unicodeFor(0, 'A', &buf));
+}
+
+/// Digests an object as its number, and a second document as the number
+/// shifted: two documents that number their objects differently.
+const Numbered = struct {
+    shift: u32 = 0,
+    /// Stands in for an object whose content changed under the same number.
+    changed: ObjectId = paint.no_object,
+
+    fn objects(n: *Numbered) Objects {
+        return .{ .ptr = n, .digest = digest };
+    }
+
+    fn digest(ptr: *anyopaque, id: ObjectId) ?u64 {
+        const n: *Numbered = @ptrCast(@alignCast(ptr));
+        const content = id - n.shift;
+        return if (id == n.changed) 0xdead else content;
+    }
+};
+
+fn testList(image_object: ObjectId, font_name: []const u8, y: f32) DisplayList {
+    const verbs = struct {
+        const v = [_]Verb{ .move, .line, .close };
+    };
+    const S = struct {
+        var points: [2]Point = undefined;
+        var fonts: [1]FontInfo = undefined;
+        var cmds: [3]DrawCmd = undefined;
+    };
+    S.points = .{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = y } };
+    const path: Path = .{
+        .verbs = .{ .start = 0, .count = 3 },
+        .points = .{ .start = 0, .count = 2 },
+    };
+    S.fonts = .{.{ .name = .{ .start = 0, .count = @intCast(font_name.len) }, .object = image_object + 1 }};
+    S.cmds = .{
+        .{ .fill_path = .{ .path = path, .rule = .nonzero, .paint = .{ .solid = .black } } },
+        .{ .image = .{ .object = image_object, .width = 4, .height = 4 } },
+        .{ .text = .{ .font = 0 } },
+    };
+    return .{
+        .cmds = &S.cmds,
+        .verbs = &verbs.v,
+        .points = &S.points,
+        .fonts = &S.fonts,
+        .strings = font_name,
+        .page = .fromRect(0, 0, 612, 792),
+    };
+}
+
+test "two lists that draw the same page hash the same, whatever their objects are numbered" {
+    var first: Numbered = .{};
+    var second: Numbered = .{ .shift = 40 };
+    const a = testList(7, "F1", 20).hash(first.objects()).?;
+    const b = testList(47, "F1", 20).hash(second.objects()).?;
+    try testing.expectEqual(a, b);
+
+    // A resource name is not drawn, so it is not hashed.
+    const renamed = testList(47, "TT0", 20).hash(second.objects()).?;
+    try testing.expectEqual(a, renamed);
+}
+
+test "a moved point or a replaced object changes the hash" {
+    var numbered: Numbered = .{};
+    const a = testList(7, "F1", 20).hash(numbered.objects()).?;
+    try testing.expect(a != testList(7, "F1", 20.5).hash(numbered.objects()).?);
+
+    // The number stayed and the figure behind it did not: the case a hash
+    // over object numbers would call identical.
+    var replaced: Numbered = .{ .changed = 7 };
+    try testing.expect(a != testList(7, "F1", 20).hash(replaced.objects()).?);
+}
+
+test "an object with no number cannot be vouched for" {
+    var numbered: Numbered = .{};
+    const cmds = [_]DrawCmd{.{ .image = .{ .object = paint.no_object, .width = 4, .height = 4 } }};
+    const l: DisplayList = .{ .cmds = &cmds };
+    try testing.expectEqual(@as(?u64, null), l.hash(numbered.objects()));
+
+    // An inline image carries its own samples and needs no object.
+    const data = [_]u8{ 1, 2, 3 };
+    const inline_cmds = [_]DrawCmd{.{ .image = .{ .width = 1, .height = 1, .data = .{ .start = 0, .count = 3 } } }};
+    const with_data: DisplayList = .{ .cmds = &inline_cmds, .bytes = &data };
+    try testing.expect(with_data.hash(numbered.objects()) != null);
 }
 
 test "a span list is searched, not scanned, so the order it was built in is irrelevant" {

@@ -14,6 +14,7 @@ const Io = std.Io;
 const fenrir = @import("fenrir");
 
 const Context = @import("Context.zig");
+const Digests = @import("digest.zig").Digests;
 
 const content = fenrir.content;
 const search = fenrir.hlidskjalf.search;
@@ -37,6 +38,11 @@ pub const usage =
     \\                 over. `--lines` is the same text with its geometry.
     \\    --find Q     Every match of Q on the page, with the boxes a
     \\                 highlight would be drawn over. Pair with --all.
+    \\    --hash       The display list's hash, which is what `fenrir diff`
+    \\                 compares before it draws anything. Two pages that
+    \\                 print the same hash draw the same page, in this file
+    \\                 or in another. A dash is a page that cannot be vouched
+    \\                 for, and would be drawn.
     \\    --no-rotate  Ignore /Rotate, so coordinates match the file's own
     \\                 numbers rather than what a reader would display.
     \\    --no-type3   Do not run Type 3 glyph procedures.
@@ -81,6 +87,8 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             shape = .find;
         } else if (std.mem.eql(u8, arg, "--lines")) {
             shape = .lines;
+        } else if (std.mem.eql(u8, arg, "--hash")) {
+            shape = .hash;
         } else if (std.mem.eql(u8, arg, "--no-rotate")) {
             options.rotate = false;
         } else if (std.mem.eql(u8, arg, "--no-type3")) {
@@ -109,15 +117,24 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
 
     if (list.len == 0) return ctx.fail("this document has no pages", .{});
 
+    // For `--hash`, and kept across pages: a document draws every page in
+    // the same few fonts.
+    var digests: Digests = .init(ctx.gpa, &doc);
+    defer digests.deinit();
+
     if (all) {
         var total: content.Interpreter.Diagnostics = .{};
         for (list, 0..) |p, index| {
-            if (index != 0) try ctx.out.writeByte('\n');
-            try ctx.out.print("# ---- page {d} of {d} ----\n", .{ index + 1, list.len });
-            const diag = try tracePage(ctx, &doc, p, options, trace_options, shape, query);
+            // One line a page is the point of `--hash`: two documents' runs
+            // are meant to be put side by side.
+            if (shape != .hash) {
+                if (index != 0) try ctx.out.writeByte('\n');
+                try ctx.out.print("# ---- page {d} of {d} ----\n", .{ index + 1, list.len });
+            }
+            const diag = try tracePage(ctx, &doc, p, options, trace_options, shape, query, &digests);
             accumulate(&total, diag);
         }
-        try ctx.out.print("\n# {d} pages\n", .{list.len});
+        if (shape != .hash) try ctx.out.print("\n# {d} pages\n", .{list.len});
         try writeDiagnostics(ctx, total);
         return;
     }
@@ -134,12 +151,13 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         trace_options,
         shape,
         query,
+        &digests,
     );
     try writeDiagnostics(ctx, diag);
 }
 
 /// What `trace` prints for a page.
-const Shape = enum { list, stats, lines, text, find };
+const Shape = enum { list, stats, lines, text, find, hash };
 
 fn tracePage(
     ctx: *Context,
@@ -149,10 +167,20 @@ fn tracePage(
     trace_options: trace.Options,
     shape: Shape,
     query: []const u8,
+    digests: *Digests,
 ) !content.Interpreter.Diagnostics {
     var result = content.page(ctx.gpa, doc, p, options) catch |err|
         return ctx.fail("page {d}: {t}", .{ p.index + 1, err });
     defer result.deinit(ctx.gpa);
+
+    if (shape == .hash) {
+        if (result.list.hash(digests.objects())) |h| {
+            try ctx.out.print("page {d}  {x:0>16}\n", .{ p.index + 1, h });
+        } else {
+            try ctx.out.print("page {d}  -\n", .{p.index + 1});
+        }
+        return result.diagnostics;
+    }
 
     if (shape == .lines) {
         // The same map the reader puts a caret and a selection on, which is
