@@ -94,6 +94,8 @@ pub const Id = enum {
     mprevious,
     cnext,
     cprevious,
+    dnext,
+    dprevious,
     lua,
     messages,
     plugins,
@@ -172,6 +174,8 @@ pub const table = [_]Entry{
     .{ .id = .mprevious, .name = "mprevious", .aliases = &.{"mp"}, .icon = "fenrir.chevron_left", .binding = "[a", .about = "the previous mark in reading order" },
     .{ .id = .cnext, .name = "cnext", .aliases = &.{"cn"}, .icon = "fenrir.chevron_right", .binding = "]c", .about = "the next comment: a mark with a note on it" },
     .{ .id = .cprevious, .name = "cprevious", .aliases = &.{"cp"}, .icon = "fenrir.chevron_left", .binding = "[c", .about = "the previous comment" },
+    .{ .id = .dnext, .name = "dnext", .aliases = &.{"dn"}, .icon = "fenrir.chevron_right", .binding = "]d", .about = "the next change between two documents, in fenrir diff" },
+    .{ .id = .dprevious, .name = "dprevious", .aliases = &.{"dp"}, .icon = "fenrir.chevron_left", .binding = "[d", .about = "the previous change between two documents" },
 
     .{ .id = .lua, .name = "lua", .args = "CODE", .needs_argument = true, .icon = "fenrir.menu", .about = "run a line of Lua in the plugin runtime" },
     .{ .id = .messages, .name = "messages", .icon = "fenrir.note", .about = "what the plugins have said, and why one failed" },

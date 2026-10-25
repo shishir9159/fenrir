@@ -187,6 +187,9 @@ pub const Command = union(enum) {
     /// from wherever the reader is -- in normal mode as well as edit, because
     /// reading through what was marked is reading, not changing it.
     jump_mark: Jump,
+    /// `]d` and `[d`: the next or previous change between two documents,
+    /// forwards when true. Anywhere `]a` is.
+    jump_change: bool,
     recolour_mark: u8,
     delete_mark,
 
@@ -782,6 +785,7 @@ fn bracketKey(c: u21, forwards: bool) ?Command {
     return switch (c) {
         'a' => .{ .jump_mark = .{ .forwards = forwards } },
         'c' => .{ .jump_mark = .{ .forwards = forwards, .comments = true } },
+        'd' => .{ .jump_change = forwards },
         else => null,
     };
 }
@@ -1042,6 +1046,15 @@ test "]a and [c step marks and comments, in normal mode and in edit" {
     state.mode = .edit;
     try testing.expect(command(&state, typing("]c")).items()[0].jump_mark.comments);
     try testing.expectEqual(Mode.edit, state.mode);
+}
+
+test "]d steps changes, and its d does not start drawing" {
+    var state: State = .{};
+    try testing.expect(command(&state, typing("]d")).items()[0].jump_change);
+    try testing.expect(!command(&state, typing("[d")).items()[0].jump_change);
+    // `d` on its own is draw mode; after a bracket it is a letter the
+    // bracket asked for.
+    try testing.expectEqual(Mode.normal, state.mode);
 }
 
 test "a letter ] does not name does nothing, and escape abandons the prefix" {

@@ -40,6 +40,7 @@ const Digests = @import("digest.zig").Digests;
 const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const Lap = @import("raster.zig").Lap;
+const read = @import("read.zig");
 
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
@@ -51,13 +52,13 @@ const Framebuffer = gleipnir.Framebuffer;
 pub const usage =
     \\fenrir diff <a.pdf> <b.pdf> [options]
     \\
-    \\    Compares two documents page by page, as diff-pdf does. Pages whose
-    \\    display lists hash the same are identical without being drawn; the
-    \\    rest are rasterised and compared pixel by pixel.
+    \\    Compares two documents page by page, as diff-pdf does, and opens them
+    \\    side by side at the first difference. Pages whose display lists hash
+    \\    the same are identical without being drawn; the rest are rasterised
+    \\    and compared pixel by pixel.
     \\
-    \\    --report                     Print the pages that differ, and exit.
-    \\                                 There is no view yet, so this is what
-    \\                                 happens with or without it.
+    \\    --report                     Print the pages that differ, and exit
+    \\                                 without opening a window.
     \\    --per-page-pixel-tolerance N A page differs only when more than N
     \\                                 of its pixels do. Defaults to 10.
     \\    --channel-tolerance N        A pixel differs when a channel moves by
@@ -80,8 +81,17 @@ pub const usage =
     \\                                 differences are in colour.
     \\    --time                       Where the time went, on stderr.
     \\
+    \\    The view takes the reader's --size, --frames, --shot, --path, --vsync,
+    \\    --samples, --db, --config, --clean, --gpu, --validate and --device.
+    \\
     \\    Exits 0 when the documents are the same, 1 when they differ, 2 for
     \\    bad arguments and 3 when a file would not open.
+    \\
+    \\in the view -- the first document on the left, the second on the right:
+    \\    both windows scroll and zoom together, page against the page it was
+    \\    compared with; the changes are washed red on the left and green on
+    \\    the right, and ticked on the scrollbar
+    \\    ]d / [d              the next / previous change
 ;
 
 /// diff-pdf's exit codes.
@@ -156,6 +166,103 @@ pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
     gpa.free(results);
 }
 
+/// A finished comparison as the view reads it: each pair, what it found, and
+/// which pair each page of each document is in.
+///
+/// The documents are sides 0 and 1, which are also their buffer numbers in
+/// the reader.
+pub const Comparison = struct {
+    pairs: []const Pair,
+    results: []const Result,
+    /// Pixels per point the regions were measured in.
+    factor: f32,
+    /// Each page's pair, by side.
+    pair_of: [2][]u32,
+    /// Every change in order: each region of each differing pair, and a
+    /// page one document has alone as a change of its own. What `]d` walks.
+    changes: []Change,
+
+    pub const Change = struct {
+        pair: u32,
+        /// Null for a whole page: added, removed, or not compared.
+        region: ?u32,
+    };
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        pairs: []const Pair,
+        results: []const Result,
+        counts: [2]usize,
+        factor: f32,
+    ) !Comparison {
+        var pair_of: [2][]u32 = undefined;
+        pair_of[0] = try gpa.alloc(u32, counts[0]);
+        errdefer gpa.free(pair_of[0]);
+        pair_of[1] = try gpa.alloc(u32, counts[1]);
+        errdefer gpa.free(pair_of[1]);
+        for (pairs, 0..) |p, i| {
+            if (p.a) |a| pair_of[0][a] = @intCast(i);
+            if (p.b) |b| pair_of[1][b] = @intCast(i);
+        }
+
+        var changes: std.ArrayList(Change) = .empty;
+        errdefer changes.deinit(gpa);
+        for (results, 0..) |r, i| {
+            if (!r.differs()) continue;
+            if (r.regions.len == 0) try changes.append(gpa, .{ .pair = @intCast(i), .region = null });
+            for (0..r.regions.len) |k| try changes.append(gpa, .{ .pair = @intCast(i), .region = @intCast(k) });
+        }
+        return .{
+            .pairs = pairs,
+            .results = results,
+            .factor = factor,
+            .pair_of = pair_of,
+            .changes = try changes.toOwnedSlice(gpa),
+        };
+    }
+
+    pub fn deinit(c: *Comparison, gpa: std.mem.Allocator) void {
+        gpa.free(c.pair_of[0]);
+        gpa.free(c.pair_of[1]);
+        gpa.free(c.changes);
+    }
+
+    /// What was found for the pair a page is in.
+    pub fn resultOn(c: Comparison, side: u1, page: u32) Result {
+        if (page >= c.pair_of[side].len) return .{};
+        return c.results[c.pair_of[side][page]];
+    }
+
+    /// The page of the other document at the same place as `page` of this
+    /// one: its partner, or for a page one document has alone, the partner
+    /// of the nearest page before it that has one -- so scrolling through
+    /// three inserted pages holds the other side still rather than jumping.
+    pub fn partner(c: Comparison, side: u1, page: u32) u32 {
+        if (page >= c.pair_of[side].len) return 0;
+        var i = c.pair_of[side][page];
+        while (true) : (i -= 1) {
+            const p = c.pairs[i];
+            if (if (side == 0) p.b else p.a) |other| return other;
+            if (i == 0) break;
+        }
+        // Nothing before it has a partner: the other side's first page.
+        return 0;
+    }
+
+    /// A change's page on one side, and how far down it the change starts,
+    /// in points. A change on a page this side does not have is placed at
+    /// the partner that side scrolls to.
+    pub fn changeAt(c: Comparison, side: u1, change: Change) struct { page: u32, down: f32 } {
+        const p = c.pairs[change.pair];
+        const page = (if (side == 0) p.a else p.b) orelse c.partner(side ^ 1, (if (side == 0) p.b else p.a).?);
+        const down = if (change.region) |r|
+            @as(f32, @floatFromInt(c.results[change.pair].regions[r].y0)) / c.factor
+        else
+            0;
+        return .{ .page = page, .down = down };
+    }
+};
+
 /// Pages by number, as diff-pdf pairs them: the first with the first, and
 /// whatever one document has past the other's end on its own.
 pub fn pairByNumber(gpa: std.mem.Allocator, a_pages: usize, b_pages: usize) ![]Pair {
@@ -172,12 +279,15 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     var given: usize = 0;
     var options: Options = .{};
     var timing = false;
+    var report_only = false;
+    // What the view is opened with: the two files, then these.
+    var reader_args: std.ArrayList([]const u8) = .empty;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (std.mem.eql(u8, arg, "--report")) {
-            // Nothing else to do yet: see the usage.
+            report_only = true;
         } else if (std.mem.eql(u8, arg, "--per-page-pixel-tolerance")) {
             i += 1;
             if (i == argv.len) return bad(ctx, "{s} needs a number", .{arg});
@@ -215,6 +325,13 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             options.grayscale = true;
         } else if (std.mem.eql(u8, arg, "--time")) {
             timing = true;
+        } else if (readerOption(arg)) |takes_value| {
+            try reader_args.append(ctx.gpa, arg);
+            if (takes_value) {
+                i += 1;
+                if (i == argv.len) return bad(ctx, "{s} needs a value", .{arg});
+                try reader_args.append(ctx.gpa, argv[i]);
+            }
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return bad(ctx, "unknown option {s}", .{arg});
         } else {
@@ -257,10 +374,32 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     for (results) |r| {
         if (r.differs()) differing += 1;
     }
-    try report(ctx.out, pairs, results, names, @max(counts[0], counts[1]), options);
-
     if (timing) clocked.print(ctx, wall.lap());
-    ctx.exit = if (differing == 0) exit_same else exit_differ;
+    const verdict: u8 = if (differing == 0) exit_same else exit_differ;
+
+    if (report_only) {
+        try report(ctx.out, pairs, results, names, @max(counts[0], counts[1]), options);
+        ctx.exit = verdict;
+        return;
+    }
+
+    ctx.note("{d} of {d} pages differ", .{ differing, pairs.len });
+    var comparison: Comparison = try .init(ctx.gpa, pairs, results, counts, options.dpi / 72.0);
+    defer comparison.deinit(ctx.gpa);
+    try reader_args.insertSlice(ctx.gpa, 0, &files);
+    try read.runWith(ctx, reader_args.items, &comparison);
+    ctx.exit = verdict;
+}
+
+/// The reader's options `fenrir diff` passes on to the view, and whether each
+/// takes a value. `--dpi` and `--time` are not among them: here they mean the
+/// comparison's.
+fn readerOption(arg: []const u8) ?bool {
+    const with_value = [_][]const u8{ "--size", "--frames", "--shot", "--path", "--vsync", "--db", "--config", "--gpu", "--samples" };
+    const alone = [_][]const u8{ "--clean", "--validate", "--device" };
+    for (with_value) |o| if (std.mem.eql(u8, arg, o)) return true;
+    for (alone) |o| if (std.mem.eql(u8, arg, o)) return false;
+    return null;
 }
 
 /// A bad argument: diff-pdf's 2, not the usual 1.
@@ -1135,6 +1274,43 @@ test "the overlay: a's ink red, b's blue, both dark, and grey where nothing chan
     overlay(out, a, b, 0, true);
     try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, out.pixels[0..4]);
     try testing.expectEqualSlices(f32, &.{ 0.5, 0.5, 0.5, 1 }, out.pixels[8..12]);
+}
+
+test "a page one document has alone sits beside the page before it, and is a change" {
+    // Two pages inserted into the second document after its second page.
+    const pairs = [_]Pair{
+        .{ .a = 0, .b = 0 },
+        .{ .a = 1, .b = 1 },
+        .{ .a = null, .b = 2 },
+        .{ .a = null, .b = 3 },
+        .{ .a = 2, .b = 4 },
+    };
+    const results = [_]Result{
+        .{ .kind = .same_list },
+        .{ .kind = .differ, .regions = &.{
+            .{ .x0 = 0, .y0 = 100, .x1 = 16, .y1 = 116 },
+            .{ .x0 = 0, .y0 = 400, .x1 = 16, .y1 = 416 },
+        } },
+        .{ .kind = .only_b },
+        .{ .kind = .only_b },
+        .{ .kind = .same_pixels },
+    };
+    var c: Comparison = try .init(testing.allocator, &pairs, &results, .{ 3, 5 }, 2);
+    defer c.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u32, 1), c.partner(1, 2));
+    try testing.expectEqual(@as(u32, 1), c.partner(1, 3));
+    try testing.expectEqual(@as(u32, 2), c.partner(1, 4));
+    try testing.expectEqual(@as(u32, 4), c.partner(0, 2));
+
+    // Two regions and two whole pages, in order.
+    try testing.expectEqual(@as(usize, 4), c.changes.len);
+    const second = c.changeAt(0, c.changes[1]);
+    try testing.expectEqual(@as(u32, 1), second.page);
+    try testing.expectEqual(@as(f32, 200), second.down);
+    // An inserted page, seen from the document without it.
+    try testing.expectEqual(@as(u32, 1), c.changeAt(0, c.changes[3]).page);
+    try testing.expectEqual(@as(u32, 3), c.changeAt(1, c.changes[3]).page);
 }
 
 test "the report lists what differs and counts it" {
