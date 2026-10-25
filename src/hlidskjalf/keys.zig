@@ -131,6 +131,13 @@ pub const Command = union(enum) {
     /// `<C-w>T`: move the focused window into a tabpage of its own.
     window_to_tab,
 
+    // -- a comparison
+    /// `gd` and `gD`: the next or previous way of showing two documents --
+    /// side by side, laid over each other, the first alone, the second
+    /// alone. `gD` back from the second alone is the first alone, so the two
+    /// keys in turn blink between them.
+    diff_view: i32,
+
     // -- buffers
     next_buffer,
     previous_buffer,
@@ -776,6 +783,8 @@ fn tabKey(c: u21) ?Command {
     return switch (c) {
         't' => .{ .go_tab = 1 },
         'T' => .{ .go_tab = -1 },
+        'd' => .{ .diff_view = 1 },
+        'D' => .{ .diff_view = -1 },
         else => null,
     };
 }
@@ -1001,6 +1010,14 @@ test "gt and gT are two keys apart, which is why they are read as codepoints" {
 
     _ = command(&state, typing("g"));
     try testing.expectEqual(@as(i32, -1), command(&state, typing("T")).items()[0].go_tab);
+}
+
+test "gd and gD turn the way two documents are shown, and neither draws" {
+    var state: State = .{};
+    try testing.expectEqual(@as(i32, 1), command(&state, typing("gd")).items()[0].diff_view);
+    try testing.expectEqual(@as(i32, -1), command(&state, typing("gD")).items()[0].diff_view);
+    // The `d` belonged to the `g`: still reading, not drawing.
+    try testing.expectEqual(Mode.normal, state.mode);
 }
 
 test "a whole tabpage command typed inside one frame still means one thing" {

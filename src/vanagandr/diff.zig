@@ -92,6 +92,12 @@ pub const usage =
     \\    compared with; the changes are washed red on the left and green on
     \\    the right, and ticked on the scrollbar
     \\    ]d / [d              the next / previous change
+    \\    gd / gD              side by side, then laid over each other (red
+    \\                         only in the first, blue only in the second),
+    \\                         then the first alone, then the second alone;
+    \\                         gD goes back, so gd gD gd blinks between the
+    \\                         two at one place
+    \\    :diff side|overlay|first|second   one of those by name
 ;
 
 /// diff-pdf's exit codes.
@@ -174,7 +180,9 @@ pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
 pub const Comparison = struct {
     pairs: []const Pair,
     results: []const Result,
-    /// Pixels per point the regions were measured in.
+    /// What it was compared with. `factor` is its dpi as pixels per point,
+    /// which is what the regions are measured in.
+    options: Options,
     factor: f32,
     /// Each page's pair, by side.
     pair_of: [2][]u32,
@@ -193,7 +201,7 @@ pub const Comparison = struct {
         pairs: []const Pair,
         results: []const Result,
         counts: [2]usize,
-        factor: f32,
+        options: Options,
     ) !Comparison {
         var pair_of: [2][]u32 = undefined;
         pair_of[0] = try gpa.alloc(u32, counts[0]);
@@ -215,7 +223,8 @@ pub const Comparison = struct {
         return .{
             .pairs = pairs,
             .results = results,
-            .factor = factor,
+            .options = options,
+            .factor = options.dpi / 72.0,
             .pair_of = pair_of,
             .changes = try changes.toOwnedSlice(gpa),
         };
@@ -384,7 +393,7 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     }
 
     ctx.note("{d} of {d} pages differ", .{ differing, pairs.len });
-    var comparison: Comparison = try .init(ctx.gpa, pairs, results, counts, options.dpi / 72.0);
+    var comparison: Comparison = try .init(ctx.gpa, pairs, results, counts, options);
     defer comparison.deinit(ctx.gpa);
     try reader_args.insertSlice(ctx.gpa, 0, &files);
     try read.runWith(ctx, reader_args.items, &comparison);
@@ -989,7 +998,7 @@ pub fn regionsOf(gpa: std.mem.Allocator, scratch: std.mem.Allocator, tiles: Tile
 }
 
 /// White paper the size of `like`.
-fn blank(gpa: std.mem.Allocator, like: Framebuffer) !Framebuffer {
+pub fn blank(gpa: std.mem.Allocator, like: Framebuffer) !Framebuffer {
     var fb = try Framebuffer.init(gpa, like.width, like.height, .srgb);
     fb.clear(.white);
     return fb;
@@ -1003,7 +1012,7 @@ fn blank(gpa: std.mem.Allocator, like: Framebuffer) !Framebuffer {
 /// round, and green is dark wherever either is. Shared ink is dark in all
 /// three. With `grayscale`, a pixel within the tolerance is drawn as a grey
 /// of `a` instead, so the colour is only where something changed.
-fn overlay(out: Framebuffer, a: Framebuffer, b: Framebuffer, tolerance: u8, grayscale: bool) void {
+pub fn overlay(out: Framebuffer, a: Framebuffer, b: Framebuffer, tolerance: u8, grayscale: bool) void {
     const tol: f32 = @floatFromInt(tolerance);
     for (0..out.height) |yy| for (0..out.width) |xx| {
         const x: u32 = @intCast(xx);
@@ -1295,7 +1304,7 @@ test "a page one document has alone sits beside the page before it, and is a cha
         .{ .kind = .only_b },
         .{ .kind = .same_pixels },
     };
-    var c: Comparison = try .init(testing.allocator, &pairs, &results, .{ 3, 5 }, 2);
+    var c: Comparison = try .init(testing.allocator, &pairs, &results, .{ 3, 5 }, .{ .dpi = 144 });
     defer c.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u32, 1), c.partner(1, 2));

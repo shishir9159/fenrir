@@ -612,11 +612,13 @@ const Slot = struct {
     height: u32 = 0,
     /// A monotonic frame stamp, for evicting the least recently drawn.
     used: u64 = 0,
+    /// The page laid over its partner in a comparison, not the page alone.
+    overlay: bool = false,
 
     const no_page = std.math.maxInt(u32);
 
-    fn matches(s: Slot, buffer: u32, page: u32, zoom: f32) bool {
-        return s.buffer == buffer and s.page == page and s.zoom == zoom;
+    fn matches(s: Slot, buffer: u32, page: u32, zoom: f32, overlay: bool) bool {
+        return s.buffer == buffer and s.page == page and s.zoom == zoom and s.overlay == overlay;
     }
 };
 
@@ -781,8 +783,9 @@ const Job = struct {
     /// both. `.text` is the same interpretation with the drawing thrown
     /// away, which is what a search wants from the six hundred pages nobody
     /// is looking at -- rasterising them would be a hundred times the work
-    /// for pixels that go straight in the bin.
-    const Want = enum { page, text };
+    /// for pixels that go straight in the bin. `.overlay` is a page of the
+    /// first document of a comparison laid over its partner in the second.
+    const Want = enum { page, text, overlay };
 
     fn eql(a: Job, b: Job) bool {
         return a.buffer == b.buffer and a.page == b.page and
@@ -1077,6 +1080,8 @@ const Session = struct {
     diff_seen: [2]Seen = @splat(.{}),
     /// The change `]d` last landed on, and where that left its window.
     diff_at: ?struct { change: u32, side: u1, scroll: f32 } = null,
+    /// How the comparison is on screen. `gd` turns it.
+    diff_showing: Showing = .side_by_side,
     /// Each document's scrollbar ticks, as fractions of its height, and the
     /// zoom they were worked out at.
     diff_ticks: [2]struct { zoom: f32 = 0, at: std.ArrayList(f32) = .empty } = @splat(.{}),
@@ -1523,6 +1528,13 @@ const Session = struct {
         const gpa = s.gpa;
         const b = s.buffer(job.buffer);
 
+        // Two pages and no text map: the cursor's map is a `.page` job's,
+        // asked for separately when the cursor wants it.
+        if (job.want == .overlay) {
+            out.result = .{ .cpu = try s.rasteriseOverlay(job) };
+            return;
+        }
+
         var result = try content.page(gpa, b.doc, b.pages[job.page], .{});
         defer result.deinit(gpa);
 
@@ -1575,9 +1587,28 @@ const Session = struct {
     /// than from the view, because a view belongs to the frame loop and can
     /// change underneath this at any moment.
     fn rasterise(s: *Session, job: Job, list: gelgja.DisplayList, b: *Buffer) !Image {
+        var canvas = try s.drawCanvas(job.buffer, job.page, list, job.zoom, b);
+        defer canvas.deinit(s.gpa);
+        return .{
+            .pixels = try canvas.fb.toRgba8(s.gpa),
+            .width = canvas.width(),
+            .height = canvas.height(),
+        };
+    }
+
+    /// The page on white paper at a zoom, or at half of it as often as the
+    /// canvas has to be halved to fit `max_page_pixels`.
+    fn drawCanvas(
+        s: *Session,
+        buffer_index: u32,
+        page: u32,
+        list: gelgja.DisplayList,
+        want_zoom: f32,
+        b: *Buffer,
+    ) !gleipnir.raster.Canvas {
         const gpa = s.gpa;
 
-        var zoom = job.zoom;
+        var zoom = want_zoom;
         var size = replay.canvasSize(list.page, zoom);
         while (@as(u64, size[0]) * size[1] > max_page_pixels and zoom > min_zoom) {
             zoom *= 0.5;
@@ -1585,13 +1616,13 @@ const Session = struct {
         }
 
         var canvas = try gleipnir.raster.Canvas.init(gpa, size[0], size[1], .{ .samples = s.samples });
-        defer canvas.deinit(gpa);
+        errdefer canvas.deinit(gpa);
         canvas.fb.clear(.white);
 
-        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, &s.faces.items[job.buffer]);
+        var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, &s.faces.items[buffer_index]);
         defer glyphs.deinit();
 
-        var images: Images = .init(gpa, b.doc, b.pages[job.page].resources);
+        var images: Images = .init(gpa, b.doc, b.pages[page].resources);
         defer images.deinit();
 
         _ = try replay.render(
@@ -1601,12 +1632,7 @@ const Session = struct {
             replay.pageTransform(list.page, zoom),
             .{ .glyphs = glyphs.source(), .images = images.source() },
         );
-
-        return .{
-            .pixels = try canvas.fb.toRgba8(gpa),
-            .width = size[0],
-            .height = size[1],
-        };
+        return canvas;
     }
 
     /// One page, recorded as outlines for the GPU pipeline, in *page space*:
@@ -1647,22 +1673,24 @@ const Session = struct {
     /// zoom throws away the CPU cache and leaves the GPU cache untouched --
     /// and two windows at two zooms need two CPU entries and one GPU entry.
     fn cached(s: *const Session, v: *const View, page: u32) bool {
+        // An overlay is pixels on either backend: see `rasteriseOverlay`.
+        if (s.overlaid(v)) return s.cachedSlot(v.buffer, page, v.zoom, true) != null;
         return switch (s.backend) {
-            .cpu => s.cachedSlot(v.buffer, page, v.zoom) != null,
+            .cpu => s.cachedSlot(v.buffer, page, v.zoom, false) != null,
             .gpu => s.recorded.has(v.buffer, page),
         };
     }
 
-    fn cachedSlot(s: *const Session, buf: u32, page: u32, zoom: f32) ?*const Slot {
+    fn cachedSlot(s: *const Session, buf: u32, page: u32, zoom: f32, overlay: bool) ?*const Slot {
         for (&s.slots) |*slot| {
-            if (slot.matches(buf, page, zoom)) return slot;
+            if (slot.matches(buf, page, zoom, overlay)) return slot;
         }
         return null;
     }
 
-    fn slotFor(s: *Session, buf: u32, page: u32, zoom: f32) ?*Slot {
+    fn slotFor(s: *Session, buf: u32, page: u32, zoom: f32, overlay: bool) ?*Slot {
         for (&s.slots) |*slot| {
-            if (slot.matches(buf, page, zoom)) return slot;
+            if (slot.matches(buf, page, zoom, overlay)) return slot;
         }
         return null;
     }
@@ -1762,7 +1790,7 @@ const Session = struct {
 
         var after = range.end;
         while (after < @min(range.end + read_ahead, v.pages.len)) : (after += 1) {
-            const job: Job = .{ .buffer = v.buffer, .page = after, .zoom = v.zoom };
+            const job: Job = .{ .buffer = v.buffer, .page = after, .zoom = v.zoom, .want = s.pixelsFor(v) };
             if (s.failed(job)) continue;
             if (!s.cached(v, after)) return job;
         }
@@ -1770,7 +1798,7 @@ const Session = struct {
         var back: u32 = 0;
         while (back < read_ahead and back < range.first) : (back += 1) {
             const page = range.first - 1 - back;
-            const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom };
+            const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = s.pixelsFor(v) };
             if (s.failed(job)) continue;
             if (!s.cached(v, page)) return job;
         }
@@ -1781,7 +1809,7 @@ const Session = struct {
         const range = v.visiblePages();
         var i = range.first;
         while (i < range.end) : (i += 1) {
-            const job: Job = .{ .buffer = v.buffer, .page = i, .zoom = v.zoom };
+            const job: Job = .{ .buffer = v.buffer, .page = i, .zoom = v.zoom, .want = s.pixelsFor(v) };
             if (s.failed(job)) continue;
             if (!s.cached(v, i)) return job;
         }
@@ -1876,6 +1904,7 @@ const Session = struct {
         slot.buffer = finished.job.buffer;
         slot.page = finished.job.page;
         slot.zoom = finished.job.zoom;
+        slot.overlay = finished.job.want == .overlay;
         slot.width = image.width;
         slot.height = image.height;
         slot.used = s.stamp;
@@ -2462,6 +2491,145 @@ const Session = struct {
         s.lockComparison();
     }
 
+    /// How a comparison is on screen, in the order `gd` goes round them:
+    /// diff-pdf's view, its `Ctrl+D` overlay, and its `Ctrl+<` and `Ctrl+>`.
+    const Showing = enum {
+        side_by_side,
+        /// One window on the first document's pages, each drawn as both
+        /// pages laid over each other.
+        overlay,
+        first,
+        second,
+
+        /// The word `:diff` takes for each.
+        fn byName(name: []const u8) ?Showing {
+            const names = [_]struct { []const u8, Showing }{
+                .{ "side", .side_by_side },
+                .{ "overlay", .overlay },
+                .{ "first", .first },
+                .{ "second", .second },
+            };
+            for (names) |n| if (std.mem.eql(u8, n[0], name)) return n[1];
+            return null;
+        }
+
+        fn label(s: Showing) []const u8 {
+            return switch (s) {
+                .side_by_side => "side by side",
+                .overlay => "laid over each other -- red only in the first, blue only in the second",
+                .first => "the first document alone",
+                .second => "the second document alone",
+            };
+        }
+    };
+
+    /// `gd` and `gD`: round the ways of showing a comparison.
+    fn turnComparison(s: *Session, delta: i32) void {
+        const n: i32 = @typeInfo(Showing).@"enum".fields.len;
+        const next = @mod(@as(i32, @intFromEnum(s.diff_showing)) + delta, n);
+        s.showComparison(@enumFromInt(next));
+    }
+
+    /// Shows the comparison as `want`, at the place the reader is now.
+    ///
+    /// Two windows for side by side and one for the rest. The one kept is
+    /// the focused one, moved to the page of its new document that was
+    /// compared with the page it was on -- which is what makes flipping
+    /// between the first alone and the second alone a blink comparator: the
+    /// page does not move, and the eye catches what did.
+    fn showComparison(s: *Session, want: Showing) void {
+        const cmp = s.diff orelse {
+            s.status = "nothing is being compared -- fenrir diff A B";
+            return;
+        };
+        if (want == s.diff_showing) return;
+
+        const v = s.view();
+        const side: u1 = if (v.buffer == 1) 1 else 0;
+        const at = v.place();
+        const pages: [2]u32 = .{
+            if (side == 0) at.page else cmp.partner(1, at.page),
+            if (side == 1) at.page else cmp.partner(0, at.page),
+        };
+
+        s.layout().only(s.gpa);
+        s.placed = null;
+        const kept = s.view();
+        const alone: u1 = if (want == .second) 1 else 0;
+        s.showDocument(kept, alone, .{ .page = pages[alone], .offset = at.offset, .zoom = at.zoom });
+
+        if (want == .side_by_side) {
+            s.splitWindow(.vertical);
+            // The new window is focused, and on the right.
+            s.showDocument(s.view(), 1, .{ .page = pages[1], .offset = at.offset, .zoom = at.zoom });
+            _ = s.layout().focusSide(.left);
+            s.diff_seen = @splat(.{});
+        }
+        s.diff_showing = want;
+        s.dirty_title = true;
+        s.say("{s}", .{want.label()});
+    }
+
+    /// A window put on a document at a place. A fitted window fits the
+    /// rectangle it has now -- half the width it had, or twice -- and a free
+    /// one keeps the zoom it was at; the place is in points either way.
+    fn showDocument(s: *Session, v: *View, index: u32, place: View.Place) void {
+        v.buffer = index;
+        v.pages = s.buffer(index).pages;
+        v.cursor = .{};
+        v.anchor = null;
+        if (v.fit == .free) v.zoom = place.zoom else v.refit();
+        v.goTo(place);
+    }
+
+    /// Whether this window draws the overlay rather than its own pages.
+    fn overlaid(s: *const Session, v: *const View) bool {
+        return s.diff_showing == .overlay and v.buffer == 0;
+    }
+
+    /// What the worker is asked for to put this window's pages on screen.
+    fn pixelsFor(s: *const Session, v: *const View) Job.Want {
+        return if (s.overlaid(v)) .overlay else .page;
+    }
+
+    /// A page of the first document and its partner in the second, drawn at
+    /// the job's zoom and laid over each other as `--output-diff` lays them.
+    ///
+    /// One picture the size of the first document's page, uploaded as that
+    /// page's texture on either backend: the GPU path draws outlines, and
+    /// "red where only one of two outlines is" is not a blend mode it has or
+    /// should grow for this.
+    ///
+    /// **Runs on the rasterising thread**, which owns both documents.
+    fn rasteriseOverlay(s: *Session, job: Job) !Image {
+        const cmp = s.diff.?;
+        const gpa = s.gpa;
+        const pair = cmp.pairs[cmp.pair_of[0][job.page]];
+
+        var canvases: [2]?gleipnir.raster.Canvas = .{ null, null };
+        defer for (&canvases) |*c| if (c.*) |*canvas| canvas.deinit(gpa);
+        for ([2]?u32{ job.page, pair.b }, 0..) |maybe, side| {
+            const page = maybe orelse continue;
+            const b = s.buffer(@intCast(side));
+            var result = try content.page(gpa, b.doc, b.pages[page], .{});
+            defer result.deinit(gpa);
+            canvases[side] = try s.drawCanvas(@intCast(side), page, result.list, job.zoom, b);
+        }
+
+        const a = canvases[0].?.fb;
+        var blank: ?gleipnir.Framebuffer = null;
+        defer if (blank) |*fb| fb.deinit(gpa);
+        const b = if (canvases[1]) |c| c.fb else blk: {
+            blank = try diff_mod.blank(gpa, a);
+            break :blk blank.?;
+        };
+
+        var out = try gleipnir.Framebuffer.init(gpa, a.width, a.height, .srgb);
+        defer out.deinit(gpa);
+        diff_mod.overlay(out, a, b, cmp.options.channel_tolerance, false);
+        return .{ .pixels = try out.toRgba8(gpa), .width = out.width, .height = out.height };
+    }
+
     /// Where a window was, to tell whether it has moved since.
     const Seen = struct {
         scroll: f32 = -1,
@@ -2598,7 +2766,8 @@ const Session = struct {
     /// theme" in `ui.md`.
     fn drawChanges(s: *Session, v: *View, range: View.Visible, over: *DrawList) !void {
         const cmp = s.diff orelse return;
-        if (v.buffer > 1) return;
+        // The overlay is its own picture of the changes, in its own colours.
+        if (v.buffer > 1 or s.overlaid(v)) return;
         const side: u1 = @intCast(v.buffer);
         const wash: Color = if (side == 0) diff_removed else diff_added;
 
@@ -3024,6 +3193,19 @@ const Session = struct {
             .cprevious => s.jumpMark(.{ .forwards = false, .comments = true }),
             .dnext => s.jumpChange(true),
             .dprevious => s.jumpChange(false),
+            .diff => {
+                if (args.len == 0) {
+                    if (s.diff == null) {
+                        s.status = "nothing is being compared -- fenrir diff A B";
+                    } else s.say("{s}", .{s.diff_showing.label()});
+                    return false;
+                }
+                const want = Showing.byName(args) orelse {
+                    s.say(":diff takes side, overlay, first or second", .{});
+                    return false;
+                };
+                s.showComparison(want);
+            },
             .lua => {
                 const rt = s.plugins orelse {
                     s.say("plugins are off in this reader", .{});
@@ -3601,6 +3783,8 @@ const Session = struct {
             .go_tab => |delta| s.goTab(delta),
             .window_to_tab => s.windowToTab(),
 
+            .diff_view => |delta| s.turnComparison(delta),
+
             .next_buffer => s.showBuffer(1),
             .previous_buffer => s.showBuffer(-1),
 
@@ -4093,6 +4277,7 @@ const Session = struct {
     fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
         const b = s.buffer(v.buffer);
         const range = v.visiblePages();
+        const overlay = s.overlaid(v);
 
         var i = range.first;
         while (i < range.end) : (i += 1) {
@@ -4106,12 +4291,12 @@ const Session = struct {
                 s.theme.shadow,
             );
 
-            if (s.backend == .gpu) {
+            if (s.backend == .gpu and !overlay) {
                 // Blank paper. The path pipeline draws on it, in its own pass
                 // between this list and `over`.
                 s.recorded.touch(v.buffer, i);
                 try list.fill(rect, s.theme.paper);
-            } else if (s.slotFor(v.buffer, i, v.zoom)) |slot| {
+            } else if (s.slotFor(v.buffer, i, v.zoom, overlay)) |slot| {
                 slot.used = s.stamp;
                 try list.image(
                     rect,
@@ -4456,6 +4641,7 @@ const Session = struct {
         var it = s.layout().iterator();
         while (it.next()) |v| {
             mix(&h, v.buffer);
+            mix(&h, @intFromBool(s.overlaid(v)));
             mix(&h, v.scroll);
             mix(&h, v.pan);
             mix(&h, v.zoom);
@@ -4478,6 +4664,8 @@ const Session = struct {
 
         var it = s.layout().iterator();
         while (it.next()) |v| {
+            // An overlaid window shows a picture, not the recorded outlines.
+            if (s.overlaid(v)) continue;
             const box: [4]f32 = .{ v.rect.min_x, v.rect.min_y, v.rect.max_x, v.rect.max_y };
             const range = v.visiblePages();
             var i = range.first;
@@ -5021,15 +5209,22 @@ const Session = struct {
         while (s.firstMissing()) |job| {
             if (slot >= cache_slots) break;
 
-            const b = s.buffer(job.buffer);
-            var result = content.page(gpa, b.doc, b.pages[job.page], .{}) catch break;
-            defer result.deinit(gpa);
+            const image = if (job.want == .overlay)
+                s.rasteriseOverlay(job) catch {
+                    s.noteFailure(job);
+                    continue;
+                }
+            else page: {
+                const b = s.buffer(job.buffer);
+                var result = content.page(gpa, b.doc, b.pages[job.page], .{}) catch break;
+                defer result.deinit(gpa);
 
-            if (text.build(gpa, result.list) catch null) |map| b.putMap(gpa, job.page, map);
+                if (text.build(gpa, result.list) catch null) |map| b.putMap(gpa, job.page, map);
 
-            const image = s.rasterise(job, result.list, b) catch {
-                s.noteFailure(job);
-                continue;
+                break :page s.rasterise(job, result.list, b) catch {
+                    s.noteFailure(job);
+                    continue;
+                };
             };
             const id = try list.registerTexture(image.width, image.height);
             images.entries[id - 1] = image;
@@ -5041,6 +5236,7 @@ const Session = struct {
                 .list = id,
                 .width = image.width,
                 .height = image.height,
+                .overlay = job.want == .overlay,
             };
             slot += 1;
         }
@@ -6107,7 +6303,7 @@ fn comparedSession(gpa: Allocator, buf: []fenrir.Page, results: *[7]diff_mod.Res
     results.* = @splat(.{ .kind = .same_list });
     results[2] = .{ .kind = .differ, .pixels = 400, .regions = &.{.{ .x0 = 40, .y0 = 300, .x1 = 240, .y1 = 320 }} };
     results[6] = .{ .kind = .only_b };
-    cmp.* = try .init(gpa, pairs, results, .{ 6, 7 }, 1);
+    cmp.* = try .init(gpa, pairs, results, .{ 6, 7 }, .{ .dpi = 72 });
     s.diff = cmp;
     return s;
 }
@@ -6177,6 +6373,46 @@ test "]d shows a page only one document has in that document's window, and wraps
     // Backwards from the first is the last.
     s.jumpChange(false);
     try testing.expectEqualStrings("change 2/2, from the end", s.status);
+}
+
+test "gd goes round side by side, the overlay, and each document alone, at one place" {
+    const gpa = testing.allocator;
+    var buf: [13]fenrir.Page = undefined;
+    var results: [7]diff_mod.Result = undefined;
+    var cmp: diff_mod.Comparison = undefined;
+    var s = try comparedSession(gpa, &buf, &results, &cmp);
+    defer closeCompared(&s, &cmp);
+    s.arrangeComparison();
+    const scroll = s.view().scroll;
+
+    // The overlay: one window, on the first document's pages, asking the
+    // worker for pictures of both rather than for the page.
+    _ = s.apply(.{ .diff_view = 1 });
+    try testing.expectEqual(Session.Showing.overlay, s.diff_showing);
+    try testing.expectEqual(@as(u32, 1), s.layout().count());
+    try testing.expectEqual(@as(u32, 0), s.view().buffer);
+    try testing.expectEqual(Job.Want.overlay, s.firstMissing().?.want);
+    try testing.expectEqual(scroll, s.view().scroll);
+
+    // Each alone, and the blink between them keeps the place.
+    _ = s.apply(.{ .diff_view = 1 });
+    try testing.expectEqual(Job.Want.page, s.firstMissing().?.want);
+    _ = s.apply(.{ .diff_view = 1 });
+    try testing.expectEqual(Session.Showing.second, s.diff_showing);
+    try testing.expectEqual(@as(u32, 1), s.view().buffer);
+    try testing.expectEqual(scroll, s.view().scroll);
+    _ = s.apply(.{ .diff_view = -1 });
+    try testing.expectEqual(@as(u32, 0), s.view().buffer);
+    try testing.expectEqual(scroll, s.view().scroll);
+
+    // And back to two windows, first on the left, still together.
+    _ = s.apply(.{ .diff_view = -1 });
+    _ = s.apply(.{ .diff_view = -1 });
+    try testing.expectEqual(Session.Showing.side_by_side, s.diff_showing);
+    const views = s.comparedViews();
+    try testing.expect(views[0].?.rect.min_x < views[1].?.rect.min_x);
+    s.lockComparison();
+    try testing.expectEqual(views[0].?.scroll, views[1].?.scroll);
 }
 
 test "a tabpage keeps its own windows, and gt goes between them" {
