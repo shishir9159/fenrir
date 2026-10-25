@@ -177,7 +177,7 @@ pub const table = [_]Entry{
     .{ .id = .cprevious, .name = "cprevious", .aliases = &.{"cp"}, .icon = "fenrir.chevron_left", .binding = "[c", .about = "the previous comment" },
     .{ .id = .dnext, .name = "dnext", .aliases = &.{"dn"}, .icon = "fenrir.chevron_right", .binding = "]d", .about = "the next change between two documents, in fenrir diff" },
     .{ .id = .dprevious, .name = "dprevious", .aliases = &.{"dp"}, .icon = "fenrir.chevron_left", .binding = "[d", .about = "the previous change between two documents" },
-    .{ .id = .diff, .name = "diff", .args = "[side|overlay|first|second]", .icon = "fenrir.split", .binding = "gd", .about = "how two documents are shown: side by side, laid over each other, or one alone" },
+    .{ .id = .diff, .name = "diff", .args = "[side|overlay|first|second|offset X Y]", .icon = "fenrir.split", .binding = "gd", .about = "how two documents are shown, or how far the second is moved against the first" },
 
     .{ .id = .lua, .name = "lua", .args = "CODE", .needs_argument = true, .icon = "fenrir.menu", .about = "run a line of Lua in the plugin runtime" },
     .{ .id = .messages, .name = "messages", .icon = "fenrir.note", .about = "what the plugins have said, and why one failed" },

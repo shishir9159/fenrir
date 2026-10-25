@@ -79,6 +79,11 @@ pub const usage =
     \\                                 beside the rows that changed.
     \\    --grayscale                  Unchanged ink in grey, so only the
     \\                                 differences are in colour.
+    \\    --offset X,Y                 Move the second document X points right
+    \\                                 and Y down before comparing, for a
+    \\                                 revision whose margins moved. Pages
+    \\                                 whose display lists hash the same stay
+    \\                                 the same.
     \\    --time                       Where the time went, on stderr.
     \\
     \\    The view takes the reader's --size, --frames, --shot, --path, --vsync,
@@ -98,6 +103,10 @@ pub const usage =
     \\                         gD goes back, so gd gD gd blinks between the
     \\                         two at one place
     \\    :diff side|overlay|first|second   one of those by name
+    \\    <C-arrows>           move the second document a point against the
+    \\                         first, and compare again; the overlay moves at
+    \\                         once and the washes when the comparison is back
+    \\    :diff offset X Y     move it exactly; :diff offset puts it back
 ;
 
 /// diff-pdf's exit codes.
@@ -122,6 +131,11 @@ pub const Options = struct {
     mark_differences: bool = false,
     /// Unchanged ink drawn grey, so only the differences carry colour.
     grayscale: bool = false,
+    /// How far the second document is moved before it is compared, in
+    /// points across and down: diff-pdf's offset, for a revision whose
+    /// margins moved. The view nudges it with `<C-arrows>`. Pages whose
+    /// display lists hash the same are still the same page, moved or not.
+    offset: [2]f32 = .{ 0, 0 },
 };
 
 /// Which page of each document is compared with which. Zero-based, and null
@@ -178,8 +192,15 @@ pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
 /// The documents are sides 0 and 1, which are also their buffer numbers in
 /// the reader.
 pub const Comparison = struct {
+    /// Everything below that this made, and `results` once they are its own.
+    /// Thread-safe, because a comparison run again is made on a thread of
+    /// its own and handed over; see `replace`.
+    gpa: std.mem.Allocator,
     pairs: []const Pair,
-    results: []const Result,
+    results: []Result,
+    /// Whether `results` are this comparison's to free: false for results
+    /// it was lent, true for ones handed to `replace`.
+    owns_results: bool = false,
     /// What it was compared with. `factor` is its dpi as pixels per point,
     /// which is what the regions are measured in.
     options: Options,
@@ -199,7 +220,7 @@ pub const Comparison = struct {
     pub fn init(
         gpa: std.mem.Allocator,
         pairs: []const Pair,
-        results: []const Result,
+        results: []Result,
         counts: [2]usize,
         options: Options,
     ) !Comparison {
@@ -212,7 +233,36 @@ pub const Comparison = struct {
             if (p.a) |a| pair_of[0][a] = @intCast(i);
             if (p.b) |b| pair_of[1][b] = @intCast(i);
         }
+        return .{
+            .gpa = gpa,
+            .pairs = pairs,
+            .results = results,
+            .options = options,
+            .factor = options.dpi / 72.0,
+            .pair_of = pair_of,
+            .changes = try listChanges(gpa, results),
+        };
+    }
 
+    pub fn deinit(c: *Comparison) void {
+        if (c.owns_results) freeResults(c.gpa, c.results);
+        c.gpa.free(c.pair_of[0]);
+        c.gpa.free(c.pair_of[1]);
+        c.gpa.free(c.changes);
+    }
+
+    /// Takes the results of comparing the same pairs again -- after a nudge
+    /// -- in place of these. They must have been made with `gpa`.
+    pub fn replace(c: *Comparison, results: []Result) !void {
+        const changes = try listChanges(c.gpa, results);
+        if (c.owns_results) freeResults(c.gpa, c.results);
+        c.gpa.free(c.changes);
+        c.results = results;
+        c.owns_results = true;
+        c.changes = changes;
+    }
+
+    fn listChanges(gpa: std.mem.Allocator, results: []const Result) ![]Change {
         var changes: std.ArrayList(Change) = .empty;
         errdefer changes.deinit(gpa);
         for (results, 0..) |r, i| {
@@ -220,20 +270,7 @@ pub const Comparison = struct {
             if (r.regions.len == 0) try changes.append(gpa, .{ .pair = @intCast(i), .region = null });
             for (0..r.regions.len) |k| try changes.append(gpa, .{ .pair = @intCast(i), .region = @intCast(k) });
         }
-        return .{
-            .pairs = pairs,
-            .results = results,
-            .options = options,
-            .factor = options.dpi / 72.0,
-            .pair_of = pair_of,
-            .changes = try changes.toOwnedSlice(gpa),
-        };
-    }
-
-    pub fn deinit(c: *Comparison, gpa: std.mem.Allocator) void {
-        gpa.free(c.pair_of[0]);
-        gpa.free(c.pair_of[1]);
-        gpa.free(c.changes);
+        return changes.toOwnedSlice(gpa);
     }
 
     /// What was found for the pair a page is in.
@@ -265,10 +302,23 @@ pub const Comparison = struct {
         const p = c.pairs[change.pair];
         const page = (if (side == 0) p.a else p.b) orelse c.partner(side ^ 1, (if (side == 0) p.b else p.a).?);
         const down = if (change.region) |r|
-            @as(f32, @floatFromInt(c.results[change.pair].regions[r].y0)) / c.factor
+            // The top edge on a page of no height, turned round: the offset
+            // applied the same way the box has it applied.
+            -c.regionIn(side, c.results[change.pair].regions[r], 0).max_y
         else
             0;
         return .{ .page = page, .down = down };
+    }
+
+    /// A region as a box in one side's page, in that page's user space. The
+    /// second document was moved by the offset before it was compared, so
+    /// its box is moved back by as much.
+    pub fn regionIn(c: Comparison, side: u1, region: Region, page_height: f32) gelgja.Bounds {
+        const box = region.inPage(c.factor, page_height);
+        if (side == 0) return box;
+        const dx = c.options.offset[0];
+        const dy = c.options.offset[1];
+        return .fromRect(box.min_x - dx, box.min_y + dy, box.max_x - dx, box.max_y + dy);
     }
 };
 
@@ -328,6 +378,15 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             i += 1;
             if (i == argv.len) return bad(ctx, "--output-diff needs a directory", .{});
             options.output_dir = argv[i];
+        } else if (std.mem.eql(u8, arg, "--offset")) {
+            i += 1;
+            if (i == argv.len) return bad(ctx, "--offset needs X,Y", .{});
+            const comma = std.mem.indexOfScalar(u8, argv[i], ',') orelse
+                return bad(ctx, "--offset wants X,Y in points", .{});
+            options.offset = .{
+                std.fmt.parseFloat(f32, argv[i][0..comma]) catch return bad(ctx, "--offset wants X,Y in points", .{}),
+                std.fmt.parseFloat(f32, argv[i][comma + 1 ..]) catch return bad(ctx, "--offset wants X,Y in points", .{}),
+            };
         } else if (std.mem.eql(u8, arg, "--mark-differences")) {
             options.mark_differences = true;
         } else if (std.mem.eql(u8, arg, "--grayscale")) {
@@ -375,8 +434,10 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
 
     const pairs = try pairByNumber(ctx.gpa, counts[0], counts[1]);
     var clocked: Timing = .{};
-    const results = try compare(ctx.gpa, ctx.io, bytes, pairs, options, &clocked);
-    defer freeResults(ctx.gpa, results);
+    // Not the command's arena: a view that nudges one document against the
+    // other compares again on a thread of its own, and swaps these out.
+    const heap = std.heap.smp_allocator;
+    const results = try compare(heap, ctx.io, bytes, pairs, options, &clocked);
 
     const names: [2][]const u8 = .{ std.fs.path.basename(files[0]), std.fs.path.basename(files[1]) };
     var differing: usize = 0;
@@ -387,14 +448,19 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const verdict: u8 = if (differing == 0) exit_same else exit_differ;
 
     if (report_only) {
+        defer freeResults(heap, results);
         try report(ctx.out, pairs, results, names, @max(counts[0], counts[1]), options);
         ctx.exit = verdict;
         return;
     }
 
     ctx.note("{d} of {d} pages differ", .{ differing, pairs.len });
-    var comparison: Comparison = try .init(ctx.gpa, pairs, results, counts, options);
-    defer comparison.deinit(ctx.gpa);
+    var comparison: Comparison = Comparison.init(heap, pairs, results, counts, options) catch |err| {
+        freeResults(heap, results);
+        return err;
+    };
+    comparison.owns_results = true;
+    defer comparison.deinit();
     try reader_args.insertSlice(ctx.gpa, 0, &files);
     try read.runWith(ctx, reader_args.items, &comparison);
     ctx.exit = verdict;
@@ -422,7 +488,7 @@ fn unreadable(ctx: *Context, comptime fmt: []const u8, args: anytype) error{Comm
     return ctx.fail(fmt, args);
 }
 
-fn cpuCount() u32 {
+pub fn cpuCount() u32 {
     const n = std.Thread.getCpuCount() catch return 1;
     return @intCast(@max(1, @min(n, 256)));
 }
@@ -668,10 +734,12 @@ const Worker = struct {
 
         const factor = options.dpi / 72.0;
         var fbs: [2]?Framebuffer = .{ null, null };
-        for (pages, lists, &w.sides, &fbs) |page, list, *side, *fb| {
+        for (pages, lists, &w.sides, &fbs, 0..) |page, list, *side, *fb, index| {
             // Identical pages are one page drawn once.
             if (fbs[0] != null and result.kind == .same_list) break;
-            const canvas = w.draw(gpa, side, page orelse continue, list.?, factor) catch |err|
+            // The second document moved by the offset, and the first never.
+            const shift = if (index == 1) options.offset else [2]f32{ 0, 0 };
+            const canvas = w.draw(gpa, side, page orelse continue, list.?, factor, shift) catch |err|
                 return .{ .err = err };
             fb.* = canvas.fb;
         }
@@ -747,6 +815,8 @@ const Worker = struct {
         index: u32,
         list: gelgja.DisplayList,
         factor: f32,
+        // Points across and down, before the page is drawn.
+        shift: [2]f32,
     ) !Canvas {
         const size = replay.canvasSize(list.page, factor);
         if (@as(u64, size[0]) * size[1] > max_pixels) return error.PageTooBig;
@@ -760,7 +830,8 @@ const Worker = struct {
         var images: Images = .init(w.heap, &side.doc, side.pages[index].resources);
         defer images.deinit();
 
-        _ = try replay.render(gpa, &canvas, list, replay.pageTransform(list.page, factor), .{
+        const place = replay.pageTransform(list.page, factor).concat(.translation(shift[0] * factor, shift[1] * factor));
+        _ = try replay.render(gpa, &canvas, list, place, .{
             .glyphs = glyphs.source(),
             .images = images.source(),
         });
@@ -1294,7 +1365,7 @@ test "a page one document has alone sits beside the page before it, and is a cha
         .{ .a = null, .b = 3 },
         .{ .a = 2, .b = 4 },
     };
-    const results = [_]Result{
+    var results = [_]Result{
         .{ .kind = .same_list },
         .{ .kind = .differ, .regions = &.{
             .{ .x0 = 0, .y0 = 100, .x1 = 16, .y1 = 116 },
@@ -1305,7 +1376,7 @@ test "a page one document has alone sits beside the page before it, and is a cha
         .{ .kind = .same_pixels },
     };
     var c: Comparison = try .init(testing.allocator, &pairs, &results, .{ 3, 5 }, .{ .dpi = 144 });
-    defer c.deinit(testing.allocator);
+    defer c.deinit();
 
     try testing.expectEqual(@as(u32, 1), c.partner(1, 2));
     try testing.expectEqual(@as(u32, 1), c.partner(1, 3));
@@ -1320,6 +1391,82 @@ test "a page one document has alone sits beside the page before it, and is a cha
     // An inserted page, seen from the document without it.
     try testing.expectEqual(@as(u32, 1), c.changeAt(0, c.changes[3]).page);
     try testing.expectEqual(@as(u32, 3), c.changeAt(1, c.changes[3]).page);
+}
+
+test "the second document's regions are moved back by the offset it was compared at" {
+    const pairs = [_]Pair{.{ .a = 0, .b = 0 }};
+    var results = [_]Result{.{ .kind = .differ, .regions = &.{.{ .x0 = 72, .y0 = 144, .x1 = 144, .y1 = 216 }} }};
+    // One pixel a point, and the second document moved 10pt right, 4pt down.
+    var c: Comparison = try .init(testing.allocator, &pairs, &results, .{ 1, 1 }, .{ .dpi = 72, .offset = .{ 10, 4 } });
+    defer c.deinit();
+
+    const a = c.regionIn(0, results[0].regions[0], 792);
+    const b = c.regionIn(1, results[0].regions[0], 792);
+    try testing.expectEqual(@as(f32, 72), a.min_x);
+    try testing.expectEqual(@as(f32, 62), b.min_x);
+    // Down the page is up in user space: moved down 4 is found 4 higher.
+    try testing.expectEqual(a.max_y + 4, b.max_y);
+    try testing.expectEqual(@as(f32, 144), c.changeAt(0, c.changes[0]).down);
+    try testing.expectEqual(@as(f32, 140), c.changeAt(1, c.changes[0]).down);
+}
+
+/// A one-page file with a blue rectangle at `x`, and no cross-reference
+/// table: the document rebuilds one by scanning.
+pub fn rectanglePdf(buf: []u8, x: u32) []const u8 {
+    var ops: [64]u8 = undefined;
+    const stream = std.fmt.bufPrint(&ops, "0 0 1 rg {d} 400 200 100 re f", .{x}) catch unreachable;
+    return std.fmt.bufPrint(buf,
+        \\%PDF-1.4
+        \\1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+        \\2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+        \\3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >> endobj
+        \\4 0 obj << /Length {d} >> stream
+        \\{s}
+        \\endstream endobj
+        \\trailer << /Root 1 0 R >>
+        \\%%EOF
+        \\
+    , .{ stream.len, stream }) catch unreachable;
+}
+
+test "moving the second document by the offset lines two pages up again" {
+    var one: [512]u8 = undefined;
+    var two: [512]u8 = undefined;
+    // 36pt apart, which at 36 dpi is eighteen whole pixels: moved back by
+    // exactly that, every edge falls where the other page's does.
+    const bytes: [2][]const u8 = .{ rectanglePdf(&one, 72), rectanglePdf(&two, 108) };
+    const pairs = [_]Pair{.{ .a = 0, .b = 0 }};
+    var time: Timing = .{};
+
+    const apart = try compare(testing.allocator, testing.io, bytes, &pairs, .{ .dpi = 36 }, &time);
+    defer freeResults(testing.allocator, apart);
+    try testing.expectEqual(Result.Kind.differ, apart[0].kind);
+
+    const lined = try compare(testing.allocator, testing.io, bytes, &pairs, .{ .dpi = 36, .offset = .{ -36, 0 } }, &time);
+    defer freeResults(testing.allocator, lined);
+    try testing.expectEqual(Result.Kind.same_pixels, lined[0].kind);
+    try testing.expectEqual(@as(u64, 0), lined[0].pixels);
+}
+
+test "a comparison made again replaces the results and the changes walked" {
+    const gpa = testing.allocator;
+    const pairs = [_]Pair{ .{ .a = 0, .b = 0 }, .{ .a = 1, .b = 1 } };
+    var first = [_]Result{ .{ .kind = .differ }, .{ .kind = .same_list } };
+    var c: Comparison = try .init(gpa, &pairs, &first, .{ 2, 2 }, .{});
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), c.changes.len);
+
+    // As a thread would hand them over: owned, regions and all.
+    const again = try gpa.alloc(Result, 2);
+    again[0] = .{ .kind = .same_pixels };
+    again[1] = .{ .kind = .differ, .regions = try std.heap.smp_allocator.dupe(Region, &.{
+        .{ .x0 = 0, .y0 = 0, .x1 = 16, .y1 = 16 },
+        .{ .x0 = 0, .y0 = 64, .x1 = 16, .y1 = 80 },
+    }) };
+    try c.replace(again);
+    try testing.expectEqual(@as(usize, 2), c.changes.len);
+    try testing.expectEqual(@as(u32, 1), c.changes[0].pair);
+    try testing.expect(c.owns_results);
 }
 
 test "the report lists what differs and counts it" {

@@ -137,6 +137,9 @@ pub const Command = union(enum) {
     /// alone. `gD` back from the second alone is the first alone, so the two
     /// keys in turn blink between them.
     diff_view: i32,
+    /// `<C-arrows>`: the second document moved against the first by a point
+    /// across and down, and the two compared again.
+    nudge: [2]i8,
 
     // -- buffers
     next_buffer,
@@ -415,11 +418,16 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
                 out.push(.enter_note);
             }
         },
+        .normal => if (in.modifiers.ctrl) {
+            // A point at a time, and with repeat: lining up two revisions
+            // is a held key watched until the colour goes.
+            if (in.repeated(.right)) out.push(.{ .nudge = .{ 1, 0 } });
+            if (in.repeated(.left)) out.push(.{ .nudge = .{ -1, 0 } });
+            if (in.repeated(.down)) out.push(.{ .nudge = .{ 0, 1 } });
+            if (in.repeated(.up)) out.push(.{ .nudge = .{ 0, -1 } });
+        } else arrows(in, &out),
         else => {
-            if (in.repeated(.down)) out.push(.{ .move_cursor = .down });
-            if (in.repeated(.up)) out.push(.{ .move_cursor = .up });
-            if (in.repeated(.right)) out.push(.{ .move_cursor = .right });
-            if (in.repeated(.left)) out.push(.{ .move_cursor = .left });
+            arrows(in, &out);
             if (state.mode.isVisual() and in.pressedOnce(.enter)) {
                 state.mode = .normal;
                 out.push(.{ .highlight_selection = null });
@@ -603,6 +611,15 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
         else => return,
     };
     out.push(cmd);
+}
+
+/// The arrow keys as cursor moves, which is what they are everywhere but
+/// edit mode and a held ctrl.
+fn arrows(in: Input, out: *Result) void {
+    if (in.repeated(.down)) out.push(.{ .move_cursor = .down });
+    if (in.repeated(.up)) out.push(.{ .move_cursor = .up });
+    if (in.repeated(.right)) out.push(.{ .move_cursor = .right });
+    if (in.repeated(.left)) out.push(.{ .move_cursor = .left });
 }
 
 fn armBracket(state: *State, c: u21) void {
@@ -1010,6 +1027,18 @@ test "gt and gT are two keys apart, which is why they are read as codepoints" {
 
     _ = command(&state, typing("g"));
     try testing.expectEqual(@as(i32, -1), command(&state, typing("T")).items()[0].go_tab);
+}
+
+test "ctrl and an arrow nudge; an arrow alone still moves the cursor" {
+    var state: State = .{};
+    const right: Event = .{ .key_down = .{ .code = .right, .modifiers = .{ .ctrl = true } } };
+    const out = command(&state, frame(&.{right}));
+    try testing.expectEqual([2]i8{ 1, 0 }, out.items()[0].nudge);
+
+    const up: Event = .{ .key_down = .{ .code = .up, .modifiers = .{ .ctrl = true } } };
+    try testing.expectEqual([2]i8{ 0, -1 }, command(&state, frame(&.{up})).items()[0].nudge);
+
+    try testing.expectEqual(View.Step.right, command(&state, frame(&.{keyDown(.right)})).items()[0].move_cursor);
 }
 
 test "gd and gD turn the way two documents are shown, and neither draws" {
