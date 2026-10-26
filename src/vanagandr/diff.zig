@@ -16,6 +16,9 @@
 //!    a time, over the union of the two pages.
 //! 4. The differing pixels' 16x16 tiles are gathered into rectangles: the
 //!    regions a view washes and steps through, and what `--report` counts.
+//! 5. The two pages' words go through Myers' diff, which says which words
+//!    went and which came -- what the pixels cannot, since one word changed
+//!    moves every glyph after it.
 //!
 //! `--output-diff` writes diff-pdf's picture of each pair as a PNG rather
 //! than a PDF, because fenrir writes no PDF yet.
@@ -40,6 +43,8 @@ const Digests = @import("digest.zig").Digests;
 const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
 const Lap = @import("raster.zig").Lap;
+const text = fenrir.hlidskjalf.text;
+const worddiff = fenrir.hlidskjalf.diff;
 const read = @import("read.zig");
 
 const content = fenrir.content;
@@ -79,6 +84,11 @@ pub const usage =
     \\                                 beside the rows that changed.
     \\    --grayscale                  Unchanged ink in grey, so only the
     \\                                 differences are in colour.
+    \\    --pair number|text           Compare pages by number, as diff-pdf
+    \\                                 does, or by what they say, so a page
+    \\                                 put in or taken out does not put every
+    \\                                 page after it against the wrong one.
+    \\                                 Defaults to number.
     \\    --offset X,Y                 Move the second document X points right
     \\                                 and Y down before comparing, for a
     \\                                 revision whose margins moved. Pages
@@ -136,6 +146,8 @@ pub const Options = struct {
     /// margins moved. The view nudges it with `<C-arrows>`. Pages whose
     /// display lists hash the same are still the same page, moved or not.
     offset: [2]f32 = .{ 0, 0 },
+    /// Which page is compared with which.
+    pair: Pairing = .number,
 };
 
 /// Which page of each document is compared with which. Zero-based, and null
@@ -158,6 +170,14 @@ pub const Result = struct {
     regions: []const Region = &.{},
     /// Why its picture was not written, when one was asked for and was not.
     unwritten: ?anyerror = null,
+    /// The words gone from the first page and come into the second, as
+    /// boxes in each page's own user space, one a line. Pixels say where;
+    /// these say what. Allocated as `regions` are.
+    removed: []const gelgja.Bounds = &.{},
+    added: []const gelgja.Bounds = &.{},
+    /// The first of them in words -- `"fox" → "cat"` -- for a line of the
+    /// report or a row of the changes panel. Allocated as `regions` are.
+    detail: []const u8 = "",
 
     pub const Kind = enum {
         /// The display lists hash the same: nothing was drawn.
@@ -182,7 +202,12 @@ pub const Result = struct {
 };
 
 pub fn freeResults(gpa: std.mem.Allocator, results: []Result) void {
-    for (results) |r| std.heap.smp_allocator.free(r.regions);
+    for (results) |r| {
+        std.heap.smp_allocator.free(r.regions);
+        std.heap.smp_allocator.free(r.removed);
+        std.heap.smp_allocator.free(r.added);
+        std.heap.smp_allocator.free(r.detail);
+    }
     gpa.free(results);
 }
 
@@ -322,6 +347,67 @@ pub const Comparison = struct {
     }
 };
 
+/// `--pair`: by number, as diff-pdf does, or by what the pages say.
+pub const Pairing = enum { number, text };
+
+/// Pages paired by their text, so that a page inserted into one document
+/// does not put every page after it against the wrong partner.
+///
+/// Each page's text is hashed and the two lists of hashes go through the
+/// same diff as a page's words. A page whose text is in both is paired with
+/// its twin. Between two such pages, what was removed and what was added
+/// are paired off in order -- a page of the old draft against the page of
+/// the new one that replaced it, which is the page that should be compared
+/// -- and whatever is left over stands alone.
+pub fn pairByText(gpa: std.mem.Allocator, bytes: [2][]const u8) ![]Pair {
+    const heap = std.heap.smp_allocator;
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+
+    var hashes: [2]std.ArrayList(u64) = .{ .empty, .empty };
+    defer for (&hashes) |*h| h.deinit(gpa);
+    for (bytes, &hashes) |file, *out| {
+        var side: Side = undefined;
+        try side.open(heap, file);
+        defer side.close();
+        for (0..side.pages.len) |i| {
+            defer _ = scratch.reset(.retain_capacity);
+            const list = try side.interpret(scratch.allocator(), @intCast(i));
+            const map = try text.build(scratch.allocator(), list);
+            try out.append(gpa, std.hash.Wyhash.hash(0, map.text));
+        }
+    }
+
+    const runs = try worddiff.script(gpa, hashes[0].items, hashes[1].items);
+    defer gpa.free(runs);
+    return pairRuns(gpa, runs);
+}
+
+/// An edit script over pages, as pairs.
+fn pairRuns(gpa: std.mem.Allocator, runs: []const worddiff.Run) ![]Pair {
+    var pairs: std.ArrayList(Pair) = .empty;
+    errdefer pairs.deinit(gpa);
+    // What was removed and added since the last page both have.
+    var gone: [2]u32 = .{ 0, 0 };
+    var came: [2]u32 = .{ 0, 0 };
+    for (runs, 0..) |r, i| {
+        switch (r.kind) {
+            .removed => gone = .{ r.a, r.len },
+            .added => came = .{ r.b, r.len },
+            .same => for (0..r.len) |k| try pairs.append(gpa, .{ .a = r.a + @as(u32, @intCast(k)), .b = r.b + @as(u32, @intCast(k)) }),
+        }
+        const ends = i + 1 == runs.len or runs[i + 1].kind == .same;
+        if (r.kind == .same or !ends) continue;
+        for (0..@max(gone[1], came[1])) |k| try pairs.append(gpa, .{
+            .a = if (k < gone[1]) gone[0] + @as(u32, @intCast(k)) else null,
+            .b = if (k < came[1]) came[0] + @as(u32, @intCast(k)) else null,
+        });
+        gone = .{ 0, 0 };
+        came = .{ 0, 0 };
+    }
+    return pairs.toOwnedSlice(gpa);
+}
+
 /// Pages by number, as diff-pdf pairs them: the first with the first, and
 /// whatever one document has past the other's end on its own.
 pub fn pairByNumber(gpa: std.mem.Allocator, a_pages: usize, b_pages: usize) ![]Pair {
@@ -378,6 +464,11 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             i += 1;
             if (i == argv.len) return bad(ctx, "--output-diff needs a directory", .{});
             options.output_dir = argv[i];
+        } else if (std.mem.eql(u8, arg, "--pair")) {
+            i += 1;
+            if (i == argv.len) return bad(ctx, "--pair needs number or text", .{});
+            options.pair = std.meta.stringToEnum(Pairing, argv[i]) orelse
+                return bad(ctx, "--pair wants number or text, not {s}", .{argv[i]});
         } else if (std.mem.eql(u8, arg, "--offset")) {
             i += 1;
             if (i == argv.len) return bad(ctx, "--offset needs X,Y", .{});
@@ -432,7 +523,11 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         counts[side] = pages.len;
     }
 
-    const pairs = try pairByNumber(ctx.gpa, counts[0], counts[1]);
+    const pairs = switch (options.pair) {
+        .number => try pairByNumber(ctx.gpa, counts[0], counts[1]),
+        .text => pairByText(ctx.gpa, bytes) catch |err|
+            return unreadable(ctx, "cannot read the pages' text to pair them: {t}", .{err}),
+    };
     var clocked: Timing = .{};
     // Not the command's arena: a view that nudges one document against the
     // other compares again on a thread of its own, and swaps these out.
@@ -542,6 +637,7 @@ pub fn report(
                 var buf: [32]u8 = undefined;
                 const n = r.regions.len;
                 try w.print("{s} px in {d} region{s}", .{ grouped(r.pixels, &buf), n, if (n == 1) "" else "s" });
+                if (r.detail.len != 0) try w.print(": {s}", .{r.detail});
             },
             .only_a => try w.print("only in {s}", .{names[0]}),
             .only_b => try w.print("only in {s}", .{names[1]}),
@@ -556,9 +652,9 @@ pub fn report(
 /// A page number from one, or blanks where a pair has no page on that side.
 fn number(w: *Io.Writer, page: ?u32, width: usize) !void {
     var buf: [16]u8 = undefined;
-    const text = if (page) |p| std.fmt.bufPrint(&buf, "{d}", .{p + 1}) catch "?" else "";
-    try w.splatByteAll(' ', width -| text.len);
-    try w.writeAll(text);
+    const shown = if (page) |p| std.fmt.bufPrint(&buf, "{d}", .{p + 1}) catch "?" else "";
+    try w.splatByteAll(' ', width -| shown.len);
+    try w.writeAll(shown);
 }
 
 fn digits(n: usize) usize {
@@ -761,6 +857,9 @@ const Worker = struct {
             result.pixels = pixels;
             if (pixels > options.pixel_tolerance) {
                 result.regions = regionsOf(w.heap, gpa, tiles) catch |err| return .{ .err = err };
+                // The words are the explanation and not the verdict: a page
+                // whose words would not diff still differs.
+                w.wordChanges(gpa, lists[0].?, lists[1].?, &result) catch {};
             } else {
                 result.kind = .same_pixels;
             }
@@ -775,6 +874,34 @@ const Worker = struct {
             }
         }
         return result;
+    }
+
+    /// The words that went from the first page and came into the second:
+    /// both pages' text, split into words, through Myers' diff. See
+    /// `hlidskjalf/diff.zig`. Everything but what goes in `result` is in
+    /// the pair's arena.
+    fn wordChanges(w: *Worker, gpa: std.mem.Allocator, a: gelgja.DisplayList, b: gelgja.DisplayList, result: *Result) !void {
+        const maps: [2]text.Page = .{ try text.build(gpa, a), try text.build(gpa, b) };
+        var words: [2]std.ArrayList(worddiff.Word) = .{ .empty, .empty };
+        var hashes: [2]std.ArrayList(u64) = .{ .empty, .empty };
+        for (maps, &words, &hashes) |map, *ws, *hs| try worddiff.words(gpa, map.text, ws, hs);
+        const runs = try worddiff.script(gpa, hashes[0].items, hashes[1].items);
+
+        var removed: std.ArrayList(gelgja.Bounds) = .empty;
+        var added: std.ArrayList(gelgja.Bounds) = .empty;
+        for (runs) |r| switch (r.kind) {
+            .same => {},
+            .removed => try worddiff.boxesOf(gpa, maps[0], words[0].items[r.a..][0..r.len], &removed),
+            .added => try worddiff.boxesOf(gpa, maps[1], words[1].items[r.b..][0..r.len], &added),
+        };
+
+        const removed_boxes = try w.heap.dupe(gelgja.Bounds, removed.items);
+        errdefer w.heap.free(removed_boxes);
+        const added_boxes = try w.heap.dupe(gelgja.Bounds, added.items);
+        errdefer w.heap.free(added_boxes);
+        result.detail = try describe(w.heap, runs, maps, .{ words[0].items, words[1].items });
+        result.removed = removed_boxes;
+        result.added = added_boxes;
     }
 
     /// diff-pdf's picture of a pair, as a PNG in `dir`: `a3-b3.png` for a
@@ -1068,6 +1195,62 @@ pub fn regionsOf(gpa: std.mem.Allocator, scratch: std.mem.Allocator, tiles: Tile
     return gpa.dupe(Region, found.items);
 }
 
+/// The first change in words -- `"fox" → "cat"`, `"fox" removed`, `"cat"
+/// added` -- and how many more changes there are after it. Empty when no
+/// word changed: a figure redrawn, a rule moved.
+fn describe(
+    heap: std.mem.Allocator,
+    runs: []const worddiff.Run,
+    maps: [2]text.Page,
+    words: [2][]const worddiff.Word,
+) ![]u8 {
+    var groups: usize = 0;
+    var first: ?usize = null;
+    for (runs, 0..) |r, i| {
+        if (r.kind == .same) continue;
+        if (i == 0 or runs[i - 1].kind == .same) {
+            groups += 1;
+            if (first == null) first = i;
+        }
+    }
+    const at = first orelse return &.{};
+
+    var buf: [160]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    const r = runs[at];
+    const then: ?worddiff.Run = if (at + 1 < runs.len and runs[at + 1].kind != .same) runs[at + 1] else null;
+    if (r.kind == .removed) {
+        quoted(&out, maps[0], words[0][r.a..][0..r.len]);
+        if (then) |t| {
+            out.writeAll(" → ") catch {};
+            quoted(&out, maps[1], words[1][t.b..][0..t.len]);
+        } else out.writeAll(" removed") catch {};
+    } else {
+        quoted(&out, maps[1], words[1][r.b..][0..r.len]);
+        out.writeAll(" added") catch {};
+    }
+    if (groups > 1) out.print(", and {d} more", .{groups - 1}) catch {};
+    return heap.dupe(u8, out.buffered());
+}
+
+/// A run of words in quotes, a line break read as a space, and cut short
+/// -- at a letter, not inside one -- when it is long.
+fn quoted(out: *Io.Writer, page: text.Page, span: []const worddiff.Word) void {
+    const from = span[0].at;
+    const to = span[span.len - 1].at + span[span.len - 1].len;
+    var s = page.text[from..to];
+    const max = 32;
+    const cut = s.len > max;
+    if (cut) {
+        var end: usize = max;
+        while (end > 0 and s[end] & 0xc0 == 0x80) end -= 1;
+        s = s[0..end];
+    }
+    out.writeByte('"') catch {};
+    for (s) |c| out.writeByte(if (c == '\n') ' ' else c) catch {};
+    out.writeAll(if (cut) "…\"" else "\"") catch {};
+}
+
 /// White paper the size of `like`.
 pub fn blank(gpa: std.mem.Allocator, like: Framebuffer) !Framebuffer {
     var fb = try Framebuffer.init(gpa, like.width, like.height, .srgb);
@@ -1228,6 +1411,28 @@ fn regionsBetween(a: Framebuffer, b: Framebuffer) ![]Region {
     defer testing.allocator.free(tiles.marked);
     _ = countDifferences(a, b, 0, &tiles);
     return regionsOf(testing.allocator, testing.allocator, tiles);
+}
+
+test "pages paired by text: twins together, a replaced page against its replacement" {
+    // Six pages against seven: B inserted one after the second, and
+    // rewrote the fourth.
+    const runs = [_]worddiff.Run{
+        .{ .kind = .same, .a = 0, .b = 0, .len = 2 },
+        .{ .kind = .added, .a = 2, .b = 2, .len = 1 },
+        .{ .kind = .same, .a = 2, .b = 3, .len = 1 },
+        .{ .kind = .removed, .a = 3, .b = 4, .len = 1 },
+        .{ .kind = .added, .a = 4, .b = 4, .len = 1 },
+        .{ .kind = .same, .a = 4, .b = 5, .len = 2 },
+    };
+    const pairs = try pairRuns(testing.allocator, &runs);
+    defer testing.allocator.free(pairs);
+    try testing.expectEqualSlices(Pair, &.{
+        .{ .a = 0, .b = 0 }, .{ .a = 1, .b = 1 },
+        .{ .a = null, .b = 2 }, // inserted
+        .{ .a = 2, .b = 3 },
+        .{ .a = 3, .b = 4 }, // rewritten, and compared with what replaced it
+        .{ .a = 4, .b = 5 }, .{ .a = 5, .b = 6 },
+    }, pairs);
 }
 
 test "pages are paired by number, and the longer document's tail stands alone" {

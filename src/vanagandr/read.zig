@@ -2942,11 +2942,17 @@ const Session = struct {
                 try over.fill(v.pageRect(page), wash.withAlpha(0.12));
                 continue;
             }
+            // The regions say where the pixels moved, lightly; the words
+            // that went or came are what a reader reads, and are washed as a
+            // highlighter would.
             const height = v.pageBox(page).max_y;
             for (r.regions) |region| {
                 const box = v.windowBox(page, cmp.regionIn(side, region, height));
-                try over.fill(box, wash.withAlpha(0.18));
+                try over.fill(box, wash.withAlpha(0.08));
                 try over.border(box, .all(0), 1, wash.withAlpha(0.7));
+            }
+            for (if (side == 0) r.removed else r.added) |words| {
+                try over.fill(v.windowBox(page, words), wash.withAlpha(0.3));
             }
         }
     }
