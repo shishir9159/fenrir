@@ -89,6 +89,9 @@ pub const Panel = union(enum) {
     annotations,
     /// The document's own outline, and the places a reader has kept.
     bookmarks,
+    /// Where two documents of `fenrir diff` differ, a page to a row. On the
+    /// rail only while there is a comparison to list.
+    changes,
     /// A plugin's, by its contribution id.
     plugin: u32,
 
@@ -103,6 +106,7 @@ pub const Panel = union(enum) {
             .none, .plugin => "",
             .annotations => "Annotations",
             .bookmarks => "Bookmarks",
+            .changes => "Changes",
         };
     }
 
@@ -112,6 +116,7 @@ pub const Panel = union(enum) {
             .none, .plugin => "fenrir.unknown",
             .annotations => "fenrir.highlight",
             .bookmarks => "fenrir.bookmark",
+            .changes => "fenrir.changes",
         };
     }
 };
@@ -150,6 +155,8 @@ pub const Right = struct {
     pages: u32 = 1,
     /// The panels plugins declared, latching beside the reader's own.
     panels: []const PanelToggle = &.{},
+    /// Whether there is a comparison, and so a changes panel to open.
+    changes: bool = false,
     /// The plugins' buttons, under the reader's own and under a rule: the
     /// things this program does are above the things somebody added.
     extra: []const Extra = &.{},
@@ -339,7 +346,8 @@ pub fn rightRail(
     var want: ?Want = null;
 
     try w.spacer(ui, .px(inset));
-    for (toggles) |p| {
+    const with_changes = toggles ++ [_]Panel{.changes};
+    for (if (st.changes) &with_changes else &toggles) |p| {
         const sig = try w.iconButton(ui, p.label(), icons.byName(p.icon(), .sidebar), .{
             .on = r.panel.eql(p),
             .accent = t.accent,

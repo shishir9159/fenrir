@@ -137,6 +137,8 @@ pub const builtin = [_]Icon{
         " M3 15h9v2H3z M16 15h5v2h-5z M12 12h4v8h-4z" },
     .{ .name = "panel", .d = "M3 4h18v16H3z M5 6v12h9V6z" },
     .{ .name = "split", .d = "M3 4h18v16H3z M5 6v12h6V6z M13 6v12h6V6z" },
+    // A plus over a minus: what came and what went.
+    .{ .name = "changes", .d = "M11 2h2v4h4v2h-4v4h-2V8H7V6h4z M6 17h12v2.5H6z" },
     .{ .name = "plus", .d = "M11 4h2v7h7v2h-7v7h-2v-7H4v-2h7z" },
     .{ .name = "minus", .d = "M4 11h16v2H4z" },
     .{

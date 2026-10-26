@@ -1050,6 +1050,7 @@ const Session = struct {
         buffer: u32 = 0,
         revision: u64 = 0,
         contributions: u32 = 0,
+        compared: usize = 0,
     } = .{},
 
     /// What is written on the tabs, and the bytes those names point into.
@@ -2875,6 +2876,16 @@ const Session = struct {
         } else {
             next = s.changeFrom(v, side, forwards, &wrapped);
         }
+        s.goToChange(next);
+        const round: []const u8 = if (!wrapped) "" else if (forwards) ", from the top" else ", from the end";
+        s.say("change {d}/{d}{s}", .{ next + 1, n, round });
+    }
+
+    /// Puts the focused window at change `next`, and the other with it.
+    fn goToChange(s: *Session, next: usize) void {
+        const cmp = s.diff orelse return;
+        const v = s.view();
+        const side: u1 = if (v.buffer == 1) 1 else 0;
 
         // A page only the other document has is shown in that document's
         // window, which then leads: placing this one beside the page before
@@ -2889,9 +2900,6 @@ const Session = struct {
         if (moving != v) s.diff_seen[side] = .of(v);
         s.lockComparison();
         s.diff_at = .{ .change = @intCast(next), .side = side, .scroll = v.scroll };
-
-        const round: []const u8 = if (!wrapped) "" else if (forwards) ", from the top" else ", from the end";
-        s.say("change {d}/{d}{s}", .{ next + 1, n, round });
     }
 
     /// How far down the window a jump puts a change.
@@ -5054,6 +5062,7 @@ const Session = struct {
             .page = v.currentPage() + 1,
             .pages = @intCast(v.pages.len),
             .panels = s.rail_panels.items,
+            .changes = s.diff != null,
             .extra = s.rail_right.items,
         };
     }
@@ -5156,6 +5165,9 @@ const Session = struct {
             // `fenrir.refresh` is how it says so. Without this a declared
             // panel would be asked once and then never again.
             .contributions = if (s.plugins) |rt| rt.revision else 0,
+            // A comparison made again hands over new results, and the rows
+            // of the old ones borrow strings from them.
+            .compared = if (s.diff) |c| @intFromPtr(c.results.ptr) else 0,
         };
         if (std.meta.eql(s.rows_for, stamp)) return s.rows.items;
         s.rows_for = stamp;
@@ -5190,6 +5202,35 @@ const Session = struct {
                         .swatch = if (r.color.len == 0) null else Library.parseColor(r.color),
                         .depth = r.depth,
                         .id = r.id,
+                    }) catch break;
+                }
+            },
+            .changes => {
+                const cmp = s.diff orelse return s.rows.items;
+                const side: u1 = if (v.buffer == 1) 1 else 0;
+                for (cmp.results, cmp.pairs, 0..) |r, p, i| {
+                    if (!r.differs()) continue;
+                    // The words when any changed, which is what somebody
+                    // reading the list wants; otherwise what kind of change,
+                    // in the few words a row has room for. The page is this
+                    // window's own, or where it stands beside one it lacks.
+                    const own = if (side == 0) p.a else p.b;
+                    const page = own orelse cmp.partner(side ^ 1, (if (side == 0) p.b else p.a).?);
+                    s.rows.append(s.gpa, .{
+                        .label = if (r.detail.len != 0) r.detail else switch (r.kind) {
+                            .only_a => "only in the first document",
+                            .only_b => "only in the second document",
+                            .failed => "could not be compared",
+                            else => "pixels changed and no words did",
+                        },
+                        .page = page + 1,
+                        .swatch = switch (r.kind) {
+                            .only_a => diff_removed,
+                            .only_b => diff_added,
+                            else => null,
+                        },
+                        // From one: zero is `State.chosen`'s "none".
+                        .id = i + 1,
                     }) catch break;
                 }
             },
@@ -5278,6 +5319,7 @@ const Session = struct {
             if (declared) |p| p.empty else switch (which) {
                 .none, .annotations => "no highlights yet",
                 .bookmarks => "this document has no outline",
+                .changes => "no differences",
                 .plugin => "",
             },
             s.panelRows(which),
@@ -5296,6 +5338,15 @@ const Session = struct {
             // view scrolls to it, so clicking a row and pressing `d` deletes
             // the one that was clicked.
             .annotations => s.focusMark(chosen.id),
+            // The pair's first change, as `]d` would land on it.
+            .changes => if (s.diff) |cmp| {
+                for (cmp.changes, 0..) |change, i| {
+                    if (change.pair + 1 != chosen.id) continue;
+                    s.goToChange(i);
+                    s.say("change {d}/{d}", .{ i + 1, cmp.changes.len });
+                    break;
+                }
+            },
             // A plugin's row means whatever the plugin says it means, and a
             // row with a page on it also goes there -- which is what every
             // other panel row in this reader does, so a plugin gets it
@@ -6601,6 +6652,27 @@ test "gd goes round side by side, the overlay, and each document alone, at one p
     try testing.expect(views[0].?.rect.min_x < views[1].?.rect.min_x);
     s.lockComparison();
     try testing.expectEqual(views[0].?.scroll, views[1].?.scroll);
+}
+
+test "the changes panel is a row a page that differs, numbered from the window's side" {
+    const gpa = testing.allocator;
+    var buf: [13]fenrir.Page = undefined;
+    var results: [7]diff_mod.Result = undefined;
+    var cmp: diff_mod.Comparison = undefined;
+    var s = try comparedSession(gpa, &buf, &results, &cmp);
+    defer closeCompared(&s, &cmp);
+    s.arrangeComparison();
+    results[2].detail = "\"fox\" → \"cat\"";
+
+    const rows = s.panelRows(.changes);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("\"fox\" → \"cat\"", rows[0].label);
+    try testing.expectEqual(@as(u32, 3), rows[0].page);
+    // The seventh page is the second document's alone. From the first
+    // document's window it stands beside that document's last page.
+    try testing.expectEqualStrings("only in the second document", rows[1].label);
+    try testing.expectEqual(@as(u32, 6), rows[1].page);
+    try testing.expectEqual(@as(u64, 7), rows[1].id);
 }
 
 test "a nudge moves the overlay at once, and a picture of the old offset is not wanted" {
