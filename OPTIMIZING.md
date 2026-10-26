@@ -348,8 +348,9 @@ measurement attached.
 7. **Budgets for the planned features** (`ui.md` phases 10–17), set before
    they are built:
    - `fenrir diff` compares display-list hashes first, so identical pages are
-     never rasterised, and stops counting a page's pixels once it passes the
-     tolerance.
+     never rasterised: *Nanite* against itself drew nothing, in 124 ms. The
+     early stop at the tolerance was measured out rather than built:
+     comparing a pair is 1–2% of drawing it (`ui.md`, phase 10).
    - A canvas of 1,000 comments docked beside a page must keep
      `read --frames 1200` within noise of the reader without it.
    - Anything drawn from a page replays the recorded scene and is never

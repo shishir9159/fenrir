@@ -335,6 +335,74 @@ Under `src/thviti/widgets/`, each written as the existing widgets are (`next`,
   button showed the cost was that button, within this machine's drift.
   `raster --all` hashes were unchanged.
 
+### Phase 10 — comparing documents ✅
+
+After [diff-pdf](https://github.com/vslavik/diff-pdf): its options, the
+defaults its users reach for (`--per-page-pixel-tolerance 10`,
+`--channel-tolerance 0`, `--skip-identical`) and its exit codes (0 the same,
+1 different, 2 bad arguments, 3 unreadable). `fenrir diff A B` opens the two
+side by side at the first change; `--report` prints and exits.
+
+| | Commit | Files | ~ |
+|---|---|---|---|
+| ✅ | a page's hash, over what its objects hold: `fenrir trace --hash` | `gelgja/DisplayList.zig`, `src/vanagandr/digest.zig`, `trace.zig` | 490 |
+| ✅ | `fenrir diff --report`: pages by display list, then by pixel | `src/vanagandr/diff.zig`, `main.zig`, `Context.zig` | 766 |
+| ✅ | changed regions, and the pictures diff-pdf writes | `diff.zig` | 499 |
+| ✅ | two documents side by side, scrolled together, changes washed | `read.zig`, `keys.zig`, `commands.zig`, `diff.zig` | 563 |
+| ✅ | gd: side by side, the overlay, and each document alone to blink | `read.zig`, `keys.zig`, `commands.zig` | 344 |
+| ✅ | nudging one document against the other, and comparing again | `read.zig`, `diff.zig`, `keys.zig` | 496 |
+| ✅ | a word diff over the text, and pages paired by it | `src/hlidskjalf/diff.zig`, `diff.zig` | 511 |
+| ✅ | the changes panel: a row a differing page, on the right rail | `rails.zig`, `read.zig`, `tyr/backend/icons.zig` | 90 |
+
+- **Cheap first, pixels last.** Pages pair by number, or by text with
+  `--pair text`. A page with no partner is never drawn. Equal display-list
+  hashes are identical pages and are never drawn. The rest are drawn at
+  `--dpi 150` and compared sixteen pixels at a time over the union of the two
+  pages, in eight-bit levels, so a float wobble is no difference.
+- **The hash digests what an object holds, never its number.** A file
+  revised in place keeps a figure's number and replaces the figure, and two
+  exports number one font apart. `digest.zig` hashes each object with every
+  reference replaced by its target's digest, streams undecoded. A font or
+  shading with no object behind it makes the hash null, and the page is
+  drawn. `trace --hash` prints what `diff` compares.
+- **Regions** are the differing pixels' 16×16 tiles. A tile is one chunk of
+  a row, so marking one costs nothing past the chunk's mask. Tiles one empty
+  tile apart are one region, and overlapping boxes merge. A tile is under
+  eight points at 150 dpi, so a reworded sentence that wraps is one region.
+- **`--output-diff DIR`** writes diff-pdf's picture as PNGs named
+  `a3-b3.png` and `b7.png`: ink only in the first document red, only in the
+  second blue, shared dark. `--grayscale` and `--mark-differences` are
+  diff-pdf's.
+- **The view is the reader.** `diff` hands its view options and a
+  `Comparison` to `read.runWith`; buffer 0 is the first document and buffer
+  1 the second. The two windows are held together by comparing where each
+  was last frame, not by hooking every scroll: the one that moved leads, and
+  the other goes to its page's partner. A page one document has alone is
+  shown in that document's window, which then leads.
+- **`gd` and `gD`** go round side by side, the overlay, the first alone and
+  the second alone. `gD` from the second is the first, so `gd gD` blinks at
+  one place. The overlay is drawn on the rasterising thread at the window's
+  zoom and shown as a texture on either backend.
+- **`<C-arrows>`** move the second document a point; `:diff offset X Y` and
+  `--offset X,Y` set it exactly. The comparison runs again on a thread of its
+  own, on every core, and a nudge that arrives meanwhile restarts it when it
+  returns. The overlay moves at once and the washes when the results come
+  back. Pages whose hashes match stay identical at any offset.
+- **Words.** A differing pair's text goes through Myers' diff
+  (`hlidskjalf/diff.zig`), with the common head and tail cut first and a cap
+  of 2,000 edits. Removed words are washed red on the first page and added
+  ones green on the second, and the first change is the report's and the
+  panel's text: `"fox" → "cat"`. `--pair text` is the same diff over hashes
+  of whole pages.
+- **Budget.** `diff X X --report` on the 155-page *Nanite* drew nothing and
+  took 124 ms. On two unrelated 13-page papers, comparing took 94 ms beside
+  4.12 s of drawing, the word diff included, and hashing 8 ms beside 52 ms of
+  interpreting. The planned early stop at the tolerance was not built: it
+  would shorten 2% of a pair. `read --frames 1200` was 748 ms before the view
+  and 749 ms after, and `raster --all` hashed the same.
+- **Not taken from diff-pdf:** a PDF of the differences (fenrir writes no
+  PDF yet) and the 300 dpi default.
+
 ### What each phase cost
 
 Estimates have been low in the same direction every phase. This table is
@@ -351,6 +419,7 @@ what to plan with.
 | 7 | 4, 980 | 4, 2,385 | 596 | estimate a file per format the commit must understand |
 | 8 | 8, 1,930 | 8, 3,892 | 487 | estimate the file, not the feature |
 | 9 | 2, 450 | 3, 1,616 | 539 | split before an exhaustive enum grows |
+| 10 | 5, 2,450 | 8, 3,759 | 470 | a view over work is a layout, its modes, a thread and a panel: a commit each |
 
 ### Open gaps
 
@@ -360,93 +429,11 @@ what to plan with.
 - **The rails do not turn off.** Fixing it takes a setting, two bools in
   `windowRect`, and a `:set` name, about 80 lines, in whichever phase next
   touches settings.
-
-### Phase 10 — comparing documents
-
-This follows [diff-pdf](https://github.com/vslavik/diff-pdf): its options,
-with the defaults its users reach for (`--per-page-pixel-tolerance=10
---skip-identical --channel-tolerance=0 --view`). `fenrir diff a.pdf b.pdf`
-opens the two side by side at the first difference. `--report` opens no
-window; scripts and the tests use it.
-
-| Option | Default | |
-|---|---|---|
-| `--per-page-pixel-tolerance N` | `10` | A page differs only when more than N pixels do. |
-| `--channel-tolerance N` | `0` | A pixel differs when any channel moves by more than N of 255. |
-| `--skip-identical` | on | Only differing pages are shown and written. `--all-pages` turns it off. |
-| `--dpi N` | `150` | diff-pdf uses 300, but two `f32` canvases at 300 dpi are 270 MB per page pair per thread, and 150 still resolves a changed glyph. `--dpi 300` gives diff-pdf's pixel counts. |
-| `--mark-differences` | off | A change bar in the margin of each output image. The view always has them. |
-| `--grayscale` | off | Unchanged ink in grey, only the differences in colour. |
-| `--output-diff DIR` | | The overlay as a PNG per differing page. fenrir writes no PDF. |
-| `--pair number\|text` | `number` | Pairs pages by number, as diff-pdf does, or by text, so an inserted page does not mark every page after it. |
-| `--jobs N` | `1` | Pages on threads, as in `raster`. |
-| `--report` | off | Print and exit. |
-
-The exit codes are diff-pdf's: 0 identical, 1 different, 2 bad arguments,
-3 a file would not open.
-
-```
-$ fenrir diff v1.pdf v2.pdf --report
-page  3 ≠  3    1,204 px in 3 regions
-page  7 +       only in v2.pdf
-2 of 12 pages differ
-```
-
-**Cheap first, pixels last.**
-1. Pair the pages. Pages of different sizes compare over the union of both
-   boxes, as diff-pdf does. An unpaired page is added or removed without
-   being rasterised.
-2. **Equal display-list hashes mean identical pages**, and nothing is
-   rasterised. `DisplayList.hash` is new: computed once per page, over the
-   commands and their arrays. Two exports of the same source usually stop
-   here.
-3. Otherwise, rasterise both at `--dpi` on `--jobs` threads and compare 16
-   pixels at a time. With `--report` and no images, stop counting a page the
-   moment it passes the tolerance.
-4. Gather changed pixels into 16×16 tiles and merge them into rectangles in
-   page space. These are the regions the view washes and `]d` steps.
-
-**The view.**
-- Two panes, A and B, with scroll locked through the pairing.
-- Changed regions are washed in fixed colours, red on A and green on B,
-  because the page's colours belong to the document, not the theme.
-- `gd` cycles side by side → overlay → A only → B only, which are diff-pdf's
-  `Ctrl+D`, `Ctrl+<` and `Ctrl+>`.
-  - The overlay is diff-pdf's: ink only in A is red, only in B blue, shared
-    ink dark. It is the comparison's own image uploaded as a page texture, so
-    the GPU path needs no new blend mode.
-  - Flipping between A only and B only at one place is a blink comparator:
-    the eye catches what moved.
-- `<C-arrows>` nudge B against A by a point, as diff-pdf's offset does, for a
-  document whose margins moved. `:diff offset X Y` sets the offset exactly
-  and `:diff offset` clears it. The comparison reruns with it.
-- `]d` / `[d` step through the changed regions across pages, the way `]a`
-  steps marks.
-- The scrollbar carries a tick at each changed region, as diff-pdf's
-  thumbnail gutter marks pages. A *changes* panel lists the pages and their
-  counts as `panels.Row`s.
-
-**Words, not only pixels.** Pixels can only say that a paragraph moved.
-- A Myers diff over each paired page's text (phase 7) washes deleted words
-  red on A and inserted words green on B, and lists them as the changes
-  panel's detail. That makes a revised paper readable as a revision.
-- `--pair text` uses the same machinery: pages are aligned by the longest
-  common subsequence of their text hashes.
-
-| Commit | Files | ~ |
-|---|---|---|
-| `fenrir diff --report`: pages by display list, then by pixel | `src/vanagandr/diff.zig`, `gelgja/DisplayList.zig` | 550 |
-| changed regions, and the images diff-pdf writes | `diff.zig` | 400 |
-| two documents side by side, scrolled together, changes washed | `read.zig`, `Layout.zig`, `keys.zig` | 600 |
-| the overlay, the blink, and nudging one against the other | `read.zig`, `keys.zig`, `commands.zig` | 400 |
-| a word diff over the text, and pages paired by it | `src/hlidskjalf/diff.zig`, `vanagandr/diff.zig` | 500 |
-
-**Budget.** `fenrir diff X X --report` on one file rasterises nothing, which
-checks that the hash path is taken. On documents that differ, the compare must
-be a rounding error beside rasterising the two pages; `--time` shows it.
-
-**Not taken from diff-pdf:** a PDF of the differences (fenrir writes no PDF
-yet, so it writes PNGs), and the 300 dpi default.
+- **`fenrir diff` compares before the window opens,** with nothing on screen.
+  Two long documents with `--jobs 1` sit for seconds. The fix is the rerun
+  thread started at open, with the view filling in as pairs come back.
+- **The overlay is the first document's pages.** A page only the second has
+  is not in them; `gD` shows it alone.
 
 ### Phase 11 — marks you can step through
 
@@ -770,6 +757,10 @@ Who each part is for:
   hangs without it.
 - **When a boundary takes a count, write down what it counts.** `lua_resume`
   counts arguments, not the function under them.
+- **What a thread will hand over is allocated where a thread can free it.**
+  The command's arena is not thread-safe, so a comparison's results are
+  `smp_allocator`'s from the start, and the one made again after a nudge
+  replaces them in kind.
 
 **The box tree**
 - **`ui.root` does not exist until `begin` has made one.**
@@ -806,6 +797,9 @@ Who each part is for:
   `gt`/`gT` are read as codepoints.
 - **A binding drawn beside a command is a claim about the keyboard.** Parse
   it back through `keyspec` and ask the live keymap who owns the key.
+- **A held key is a request a frame.** Work it starts is restarted when the
+  running one returns, not once per repeat: a nudge held for a second is one
+  comparison behind, never thirty.
 - **Rename a field the day a second meaning arrives.**
 - **Add a variant to an exhaustive enum in the commit that answers it**, or
   split before the enum grows. A split after it grows does not build.
@@ -813,6 +807,9 @@ Who each part is for:
 **The page**
 - **A colour drawn on the page cannot come from the theme.** The page is the
   document's, and white on white is nothing.
+- **Hold two windows together by comparing them, not by hooking them.** A
+  window moves by key, wheel, scrollbar, jump, fit and resize. Asking each
+  frame which one moved catches all six, including the one nobody listed.
 - **A box is where a mark is, not what it is.** Bounds answer visibility and
   order; a click asks `Mark.hits`.
 - **A plan that names a file for drawing is naming a pipeline.** Check the
@@ -843,6 +840,14 @@ Who each part is for:
 - **Take the suspect out and measure again.** The diff for ink does nothing
   without ink; removing a button found the cost.
 - **A table is written one entry a line**, so a column can be read down.
+- **A hash that lets work be skipped may be wrong in one direction only.**
+  Hash what is drawn, digest objects by content, and return nothing rather
+  than guess. Two pages that hash apart cost a render; two that wrongly hash
+  alike report a changed page as identical.
+- **Measure the plan's optimisation before building it.** The early stop at
+  the pixel tolerance would have shortened 2% of a pair.
+- **Send stdout and stderr to two files.** On this machine `> f 2>&1` has
+  lost a report's lines under the timing line, twice.
 
 **Estimating and committing**
 - **Estimate the file, not the feature.** A new file is about 400 lines: a
@@ -878,6 +883,10 @@ fenrir marks F [--db D]                 # every mark as stored
 fenrir marks F --ink P X Y X Y ...      # seed a stroke for a shot
 fenrir health | plugins [--api]         # what the build has; what a configuration did
 fenrir run S.lua F.pdf                  # a plugin over a document, no window
+fenrir trace F --all --hash             # each page's hash, which diff compares
+fenrir diff A B --report [--pair text]  # the pages that differ, and the words
+fenrir diff A B --output-diff DIR       # diff-pdf's pictures, as PNGs
+fenrir diff A B --shot s.png --path cpu # the comparison view, no display
 ```
 
 Tests go where no window, device or font is needed: Þviti's solver, `keys`,

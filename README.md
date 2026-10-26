@@ -46,10 +46,11 @@ filesystems on three platforms are less reliable about it.
 
 `fenrir read paper.pdf` opens a document in a window: continuous scrolling,
 zoom and fits, Vim-style windows and tabpages, highlights, notes and ink that
-survive reopening, search, a command palette, and plugins. `fenrir raster`
-writes the same page to a PNG with no device at all. Across a 400-document
-corpus every glyph on every first page is accounted for: drawn, blank, or an
-invisible OCR layer over a scan.
+survive reopening, search, a command palette, and plugins. `fenrir diff`
+opens two revisions side by side at their first change, as diff-pdf does.
+`fenrir raster` writes the same page to a PNG with no device at all. Across a
+400-document corpus every glyph on every first page is accounted for: drawn,
+blank, or an invisible OCR layer over a scan.
 
 - **Gjöll** reads the whole container and interprets all 73 content-stream
   operators into a display list, including colour spaces, functions, form
@@ -391,9 +392,10 @@ command's options.
 | `pages <file> [--verbose]` | every page and its effective geometry |
 | `xref <file> [--verify]` | where every object lives; `--verify` checks each offset hits its own `N G obj` |
 | `extract <file> <obj> [--raw]`, `extract <file> --page N` | a stream's decoded bytes, or a page's content stream |
-| `trace <file> [--page N\|--all] [--stats\|--paths\|--glyphs\|--lines\|--text\|--find Q]` | a page as a display list, or as the text a search runs over |
+| `trace <file> [--page N\|--all] [--stats\|--paths\|--glyphs\|--lines\|--text\|--find Q\|--hash]` | a page as a display list, as the text a search runs over, or as the hash `diff` compares |
 | `raster <file> [--page N\|--all] [--dpi N] [--samples N] [--path stencil\|slug\|both] [--stats] [--time] [--jobs N] [-o F]` | a page rendered to a PNG on the CPU, and the benchmark |
 | `read <file>...` | the reader; see above |
+| `diff <a> <b> [--report] [--pair number\|text] [--output-diff DIR] [--jobs N]` | which pages of two documents differ, as diff-pdf finds them: by display-list hash, then by pixel, then by word. Without `--report`, the two side by side |
 | `recent`, `config`, `marks <file>` | what Mímir remembers; `marks --add` and `--ink` write marks from a script |
 | `plugins [--api]` | load the configuration and report, or print the whole `fenrir` table |
 | `health` | what this build has, where it keeps things, what the configuration asked for |
