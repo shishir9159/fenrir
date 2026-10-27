@@ -55,6 +55,12 @@ change: it needs its own justification, images and commit.
 build. It is not a substitute for the before-and-after hash, but it catches a
 change that broke one path and not the other.
 
+**On the GPU the proof is a shot.** `read F --path gpu --shot s.png` reads
+the frame back from the device, and two runs of one binary write the same
+bytes. Compare `Get-FileHash` of shots from both binaries, at the same page,
+zoom and window size. A shader change that moves a pixel is a rendering
+change, the same as on the CPU. See "The GPU path" for the timers.
+
 **Leave `--jobs` at 1 when measuring the rasteriser.** Six threads turn a 2%
 change into noise, and the columns become work done rather than time waited.
 Use `--jobs` to measure `--jobs`, reading its `wall` line.
@@ -98,7 +104,8 @@ Open hypotheses, by module:
   would do.
 - The framebuffer is four `f32` a pixel, so a page at 2× is a 31 MB working
   set and every full sweep is bandwidth-bound. This is deliberate: the file is
-  the oracle the GPU is checked against. See Tier 3 item 13.
+  meant to be the oracle the GPU is checked against. Nothing does the checking
+  yet; see Tier 3 item 13 and "The GPU path".
 
 **The JPEG decoder** (`gjoll/filter/jpeg.zig`), after the DC-only shortcut:
 - `bit()` reads one bit at a time, branching on refill and `0xFF` stuffing;
@@ -181,14 +188,18 @@ Two hazards stay live:
 10. A scratch buffer for `Scanner.array`; indirect `ColorSpace` in `State`; a
     shading cache; resource sub-dictionaries hoisted per content stream.
 11. Pack `(reach, index)` into the slug bands, so the early exit needs no
-    gather and the sort no comparator indirection.
+    gather and the sort no comparator indirection. The shader walks the same
+    two indirections (`rayAlongX` in `slug.glsl`), so this is one change for
+    both. It moves data and not arithmetic, so the CPU hash must not move.
 12. **Threads.** ~~Pages~~: `raster --all --jobs N`, **4.4× to 5.0× on six
     cores**, every hash unchanged. **Rows are still to do**, and they are what
     a person waiting on one page would feel. Splitting a page into bands moves
     the transform by whole pixels, and `a*x + b*y + (f - y0)` is not
     `(a*x + b*y + f) - y0` in floating point, so the hashes would move. Try
     splitting the *display list* by band instead: each thread keeps the
-    unmodified transform and clips to its own rows.
+    unmodified transform and clips to its own rows. On the GPU path a zoom
+    is a matrix, so rows help `raster`, `--path cpu`, and the pages the GPU
+    path hands back to the CPU. They do not help a reader on the GPU.
 13. **A narrower framebuffer.** Eight or four bytes a pixel would halve or
     quarter the bandwidth and change pixels. That makes it a rewrite, and it
     ends the file's role as the GPU's oracle. Propose it as a rendering change
@@ -206,7 +217,8 @@ These are already right. Change them only when a profile names them.
   image. There is no `vkDeviceWaitIdle` on the frame path.
   `PathRenderer.upload` is generation-gated, so a still reader uploads
   nothing. The stalls that remain are outside the steady state, and each says
-  why it is safe.
+  why it is safe. None of this was measured, and it covers only a reader
+  that is still. A moving reader is flaws F2 and F3 below.
 - **`Font.cidWidth`'s linear scan.** Measured: it beats anything cleverer
   until it does not. Re-measure it on a large CJK font before changing it.
 - **`Scanner`'s one-byte dispatch and `Lexer`'s borrowed slices.** They are
@@ -232,6 +244,149 @@ These are already right. Change them only when a profile names them.
 - Zig 0.16's std, checked against the installed source. The vector and
   `@branchHint` APIs are exactly what moves.
 - Wayland is compile-verified only.
+
+## The GPU path
+
+Everything above measures `raster`, which never opens a device. The reader
+has a second rasteriser, and none of it has been measured:
+- `replay.record` walks the same display list into a `Scene`: outlines as
+  quadratics, instances that place them, and a clip chain;
+- `PathRenderer` puts the scene in eight storage buffers;
+- `slug.frag` works out each pixel's coverage from the curves.
+
+A glyph is recorded once per page, in em units, and each occurrence of it is
+an 80-byte instance. A zoom is a matrix.
+
+**Why the reader does not use it.** `read` picks `.cpu` whenever the build
+has both rasterisers (`backend = if (have_gpu and !have_cpu) .gpu else .cpu`),
+and `-Dpath=both` is the default. So the GPU path runs only under
+`--path gpu`. Two other places look like GPU text and are not:
+- `raster --path slug` is the shader's CPU model and never touches a device;
+- the interface's text is Týr's atlas, which is right for text at fixed sizes.
+
+The default is right today, for the reasons in F1: at 800% the GPU path
+draws strokes and clips as polygons, and hairlines eight pixels wide. It also
+has five of the sixteen blend modes. The intent is to make `.gpu` the default
+once G1 is done, with a per-page fallback: a page whose recording could not be
+drawn exactly is rasterised on the CPU and shown as a texture. The reader
+already holds both kinds of result.
+
+### What is wrong with it
+
+These were found by reading, so each is a hypothesis until the G0 timers
+confirm it. F1 and F4 are about correctness; the others are about cost.
+
+- **F1. Strokes, clips and hairlines are baked at 72 dpi.** `recordPage`
+  records at zoom 1.0, and the flattener's tolerance is a tenth of a device
+  pixel *at that zoom*.
+  - Fills keep their curves (`slug.fromPath`). Strokes (`strokePath`) and
+    clips (`pushClip`) are flattened first, so at 800% the polygon strays by
+    0.8 px. Clips can take `slug.fromPath` the way fills do.
+  - A hairline resolves to one device pixel (§8.4.3.2) at record time, so it
+    is eight pixels wide at 800%.
+- **F2. Scrolling re-places every instance.** `placeVisible` composes a
+  matrix and a scissor for every instance of every visible page, and `upload`
+  sends all of them, eighty bytes each, whenever the view moves. A page of
+  prose is about four thousand instances, so a scroll costs a few hundred
+  kilobytes a frame and a loop over them on the frame thread. The outlines
+  were recorded in page space so that a move would cost one matrix; it costs
+  one per instance.
+- **F3. A page past the cache rebuilds all of them.** `Recorded` holds
+  twelve pages in one append-only store.
+  - The thirteenth page evicts one, and `rebuild` merges the eleven survivors
+    again.
+  - Then every binding, texels included, is uploaded again, once for each
+    frame in flight.
+  - The buffers are host-visible and only *prefer* device-local. On a card
+    without resizable BAR (this one), that is a 256 MB heap. When it is full,
+    `allocateMemory` fails instead of falling back to system memory.
+- **F4. The texel budget is per page.** `max_texels` is 128 MiB, the smallest
+  `maxStorageBufferRange` Vulkan promises. `Scene.drawImage` enforces it while
+  a page records, but `Scene.merge` does not. Twelve pages of a scan can
+  exceed it on a device that offers only the minimum.
+- **F5. Per-fragment work that belongs on the host.** `slug.frag` inverts the
+  instance's matrix and derives pixels-per-unit for every fragment, then again
+  for every clip node it walks. Both are constants of the placement.
+  `Canvas.fillSlug` inverts once per fill, so moving this work would also
+  bring the shader closer to its model.
+- **F6. Two gathers per curve.** A fragment reads a band, then an index, then
+  the curve, and recomputes the reach to decide the early exit. This is Tier 3
+  item 11, on both sides.
+
+### How to measure it
+
+The same rules apply, with a different oracle.
+- **Time on the device.** Write timestamps around the frame and around the
+  path draws, and read them back after the frame's own fence, so reading never
+  stalls. `read --time` reports:
+  - GPU frame and path milliseconds, as the best, median and 95th percentile;
+  - the CPU's frame time;
+  - the time spent in `placeVisible`;
+  - bytes uploaded per frame.
+- **A scripted workload.** `read F --bench scroll|zoom|flip --vsync off --time`.
+  - `scroll` moves a fixed fraction of a page each frame, to the end.
+  - `zoom` cycles from 50% to 800% and back on one page.
+  - `flip` pages through the document, which exercises F3.
+
+  Each step waits for its pages, so frame cost and page arrival are separate
+  numbers. Run it under both `--path cpu` and `--path gpu`: that is how a
+  re-render is compared with a matrix.
+- **Where the buffers live.** `--time` also prints whether they are
+  device-local, host-visible, or both.
+- **Output.** Take a GPU shot hash before and after (see "The method").
+  `scene.modelFrame` runs the fragment shader over a whole recorded frame on
+  the CPU, so a `Scene` can be checked against `replay.render` without a
+  device.
+
+RenderDoc stays the tool for finding *why* a frame is slow. These say
+*whether* it is.
+
+### The GPU worklist
+
+**G0: the harness.** The timers, the workloads and the memory report. Also
+the tests that hold the scene format still: merge and eviction, placement,
+the clip chain, and the model against `render`.
+
+**G1: correct before default.** Each item changes GPU pixels and needs shots.
+- Clips through `slug.fromPath` rather than flattened.
+- Strokes flattened at a tolerance that holds to `View.max_zoom`, or a
+  stroker that emits quadratics. Either way, measure how much the store grows.
+- Hairlines resolved in the shader. The width is the device's, and cannot be
+  decided at record time.
+- A texel budget for the merged scene, and a fallback when the preferred
+  memory heap is full.
+- Then `.gpu` by default. A page is drawn on the CPU when its recording counts
+  `blended`, `images_dropped` or `clips_too_deep`.
+
+**G2: on change, not per frame.**
+- Instances uploaded once with their page, in page space. A frame sends one
+  placement per visible page and window, as a push constant per draw, so a
+  scroll uploads nothing.
+- One region of the store per cache slot, addressed by base offsets rather
+  than renumbered. An eviction then overwrites one region and merges nothing.
+- Device-local buffers written through a staging copy, with one copy of a
+  page's outlines rather than one per frame in flight. They do not change
+  while a frame reads them.
+
+**G3: per fragment.** Measure each item with the device timer on a page of
+prose, a page of line art, and the scatter plot of 1,635 clips.
+- Inverse and pixels-per-unit computed on the host (F5).
+- The clip chain evaluated before the path, so a fragment that is clipped
+  away never walks the glyph's bands.
+- `(reach, index)` in the bands (F6).
+- An instance whose box is large and mostly empty, such as a long diagonal
+  stroke, split into tiles that have curves.
+- Images as sampled textures with mipmaps, rather than sixteen nearest
+  fetches from a buffer. This changes pixels.
+
+**G4: startup.** A `VkPipelineCache` kept beside the database, measured
+against the `renderer` and `paths` stages.
+
+Budgets, with numbers set once G0 has a baseline:
+- a scroll uploads no instances;
+- a flip past the cache moves one page's bytes, not twelve;
+- the path draw on a page of prose costs a stated fraction of a frame at the
+  refresh rate.
 
 ## The ledger
 
@@ -302,6 +457,18 @@ same code in the same order. Each thread opens its own `Document` over the
 same bytes (`Document.openBorrowed`). A shared document behind a mutex would
 have serialised image decoding, which happens during the render.
 
+**Stencil against slug, both on the CPU.** *Pretrained Transformers*, one
+binary, the two `--path` values interleaved, best of five:
+
+| | total | render | hash |
+|---|---|---|---|
+| `--path stencil` | 1,769.03 ms | 1,592.85 ms | `bf68db5063ccf734` |
+| `--path slug` | 981.54 ms | 804.74 ms | `41213873b2b6f905` |
+
+The analytic model renders this paper in **half the time** of eight-sample
+stencil-and-cover. Each hash held across all five runs. The reader's CPU path
+draws with stencil. See item 8 under "Added after review".
+
 ## The graveyard
 
 Measured and lost. Append yours, with the number.
@@ -333,15 +500,18 @@ measurement attached.
 3. **Latency a reader feels.** `read --time` stops at the first page. Add per
    event timings: a zoom, from the key to the sharp page, and a scroll onto a
    page not yet rasterised. Row threading (item 12) is justified by exactly
-   this and has no number to beat.
+   this and has no number to beat. `read --bench` (G0) is where these come
+   from, on both paths.
 4. **Split the canvas lap** into allocate, fault and clear. It is 8% of a run.
    After the arena fix, faulting should be gone. If clearing dominates, a
    tile-level lazy clear skips a page's untouched margins and stays bit-exact,
    unlike item 13.
-5. **Find what the swapchain's 353 ms is.** That is long for a swapchain. If
-   pipeline creation is inside it, a `VkPipelineCache` kept beside the
-   database is the standard fix. If it is all driver time, record that and
-   stop.
+5. **Find what the swapchain's 353 ms is.** That is long for a swapchain.
+   Pipeline creation is not inside it. The rect pipelines are built in the
+   `renderer` stage and the five path pipelines in `paths`, and both are
+   marked separately by `read --time`. So a `VkPipelineCache` is measured
+   against those two stages (G4). What the swapchain's own time is remains
+   open. If it is all driver time, record that and stop.
 6. **The JPEG decoder's other three**, in this order, each measured alone on
    *Nanite_2021*: a lookup table for Huffman codes up to nine bits, a
    word-refilled bit reader, then AAN.
@@ -355,6 +525,13 @@ measurement attached.
      `read --frames 1200` within noise of the reader without it.
    - Anything drawn from a page replays the recorded scene and is never
      re-interpreted.
+8. **The CPU reader on slug.** The analytic rasteriser renders a paper in
+   half the time of the stencil one (see the ledger), and it is also what the
+   GPU draws, so a page would look the same on either path. It changes every
+   antialiased edge, which makes it a rendering change to argue with images,
+   not an optimisation. Measure a scan and *Nanite_2021* before arguing it:
+   one paper is not a corpus. Clips are the open question, since `fillSlug`
+   still reads the stencil's clip mask.
 
 ## Finishing
 
