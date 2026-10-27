@@ -50,10 +50,13 @@ const geom = @import("../gelgja/geom.zig");
 const paint = @import("../gelgja/paint.zig");
 const slug = @import("slug.zig");
 const slugpipe = @import("slugpipe.zig");
+const software = @import("software.zig");
 
 const Bounds = geom.Bounds;
 const Color = paint.Color;
 const FillRule = geom.FillRule;
+const Framebuffer = software.Framebuffer;
+const Point = geom.Point;
 const Transform = geom.Transform;
 
 /// What names one glyph outline: which font, and both the ways a display list
@@ -85,6 +88,10 @@ pub const Scene = struct {
     /// Where each image's texels are. See the module comment.
     images: std.ArrayList(slugpipe.ImageInfo) = .empty,
     texels: std.ArrayList(u32) = .empty,
+    /// The most texels `drawImage` will hold: `max_texels`. A field rather
+    /// than the constant so a test can reach the limit without allocating
+    /// 128 MiB on the way.
+    texel_budget: usize = max_texels,
     /// Images already recorded in this scene, by the address of the pixels
     /// they came from, so a logo drawn forty times is stored once. Only
     /// meaningful while recording: a merged scene's images came from pixels
@@ -286,7 +293,7 @@ pub const Scene = struct {
         const index = s.image_seen.get(key) orelse blk: {
             const size = storedSize(bitmap.width, bitmap.height, xform);
             const count = @as(usize, size[0]) * size[1];
-            if (s.texels.items.len + count > max_texels) {
+            if (s.texels.items.len + count > s.texel_budget) {
                 s.stats.images_dropped += 1;
                 return;
             }
@@ -538,6 +545,152 @@ pub const Frame = struct {
     }
 };
 
+/// What `modelFrame` drew, and what it passed over.
+pub const Modelled = struct {
+    /// Path instances that left a fragment.
+    paths: u32 = 0,
+    /// Image instances, which the model does not sample: `Canvas.drawImage`
+    /// is the oracle for that half of the shader.
+    images_skipped: u32 = 0,
+};
+
+/// A frame drawn the way `slug.vert` and `slug.frag` draw it, on the CPU.
+///
+/// `Canvas.fillSlug` is the model of the coverage function. This is the model
+/// of everything the device does around it, which nothing else checks without
+/// a GPU: the headers `merge` renumbered, the matrices `Frame.place`
+/// composed, the quad the vertex shader shrinks to the scissor, the clip
+/// chain the fragment shader walks and where the walk stops, and the blend
+/// state each composite is created with. A page recorded and placed has to
+/// come out the way `replay.render` draws the same page, and the test that
+/// says so is in `replay.zig`.
+///
+/// `fb` is linear light, because the device blends into an `_SRGB`
+/// attachment. The device then rounds to eight bits and this does not, which
+/// is below any tolerance a test compares at.
+///
+/// The inverse, the scale and the clip chain are taken once per instance
+/// here and once per fragment in the shader. The arithmetic is the same; the
+/// shader doing it per fragment is F5 in OPTIMIZING.md.
+pub fn modelFrame(fb: *Framebuffer, s: Scene, frame: Frame) Modelled {
+    std.debug.assert(fb.space == .linear);
+    var out: Modelled = .{};
+
+    for (frame.instances.items) |it| {
+        if (it.flags & slugpipe.flag.image != 0) {
+            out.images_skipped += 1;
+            continue;
+        }
+        if (it.header >= s.store.headers.items.len) continue;
+        const xform = transformOf(it.xform, it.translate);
+        const inverse = xform.invert() orelse continue;
+        const scale: slug.Scale = .of(xform);
+
+        var chain: [slugpipe.max_clip_walk]Link = undefined;
+        const links = walkClips(&chain, frame, it.clip_node);
+
+        // The vertex shader's quad: the header's box through the matrix, a
+        // pixel of margin, cut to the scissor.
+        const quad = intersect(deviceBox(s.store.headers.items[it.header].bounds(), xform), it.clip);
+        const xs = pixelSpan(quad[0], quad[2], fb.width);
+        const ys = pixelSpan(quad[1], quad[3], fb.height);
+
+        var drew = false;
+        var y = ys[0];
+        while (y < ys[1]) : (y += 1) {
+            var x = xs[0];
+            while (x < xs[1]) : (x += 1) {
+                const centre: Point = .{
+                    .x = @as(f32, @floatFromInt(x)) + 0.5,
+                    .y = @as(f32, @floatFromInt(y)) + 0.5,
+                };
+                const p = inverse.apply(centre);
+                const cov = slug.coverageAt(s.store, it.header, p.x, p.y, scale);
+                if (cov <= 0) continue;
+                var color = it.color;
+                for (&color) |*ch| ch.* *= cov;
+                if (!clipped(&color, s.store, chain[0..links], centre)) continue;
+                blendFixed(fb.pixels[(@as(usize, y) * fb.width + x) * 4 ..][0..4], color, it.compositeOf());
+                drew = true;
+            }
+        }
+        if (drew) out.paths += 1;
+    }
+    return out;
+}
+
+/// One clip node, ready for fragments. `inverse` is null for a matrix that
+/// flattens the clip to a line, which the shader's `invertXform` meets as a
+/// zero determinant and answers with no coverage.
+const Link = struct { header: u32, inverse: ?Transform, scale: slug.Scale };
+
+/// The chain from `first` outwards, as far as the shader walks it. Past
+/// `max_clip_walk` the outer clips are not applied, there as here.
+fn walkClips(chain: *[slugpipe.max_clip_walk]Link, frame: Frame, first: u32) usize {
+    var n: usize = 0;
+    var node = first;
+    while (n < chain.len and node != slugpipe.no_clip) : (n += 1) {
+        const c = frame.clips.items[node];
+        const t = transformOf(c.xform, c.translate);
+        chain[n] = .{ .header = c.header, .inverse = t.invert(), .scale = .of(t) };
+        node = c.parent;
+    }
+    return n;
+}
+
+/// Multiplies each clip's coverage into `color`. False where the shader
+/// would `discard`.
+fn clipped(color: *[4]f32, store: slug.Store, chain: []const Link, centre: Point) bool {
+    for (chain) |link| {
+        const inverse = link.inverse orelse return false;
+        const p = inverse.apply(centre);
+        const cov = slug.coverageAt(store, link.header, p.x, p.y, link.scale);
+        for (color) |*ch| ch.* *= cov;
+        if (color[3] <= 0) return false;
+    }
+    return true;
+}
+
+/// The blend state `PathRenderer.blendFor` gives each composite, on one
+/// premultiplied pixel.
+fn blendFixed(dst: *[4]f32, src: [4]f32, composite: slugpipe.Composite) void {
+    const keep = 1 - src[3];
+    switch (composite) {
+        .normal => for (dst, src) |*d, v| {
+            d.* = v + d.* * keep;
+        },
+        .multiply => {
+            for (dst[0..3], src[0..3]) |*d, v| d.* = v * d.* + d.* * keep;
+            dst[3] = src[3] + dst[3] * keep;
+        },
+        .screen => {
+            for (dst[0..3], src[0..3]) |*d, v| d.* = v + d.* * (1 - v);
+            dst[3] = src[3] + dst[3] * keep;
+        },
+        // MIN and MAX ignore the factors. The shader composites darken's
+        // source over white first, which is where `keep` comes in.
+        .darken => {
+            for (dst[0..3], src[0..3]) |*d, v| d.* = @min(d.*, v + keep);
+            dst[3] = @max(dst[3], 1);
+        },
+        .lighten => {
+            for (dst[0..3], src[0..3]) |*d, v| d.* = @max(d.*, v);
+            dst[3] = @max(dst[3], src[3]);
+        },
+    }
+}
+
+/// The pixels a quad from `lo` to `hi` generates fragments for, along one
+/// axis: those whose centres it contains, its low edge in and its high edge
+/// out.
+fn pixelSpan(lo: f32, hi: f32, limit: u32) [2]u32 {
+    if (!(hi > lo)) return .{ 0, 0 };
+    const top: f32 = @floatFromInt(limit);
+    const a = std.math.clamp(@ceil(lo - 0.5), 0, top);
+    const b = std.math.clamp(@ceil(hi - 0.5), a, top);
+    return .{ @intFromFloat(a), @intFromFloat(b) };
+}
+
 /// Texels kept per pixel of an image's recorded placement, in each direction.
 ///
 /// A page is recorded at one device pixel per point, and a reader zooms it.
@@ -630,9 +783,13 @@ const Placed = struct { xform: [4]f32, translate: [2]f32 };
 /// The recorded matrix followed by the frame's, in that order: a point goes
 /// through the page's own placement first and then onto the screen.
 fn compose(m: [4]f32, t: [2]f32, outer: Transform) Placed {
-    const inner: Transform = .{ .a = m[0], .b = m[1], .c = m[2], .d = m[3], .e = t[0], .f = t[1] };
-    const c = inner.concat(outer);
+    const c = transformOf(m, t).concat(outer);
     return .{ .xform = .{ c.a, c.b, c.c, c.d }, .translate = .{ c.e, c.f } };
+}
+
+/// A matrix the way an instance or a clip node stores it.
+fn transformOf(m: [4]f32, t: [2]f32) Transform {
+    return .{ .a = m[0], .b = m[1], .c = m[2], .d = m[3], .e = t[0], .f = t[1] };
 }
 
 /// A recorded scissor through the frame's transform. The recorded box was in
@@ -672,7 +829,11 @@ fn intersect(a: [4]f32, b: [4]f32) [4]f32 {
 const testing = std.testing;
 
 fn square(gpa: Allocator, out: *std.ArrayList(slug.Curve), x0: f32, y0: f32, x1: f32, y1: f32) !void {
-    const pts = [_][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
+    try outline(gpa, out, &.{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } });
+}
+
+/// A closed polygon as straight quadratics.
+fn outline(gpa: Allocator, out: *std.ArrayList(slug.Curve), pts: []const [2]f32) !void {
     for (pts, 0..) |p, i| {
         const q = pts[(i + 1) % pts.len];
         try out.append(gpa, .{
@@ -971,4 +1132,277 @@ test "placing a recorded page composes its transform and keeps the chain" {
     try testing.expectEqual([2]f32{ 0, 200 }, f.clips.items[1].translate);
 }
 
+fn pixelOf(fb: Framebuffer, x: u32, y: u32) [4]f32 {
+    return fb.pixels[(@as(usize, y) * fb.width + x) * 4 ..][0..4].*;
+}
 
+test "placing a range renumbers its nested chain and passes no_clip through" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 100, 100 });
+
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 10, 10);
+
+    // Page one: a path under one clip.
+    const one_start = s.rangeStart();
+    try s.pushClip(gpa, curves.items, .nonzero, .identity);
+    try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1, .normal);
+    s.popClip();
+    const one = s.rangeEnd(one_start);
+
+    // Page two: a path under two nested clips, and one under none.
+    const two_start = s.rangeStart();
+    try s.pushClip(gpa, curves.items, .nonzero, .identity);
+    try s.pushClip(gpa, curves.items, .nonzero, .identity);
+    try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1, .normal);
+    s.popClip();
+    s.popClip();
+    try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1, .normal);
+    const two = s.rangeEnd(two_start);
+    try testing.expectEqual(@as(u32, 1), two.first_clip);
+
+    // Two before one, so neither lands where it was recorded.
+    var f: Frame = .{};
+    defer f.deinit(gpa);
+    try f.place(gpa, s, two, .identity, .{ 0, 0, 100, 100 });
+    try f.place(gpa, s, one, .identity, .{ 0, 0, 100, 100 });
+
+    try testing.expectEqual(@as(usize, 3), f.clips.items.len);
+    try testing.expectEqual(slugpipe.no_clip, f.clips.items[0].parent);
+    try testing.expectEqual(@as(u32, 0), f.clips.items[1].parent);
+    try testing.expectEqual(slugpipe.no_clip, f.clips.items[2].parent);
+
+    try testing.expectEqual(@as(u32, 1), f.instances.items[0].clip_node);
+    try testing.expectEqual(slugpipe.no_clip, f.instances.items[1].clip_node);
+    try testing.expectEqual(@as(u32, 2), f.instances.items[2].clip_node);
+    // Headers index the scene's store, which a placement does not copy.
+    try testing.expectEqual(s.instances.items[0].header, f.instances.items[2].header);
+}
+
+test "a range with no instances places nothing, and a box off the page draws nothing" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 100, 100 });
+
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 10, 10);
+
+    // A clip opened and closed around nothing: a node, and no instance.
+    const bare_start = s.rangeStart();
+    try s.pushClip(gpa, curves.items, .nonzero, .identity);
+    s.popClip();
+    const bare = s.rangeEnd(bare_start);
+    try testing.expectEqual(@as(u32, 1), bare.clip_count);
+
+    var f: Frame = .{};
+    defer f.deinit(gpa);
+    try f.place(gpa, s, bare, .identity, .{ 0, 0, 100, 100 });
+    try testing.expect(f.isEmpty());
+    try testing.expectEqual(@as(usize, 0), f.clips.items.len);
+
+    // A page scrolled below the window: placed, with a scissor of no area.
+    const start = s.rangeStart();
+    try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1, .normal);
+    try f.place(gpa, s, s.rangeEnd(start), .translation(0, 500), .{ 0, 0, 100, 100 });
+    const clip = f.instances.items[0].clip;
+    try testing.expect(clip[3] <= clip[1]);
+
+    var fb = try Framebuffer.init(gpa, 100, 100, .linear);
+    defer fb.deinit(gpa);
+    fb.clear(.white);
+    try testing.expectEqual(@as(u32, 0), modelFrame(&fb, s, f).paths);
+}
+
+test "the model draws inside the scissor and the clip, and passes images over" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 40, 40 });
+
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    // A square, filled under a clip over its left half.
+    try square(gpa, &curves, 0, 0, 10, 20);
+    try s.pushClip(gpa, curves.items, .nonzero, .identity);
+    curves.clearRetainingCapacity();
+    try square(gpa, &curves, 0, 0, 20, 20);
+    try s.draw(gpa, curves.items, .nonzero, .identity, .black, 1, .normal);
+    s.popClip();
+    var red: [4]u8 = .{ 255, 0, 0, 255 };
+    try s.drawImage(gpa, .{ .pixels = &red, .width = 1, .height = 1 }, .scaling(5, 5), .black, 1, .normal);
+
+    // Placed at (10, 10), in a window box that ends at y = 25.
+    var f: Frame = .{};
+    defer f.deinit(gpa);
+    try f.place(gpa, s, s.rangeEnd(.{}), .translation(10, 10), .{ 0, 0, 40, 25 });
+
+    var fb = try Framebuffer.init(gpa, 40, 40, .linear);
+    defer fb.deinit(gpa);
+    fb.clear(.white);
+    const drawn = modelFrame(&fb, s, f);
+    try testing.expectEqual(@as(u32, 1), drawn.paths);
+    try testing.expectEqual(@as(u32, 1), drawn.images_skipped);
+
+    // Inside the clip, ink; right of it, inside the square, paper.
+    try testing.expectEqual(@as(f32, 0), pixelOf(fb, 15, 15)[0]);
+    try testing.expectEqual(@as(f32, 1), pixelOf(fb, 25, 15)[0]);
+    // A clip edge on a pixel boundary leaves each side whole, to the
+    // rounding in evaluating a straight edge as a quadratic.
+    try testing.expectApproxEqAbs(@as(f32, 0), pixelOf(fb, 19, 15)[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1), pixelOf(fb, 20, 15)[0], 1e-6);
+    // Past the window's box, paper, though the clip and the square go on.
+    try testing.expectEqual(@as(f32, 0), pixelOf(fb, 15, 24)[0]);
+    try testing.expectEqual(@as(f32, 1), pixelOf(fb, 15, 25)[0]);
+}
+
+test "the model blends each composite the way its pipeline is set up to" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 50, 10 });
+
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    const cases = [_]struct { paint.BlendMode, Color, f32 }{
+        .{ .normal, .black, 0.5 },
+        .{ .multiply, .gray(0.5), 1 },
+        .{ .screen, .gray(0.5), 1 },
+        .{ .darken, .gray(0.8), 1 },
+        .{ .lighten, .black, 1 },
+    };
+    for (cases, 0..) |c, i| {
+        const x: f32 = @floatFromInt(i * 10);
+        curves.clearRetainingCapacity();
+        try square(gpa, &curves, x, 0, x + 10, 10);
+        try s.draw(gpa, curves.items, .nonzero, .identity, c[1], c[2], c[0]);
+    }
+    try testing.expectEqual(@as(u32, 0), s.stats.blended);
+
+    var f: Frame = .{};
+    defer f.deinit(gpa);
+    try f.place(gpa, s, s.rangeEnd(.{}), .identity, .{ 0, 0, 50, 10 });
+
+    var fb = try Framebuffer.init(gpa, 50, 10, .linear);
+    defer fb.deinit(gpa);
+    fb.clear(.gray(0.5));
+    const g = fb.pixels[0];
+    _ = modelFrame(&fb, s, f);
+
+    // Each by its definition over a grey backdrop. Darken by something
+    // lighter and lighten by black both leave it alone, which `normal` would
+    // not.
+    const want = [_]f32{ g * 0.5, g * g, g + g - g * g, g, g };
+    for (want, 0..) |w, i| {
+        const px = pixelOf(fb, @intCast(i * 10 + 5), 5);
+        try testing.expectApproxEqAbs(w, px[0], 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, 1), px[3], 1e-6);
+    }
+}
+
+test "a clip deeper than the shader walks is counted, and left out as the shader leaves it" {
+    // Too much rather than too little: past the walk the outermost clips are
+    // not applied. The model has to be wrong in the same way the device is,
+    // or it is a model of some other device.
+    const gpa = testing.allocator;
+
+    var corner: std.ArrayList(slug.Curve) = .empty;
+    defer corner.deinit(gpa);
+    try outline(gpa, &corner, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 0, 20 } });
+    var all: std.ArrayList(slug.Curve) = .empty;
+    defer all.deinit(gpa);
+    try square(gpa, &all, 0, 0, 20, 20);
+
+    for ([_]u32{ slugpipe.max_clip_walk, slugpipe.max_clip_walk + 1 }) |depth| {
+        var s: Scene = .{};
+        defer s.deinit(gpa);
+        s.reset(.{ 20, 20 });
+
+        // The outermost clip is a triangle, so the scissor cannot do its job
+        // for it; the rest hide nothing.
+        try s.pushClip(gpa, corner.items, .nonzero, .identity);
+        for (1..depth) |_| try s.pushClip(gpa, all.items, .nonzero, .identity);
+        try s.draw(gpa, all.items, .nonzero, .identity, .black, 1, .normal);
+        const too_deep = depth > slugpipe.max_clip_walk;
+        try testing.expectEqual(@as(u32, @intFromBool(too_deep)), s.stats.clips_too_deep);
+
+        var f: Frame = .{};
+        defer f.deinit(gpa);
+        try f.place(gpa, s, s.rangeEnd(.{}), .identity, .{ 0, 0, 20, 20 });
+        var fb = try Framebuffer.init(gpa, 20, 20, .linear);
+        defer fb.deinit(gpa);
+        fb.clear(.white);
+        _ = modelFrame(&fb, s, f);
+
+        try testing.expectEqual(@as(f32, 0), pixelOf(fb, 2, 2)[0]);
+        try testing.expectEqual(@as(f32, if (too_deep) 0 else 1), pixelOf(fb, 15, 15)[0]);
+    }
+}
+
+test "a glyph is found under its whole key and under no part of it" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 100, 100 });
+
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 0.5, 0.7);
+
+    const key: GlyphKey = .{ .font = 1, .code = 'a', .id = 5 };
+    const header = try s.addGlyph(gpa, key, curves.items);
+    try testing.expectEqual(header, s.glyphHeader(key).?);
+    try testing.expect(s.glyphHeader(.{ .font = 2, .code = 'a', .id = 5 }) == null);
+    try testing.expect(s.glyphHeader(.{ .font = 1, .code = 'b', .id = 5 }) == null);
+    try testing.expect(s.glyphHeader(.{ .font = 1, .code = 'a', .id = 0 }) == null);
+
+    // Not carried by a merge, where the header would be renumbered, and
+    // forgotten by a reset.
+    var into: Scene = .{};
+    defer into.deinit(gpa);
+    into.reset(.{ 100, 100 });
+    _ = try into.merge(gpa, s);
+    try testing.expect(into.glyphHeader(key) == null);
+    s.reset(.{ 100, 100 });
+    try testing.expect(s.glyphHeader(key) == null);
+}
+
+test "an image is stored no longer than max_image_side and no smaller than a texel" {
+    // Wider than the limit, and placed wide enough to want all of it.
+    try testing.expectEqual([2]u32{ max_image_side, 3 }, storedSize(10_000, 3, .scaling(10_000, 10_000)));
+    // Smaller than a pixel on the page.
+    try testing.expectEqual([2]u32{ 1, 1 }, storedSize(500, 500, .scaling(0.1, 0.1)));
+    // A quarter turn keeps the lengths of the sides: twenty pixels, four
+    // texels each.
+    try testing.expectEqual([2]u32{ 80, 80 }, storedSize(500, 500, .{ .a = 0, .b = 20, .c = -20, .d = 0 }));
+    // A singular placement still stores the texel it can.
+    try testing.expectEqual([2]u32{ 1, 1 }, storedSize(64, 64, .{ .a = 0, .b = 0, .c = 0, .d = 0 }));
+}
+
+test "an image past the texel budget is dropped and counted, and one already kept is not" {
+    const gpa = testing.allocator;
+    var s: Scene = .{};
+    defer s.deinit(gpa);
+    s.reset(.{ 100, 100 });
+    try testing.expectEqual(max_texels, s.texel_budget);
+    s.texel_budget = 100;
+
+    var pixels: [8 * 8 * 4]u8 = @splat(255);
+    const kept: Scene.Bitmap = .{ .pixels = &pixels, .width = 8, .height = 8 };
+    try s.drawImage(gpa, kept, .scaling(100, 100), .black, 1, .normal);
+    // Sixty-four more would pass a hundred.
+    try s.drawImage(gpa, .{ .pixels = &pixels, .width = 4, .height = 16 }, .scaling(100, 100), .black, 1, .normal);
+    try testing.expectEqual(@as(u32, 1), s.stats.images_dropped);
+    try testing.expectEqual(@as(usize, 1), s.images.items.len);
+    try testing.expectEqual(@as(usize, 1), s.instances.items.len);
+
+    // The first again costs no texels, so it is drawn.
+    try s.drawImage(gpa, kept, .scaling(50, 50), .black, 1, .normal);
+    try testing.expectEqual(@as(usize, 2), s.instances.items.len);
+    try testing.expectEqual(@as(u32, 1), s.stats.images_dropped);
+    try testing.expectEqual(@as(u32, 3), s.stats.images);
+}

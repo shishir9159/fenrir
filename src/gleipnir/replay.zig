@@ -1538,3 +1538,146 @@ test "text and images are counted, and drawn only when asked" {
         try testing.expectEqual(boxes, r.anyInk());
     }
 }
+
+/// The page `record` and `render` are held to agreeing on: a curved fill, a
+/// round-joined stroke and glyphs under two nested clips, one of them
+/// diagonal, over a grey ground, and a multiply group across its edge.
+fn busyPage(b: *Builder) !void {
+    try box(b, 5, 5, 75, 55);
+    try b.fill(.nonzero, .{ .solid = .gray(0.8) });
+
+    try box(b, 10, 10, 70, 50);
+    try b.pushClip(.nonzero);
+    try b.moveTo(.{ .x = 10, .y = 10 });
+    try b.lineTo(.{ .x = 70, .y = 10 });
+    try b.lineTo(.{ .x = 10, .y = 50 });
+    try b.closePath();
+    try b.pushClip(.nonzero);
+
+    // A circle, as the four cubics a PDF writes one with.
+    const k: f32 = 0.5523 * 18;
+    try b.moveTo(.{ .x = 53, .y = 30 });
+    try b.curveTo(.{ .x = 53, .y = 30 + k }, .{ .x = 35 + k, .y = 48 }, .{ .x = 35, .y = 48 });
+    try b.curveTo(.{ .x = 35 - k, .y = 48 }, .{ .x = 17, .y = 30 + k }, .{ .x = 17, .y = 30 });
+    try b.curveTo(.{ .x = 17, .y = 30 - k }, .{ .x = 35 - k, .y = 12 }, .{ .x = 35, .y = 12 });
+    try b.curveTo(.{ .x = 35 + k, .y = 12 }, .{ .x = 53, .y = 30 - k }, .{ .x = 53, .y = 30 });
+    try b.closePath();
+    try b.fill(.nonzero, .{ .solid = .{ .r = 0.8, .g = 0.1, .b = 0.1 } });
+
+    try b.moveTo(.{ .x = 12, .y = 14 });
+    try b.lineTo(.{ .x = 40, .y = 40 });
+    try b.lineTo(.{ .x = 60, .y = 14 });
+    try b.stroke(.{ .width = 3, .join = .round }, .{ .solid = .{ .r = 0.1, .g = 0.2, .b = 0.9 } }, .identity);
+    try b.popClip();
+
+    // Past the diagonal, so they show only if the pop restored the outer clip.
+    const font = try b.fontId(1, "F1", "Test", false);
+    try b.textRun(.{ .font = font, .size = 10, .transform = .translation(46, 38) }, &.{
+        .{ .code = 'a', .offset = .{ .x = 0, .y = 0 } },
+        .{ .code = 'b', .offset = .{ .x = 6, .y = 0 } },
+        .{ .code = 'a', .offset = .{ .x = 12, .y = 0 } },
+    });
+    try b.popClip();
+
+    try b.pushLayer(.{ .blend = .multiply });
+    try box(b, 50, 8, 78, 20);
+    try b.fill(.nonzero, .{ .solid = .{ .r = 1, .g = 0.9, .b = 0.2 } });
+    try b.popLayer();
+}
+
+/// Black stripes under a clip: something for a page to be merged behind, and
+/// to draw instead of it if the merge forgets to renumber.
+fn stripes(b: *Builder) !void {
+    try box(b, 0, 0, 80, 60);
+    try b.pushClip(.nonzero);
+    for (0..4) |i| {
+        const x: f32 = @floatFromInt(i * 20);
+        try box(b, x, 0, x + 10, 60);
+        try b.fill(.nonzero, .{ .solid = .black });
+    }
+    try b.popClip();
+}
+
+test "a page recorded, merged and placed draws as the same page rendered" {
+    // The scene format against the rasteriser, with no device. One side is
+    // `record`, a merge behind another page, `Frame.place` and
+    // `scene.modelFrame`; the other is `render` through `fillSlug`. Both ask
+    // the same curves the same question, so what differs is the format -- a
+    // header renumbered wrong, a clip chain the merge broke, a scissor too
+    // tight, a composite with the wrong blend state. The one honest
+    // difference is along the diagonal clip, which the canvas keeps as a
+    // stencil mask and the device computes as coverage.
+    const gpa = testing.allocator;
+    const Framebuffer = @import("software.zig").Framebuffer;
+
+    var pb: Builder = .init(gpa, .fromRect(0, 0, 80, 60));
+    try busyPage(&pb);
+    var list = try pb.finish();
+    defer list.deinit(gpa);
+    var ob: Builder = .init(gpa, .fromRect(0, 0, 80, 60));
+    try stripes(&ob);
+    var other_list = try ob.finish();
+    defer other_list.deinit(gpa);
+
+    const at: Transform = .translation(3, 2);
+    const page_xform = pageTransform(list.page, 1);
+    var glyphs: Squares = .{};
+
+    // Linear light, which is what the device blends in.
+    var canvas: Canvas = try .init(gpa, 90, 70, .{ .samples = .eight, .space = .linear });
+    defer canvas.deinit(gpa);
+    canvas.fb.clear(.white);
+    const rendered = try render(gpa, &canvas, list, page_xform.concat(at), .{
+        .path_backend = .slug,
+        .glyphs = glyphs.source(),
+    });
+
+    var shared: Scene = .{};
+    defer shared.deinit(gpa);
+    shared.reset(.{ 1, 1 });
+    var other: Scene = .{};
+    defer other.deinit(gpa);
+    other.reset(.{ 80, 60 });
+    _ = try record(gpa, &other, other_list, page_xform, .{});
+    _ = try shared.merge(gpa, other);
+
+    var page: Scene = .{};
+    defer page.deinit(gpa);
+    page.reset(.{ 80, 60 });
+    const recorded = try record(gpa, &page, list, page_xform, .{ .glyphs = glyphs.source() });
+    const range = try shared.merge(gpa, page);
+    try testing.expect(range.first_instance > 0 and range.first_clip > 0);
+
+    var frame: scene_mod.Frame = .{};
+    defer frame.deinit(gpa);
+    try frame.place(gpa, shared, range, at, .{ 0, 0, 90, 70 });
+
+    var fb = try Framebuffer.init(gpa, 90, 70, .linear);
+    defer fb.deinit(gpa);
+    fb.clear(.white);
+    const drawn = scene_mod.modelFrame(&fb, shared, frame);
+
+    try testing.expectEqual(@as(u32, 3), rendered.glyphs_drawn);
+    try testing.expectEqual(rendered.glyphs_drawn, recorded.glyphs_drawn);
+    try testing.expectEqual(page.instanceCount(), drawn.paths);
+    try testing.expectEqual(@as(u32, 0), page.stats.blended);
+
+    // Every pixel that differs is on the diagonal: (10, 50) to (70, 10) on
+    // the page, which is (13, 12) to (73, 52) here.
+    var worst: f32 = 0;
+    for (0..fb.height) |y| {
+        for (0..fb.width) |x| {
+            const i = (y * fb.width + x) * 4;
+            var d: f32 = 0;
+            for (0..4) |c| d = @max(d, @abs(canvas.fb.pixels[i + c] - fb.pixels[i + c]));
+            if (d <= 1e-4) continue;
+            worst = @max(worst, d);
+            const px = @as(f32, @floatFromInt(x)) + 0.5;
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+            const off_line = @abs(40 * (px - 13) - 60 * (py - 12)) / @sqrt(@as(f32, 60 * 60 + 40 * 40));
+            try testing.expect(off_line < 1.5);
+        }
+    }
+    // Eight samples against the exact area: 0.14 measured.
+    try testing.expect(worst < 0.2);
+}

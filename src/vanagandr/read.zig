@@ -6098,6 +6098,95 @@ test "two windows at different zooms need two rasters and one recording" {
     s.recorded.pages[0].source = null;
 }
 
+/// A square `side` across as straight quadratics, the shape a scene stores.
+fn squareCurves(side: f32) [4]gleipnir.slug.Curve {
+    const p = [_][2]f32{ .{ 0, 0 }, .{ side, 0 }, .{ side, side }, .{ 0, side } };
+    var out: [4]gleipnir.slug.Curve = undefined;
+    for (p, 0..) |a, i| {
+        const b = p[(i + 1) % 4];
+        out[i] = .{
+            .x0 = a[0],
+            .y0 = a[1],
+            .x1 = (a[0] + b[0]) * 0.5,
+            .y1 = (a[1] + b[1]) * 0.5,
+            .x2 = b[0],
+            .y2 = b[1],
+        };
+    }
+    return out;
+}
+
+fn curvesOf(store: gleipnir.slug.Store, header: u32) []const gleipnir.slug.Curve {
+    const h = store.headers.items[header];
+    return store.curves.items[h.curve_first..][0..h.curve_count];
+}
+
+test "evicting a recorded page leaves every other page's range naming its own curves" {
+    // An eviction merges the survivors again, which moves every page after
+    // the hole. A range kept from before that would draw another page's
+    // outlines at this page's positions, which looks like a rendering bug
+    // anywhere but here.
+    const gpa = testing.allocator;
+    const no_clip = gleipnir.slugpipe.no_clip;
+    var rc: Recorded = .{};
+    defer rc.deinit(gpa);
+
+    for (0..cache_slots + 1) |i| {
+        // A different size per page, and a clip, so each page's curves and
+        // nodes are its own.
+        var page: Scene = .{};
+        page.reset(.{ 100, 100 });
+        const own = squareCurves(@floatFromInt(10 + i));
+        const unit = squareCurves(1);
+        try page.pushClip(gpa, &own, .nonzero, .identity);
+        try page.draw(gpa, &unit, .nonzero, .identity, .black, 1, .normal);
+        page.popClip();
+        try page.draw(gpa, &own, .even_odd, .identity, .black, 1, .normal);
+
+        // Page 0 is drawn again just before the cache overflows, so page 1
+        // is the one that has waited longest.
+        if (i == cache_slots) {
+            rc.stamp = 100;
+            rc.touch(0, 0);
+        }
+        rc.stamp = i;
+        try rc.insert(gpa, 0, @intCast(i), page);
+    }
+
+    try testing.expect(rc.has(0, 0));
+    try testing.expect(!rc.has(0, 1));
+    try testing.expect(rc.has(0, cache_slots));
+
+    var instances: u32 = 0;
+    for (rc.pages) |e| {
+        const src = e.source orelse continue;
+        instances += e.range.instance_count;
+        try testing.expectEqual(src.instanceCount(), e.range.instance_count);
+        try testing.expectEqual(@as(u32, @intCast(src.clips.items.len)), e.range.clip_count);
+
+        for (src.instances.items, 0..) |want, k| {
+            const got = rc.scene.instances.items[e.range.first_instance + k];
+            try testing.expectEqualSlices(
+                gleipnir.slug.Curve,
+                curvesOf(src.store, want.header),
+                curvesOf(rc.scene.store, got.header),
+            );
+            if (want.clip_node == no_clip) {
+                try testing.expectEqual(no_clip, got.clip_node);
+                continue;
+            }
+            try testing.expectEqual(want.clip_node + e.range.first_clip, got.clip_node);
+            try testing.expectEqualSlices(
+                gleipnir.slug.Curve,
+                curvesOf(src.store, src.clips.items[want.clip_node].header),
+                curvesOf(rc.scene.store, rc.scene.clips.items[got.clip_node].header),
+            );
+        }
+    }
+    // Nothing left behind from the page that went.
+    try testing.expectEqual(rc.scene.instanceCount(), instances);
+}
+
 test "a page rendered for a window that has closed is not cached" {
     const gpa = testing.allocator;
     var buf: [8]fenrir.Page = undefined;
