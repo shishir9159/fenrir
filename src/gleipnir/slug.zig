@@ -598,12 +598,14 @@ pub const glyph_tolerance: f32 = 1.0 / 2048.0;
 ///
 /// Every segment becomes a straight quadratic. That throws away the
 /// resolution independence for anything that arrives this way -- a stroke's
-/// generated outline, and a glyph, both of which are flattened by the layer
-/// that produces them -- but it is what makes the analytic fill usable for
-/// everything on the page today rather than for path fills alone.
+/// generated outline, and a clip path, which the replay flattens for the
+/// canvas's stencil and hands to a scene as well -- but it is what makes the
+/// analytic fill usable for everything on the page today rather than for
+/// path fills alone.
 ///
 /// `fromPath` is the one that keeps curves as curves, and it is the one a
-/// `fill_path` command goes through.
+/// `fill_path` command goes through. A glyph goes through `fromOutline`,
+/// which is the same walk.
 pub fn fromFlattened(
     gpa: Allocator,
     out: *std.ArrayList(Curve),
@@ -1306,4 +1308,406 @@ test "the pixel footprint comes from the inverse, the way fwidth does" {
     const rot = Scale.of(.{ .a = r, .b = r, .c = -r, .d = r });
     try testing.expectApproxEqAbs(@as(f32, r), rot.x, 0.0001);
     try testing.expectApproxEqAbs(@as(f32, r), rot.y, 0.0001);
+}
+
+test "a merged store draws each path exactly as its source did" {
+    // Three levels of renumbering, and a page made of the wrong shapes if any
+    // of them is missed. Merging moves data and never arithmetic, so the
+    // coverage is compared bit for bit rather than to a tolerance.
+    const gpa = testing.allocator;
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+
+    var a: Store = .{};
+    defer a.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 10, 10);
+    const small = try a.add(gpa, curves.items, .nonzero);
+
+    var b: Store = .{};
+    defer b.deinit(gpa);
+    curves.clearRetainingCapacity();
+    try square(gpa, &curves, 0, 0, 40, 40);
+    try square(gpa, &curves, 10, 10, 30, 30);
+    const ring = try b.add(gpa, curves.items, .even_odd);
+    curves.clearRetainingCapacity();
+    try addCubic(gpa, &curves, .{ .x = 0, .y = 0 }, .{ .x = 30, .y = 40 }, .{ .x = 10, .y = 40 }, .{ .x = 40, .y = 0 }, 0.02, 16);
+    try lineOf(gpa, &curves, .{ .x = 40, .y = 0 }, .{ .x = 0, .y = 0 });
+    const arch = try b.add(gpa, curves.items, .nonzero);
+
+    var merged: Store = .{};
+    defer merged.deinit(gpa);
+    const base_a = try merged.merge(gpa, a);
+    const base_b = try merged.merge(gpa, b);
+    // Merged a second time, so a base is never right by being zero.
+    const base_c = try merged.merge(gpa, b);
+    try testing.expectEqual(@as(u32, 0), base_a);
+    try testing.expectEqual(@as(u32, 1), base_b);
+    try testing.expectEqual(@as(u32, 3), base_c);
+    try testing.expectEqual(merged.curves.items.len, a.curves.items.len + 2 * b.curves.items.len);
+
+    const cases = [_]struct { src: *const Store, id: u32, base: u32 }{
+        .{ .src = &a, .id = small, .base = base_a },
+        .{ .src = &b, .id = ring, .base = base_b },
+        .{ .src = &b, .id = arch, .base = base_b },
+        .{ .src = &b, .id = arch, .base = base_c },
+    };
+    for (cases) |case| {
+        var y: f32 = -2;
+        while (y < 42) : (y += 0.7) {
+            var x: f32 = -2;
+            while (x < 42) : (x += 0.7) {
+                try testing.expectEqual(
+                    coverageAt(case.src.*, case.id, x, y, unit),
+                    coverageAt(merged, case.id + case.base, x, y, unit),
+                );
+            }
+        }
+    }
+}
+
+test "rewinding to a mark drops what came after it and keeps what came before" {
+    // What a CPU replay does around a one-off fill: the glyphs added before
+    // the mark are kept and reused, the fill after it is dropped, and the
+    // arrays keep their capacity for the next one.
+    const gpa = testing.allocator;
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+    var s: Store = .{};
+    defer s.deinit(gpa);
+
+    try square(gpa, &curves, 0, 0, 10, 10);
+    const glyph = try s.add(gpa, curves.items, .nonzero);
+    const before = s.mark();
+    const covered = coverageAt(s, glyph, 5, 5, unit);
+    const edge = coverageAt(s, glyph, 10.25, 5, unit);
+
+    curves.clearRetainingCapacity();
+    var x: f32 = 0;
+    while (x < 200) : (x += 10) try square(gpa, &curves, x, 0, x + 5, 100);
+    _ = try s.add(gpa, curves.items, .even_odd);
+    const grown = s.indices.capacity;
+
+    s.rewind(before);
+    try testing.expectEqual(before, s.mark());
+    try testing.expectEqual(grown, s.indices.capacity);
+    try testing.expectEqual(covered, coverageAt(s, glyph, 5, 5, unit));
+    try testing.expectEqual(edge, coverageAt(s, glyph, 10.25, 5, unit));
+
+    // The next path takes the place of the dropped one.
+    curves.clearRetainingCapacity();
+    try square(gpa, &curves, 0, 0, 1, 1);
+    try testing.expectEqual(glyph + 1, try s.add(gpa, curves.items, .nonzero));
+}
+
+test "every band is sorted by reach and holds every curve that meets it" {
+    // The invariant the early exit stands on, checked directly rather than
+    // through its consequence: a band out of order, or one missing a curve
+    // that reaches into it, is a pixel with the wrong winding.
+    const gpa = testing.allocator;
+    var rng: std.Random.DefaultPrng = .init(0xb4d5);
+    const rand = rng.random();
+
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+
+    for (0..24) |_| {
+        curves.clearRetainingCapacity();
+        const n = 3 + rand.uintLessThan(usize, 90);
+        const first: Point = .{ .x = rand.float(f32) * 100, .y = rand.float(f32) * 100 };
+        var prev = first;
+        for (0..n) |i| {
+            const next: Point = if (i == n - 1)
+                first
+            else
+                .{ .x = rand.float(f32) * 100, .y = rand.float(f32) * 100 };
+            // Every fourth one straight, and some of those horizontal or
+            // vertical, so the parallel-line exclusion has work to do.
+            var to = next;
+            if (i % 8 == 1 and i != n - 1) to.y = prev.y;
+            if (i % 8 == 5 and i != n - 1) to.x = prev.x;
+            const ctrl: Point = if (i % 4 == 1)
+                .{ .x = (prev.x + to.x) * 0.5, .y = (prev.y + to.y) * 0.5 }
+            else
+                .{ .x = rand.float(f32) * 100, .y = rand.float(f32) * 100 };
+            try curves.append(gpa, .{ .x0 = prev.x, .y0 = prev.y, .x1 = ctrl.x, .y1 = ctrl.y, .x2 = to.x, .y2 = to.y });
+            prev = to;
+        }
+        const id = try store.add(gpa, curves.items, .nonzero);
+        const h = store.headers.items[id];
+        try testing.expectEqual(bandCount(curves.items.len), h.h_bands);
+        try testing.expectEqual(bandCount(curves.items.len), h.v_bands);
+
+        for ([_]Axis{ .horizontal, .vertical }) |axis| {
+            const band_first = h.band_first + if (axis == .horizontal) 0 else h.h_bands;
+            const count = if (axis == .horizontal) h.h_bands else h.v_bands;
+            const lo, const hi = axis.across(h.bounds());
+            const step = (hi - lo) / @as(f32, @floatFromInt(count));
+
+            for (0..count) |bi| {
+                const band = store.bands.items[band_first + bi];
+                const ids = store.indices.items[band.first..][0..band.count];
+                if (ids.len > 1) {
+                    for (ids[1..], ids[0 .. ids.len - 1]) |later, earlier| {
+                        try testing.expect(axis.reach(store.curves.items[earlier]) >= axis.reach(store.curves.items[later]));
+                    }
+                }
+
+                const band_lo = lo + step * @as(f32, @floatFromInt(bi));
+                const band_hi = band_lo + step;
+                for (h.curve_first..h.curve_first + h.curve_count) |ci| {
+                    const c = store.curves.items[ci];
+                    const listed = std.mem.indexOfScalar(u32, ids, @intCast(ci)) != null;
+                    if (axis.parallel(c)) {
+                        try testing.expect(!listed);
+                        continue;
+                    }
+                    const a, const b = axis.across(c.bounds());
+                    if (b < band_lo or a > band_hi) continue;
+                    try testing.expect(listed);
+                }
+            }
+        }
+    }
+}
+
+test "every coordinate lands in some band, the awkward ones included" {
+    // The shader's `bandOf` is a transcription of this, so the edges are
+    // pinned here: a sample on a boundary goes up, one past either end is
+    // clamped into the last or first band, and a NaN or a path with no extent
+    // reads band zero rather than an index off the end of the array.
+    try testing.expectEqual(@as(u32, 0), bandOf(0, 10, -5, 4));
+    try testing.expectEqual(@as(u32, 3), bandOf(0, 10, 15, 4));
+    try testing.expectEqual(@as(u32, 3), bandOf(0, 10, 10, 4));
+    try testing.expectEqual(@as(u32, 1), bandOf(0, 10, 2.5, 4));
+    try testing.expectEqual(@as(u32, 0), bandOf(0, 10, std.math.nan(f32), 4));
+    try testing.expectEqual(@as(u32, 0), bandOf(5, 5, 5, 4));
+    try testing.expectEqual(@as(u32, 0), bandOf(0, 10, 5, 0));
+
+    // A span is clamped the same way, and never comes back inverted.
+    const whole = bandSpan(-5, 25, 0, 0.4, 4);
+    try testing.expectEqual(@as(u32, 0), whole[0]);
+    try testing.expectEqual(@as(u32, 3), whole[1]);
+    const nan = bandSpan(std.math.nan(f32), std.math.nan(f32), 0, 0.4, 4);
+    try testing.expectEqual(@as(u32, 0), nan[0]);
+    try testing.expectEqual(@as(u32, 0), nan[1]);
+    const point = bandSpan(6, 6, 0, 0.4, 4);
+    try testing.expectEqual(@as(u32, 2), point[0]);
+    try testing.expectEqual(@as(u32, 2), point[1]);
+
+    // And how many bands a path gets: one for a line or two, about the
+    // square root of twice the curves, and never more than the ceiling.
+    try testing.expectEqual(@as(u32, 1), bandCount(0));
+    try testing.expectEqual(@as(u32, 1), bandCount(2));
+    try testing.expectEqual(@as(u32, 9), bandCount(40));
+    try testing.expectEqual(max_bands, bandCount(2048));
+    try testing.expectEqual(max_bands, bandCount(1 << 20));
+}
+
+test "a pixel at infinity is uncovered rather than a crash" {
+    // A matrix singular to within a float inverts to infinities, and a
+    // fragment then asks about a point nowhere. The box test answers first,
+    // so no infinity reaches the float-to-integer conversion in `bandOf`.
+    const gpa = testing.allocator;
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+    try square(gpa, &curves, 0, 0, 10, 10);
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    const id = try store.add(gpa, curves.items, .nonzero);
+
+    const inf = std.math.inf(f32);
+    try testing.expectEqual(@as(f32, 0), coverageAt(store, id, inf, 5, unit));
+    try testing.expectEqual(@as(f32, 0), coverageAt(store, id, 5, -inf, unit));
+    try testing.expectEqual(@as(f32, 0), coverageAt(store, id, 5, 5, .{ .x = 0, .y = 1 }));
+    // And an id past the end is not a path.
+    try testing.expectEqual(@as(f32, 0), coverageAt(store, id + 1, 5, 5, unit));
+}
+
+const Builder = @import("../gelgja/Builder.zig");
+
+fn firstFill(list: DisplayList) DisplayList.Path {
+    for (list.cmds) |cmd| switch (cmd) {
+        .fill_path => |c| return c.path,
+        else => {},
+    };
+    unreachable;
+}
+
+test "an open subpath is closed, so its winding comes back to zero" {
+    // Coverage is only defined for a closed outline. Left open, the crossing
+    // the missing edge would have made is unpaired, and every pixel to one
+    // side of the shape is filled.
+    const gpa = testing.allocator;
+    var b: Builder = .init(gpa, .fromRect(0, 0, 100, 100));
+    // Two subpaths, neither closed: the second move is what ends the first.
+    try b.moveTo(.{ .x = 10, .y = 10 });
+    try b.lineTo(.{ .x = 30, .y = 10 });
+    try b.lineTo(.{ .x = 30, .y = 30 });
+    try b.lineTo(.{ .x = 10, .y = 30 });
+    try b.moveTo(.{ .x = 50, .y = 10 });
+    try b.lineTo(.{ .x = 70, .y = 10 });
+    try b.lineTo(.{ .x = 70, .y = 30 });
+    try b.fill(.nonzero, .{ .solid = .black });
+    var list = try b.finish();
+    defer list.deinit(gpa);
+
+    var curves: std.ArrayList(Curve) = .empty;
+    defer curves.deinit(gpa);
+    try fromPath(gpa, &curves, list, firstFill(list), .identity, default_tolerance);
+    // Three sides and two, each with its closing edge added.
+    try testing.expectEqual(@as(usize, 7), curves.items.len);
+
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    const id = try store.add(gpa, curves.items, .nonzero);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 20, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), coverageAt(store, id, 66, 14, unit), 0.001);
+    // Above the triangle's diagonal, between the two, and past both: empty.
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 54, 26, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 40, 20, unit), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), coverageAt(store, id, 90, 20, unit), 0.001);
+}
+
+/// The distance from `p` to the nearest point of a chain of quadratics,
+/// measured against each as a polyline fine enough that its chords sit well
+/// inside any tolerance the tests ask about.
+fn distanceToQuads(p: Point, quads: []const Curve) f32 {
+    const steps = 64;
+    var best = std.math.inf(f32);
+    for (quads) |q| {
+        var prev = q.at(0);
+        for (1..steps + 1) |k| {
+            const next = q.at(@as(f32, @floatFromInt(k)) / steps);
+            const dx = next.x - prev.x;
+            const dy = next.y - prev.y;
+            const len2 = dx * dx + dy * dy;
+            const t = if (len2 > 0) std.math.clamp(((p.x - prev.x) * dx + (p.y - prev.y) * dy) / len2, 0, 1) else 0;
+            const ex = prev.x + t * dx - p.x;
+            const ey = prev.y + t * dy - p.y;
+            best = @min(best, @sqrt(ex * ex + ey * ey));
+            prev = next;
+        }
+    }
+    return best;
+}
+
+test "a cubic's quadratics stay within the tolerance of it, whatever its shape" {
+    // The bound `addCubic` recurses on is the distance between the cubic and
+    // its quadratic at the same parameter, which is never less than the
+    // distance to the nearest point. The shapes are the ones a quarter circle
+    // does not have: an inflection, a loop, a cusp.
+    const gpa = testing.allocator;
+    const tolerance = default_tolerance;
+    const shapes = [_][4]Point{
+        // An S: one inflection.
+        .{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 0, .y = 100 }, .{ .x = 100, .y = 100 } },
+        // A loop: the control points cross over.
+        .{ .{ .x = 0, .y = 0 }, .{ .x = 150, .y = 100 }, .{ .x = -50, .y = 100 }, .{ .x = 100, .y = 0 } },
+        // A cusp: the tangent vanishes in the middle.
+        .{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 100 }, .{ .x = 0, .y = 100 }, .{ .x = 100, .y = 0 } },
+        // Collinear and evenly spaced: already a line.
+        .{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 20, .y = 20 }, .{ .x = 30, .y = 30 } },
+    };
+
+    var out: std.ArrayList(Curve) = .empty;
+    defer out.deinit(gpa);
+    for (shapes) |c| {
+        out.clearRetainingCapacity();
+        try addCubic(gpa, &out, c[0], c[1], c[2], c[3], tolerance, 16);
+        try testing.expect(out.items.len >= 1);
+        // Continuous, and ending where the cubic does.
+        try testing.expectEqual(c[0].x, out.items[0].x0);
+        try testing.expectEqual(c[3].y, out.items[out.items.len - 1].y2);
+        for (out.items[1..], out.items[0 .. out.items.len - 1]) |next, prev| {
+            try testing.expectEqual(prev.x2, next.x0);
+            try testing.expectEqual(prev.y2, next.y0);
+        }
+        var i: u32 = 0;
+        while (i <= 200) : (i += 1) {
+            const at = cubicAt(c[0], c[1], c[2], c[3], @as(f32, @floatFromInt(i)) / 200);
+            try testing.expect(distanceToQuads(at, out.items) <= tolerance * 1.01);
+        }
+    }
+    // The line takes one quadratic.
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    // So does a point. Its box is a point and it still gets a band, but no ray
+    // crosses it, so it draws nothing rather than a dot.
+    const p: Point = .{ .x = 5, .y = 5 };
+    out.clearRetainingCapacity();
+    try addCubic(gpa, &out, p, p, p, p, tolerance, 16);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    const id = try store.add(gpa, out.items, .nonzero);
+    for ([_]f32{ 4.5, 5, 5.5 }) |at| {
+        try testing.expectEqual(@as(f32, 0), coverageAt(store, id, at, 5, unit));
+        try testing.expectEqual(@as(f32, 0), coverageAt(store, id, 5, at, unit));
+    }
+}
+
+test "a glyph outline comes out in em units, and a short one stops cleanly" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(Curve) = .empty;
+    defer out.deinit(gpa);
+
+    // A 1000-unit em, as a Type 1 or CFF font counts: a square with one
+    // curved side.
+    const verbs = [_]Verb{ .move, .line, .cubic, .line, .close };
+    const points = [_]Point{
+        .{ .x = 0, .y = 0 },
+        .{ .x = 500, .y = 0 },
+        .{ .x = 600, .y = 200 },
+        .{ .x = 600, .y = 500 },
+        .{ .x = 500, .y = 700 },
+        .{ .x = 0, .y = 700 },
+    };
+    try fromOutline(gpa, &out, &verbs, &points, 1.0 / 1000.0, glyph_tolerance);
+    var box: Bounds = .empty;
+    for (out.items) |c| box = box.unionWith(c.bounds());
+    try testing.expectApproxEqAbs(@as(f32, 0.7), box.max_y, 0.0001);
+    // The curved side bulges to its midpoint, 0.575 of an em, not out to its
+    // control points at 0.6: the quadratics hug the curve, not its hull.
+    try testing.expectApproxEqAbs(@as(f32, 0.575), box.max_x, 0.001);
+    try testing.expectEqual(@as(f32, 0), box.min_x);
+
+    // A font program that ends mid-curve: a cubic with one point where it
+    // needs three. The walk stops there and still closes what it had, rather
+    // than reading past the end of the points.
+    out.clearRetainingCapacity();
+    try fromOutline(gpa, &out, &verbs, points[0..3], 1.0 / 1000.0, glyph_tolerance);
+    // The line, and the edge closing it back to the start.
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(f32, 0), out.items[1].x2);
+}
+
+test "a flattened path becomes one straight quadratic per segment" {
+    // Strokes and clips arrive this way. Each subpath is shut whether or not
+    // it was closed, and a closing edge that is already there is not doubled.
+    const gpa = testing.allocator;
+    const path_mod = @import("path.zig");
+    var f: path_mod.Flattener = .init(.{});
+    defer f.deinit(gpa);
+    try f.moveTo(gpa, .{ .x = 0, .y = 0 });
+    try f.lineTo(gpa, .{ .x = 10, .y = 0 });
+    try f.lineTo(gpa, .{ .x = 0, .y = 10 });
+    try f.close(gpa);
+    try f.moveTo(gpa, .{ .x = 20, .y = 0 });
+    try f.lineTo(gpa, .{ .x = 30, .y = 0 });
+    try f.lineTo(gpa, .{ .x = 30, .y = 10 });
+    const flat = try f.finish(gpa);
+
+    var out: std.ArrayList(Curve) = .empty;
+    defer out.deinit(gpa);
+    try fromFlattened(gpa, &out, flat);
+    try testing.expectEqual(flat.segmentCount(), out.items.len);
+    try testing.expectEqual(@as(usize, 6), out.items.len);
+    // Straight: the control point is the midpoint, exactly, which is what
+    // lets `Axis.parallel` recognise a horizontal one.
+    for (out.items) |c| {
+        try testing.expectEqual((c.x0 + c.x2) * 0.5, c.x1);
+        try testing.expectEqual((c.y0 + c.y2) * 0.5, c.y1);
+    }
 }

@@ -1242,6 +1242,110 @@ test "a clip path cuts the fill and pops back" {
     try testing.expectApproxEqAbs(@as(f32, 1), c.fb.alphaAt(48, 16), 0.001);
 }
 
+/// A polygon's curves in a store of their own, for the analytic fill.
+fn slugPolygon(gpa: Allocator, store: *slug.Store, pts: []const [2]f32) !u32 {
+    var f: Flattener = .init(.{});
+    defer f.deinit(gpa);
+    const flat = try polygon(gpa, &f, pts);
+    var curves: std.ArrayList(slug.Curve) = .empty;
+    defer curves.deinit(gpa);
+    try slug.fromFlattened(gpa, &curves, flat);
+    return store.add(gpa, curves.items, .nonzero);
+}
+
+fn inkSum(c: Canvas) f64 {
+    var sum: f64 = 0;
+    var y: u32 = 0;
+    while (y < c.height()) : (y += 1) {
+        var x: u32 = 0;
+        while (x < c.width()) : (x += 1) sum += c.fb.alphaAt(x, y);
+    }
+    return sum;
+}
+
+test "the analytic fill and the stencil fill agree, and both keep the area" {
+    // `fillSlug` is the fragment shader's model and `fill` is the stencil
+    // pipeline's, and neither had been run against the other outside
+    // `raster --path both`. Two things are checked. Every pixel is within a
+    // quarter of the other rasteriser's answer, which is what eight samples
+    // and the two-ray blend can each be off by on a diagonal. And the ink
+    // summed over the canvas is the polygon's area, to a tenth of a percent,
+    // for both.
+    const gpa = testing.allocator;
+    const pts = [_][2]f32{ .{ 8.3, 6.1 }, .{ 52.7, 10.4 }, .{ 58.2, 40.9 }, .{ 30.5, 57.6 }, .{ 5.9, 35.2 } };
+
+    var stencil: Canvas = try .init(gpa, 64, 64, .{ .samples = .eight });
+    defer stencil.deinit(gpa);
+    stencil.fb.clear(.transparent);
+    var f: Flattener = .init(.{});
+    defer f.deinit(gpa);
+    try fillPath(gpa, &stencil, try polygon(gpa, &f, &pts), .identity, .nonzero, .black);
+
+    var analytic: Canvas = try .init(gpa, 64, 64, .{ .samples = .one });
+    defer analytic.deinit(gpa);
+    analytic.fb.clear(.transparent);
+    var store: slug.Store = .{};
+    defer store.deinit(gpa);
+    const id = try slugPolygon(gpa, &store, &pts);
+    analytic.fillSlug(.{ .store = &store, .header = id, .xform = .identity }, .black, 1);
+
+    var area: f64 = 0;
+    for (pts, 0..) |p, i| {
+        const q = pts[(i + 1) % pts.len];
+        area += @as(f64, p[0]) * q[1] - @as(f64, q[0]) * p[1];
+    }
+    area = @abs(area) / 2;
+    // Measured at 0.03% for eight samples and 0.007% for the analytic fill.
+    try testing.expectApproxEqRel(area, inkSum(stencil), 0.001);
+    try testing.expectApproxEqRel(area, inkSum(analytic), 0.001);
+
+    var worst: f32 = 0;
+    var y: u32 = 0;
+    while (y < 64) : (y += 1) {
+        var x: u32 = 0;
+        while (x < 64) : (x += 1) {
+            worst = @max(worst, @abs(stencil.fb.alphaAt(x, y) - analytic.fb.alphaAt(x, y)));
+        }
+    }
+    try testing.expect(worst <= 0.25);
+}
+
+test "the analytic fill goes through its transform and obeys the clip" {
+    const gpa = testing.allocator;
+    var c: Canvas = try .init(gpa, 64, 64, .{ .samples = .one });
+    defer c.deinit(gpa);
+    c.fb.clear(.transparent);
+
+    // A unit square, placed by the matrix: the curves stay where they were
+    // recorded and the fill inverts the transform per pixel, which is how an
+    // instance draws a glyph.
+    var store: slug.Store = .{};
+    defer store.deinit(gpa);
+    const id = try slugPolygon(gpa, &store, &.{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } });
+    const place = Transform.scaling(48, 16).concat(.translation(8, 8));
+
+    var cf: Flattener = .init(.{});
+    defer cf.deinit(gpa);
+    var clip_mesh = try path.mesh(gpa, try polygon(gpa, &cf, &.{ .{ 0, 0 }, .{ 32, 0 }, .{ 32, 64 }, .{ 0, 64 } }));
+    defer clip_mesh.deinit(gpa);
+    try c.pushClip(gpa, clip_mesh, .identity, .nonzero);
+
+    c.fillSlug(.{ .store = &store, .header = id, .xform = place }, .black, 0.5);
+    // The constant alpha scales the coverage, inside the clip.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), c.fb.alphaAt(16, 16), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), c.fb.alphaAt(48, 16), 0.001);
+    // Outside the square's placed rows, nothing.
+    try testing.expectApproxEqAbs(@as(f32, 0), c.fb.alphaAt(16, 30), 0.001);
+
+    c.popClip(gpa);
+    c.fillSlug(.{ .store = &store, .header = id, .xform = place }, .black, 1);
+    try testing.expectApproxEqAbs(@as(f32, 1), c.fb.alphaAt(48, 16), 0.001);
+    // A singular matrix places nothing, and does not divide by zero.
+    c.fb.clear(.transparent);
+    c.fillSlug(.{ .store = &store, .header = id, .xform = Transform.scaling(0, 16) }, .black, 1);
+    try testing.expectEqual(@as(f64, 0), inkSum(c));
+}
+
 test "nested clips intersect and never widen" {
     const gpa = testing.allocator;
     var c: Canvas = try .init(gpa, 64, 64, .{ .samples = .one });
