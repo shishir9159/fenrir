@@ -532,6 +532,7 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
         .page_given = page_given,
         .splits = splits,
         .device = .{ .validation = validate, .prefer = prefer },
+        .time = timing,
     });
 }
 
@@ -546,6 +547,8 @@ const Settings = struct {
     page_given: bool,
     splits: []const u8 = &.{},
     device: lyngvi.Device.Options,
+    /// `--time`: what the frames cost, summarised on exit.
+    time: bool = false,
 };
 
 /// `--time`'s startup stopwatch.
@@ -576,6 +579,19 @@ const Stage = struct {
         });
     }
 };
+
+fn msOf(ns: u64) f32 {
+    return @floatCast(@as(f64, @floatFromInt(ns)) / 1_000_000.0);
+}
+
+/// One line of `--time`'s exit summary.
+fn reportSpread(ctx: *Context, comptime what: []const u8, samples: *lyngvi.Renderer.Samples) void {
+    const sp = samples.spread();
+    if (sp.n == 0) return;
+    ctx.note("time   {s:<10} best {d:.3}ms  median {d:.3}  p95 {d:.3}  of {d}", .{
+        what, sp.best, sp.median, sp.p95, sp.n,
+    });
+}
 
 /// A stopwatch over `Io`'s monotonic clock. Zig 0.16 has no `std.time.Timer`,
 /// and `lyngvi.Clock` answers in seconds of `f32`, which cannot resolve a
@@ -5717,6 +5733,12 @@ const Session = struct {
         var clock: lyngvi.Clock = .start(ctx.io);
         var drawn: u32 = 0;
 
+        // `--time`: from one drawn frame to the next, and the placement, on
+        // the CPU. The device's side is in `renderer.gpu_frame`.
+        var interval: lyngvi.Renderer.Samples = .{};
+        var placing: lyngvi.Renderer.Samples = .{};
+        var lap: Lap = .start(ctx.io);
+
         while (true) {
             window.pump();
             if (window.shouldClose()) break;
@@ -5837,8 +5859,10 @@ const Session = struct {
                     // are on the device and so is the placement.
                     const key = s.placementKey();
                     if (s.placed == null or s.placed.? != key) {
+                        var place_lap: Lap = .start(ctx.io);
                         try s.placeVisible();
                         s.placed = key;
+                        if (settings.time) placing.push(msOf(place_lap.lap()));
                     }
                     paths = .{
                         .renderer = pr,
@@ -5871,6 +5895,9 @@ const Session = struct {
                         }
                     }
                     drawn += 1;
+                    // The first interval is startup, which `Stage` reports.
+                    const since = lap.lap();
+                    if (settings.time and drawn > 1) interval.push(msOf(since));
                     if (shooting) {
                         if (renderer.captured) |c| try s.writeShot(settings.shot.?, c);
                         break;
@@ -5917,6 +5944,22 @@ const Session = struct {
                     .{ stats.blended, stats.clips_too_deep, stats.images_dropped },
                 );
             }
+        }
+        if (settings.time) {
+            reportSpread(ctx, "frame", &interval);
+            reportSpread(ctx, "place", &placing);
+            if (renderer.query_pool == lyngvi.vk.null_handle) {
+                ctx.note("time   this queue keeps no timestamps; no device times", .{});
+            } else {
+                reportSpread(ctx, "gpu frame", &renderer.gpu_frame);
+                if (paths_renderer != null) reportSpread(ctx, "gpu paths", &renderer.gpu_paths);
+            }
+            const frames: f64 = @floatFromInt(@max(renderer.frames_drawn, 1));
+            const paths_bytes = if (paths_renderer) |p| p.bytes_uploaded else 0;
+            ctx.note("time   uploads    {d:.1} KiB a frame for rects and textures, {d:.1} for paths", .{
+                @as(f64, @floatFromInt(renderer.bytes_uploaded)) / 1024.0 / frames,
+                @as(f64, @floatFromInt(paths_bytes)) / 1024.0 / frames,
+            });
         }
     }
 

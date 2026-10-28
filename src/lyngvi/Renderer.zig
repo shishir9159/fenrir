@@ -76,6 +76,38 @@ pub const max_textures = 64;
 pub const min_instance_bytes: u64 = 64 * 1024;
 pub const min_staging_bytes: u64 = 256 * 1024;
 
+/// Timestamps a frame writes: the start of its command buffer, either side of
+/// the paths, and the end.
+const queries_per_frame = 4;
+
+/// A fixed ring of timings, in milliseconds, and what `--time` makes of them.
+///
+/// Fixed, so recording one is a store and never an allocation. A run longer
+/// than the ring keeps its latest frames, which after the first page has
+/// arrived is what a measurement wants.
+pub const Samples = struct {
+    pub const capacity = 2048;
+
+    values: [capacity]f32 = undefined,
+    count: u64 = 0,
+
+    pub fn push(s: *Samples, ms: f32) void {
+        s.values[@intCast(s.count % capacity)] = ms;
+        s.count += 1;
+    }
+
+    pub const Spread = struct { n: usize = 0, best: f32 = 0, median: f32 = 0, p95: f32 = 0 };
+
+    /// Sorts what it holds in place, so it is for the end of a run.
+    pub fn spread(s: *Samples) Spread {
+        const n: usize = @intCast(@min(s.count, capacity));
+        if (n == 0) return .{};
+        const v = s.values[0..n];
+        std.mem.sort(f32, v, {}, std.sort.asc(f32));
+        return .{ .n = n, .best = v[0], .median = v[n / 2], .p95 = v[(n * 95) / 100] };
+    }
+};
+
 pub const Status = enum {
     /// Drawn and queued for presentation.
     drawn,
@@ -216,6 +248,17 @@ recreates: u32 = 0,
 instance_high_water: u32 = 0,
 bytes_uploaded: u64 = 0,
 
+/// `queries_per_frame` timestamps for each frame in flight, or null on a
+/// queue that keeps none.
+query_pool: vk.QueryPool = vk.null_handle,
+/// Which frames submitted timestamps that have not been read yet.
+queried: [frames_in_flight]bool = @splat(false),
+/// What the device says each frame took, and the paths within it. A frame's
+/// are read back right after its own fence, two frames later, when they are
+/// certainly there: asking never waits.
+gpu_frame: Samples = .{},
+gpu_paths: Samples = .{},
+
 pub fn init(gpa: Allocator, device: *Device, swapchain: *Swapchain) Error!Renderer {
     if (!device.descriptor_indexing) return error.NoDescriptorIndexing;
 
@@ -232,6 +275,7 @@ pub fn init(gpa: Allocator, device: *Device, swapchain: *Swapchain) Error!Render
     try r.createDescriptorPool();
     try r.createSetupPool();
     try r.createFrames();
+    r.createQueryPool();
 
     // Slot zero of the array is never named by an instance -- ids from
     // `DrawList.registerTexture` are one-based, and zero means "no texture" --
@@ -274,6 +318,7 @@ pub fn deinit(r: *Renderer) void {
         d.destroyBuffer(&f.staging);
     }
     if (r.setup_pool != vk.null_handle) dt.destroyCommandPool(d.handle, r.setup_pool, null);
+    if (r.query_pool != vk.null_handle) dt.destroyQueryPool(d.handle, r.query_pool, null);
     if (r.pool != vk.null_handle) dt.destroyDescriptorPool(d.handle, r.pool, null);
     if (r.pipeline != vk.null_handle) dt.destroyPipeline(d.handle, r.pipeline, null);
     if (r.layout != vk.null_handle) dt.destroyPipelineLayout(d.handle, r.layout, null);
@@ -502,6 +547,51 @@ fn createFrames(r: *Renderer) Error!void {
         r.writeBufferDescriptor(f.*);
         r.writeSamplerDescriptor(f.*);
     }
+}
+
+/// Not an error to go without: a queue with no timestamps draws the same
+/// frames, and `--time` says it has no device times to give.
+fn createQueryPool(r: *Renderer) void {
+    const d = r.device;
+    if (d.families.timestamp_bits == 0 or !(d.properties.limits.timestamp_period > 0)) return;
+    const info: vk.QueryPoolCreateInfo = .{
+        .query_type = .timestamp,
+        .query_count = queries_per_frame * frames_in_flight,
+    };
+    var pool: vk.QueryPool = vk.null_handle;
+    if (d.dt.createQueryPool(d.handle, &info, null, &pool) != .success) return;
+    r.query_pool = pool;
+}
+
+/// One of this frame's timestamps, written once every command before it has
+/// reached `stage`.
+fn stamp(r: *Renderer, cb: vk.CommandBuffer, stage: u32, which: u32) void {
+    if (r.query_pool == vk.null_handle) return;
+    r.device.dt.cmdWriteTimestamp(cb, stage, r.query_pool, r.index * queries_per_frame + which);
+}
+
+/// Reads back the timestamps frame `i` wrote, if it wrote any. Called after
+/// that frame's fence, so they are there and this does not wait for them.
+fn collectTimestamps(r: *Renderer, i: u32) void {
+    if (!r.queried[i]) return;
+    r.queried[i] = false;
+    const d = r.device;
+    var ticks: [queries_per_frame]u64 = undefined;
+    const got = d.dt.getQueryPoolResults(
+        d.handle,
+        r.query_pool,
+        i * queries_per_frame,
+        queries_per_frame,
+        @sizeOf(@TypeOf(ticks)),
+        &ticks,
+        @sizeOf(u64),
+        vk.QueryResultFlags.result_64,
+    );
+    if (got != .success) return;
+    const period = d.properties.limits.timestamp_period;
+    const bits = d.families.timestamp_bits;
+    if (choose.ticksToMs(ticks[0], ticks[3], period, bits)) |ms| r.gpu_frame.push(@floatCast(ms));
+    if (choose.ticksToMs(ticks[1], ticks[2], period, bits)) |ms| r.gpu_paths.push(@floatCast(ms));
 }
 
 fn newInstanceBuffer(r: *Renderer, size: u64) Error!Device.Buffer {
@@ -894,6 +984,7 @@ pub fn frameWith(
     // Waits for the frame two submissions ago, which is what makes writing to
     // this frame's mapped buffer safe without any other synchronisation.
     _ = d.dt.waitForFences(d.handle, 1, @ptrCast(&f.fence), 1, std.math.maxInt(u64));
+    r.collectTimestamps(r.index);
 
     const acquired = try s.acquire(f.image_available);
     const image = switch (acquired) {
@@ -922,6 +1013,12 @@ pub fn frameWith(
     try vk.check(d.dt.resetCommandPool(d.handle, f.pool, 0));
     const begin: vk.CommandBufferBeginInfo = .{ .flags = vk.CommandBufferUsageFlags.one_time_submit };
     try vk.check(d.dt.beginCommandBuffer(f.cb, &begin));
+    // Reset where the reset is allowed, outside the pass, before this frame
+    // writes the queries its predecessor two frames ago left behind.
+    if (r.query_pool != vk.null_handle) {
+        d.dt.cmdResetQueryPool(f.cb, r.query_pool, r.index * queries_per_frame, queries_per_frame);
+    }
+    r.stamp(f.cb, vk.PipelineStageFlags.top_of_pipe, 0);
 
     // Uploads first, outside the render pass: a copy cannot be recorded inside
     // one, and doing them here rather than in their own submission is what
@@ -974,8 +1071,16 @@ pub fn frameWith(
     // Three layers in one pass: rects under, paths, rects over. Each is at
     // most one draw call, so a page of ten thousand marks under a scrollbar
     // is three.
+    //
+    // The two stamps either side of the paths are each written once
+    // everything before them has finished, so their difference is what the
+    // paths added to the frame. Not quite what they cost: the device may
+    // start them under the tail of the rects before, which on a page is a
+    // few hundred rectangles.
     r.recordRects(f, split.under, 0);
+    r.stamp(f.cb, vk.PipelineStageFlags.bottom_of_pipe, 1);
     if (paths) |p| p.renderer.record(f.cb, r.index, p.frame, s.extent);
+    r.stamp(f.cb, vk.PipelineStageFlags.bottom_of_pipe, 2);
     r.recordRects(f, split.over, split.under);
 
     d.dt.cmdEndRenderPass(f.cb);
@@ -1005,6 +1110,7 @@ pub fn frameWith(
         recordTransition(d, f.cb, target, .transfer_src_optimal, .present_src_khr);
     }
 
+    r.stamp(f.cb, vk.PipelineStageFlags.bottom_of_pipe, 3);
     try vk.check(d.dt.endCommandBuffer(f.cb));
 
     var wait_semaphore = f.image_available;
@@ -1026,6 +1132,7 @@ pub fn frameWith(
     };
     try vk.check(d.dt.queueSubmit(d.graphics_queue, 1, @ptrCast(&submit), f.fence));
     s.markInFlight(image.index, f.fence);
+    r.queried[r.index] = r.query_pool != vk.null_handle;
 
     if (capturing) try r.finishCapture(f.fence);
 
@@ -1198,6 +1305,30 @@ test "no sampled texture is an sRGB format, whatever its bytes mean" {
         try testing.expect(!kind.format().isSrgb());
     }
     try testing.expectEqual(vk.Format.r8g8b8a8_unorm, TextureKind.color.format());
+}
+
+test "a ring of timings keeps the latest and reports their spread" {
+    var s: Samples = .{};
+    try testing.expectEqual(@as(usize, 0), s.spread().n);
+
+    // A hundred frames of 1 to 100 ms, pushed out of order.
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) s.push(@floatFromInt((i * 37) % 100 + 1));
+    const a = s.spread();
+    try testing.expectEqual(@as(usize, 100), a.n);
+    try testing.expectEqual(@as(f32, 1), a.best);
+    try testing.expectEqual(@as(f32, 51), a.median);
+    try testing.expectEqual(@as(f32, 96), a.p95);
+
+    // Past capacity it keeps the last `capacity`: a slow start is forgotten.
+    var r: Samples = .{};
+    r.push(1000);
+    i = 0;
+    while (i < Samples.capacity) : (i += 1) r.push(2);
+    const b = r.spread();
+    try testing.expectEqual(@as(usize, Samples.capacity), b.n);
+    try testing.expectEqual(@as(f32, 2), b.p95);
+    try testing.expectEqual(@as(f32, 2), b.best);
 }
 
 test "the descriptor pool is sized for what the sets actually hold" {

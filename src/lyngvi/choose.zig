@@ -191,6 +191,9 @@ pub fn memoryType(
 pub const Families = struct {
     graphics: u32,
     present: u32,
+    /// How many bits of a timestamp written on the graphics queue mean
+    /// anything. Zero is a queue with no timestamps at all.
+    timestamp_bits: u32 = 0,
 
     pub fn shared(f: Families) bool {
         return f.graphics == f.present;
@@ -221,12 +224,35 @@ pub fn queueFamilies(
         const does_graphics = f.queue_flags & vk.QueueFlags.graphics != 0;
         const does_present = present_support & (@as(u64, 1) << @intCast(i)) != 0;
 
-        if (does_graphics and does_present) return .{ .graphics = index, .present = index };
+        if (does_graphics and does_present) {
+            return .{ .graphics = index, .present = index, .timestamp_bits = f.timestamp_valid_bits };
+        }
         if (does_graphics and graphics == null) graphics = index;
         if (does_present and present == null) present = index;
     }
 
-    return .{ .graphics = graphics orelse return null, .present = present orelse return null };
+    const g = graphics orelse return null;
+    return .{
+        .graphics = g,
+        .present = present orelse return null,
+        .timestamp_bits = families[g].timestamp_valid_bits,
+    };
+}
+
+/// A timestamp difference in milliseconds, or null from a queue that keeps no
+/// timestamps.
+///
+/// Only the low `valid_bits` of a timestamp are meaningful. Masking the
+/// difference, rather than the two values, also gets a counter that wrapped
+/// between them right, once.
+pub fn ticksToMs(begin: u64, end: u64, period_ns: f32, valid_bits: u32) ?f64 {
+    if (valid_bits == 0 or !(period_ns > 0)) return null;
+    const mask: u64 = if (valid_bits >= 64)
+        std.math.maxInt(u64)
+    else
+        (@as(u64, 1) << @intCast(valid_bits)) - 1;
+    const ticks = (end -% begin) & mask;
+    return @as(f64, @floatFromInt(ticks)) * period_ns / 1_000_000.0;
 }
 
 /// How much this device is wanted, higher being better. Only compared against
@@ -418,13 +444,15 @@ test "one family that does both beats two that each do one" {
     const both = queueFamilies(&families, 0b10).?;
     try testing.expectEqual(@as(u32, 1), both.graphics);
     try testing.expect(both.shared());
+    try testing.expectEqual(@as(u32, 64), both.timestamp_bits);
 
     // Present only on the family that cannot draw: legal, and the swapchain
-    // then has to be CONCURRENT.
+    // then has to be CONCURRENT. The timestamps are the drawing family's.
     const split = queueFamilies(&families, 0b01).?;
     try testing.expectEqual(@as(u32, 1), split.graphics);
     try testing.expectEqual(@as(u32, 0), split.present);
     try testing.expect(!split.shared());
+    try testing.expectEqual(@as(u32, 64), split.timestamp_bits);
 
     // Nothing can present: not a usable device.
     try testing.expectEqual(@as(?Families, null), queueFamilies(&families, 0));
@@ -465,4 +493,23 @@ test "buffer capacity doubles from a floor rather than tracking the frame" {
     // A zoom that multiplies the instance count by fifty reallocates six
     // times, not fifty.
     try testing.expectEqual(@as(u64, 262144), bufferCapacity(4096, 200000, 4096));
+}
+
+test "a timestamp difference counts only the valid bits, and survives a wrap" {
+    // A queue with no timestamps, and a device that reports no period.
+    try testing.expectEqual(@as(?f64, null), ticksToMs(0, 100, 1, 0));
+    try testing.expectEqual(@as(?f64, null), ticksToMs(0, 100, 0, 64));
+
+    // A nanosecond a tick, a million ticks.
+    try testing.expectApproxEqAbs(@as(f64, 1), ticksToMs(5, 1_000_005, 1, 64).?, 1e-12);
+    // A period that is not a whole number of nanoseconds, as Intel's is not.
+    try testing.expectApproxEqAbs(@as(f64, 1), ticksToMs(0, 12_000, 83.333336, 64).?, 1e-4);
+
+    // A 36-bit counter that wrapped between the two: fifteen ticks, not
+    // most of two to the sixty-fourth.
+    const top = (@as(u64, 1) << 36) - 10;
+    try testing.expectApproxEqAbs(@as(f64, 15e-6), ticksToMs(top, 5, 1, 36).?, 1e-12);
+    // Bits above the valid ones do not count.
+    const high: u64 = 0xf000_0000_0000_0000;
+    try testing.expectApproxEqAbs(@as(f64, 1e-6), ticksToMs(high | 3, 0x0f00_0000_0000_0000 | 4, 1, 36).?, 1e-12);
 }

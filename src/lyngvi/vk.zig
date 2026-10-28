@@ -67,6 +67,7 @@ pub const CommandPool = Handle;
 pub const SurfaceKHR = Handle;
 pub const SwapchainKHR = Handle;
 pub const DebugUtilsMessengerEXT = Handle;
+pub const QueryPool = Handle;
 
 pub const whole_size: u64 = ~@as(u64, 0);
 pub const queue_family_ignored: u32 = ~@as(u32, 0);
@@ -193,6 +194,7 @@ pub const StructureType = enum(u32) {
     mapped_memory_range = 6,
     fence_create_info = 8,
     semaphore_create_info = 9,
+    query_pool_create_info = 11,
     buffer_create_info = 12,
     image_create_info = 14,
     image_view_create_info = 15,
@@ -375,6 +377,13 @@ pub const QueueFlags = struct {
     pub const compute: u32 = 0x2;
     pub const transfer: u32 = 0x4;
     pub const sparse_binding: u32 = 0x8;
+};
+
+pub const QueryResultFlags = struct {
+    pub const result_64: u32 = 0x1;
+    pub const wait: u32 = 0x2;
+    pub const with_availability: u32 = 0x4;
+    pub const partial: u32 = 0x8;
 };
 
 pub const MemoryPropertyFlags = struct {
@@ -636,7 +645,13 @@ pub const LayerProperties = extern struct {
     }
 };
 
-/// Only the head is named; see the header for why the tail is a blob.
+/// Named as far as the timestamp period; see the header for why the rest is
+/// a blob.
+///
+/// The fields between are blobs too, sized from the spec's field order: all
+/// four-byte values but one `size_t` and three `VkDeviceSize`s, which are
+/// named because their width and alignment depend on the target. A test
+/// checks the period lands at 424, where every 64-bit header puts it.
 ///
 /// The tail is sized well past `sizeof(VkPhysicalDeviceLimits) +
 /// sizeof(VkPhysicalDeviceSparseProperties)`, which is a little over 500
@@ -660,7 +675,19 @@ pub const PhysicalDeviceLimits = extern struct {
     max_per_stage_descriptor_uniform_buffers: u32,
     max_per_stage_descriptor_storage_buffers: u32,
     max_per_stage_descriptor_sampled_images: u32,
-    _rest: [768]u8,
+    /// `maxPerStageDescriptorStorageImages` to `viewportSubPixelBits`: 54
+    /// four-byte values.
+    _to_map_alignment: [216]u8,
+    min_memory_map_alignment: usize,
+    min_texel_buffer_offset_alignment: u64,
+    min_uniform_buffer_offset_alignment: u64,
+    min_storage_buffer_offset_alignment: u64,
+    /// `minTexelOffset` to `maxSampleMaskWords`: 21 four-byte values.
+    _to_timestamps: [84]u8,
+    timestamp_compute_and_graphics: u32,
+    /// Nanoseconds per timestamp tick.
+    timestamp_period: f32,
+    _rest: [424]u8,
 };
 
 pub const PhysicalDeviceProperties = extern struct {
@@ -1355,6 +1382,22 @@ pub const FenceCreateInfo = extern struct {
     flags: u32 = 0,
 };
 
+pub const QueryType = enum(u32) {
+    occlusion = 0,
+    pipeline_statistics = 1,
+    timestamp = 2,
+    _,
+};
+
+pub const QueryPoolCreateInfo = extern struct {
+    s_type: StructureType = .query_pool_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: u32 = 0,
+    query_type: QueryType,
+    query_count: u32,
+    pipeline_statistics: u32 = 0,
+};
+
 pub const SemaphoreCreateInfo = extern struct {
     s_type: StructureType = .semaphore_create_info,
     p_next: ?*const anyopaque = null,
@@ -1535,6 +1578,11 @@ pub const PfnCmdPipelineBarrier = *const fn (
     u32,
     ?[*]const ImageMemoryBarrier,
 ) callconv(.c) void;
+pub const PfnCreateQueryPool = *const fn (Device, *const QueryPoolCreateInfo, ?*const anyopaque, *QueryPool) callconv(.c) Result;
+pub const PfnDestroyQueryPool = *const fn (Device, QueryPool, ?*const anyopaque) callconv(.c) void;
+pub const PfnCmdResetQueryPool = *const fn (CommandBuffer, QueryPool, u32, u32) callconv(.c) void;
+pub const PfnCmdWriteTimestamp = *const fn (CommandBuffer, u32, QueryPool, u32) callconv(.c) void;
+pub const PfnGetQueryPoolResults = *const fn (Device, QueryPool, u32, u32, usize, *anyopaque, u64, u32) callconv(.c) Result;
 
 // -- tests ------------------------------------------------------------------
 
@@ -1582,6 +1630,19 @@ test "the properties structure is at least as large as the real one" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(PhysicalDeviceProperties, "api_version"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(PhysicalDeviceProperties, "device_type"));
     try testing.expectEqual(@as(usize, 20), @offsetOf(PhysicalDeviceProperties, "device_name"));
+
+    // What the timestamps are read with, at the spec's offsets. A period read
+    // from the wrong place is a plausible float and every GPU time wrong by
+    // a constant factor.
+    if (@sizeOf(usize) == 8) {
+        try testing.expectEqual(@as(usize, 296), @offsetOf(PhysicalDeviceProperties, "limits"));
+        // Padded from 300 to the `size_t`'s alignment.
+        try testing.expectEqual(@as(usize, 304), @offsetOf(PhysicalDeviceLimits, "min_memory_map_alignment"));
+        try testing.expectEqual(@as(usize, 336), @offsetOf(PhysicalDeviceLimits, "_to_timestamps"));
+        try testing.expectEqual(@as(usize, 420), @offsetOf(PhysicalDeviceLimits, "timestamp_compute_and_graphics"));
+        try testing.expectEqual(@as(usize, 424), @offsetOf(PhysicalDeviceLimits, "timestamp_period"));
+    }
+    try testing.expectEqual(@as(usize, 84), @offsetOf(PhysicalDeviceLimits, "_to_map_alignment"));
 }
 
 test "version numbers pack the way the macro does" {

@@ -391,6 +391,12 @@ pub const DeviceTable = struct {
     cmdCopyBufferToImage: vk.PfnCmdCopyBufferToImage,
     cmdCopyImageToBuffer: vk.PfnCmdCopyImageToBuffer,
     cmdPipelineBarrier: vk.PfnCmdPipelineBarrier,
+
+    createQueryPool: vk.PfnCreateQueryPool,
+    destroyQueryPool: vk.PfnDestroyQueryPool,
+    cmdResetQueryPool: vk.PfnCmdResetQueryPool,
+    cmdWriteTimestamp: vk.PfnCmdWriteTimestamp,
+    getQueryPoolResults: vk.PfnGetQueryPoolResults,
 };
 
 // -- tests ------------------------------------------------------------------
