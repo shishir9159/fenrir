@@ -409,10 +409,11 @@ const Replayer = struct {
         // way to the fragment, so the same buffers draw the page at any zoom
         // and a curve never shows the flat spots of its approximation.
         //
-        // Strokes and glyphs cannot do this -- the stroker and the font layer
-        // both hand over outlines that are already flattened -- so they go
-        // through `paintThrough` with segments. Fills are the case where it
-        // is free, and fills are most of the vector art on a page.
+        // Glyphs do the same, from the font's outline in em units, in
+        // `drawGlyphOutline`. Strokes and clips cannot yet: the stroker's
+        // outline and the clip path are flattened at the recording's scale,
+        // and go through `paintThrough` and `pushClip` as segments. That is
+        // F1 in OPTIMIZING.md.
         if (r.options.path_backend == .slug) {
             r.curves.clearRetainingCapacity();
             slug.fromPath(
@@ -1080,6 +1081,7 @@ fn solid(p: paint.Paint) ?Color {
 
 const testing = std.testing;
 const Builder = @import("../gelgja/Builder.zig");
+const software = @import("software.zig");
 
 /// Records a display list, replays it at a given scale, and hands back the
 /// canvas. The shape every test below takes.
@@ -1096,13 +1098,28 @@ const Rendered = struct {
         options: Options,
         build: *const fn (*Builder) anyerror!void,
     ) !Rendered {
+        return initOn(gpa, .{ .samples = .one }, w, h, scale, options, build);
+    }
+
+    /// `init` onto a canvas set up some other way: more samples, when two
+    /// backends are being compared rather than one being checked for where
+    /// it put things.
+    fn initOn(
+        gpa: Allocator,
+        canvas_options: raster.Options,
+        w: f32,
+        h: f32,
+        scale: f32,
+        options: Options,
+        build: *const fn (*Builder) anyerror!void,
+    ) !Rendered {
         var b: Builder = .init(gpa, .fromRect(0, 0, w, h));
         errdefer b.deinit();
         try build(&b);
         const list = try b.finish();
 
         const size = canvasSize(list.page, scale);
-        var canvas: Canvas = try .init(gpa, size[0], size[1], .{ .samples = .one });
+        var canvas: Canvas = try .init(gpa, size[0], size[1], canvas_options);
         errdefer canvas.deinit(gpa);
         canvas.fb.clear(.white);
 
@@ -1119,6 +1136,17 @@ const Rendered = struct {
     /// How dark a pixel is: 0 for the white page, 1 for solid black.
     fn ink(r: Rendered, x: u32, y: u32) f32 {
         return 1.0 - r.canvas.fb.at(x, y).r;
+    }
+
+    /// Ink summed over the page: the area drawn, in pixels, for black.
+    fn totalInk(r: Rendered) f64 {
+        var sum: f64 = 0;
+        var y: u32 = 0;
+        while (y < r.canvas.height()) : (y += 1) {
+            var x: u32 = 0;
+            while (x < r.canvas.width()) : (x += 1) sum += r.ink(x, y);
+        }
+        return sum;
     }
 
     fn anyInk(r: Rendered) bool {
@@ -1608,7 +1636,6 @@ test "a page recorded, merged and placed draws as the same page rendered" {
     // difference is along the diagonal clip, which the canvas keeps as a
     // stencil mask and the device computes as coverage.
     const gpa = testing.allocator;
-    const Framebuffer = @import("software.zig").Framebuffer;
 
     var pb: Builder = .init(gpa, .fromRect(0, 0, 80, 60));
     try busyPage(&pb);
@@ -1652,7 +1679,7 @@ test "a page recorded, merged and placed draws as the same page rendered" {
     defer frame.deinit(gpa);
     try frame.place(gpa, shared, range, at, .{ 0, 0, 90, 70 });
 
-    var fb = try Framebuffer.init(gpa, 90, 70, .linear);
+    var fb = try software.Framebuffer.init(gpa, 90, 70, .linear);
     defer fb.deinit(gpa);
     fb.clear(.white);
     const drawn = scene_mod.modelFrame(&fb, shared, frame);
@@ -1680,4 +1707,148 @@ test "a page recorded, merged and placed draws as the same page rendered" {
     }
     // Eight samples against the exact area: 0.14 measured.
     try testing.expect(worst < 0.2);
+}
+
+/// How far apart the two backends drew one page: per pixel, and in how much
+/// ink each put down in all.
+const Agreement = struct {
+    pixels: software.Difference,
+    /// The analytic backend's ink over the stencil's, less one.
+    ink: f64,
+};
+
+/// One page through each backend, onto canvases alike in everything else.
+fn backendsDiffer(
+    gpa: Allocator,
+    scale: f32,
+    options: Options,
+    build: *const fn (*Builder) anyerror!void,
+) !Agreement {
+    var opts = options;
+    opts.path_backend = .stencil;
+    var stencil = try Rendered.initOn(gpa, .{}, 60, 60, scale, opts, build);
+    defer stencil.deinit(gpa);
+    try testing.expect(stencil.anyInk());
+
+    opts.path_backend = .slug;
+    var analytic = try Rendered.initOn(gpa, .{}, 60, 60, scale, opts, build);
+    defer analytic.deinit(gpa);
+    return .{
+        .pixels = software.Difference.of(stencil.canvas.fb, analytic.canvas.fb).?,
+        .ink = analytic.totalInk() / stencil.totalInk() - 1,
+    };
+}
+
+fn circle(b: *Builder) !void {
+    const k: f32 = 0.5523 * 22;
+    try b.moveTo(.{ .x = 52, .y = 30 });
+    try b.curveTo(.{ .x = 52, .y = 30 + k }, .{ .x = 30 + k, .y = 52 }, .{ .x = 30, .y = 52 });
+    try b.curveTo(.{ .x = 30 - k, .y = 52 }, .{ .x = 8, .y = 30 + k }, .{ .x = 8, .y = 30 });
+    try b.curveTo(.{ .x = 8, .y = 30 - k }, .{ .x = 30 - k, .y = 8 }, .{ .x = 30, .y = 8 });
+    try b.curveTo(.{ .x = 30 + k, .y = 8 }, .{ .x = 52, .y = 30 - k }, .{ .x = 52, .y = 30 });
+    try b.closePath();
+    try b.fill(.nonzero, .{ .solid = .black });
+}
+
+fn zigzag(b: *Builder) !void {
+    try b.moveTo(.{ .x = 6, .y = 10 });
+    try b.lineTo(.{ .x = 18, .y = 50 });
+    try b.lineTo(.{ .x = 30, .y = 12 });
+    try b.curveTo(.{ .x = 36, .y = 30 }, .{ .x = 44, .y = 52 }, .{ .x = 54, .y = 40 });
+    try b.stroke(.{ .width = 4, .join = .round, .cap = .round }, .{ .solid = .black }, .identity);
+}
+
+fn words(b: *Builder) !void {
+    const font = try b.fontId(1, "F1", "Test", false);
+    try b.textRun(.{ .font = font, .size = 11, .transform = .translation(4.3, 30.6) }, &.{
+        .{ .code = 'a', .offset = .{ .x = 0, .y = 0 } },
+        .{ .code = 'b', .offset = .{ .x = 6.2, .y = 0 } },
+        .{ .code = 'c', .offset = .{ .x = 12.7, .y = 0 } },
+        .{ .code = 'd', .offset = .{ .x = 19.1, .y = 0 } },
+        .{ .code = 'a', .offset = .{ .x = 25.5, .y = 0 } },
+        .{ .code = 'c', .offset = .{ .x = 33.4, .y = 0 } },
+        .{ .code = 'd', .offset = .{ .x = 40.8, .y = 0 } },
+    });
+}
+
+test "the stencil and analytic backends draw a curve, a stroke and glyphs alike" {
+    // `raster --path both` on shapes small enough that every pixel is near
+    // an edge, which is the hard case for the mean.
+    //
+    // The worst single pixel is not bounded, because each backend is wrong
+    // somewhere by up to half a pixel: eight samples quantise an edge, and
+    // the analytic one's two rays are approximate at a corner (0.25 against
+    // 0), on an edge near 45 degrees (0.5 against 0.8), and where the
+    // stroker's overlapping pieces meet an edge, which it counts twice (0.5
+    // against 1.0 on the zigzag). What is bounded is that those stay a few
+    // pixels, and that no shape moved or changed its area.
+    const gpa = testing.allocator;
+    var glyphs: Squares = .{};
+    for ([_]*const fn (*Builder) anyerror!void{ circle, zigzag, words }) |build| {
+        // Measured, at 1x then 3x: means of 0.72, 1.51 and 0.49 levels and
+        // 0.24, 0.51 and 0.13; 3.0, 5.1 and 2.0% of pixels over 8 levels
+        // and 0.9, 1.7 and 0.7%; ink within 1.9% (the stroke) and 0.6%.
+        for ([_]f32{ 1, 3 }, [_]f64{ 2, 0.75 }, [_]f64{ 7, 2.5 }, [_]f64{ 0.03, 0.01 }) |scale, mean, over_8, ink| {
+            const a = try backendsDiffer(gpa, scale, .{ .glyphs = glyphs.source() }, build);
+            try testing.expect(a.pixels.mean() < mean);
+            try testing.expect(a.pixels.percent(a.pixels.over_8) < over_8);
+            try testing.expect(@abs(a.ink) < ink);
+        }
+    }
+}
+
+test "a clip past max_clip_depth is counted, and what it would have hidden is drawn" {
+    const gpa = testing.allocator;
+    for ([_]PathBackend{ .stencil, .slug }) |backend| {
+        var r = try Rendered.init(gpa, 40, 40, 1, .{ .max_clip_depth = 1, .path_backend = backend }, struct {
+            fn build(b: *Builder) !void {
+                try box(b, 0, 0, 40, 40);
+                try b.pushClip(.nonzero);
+                try box(b, 0, 0, 20, 40);
+                try b.pushClip(.nonzero);
+                try box(b, 0, 0, 40, 40);
+                try b.fill(.nonzero, .{ .solid = .black });
+                try b.popClip();
+                try b.popClip();
+                // Balanced still: the dropped clip's pop did not take the
+                // first one with it, so this is clipped by nothing.
+                try box(b, 0, 0, 40, 40);
+                try b.fill(.nonzero, .{ .solid = .black });
+            }
+        }.build);
+        defer r.deinit(gpa);
+
+        try testing.expectEqual(@as(u32, 2), r.stats.clips);
+        try testing.expectEqual(@as(u32, 1), r.stats.clips_dropped);
+        try testing.expect(!r.stats.complete());
+        // Right of the dropped clip's edge: drawn, which is too much.
+        try testing.expectApproxEqAbs(@as(f32, 1), r.ink(30, 20), 0.01);
+        try testing.expectApproxEqAbs(@as(f32, 1), r.ink(10, 20), 0.01);
+    }
+}
+
+test "a hairline is one device pixel of ink at any zoom" {
+    // Width zero is the thinnest line the device can draw (§8.4.3.2), so it
+    // is resolved against the whole matrix and a zoom does not fatten it.
+    // The GPU path resolves it once, when the page is recorded, and does
+    // fatten it: F1 in OPTIMIZING.md.
+    const gpa = testing.allocator;
+    for ([_]f32{ 1, 4 }) |scale| {
+        for ([_]PathBackend{ .stencil, .slug }) |backend| {
+            var r = try Rendered.initOn(gpa, .{}, 40, 40, scale, .{ .path_backend = backend }, struct {
+                fn build(b: *Builder) !void {
+                    try b.moveTo(.{ .x = 5, .y = 20.3 });
+                    try b.lineTo(.{ .x = 35, .y = 20.3 });
+                    try b.stroke(.{ .width = 0 }, .{ .solid = .black }, .identity);
+                }
+            }.build);
+            defer r.deinit(gpa);
+
+            // Summed down one column, which is the line's width in pixels.
+            const x: u32 = @intFromFloat(20 * scale);
+            var ink: f32 = 0;
+            for (0..r.canvas.height()) |y| ink += r.ink(x, @intCast(y));
+            try testing.expectApproxEqAbs(@as(f32, 1), ink, 0.02);
+        }
+    }
 }

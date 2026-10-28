@@ -210,6 +210,52 @@ fn byteOf(v: f32) u8 {
     return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255.0));
 }
 
+/// How far two renders of the same page disagree, in levels out of 255 of
+/// what is stored.
+///
+/// Levels, because that is the unit a difference has to be judged in: a mean
+/// under one is invisible, a worst of a few is an antialiased edge landing
+/// differently, and a large share of big differences is a shape in the wrong
+/// place. A pixel's difference is its largest colour channel's. Alpha is left
+/// out: both renders are onto the same opaque page, so it can only differ
+/// where the colour already does.
+pub const Difference = struct {
+    pixels: u64 = 0,
+    /// Summed rather than averaged, so `mean` divides once.
+    total: f64 = 0,
+    worst: f32 = 0,
+    over_1: u64 = 0,
+    over_8: u64 = 0,
+
+    /// Null when the sizes differ, which is two different pages.
+    pub fn of(a: Framebuffer, b: Framebuffer) ?Difference {
+        if (a.width != b.width or a.height != b.height) return null;
+        var out: Difference = .{ .pixels = @as(u64, a.width) * a.height };
+        var i: usize = 0;
+        while (i < a.pixels.len) : (i += 4) {
+            var d: f32 = 0;
+            for (0..3) |c| d = @max(d, @abs(a.pixels[i + c] - b.pixels[i + c]));
+            const levels = d * 255.0;
+            out.total += levels;
+            out.worst = @max(out.worst, levels);
+            if (levels > 1) out.over_1 += 1;
+            if (levels > 8) out.over_8 += 1;
+        }
+        return out;
+    }
+
+    pub fn mean(d: Difference) f64 {
+        if (d.pixels == 0) return 0;
+        return d.total / @as(f64, @floatFromInt(d.pixels));
+    }
+
+    /// `count` as a percentage of the pixels compared.
+    pub fn percent(d: Difference, count: u64) f64 {
+        if (d.pixels == 0) return 0;
+        return @as(f64, @floatFromInt(count)) * 100.0 / @as(f64, @floatFromInt(d.pixels));
+    }
+};
+
 /// Encodes an sRGB colour for `space` and premultiplies it by its own alpha
 /// and by `cov`.
 fn premultiplied(c: Color, cov: f32, space: Space) [4]f32 {
@@ -562,4 +608,39 @@ test "the PPM header and payload are the size they claim" {
     try testing.expect(std.mem.startsWith(u8, out, "P6\n4 3\n255\n"));
     try testing.expectEqual(@as(usize, 11 + 4 * 3 * 3), out.len);
     try testing.expectEqual(@as(u8, 255), out[11]);
+}
+
+test "a difference is counted in levels, by each pixel's worst channel" {
+    const gpa = testing.allocator;
+    var a = try Framebuffer.init(gpa, 10, 10, .srgb);
+    defer a.deinit(gpa);
+    var b = try Framebuffer.init(gpa, 10, 10, .srgb);
+    defer b.deinit(gpa);
+    a.clear(.white);
+    b.clear(.white);
+
+    const same = Difference.of(a, b).?;
+    try testing.expectEqual(@as(u64, 100), same.pixels);
+    try testing.expectEqual(@as(f32, 0), same.worst);
+    try testing.expectEqual(@as(f64, 0), same.mean());
+
+    // One pixel two levels off in green and half a level in red: two, not
+    // two and a half. Another ten levels off in blue.
+    b.pixels[4 * 3 + 0] -= 0.5 / 255.0;
+    b.pixels[4 * 3 + 1] -= 2.0 / 255.0;
+    b.pixels[4 * 7 + 2] -= 10.0 / 255.0;
+    // And an alpha that differs where the colour does not, which is ignored.
+    b.pixels[4 * 9 + 3] = 0.5;
+
+    const d = Difference.of(a, b).?;
+    try testing.expectApproxEqAbs(@as(f32, 10), d.worst, 1e-3);
+    try testing.expectApproxEqAbs(@as(f64, 0.12), d.mean(), 1e-4);
+    try testing.expectEqual(@as(u64, 2), d.over_1);
+    try testing.expectEqual(@as(u64, 1), d.over_8);
+    try testing.expectApproxEqAbs(@as(f64, 1), d.percent(d.over_8), 1e-9);
+
+    // Two sizes are two pages.
+    var c = try Framebuffer.init(gpa, 10, 9, .srgb);
+    defer c.deinit(gpa);
+    try testing.expect(Difference.of(a, c) == null);
 }

@@ -789,42 +789,12 @@ fn suffixed(ctx: *Context, name: []const u8, tail: []const u8) ![]u8 {
         return ctx.fail("out of memory", .{});
 }
 
-/// Per-pixel difference between two renders of the same page.
-///
-/// Reported in levels out of 255, because that is the unit a difference has
-/// to be judged in: a mean under a level is invisible, a maximum of a few
-/// levels is an antialiased edge landing differently, and anything with a
-/// large *count* of big differences is a shape in the wrong place.
+/// The two renders' `Difference`, on one line.
 fn compare(ctx: *Context, a: gleipnir.Framebuffer, b: gleipnir.Framebuffer) void {
-    if (a.width != b.width or a.height != b.height) return;
-    const n = @as(usize, a.width) * a.height;
-
-    var total: f64 = 0;
-    var worst: f32 = 0;
-    var over_1: u64 = 0;
-    var over_8: u64 = 0;
-
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        var d: f32 = 0;
-        for (0..3) |c| {
-            d = @max(d, @abs(a.pixels[i * 4 + c] - b.pixels[i * 4 + c]));
-        }
-        const levels = d * 255.0;
-        total += levels;
-        worst = @max(worst, levels);
-        if (levels > 1) over_1 += 1;
-        if (levels > 8) over_8 += 1;
-    }
-
+    const d = gleipnir.software.Difference.of(a, b) orelse return;
     ctx.out.print(
         "         stencil vs slug: mean {d:.3}, worst {d:.1}, {d:.3}% over 1 level, {d:.3}% over 8\n",
-        .{
-            total / @as(f64, @floatFromInt(n)),
-            worst,
-            @as(f64, @floatFromInt(over_1)) * 100.0 / @as(f64, @floatFromInt(n)),
-            @as(f64, @floatFromInt(over_8)) * 100.0 / @as(f64, @floatFromInt(n)),
-        },
+        .{ d.mean(), d.worst, d.percent(d.over_1), d.percent(d.over_8) },
     ) catch {};
 }
 
