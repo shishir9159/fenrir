@@ -188,6 +188,18 @@ pub fn memoryType(
     return fallback;
 }
 
+/// Where a memory type's bytes live and who reaches across the bus for them,
+/// in the words a decision about staging buffers is made in.
+pub fn memoryKind(flags: u32) []const u8 {
+    const m = vk.MemoryPropertyFlags;
+    const local = flags & m.device_local != 0;
+    const visible = flags & m.host_visible != 0;
+    if (local and visible) return "video memory the CPU writes through the BAR";
+    if (local) return "video memory";
+    if (visible) return "system memory the GPU reads across the bus";
+    return "memory neither side maps";
+}
+
 pub const Families = struct {
     graphics: u32,
     present: u32,
@@ -512,4 +524,20 @@ test "a timestamp difference counts only the valid bits, and survives a wrap" {
     // Bits above the valid ones do not count.
     const high: u64 = 0xf000_0000_0000_0000;
     try testing.expectApproxEqAbs(@as(f64, 1e-6), ticksToMs(high | 3, 0x0f00_0000_0000_0000 | 4, 1, 36).?, 1e-12);
+}
+
+test "a memory type is named for where it is and who crosses the bus" {
+    const m = vk.MemoryPropertyFlags;
+    // The two the path buffers can land in, which is the difference between
+    // reading the outlines at video memory speed and reading them over PCIe.
+    try testing.expectEqualStrings(
+        "video memory the CPU writes through the BAR",
+        memoryKind(m.device_local | m.host_visible | m.host_coherent),
+    );
+    try testing.expectEqualStrings(
+        "system memory the GPU reads across the bus",
+        memoryKind(m.host_visible | m.host_coherent | m.host_cached),
+    );
+    try testing.expectEqualStrings("video memory", memoryKind(m.device_local));
+    try testing.expectEqualStrings("memory neither side maps", memoryKind(0));
 }

@@ -533,6 +533,10 @@ pub const Buffer = struct {
     mapped: ?[*]u8 = null,
     /// Whether writes are visible to the device without an explicit flush.
     coherent: bool = true,
+    /// Which of the device's memory types it landed in: what
+    /// `choose.memoryType` settled for, which is not always what was
+    /// preferred, and the only way to find out afterwards which it was.
+    memory_type: u32 = 0,
 
     pub fn slice(b: Buffer) []u8 {
         return (b.mapped orelse return &.{})[0..b.size];
@@ -557,6 +561,7 @@ pub fn createBuffer(
 
     const index = choose.memoryType(&d.memory, req.memory_type_bits, required, preferred) orelse
         return error.FeatureNotPresent;
+    b.memory_type = index;
 
     const alloc: vk.MemoryAllocateInfo = .{
         .allocation_size = req.size,

@@ -232,6 +232,20 @@ fn newBuffer(p: *PathRenderer, size: u64) Error!Device.Buffer {
     );
 }
 
+/// The memory type every path buffer is in, or null if they are not all in
+/// one. `newBuffer` only prefers video memory, and whether it got it decides
+/// whether each frame's upload crosses the bus once or every fragment's read
+/// does (F3 in OPTIMIZING.md).
+pub fn memoryType(p: *const PathRenderer) ?u32 {
+    const first = p.frames[0].list[0].memory_type;
+    for (p.frames) |f| {
+        for (f.list) |b| {
+            if (b.memory_type != first) return null;
+        }
+    }
+    return first;
+}
+
 fn writeDescriptors(p: *PathRenderer, f: *Buffers) void {
     const d = p.device;
     var infos: [slugpipe.binding.count]vk.DescriptorBufferInfo = undefined;

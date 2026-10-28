@@ -113,6 +113,7 @@ pub const usage =
     \\fenrir read <file>... [--page N] [--zoom N | --dpi N] [--size WxH]
     \\                      [--samples N] [--vsync on|off|adaptive]
     \\                      [--validate] [--gpu NAME] [--frames N]
+    \\                      [--time] [--bench scroll|zoom|flip]
     \\
     \\    Opens the documents in a window and scrolls through them. More than
     \\    one file opens them as buffers; the first is shown and the rest are
@@ -129,7 +130,16 @@ pub const usage =
     \\    --samples N  Multisampling for the page raster: 1, 2, 4 or 8.
     \\                 Defaults to 8.
     \\    --frames N   Run N frames and exit, so the command can be scripted.
-    \\    --shot F     Write one composed frame to F as a PNG and exit. With
+    \\    --time       How long startup took, stage by stage, and on exit
+    \\                 what the frames cost: between frames, placing the
+    \\                 paths, and on the device from its own timestamps.
+    \\    --bench W    Drive the first window through a fixed workload and
+    \\                 exit, with --time's report. scroll: the whole document
+    \\                 a twentieth of a page a frame. zoom: 50% to the closest
+    \\                 the reader goes and back, twice. flip: every page in
+    \\                 turn. Each step waits for the pages it shows; that wait
+    \\                 is reported apart.
+    \\    --shot F    Write one composed frame to F as a PNG and exit. With
     \\                 --path cpu there is no window and no device: what the
     \\                 reader would look like, on a machine with no display
     \\                 and in a test. With --path gpu the frame is drawn by
@@ -310,6 +320,7 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
     var splits: []const u8 = &.{};
     var clean = false;
     var timing = false;
+    var bench: ?Bench.Kind = null;
     var config_dir: ?[]const u8 = null;
     var on_device = false;
     var backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu;
@@ -353,6 +364,12 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
             frames = std.fmt.parseInt(u32, args[i], 10) catch
                 return ctx.fail("--frames wants a number, not '{s}'", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--time")) {
+            timing = true;
+        } else if (std.mem.eql(u8, arg, "--bench")) {
+            i += 1;
+            if (i >= args.len) return ctx.fail("--bench needs scroll, zoom or flip", .{});
+            bench = std.meta.stringToEnum(Bench.Kind, args[i]) orelse
+                return ctx.fail("--bench wants scroll, zoom or flip, not '{s}'", .{args[i]});
             timing = true;
         } else if (std.mem.eql(u8, arg, "--db")) {
             i += 1;
@@ -470,8 +487,9 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
     session.library = library.openWith(ctx, gpa, db_path);
     stage.mark("library");
     // A comparison opens at its first difference, wherever either document
-    // was last read to, and does not move where they will reopen.
-    session.remembers_place = shot == null and comparison == null;
+    // was last read to, and does not move where they will reopen. A bench
+    // ends at the last page and must not leave the reader there.
+    session.remembers_place = shot == null and comparison == null and bench == null;
     session.diff = comparison;
     if (session.library) |l| {
         if (l.accent() catch null) |c| {
@@ -533,6 +551,7 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
         .splits = splits,
         .device = .{ .validation = validate, .prefer = prefer },
         .time = timing,
+        .bench = bench,
     });
 }
 
@@ -549,6 +568,68 @@ const Settings = struct {
     device: lyngvi.Device.Options,
     /// `--time`: what the frames cost, summarised on exit.
     time: bool = false,
+    bench: ?Bench.Kind = null,
+};
+
+/// `--bench`: a workload that is the same on every run, so two builds, or the
+/// two backends, can be set side by side on it.
+///
+/// A step moves the focused window, and the next waits until everything the
+/// step brought into view has arrived. So the frames drawn with every page
+/// present -- what scrolling and zooming cost, frame after frame -- and the
+/// wait for a page -- what arriving costs -- are counted apart, and neither
+/// hides in the other's average.
+const Bench = struct {
+    kind: Kind,
+    step: u32 = 0,
+    /// The scroll's stride, taken at the first step, so later zooms and page
+    /// sizes do not change the run.
+    stride: f32 = 0,
+    /// Frames drawn while something visible was still missing.
+    waited: u32 = 0,
+    /// From a step to the last page it brought into view being there.
+    arrival: lyngvi.Renderer.Samples = .{},
+    pending: ?Lap = null,
+
+    /// Steps each way between 50% and `max_zoom`, five percent a step. Taken
+    /// at the first step, from the window's own 100%.
+    zoom_steps: u32 = 0,
+
+    const Kind = enum { scroll, zoom, flip };
+
+    /// Up, down, up, down.
+    const zoom_legs = 4;
+
+    /// Moves the window for the next frame. False once the workload is done.
+    fn advance(b: *Bench, v: *View) bool {
+        defer b.step += 1;
+        switch (b.kind) {
+            .scroll => {
+                if (b.step == 0) {
+                    b.stride = v.pageSize(0)[1] / 20;
+                    v.scroll = 0;
+                } else {
+                    if (v.scroll >= v.maxScroll()) return false;
+                    v.scroll += b.stride;
+                }
+                v.clampScroll();
+            },
+            .zoom => {
+                const half = 0.5 * v.hundredPercent();
+                if (b.step == 0) b.zoom_steps = @intFromFloat(@ceil(@log(max_zoom / half) / @log(1.05)));
+                const leg = b.step / b.zoom_steps;
+                if (leg >= zoom_legs) return false;
+                const k = b.step % b.zoom_steps;
+                const up = if (leg % 2 == 0) k else b.zoom_steps - k;
+                v.setZoom(half * std.math.pow(f32, 1.05, @floatFromInt(up)));
+            },
+            .flip => {
+                if (b.step >= v.pages.len) return false;
+                v.scrollToPage(b.step);
+            },
+        }
+        return true;
+    }
 };
 
 /// `--time`'s startup stopwatch.
@@ -5738,6 +5819,7 @@ const Session = struct {
         var interval: lyngvi.Renderer.Samples = .{};
         var placing: lyngvi.Renderer.Samples = .{};
         var lap: Lap = .start(ctx.io);
+        var bench: ?Bench = if (settings.bench) |kind| .{ .kind = kind } else null;
 
         while (true) {
             window.pump();
@@ -5779,6 +5861,21 @@ const Session = struct {
                 error.OutOfMemory => return ctx.fail("out of memory rendering a page", .{}),
                 else => null,
             };
+            // After what arrived is in and before the next job is chosen, so
+            // the worker is asked for what the step just brought into view.
+            if (bench) |*b| {
+                if (s.firstMissing() != null) {
+                    b.waited += 1;
+                } else if (b.pending) |*l| {
+                    // Arrived. Drawn for a frame before the next step, or a
+                    // flip would move on from every page unseen.
+                    b.arrival.push(msOf(l.lap()));
+                    b.pending = null;
+                } else {
+                    if (!b.advance(s.view())) break;
+                    if (s.firstMissing() != null) b.pending = .start(ctx.io);
+                }
+            }
             if (s.nextJob()) |job| worker.post(job);
 
             // One resumption each for the handlers that yielded, and no more:
@@ -5895,9 +5992,12 @@ const Session = struct {
                         }
                     }
                     drawn += 1;
-                    // The first interval is startup, which `Stage` reports.
+                    // The first interval is startup, which `Stage` reports,
+                    // and under a bench a frame waiting for a page is the
+                    // arrival's, which it reports.
                     const since = lap.lap();
-                    if (settings.time and drawn > 1) interval.push(msOf(since));
+                    const steady = if (bench) |b| b.pending == null else true;
+                    if (settings.time and drawn > 1 and steady) interval.push(msOf(since));
                     if (shooting) {
                         if (renderer.captured) |c| try s.writeShot(settings.shot.?, c);
                         break;
@@ -5945,9 +6045,24 @@ const Session = struct {
                 );
             }
         }
+        if (bench) |*b| {
+            ctx.note("bench  {t}: {d} steps, {d} frames drawn waiting for a page", .{ b.kind, b.step, b.waited });
+            reportSpread(ctx, "arrival", &b.arrival);
+        }
         if (settings.time) {
             reportSpread(ctx, "frame", &interval);
             reportSpread(ctx, "place", &placing);
+            if (paths_renderer) |*p| {
+                if (p.memoryType()) |t| {
+                    const kind = device.memory.memory_types[t];
+                    ctx.note("time   paths in   {s}, of a {d} MiB heap", .{
+                        lyngvi.choose.memoryKind(kind.property_flags),
+                        device.memory.memory_heaps[kind.heap_index].size >> 20,
+                    });
+                } else {
+                    ctx.note("time   paths in   more than one kind of memory", .{});
+                }
+            }
             if (renderer.query_pool == lyngvi.vk.null_handle) {
                 ctx.note("time   this queue keeps no timestamps; no device times", .{});
             } else {
@@ -6139,6 +6254,41 @@ test "two windows at different zooms need two rasters and one recording" {
     try testing.expect(s.cached(a, 0));
     try testing.expect(s.cached(b, 0));
     s.recorded.pages[0].source = null;
+}
+
+test "each bench workload runs its course and then stops" {
+    const gpa = testing.allocator;
+    var buf: [8]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 8), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // Every page once, ending on the last.
+    var flip: Bench = .{ .kind = .flip };
+    var steps: u32 = 0;
+    while (flip.advance(s.view())) steps += 1;
+    try testing.expectEqual(@as(u32, 8), steps);
+    try testing.expectEqual(@as(u32, 7), s.view().currentPage());
+
+    // From half size to the limit and back, twice, and nowhere outside that.
+    var zoom: Bench = .{ .kind = .zoom };
+    var lo: f32 = max_zoom;
+    var hi: f32 = 0;
+    steps = 0;
+    while (zoom.advance(s.view())) : (steps += 1) {
+        lo = @min(lo, s.view().zoom);
+        hi = @max(hi, s.view().zoom);
+    }
+    try testing.expectEqual(Bench.zoom_legs * zoom.zoom_steps, steps);
+    try testing.expectApproxEqRel(0.5 * s.view().hundredPercent(), lo, 1e-5);
+    try testing.expectEqual(max_zoom, hi);
+
+    // Top to bottom, twenty steps a page.
+    s.view().setZoom(1);
+    var scroll: Bench = .{ .kind = .scroll };
+    steps = 0;
+    while (scroll.advance(s.view())) steps += 1;
+    try testing.expectEqual(s.view().maxScroll(), s.view().scroll);
+    try testing.expect(steps > 7 * 20 and steps < 8 * 20);
 }
 
 /// A square `side` across as straight quadratics, the shape a scene stores.
