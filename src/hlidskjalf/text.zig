@@ -15,7 +15,9 @@
 //! The columns matter as much as the lines. A selection is a range of line
 //! indices, so if the two columns of a paper were interleaved down the page,
 //! dragging over a paragraph in the left column would take in whatever the
-//! right column had at the same heights. `findGutters` is what stops that.
+//! right column had at the same heights. `findGutters` is what stops that,
+//! and `findBands` stops it on the pages where a full-width figure or caption
+//! crosses the gutter and no gutter runs the height of the page.
 //!
 //! ## What a box is
 //!
@@ -127,9 +129,13 @@ pub const Line = struct {
     baseline: f32 = 0,
     /// Every glyph on the line, together.
     box: Bounds = .empty,
-    /// Which column of the page the line belongs to, counting from the left.
-    /// Zero on a page with one column, which is most of them.
+    /// Which column of the page the line belongs to, counting from the left
+    /// and then down the page a band at a time: a full-width figure above two
+    /// columns is column 0, and the columns under it are 1 and 2. Zero on a
+    /// page with one column, which is most of them.
     column: u32 = 0,
+    /// Which band of the page the line is in, counting down. See `group`.
+    band: u32 = 0,
     /// The line as a span of `Page.text`, its inserted word spaces included
     /// and its newline not.
     at: u32 = 0,
@@ -218,10 +224,14 @@ pub const Page = struct {
     /// click in one of them must not land in the other, however close the
     /// baseline is. Within a column the nearest baseline wins, so a click in
     /// the margin beside a line still lands on that line.
+    ///
+    /// The band is chosen before either. A drag down the left column under a
+    /// full-width figure must stay in that column, and the figure's own lines
+    /// are as near its x as the column's are -- nearer, being wider.
     pub fn lineAt(p: Page, x: f32, y: f32) u32 {
         if (p.lines.len == 0) return 0;
 
-        const want = p.columnNear(x);
+        const want = p.columnNear(p.bandNear(y), x);
         var best: u32 = 0;
         var best_d: f32 = std.math.floatMax(f32);
         for (p.lines, 0..) |l, i| {
@@ -235,12 +245,33 @@ pub const Page = struct {
         return best;
     }
 
-    /// The column whose lines come nearest an x, which is the column a click
-    /// at that x is in.
-    pub fn columnNear(p: Page, x: f32) u32 {
+    /// The band whose lines come nearest a height: the one it is in, or the
+    /// nearer of the two it falls between.
+    pub fn bandNear(p: Page, y: f32) u32 {
         var best: u32 = 0;
         var best_d: f32 = std.math.floatMax(f32);
         for (p.lines) |l| {
+            const d = if (y < l.box.min_y)
+                l.box.min_y - y
+            else if (y > l.box.max_y)
+                y - l.box.max_y
+            else
+                0;
+            if (d < best_d) {
+                best_d = d;
+                best = l.band;
+            }
+        }
+        return best;
+    }
+
+    /// The column of `band` whose lines come nearest an x, which is the
+    /// column a click at that x is in.
+    pub fn columnNear(p: Page, band: u32, x: f32) u32 {
+        var best: u32 = 0;
+        var best_d: f32 = std.math.floatMax(f32);
+        for (p.lines) |l| {
+            if (l.band != band) continue;
             const d = if (x < l.box.min_x)
                 l.box.min_x - x
             else if (x > l.box.max_x)
@@ -471,6 +502,16 @@ fn gapIsSpace(prev: Box, next: Box) bool {
 /// the distance between their baselines, because a distance threshold has to
 /// be in some unit and a page mixes eight-point footnotes with a
 /// twenty-four-point heading. Overlap scales itself.
+///
+/// A page is read a *band* at a time, top to bottom, and each band down its
+/// own columns. Most pages are one band. The others are the ones a two-column
+/// paper puts a full-width figure, caption or title on: its lines cross the
+/// gutter, so no gutter runs the height of the page, and without bands the
+/// whole page came out as one column -- the left and right columns fused
+/// into one line at every height, and a drag down the left column selecting
+/// the right one too. The author reported that as a regression of the
+/// column work; `findBands` is the fix. Do not go back to one set of
+/// gutters for the page.
 fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
     // Down the page, which is the order the gutter scan reads rows in.
     std.mem.sort(Box, boxes, {}, struct {
@@ -480,20 +521,8 @@ fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
         }
     }.less);
 
-    var gutters_buf: [max_columns - 1]f32 = undefined;
-    const gutters = findGutters(boxes, &gutters_buf);
-
-    // Column first, then down the page, then along each line. User space
-    // counts upwards, so "down" is descending y.
-    if (gutters.len != 0) std.mem.sort(Box, boxes, gutters, struct {
-        fn less(cuts: []const f32, a: Box, b: Box) bool {
-            const ca = columnOf(cuts, a);
-            const cb = columnOf(cuts, b);
-            if (ca != cb) return ca < cb;
-            if (a.box.min_y != b.box.min_y) return a.box.min_y > b.box.min_y;
-            return a.box.min_x < b.box.min_x;
-        }
-    }.less);
+    var bands_buf: [max_bands]Band = undefined;
+    const bands = findBands(boxes, &bands_buf);
 
     var lines: std.ArrayList(Line) = .empty;
     errdefer lines.deinit(gpa);
@@ -503,38 +532,62 @@ fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
     // number.
     const fold_gap = medianHeight(boxes) * 0.35;
 
-    var start: usize = 0;
-    var i: usize = 1;
-    while (i <= boxes.len) : (i += 1) {
-        const ends = i == boxes.len or
-            columnOf(gutters, boxes[start]) != columnOf(gutters, boxes[i]) or
-            !sameLine(boxes[start], boxes[i]);
-        if (!ends) continue;
+    var column_base: u32 = 0;
+    var band_start: usize = 0;
+    for (bands, 0..) |*band, band_index| {
+        if (band.end <= band_start) continue;
+        const gutters = band.cuts();
 
-        // Along the line, which the sort above only did within one y.
-        const on_line = boxes[start..i];
-        std.mem.sort(Box, on_line, {}, byX);
+        // Column first, then down the band, then along each line. User space
+        // counts upwards, so "down" is descending y. A band is a run of whole
+        // rows of the sort above, so sorting it in place keeps every band
+        // after the one above it.
+        if (gutters.len != 0) std.mem.sort(Box, boxes[band_start..band.end], gutters, struct {
+            fn less(cuts: []const f32, a: Box, b: Box) bool {
+                const ca = columnOf(cuts, a);
+                const cb = columnOf(cuts, b);
+                if (ca != cb) return ca < cb;
+                if (a.box.min_y != b.box.min_y) return a.box.min_y > b.box.min_y;
+                return a.box.min_x < b.box.min_x;
+            }
+        }.less);
 
-        var box: Bounds = .empty;
-        var baseline: f32 = 0;
-        for (on_line) |g| {
-            box = box.unionWith(g.box);
-            baseline += g.base;
-        }
-        const line: Line = .{
-            .first = @intCast(start),
-            .count = @intCast(on_line.len),
-            .baseline = baseline / @as(f32, @floatFromInt(on_line.len)),
-            .box = box,
-            .column = columnOf(gutters, on_line[0]),
-        };
+        var start: usize = band_start;
+        var i: usize = band_start + 1;
+        while (i <= band.end) : (i += 1) {
+            const ends = i == band.end or
+                columnOf(gutters, boxes[start]) != columnOf(gutters, boxes[i]) or
+                !sameLine(boxes[start], boxes[i]);
+            if (!ends) continue;
 
-        if (lines.items.len != 0 and fold(&lines.items[lines.items.len - 1], line, boxes, fold_gap)) {
+            // Along the line, which the sort above only did within one y.
+            const on_line = boxes[start..i];
+            std.mem.sort(Box, on_line, {}, byX);
+
+            var box: Bounds = .empty;
+            var baseline: f32 = 0;
+            for (on_line) |g| {
+                box = box.unionWith(g.box);
+                baseline += g.base;
+            }
+            const line: Line = .{
+                .first = @intCast(start),
+                .count = @intCast(on_line.len),
+                .baseline = baseline / @as(f32, @floatFromInt(on_line.len)),
+                .box = box,
+                .column = column_base + columnOf(gutters, on_line[0]),
+                .band = @intCast(band_index),
+            };
+
+            if (lines.items.len != 0 and fold(&lines.items[lines.items.len - 1], line, boxes, fold_gap)) {
+                start = i;
+                continue;
+            }
+            try lines.append(gpa, line);
             start = i;
-            continue;
         }
-        try lines.append(gpa, line);
-        start = i;
+        column_base += @intCast(gutters.len + 1);
+        band_start = band.end;
     }
     return lines.toOwnedSlice(gpa);
 }
@@ -719,6 +772,313 @@ fn tryGutter(
 
     out[0] = mid;
     return 1;
+}
+
+// -- bands --------------------------------------------------------------------
+
+/// As many bands as a page is cut into. A paper's worst is a title, a figure,
+/// its caption and the columns under them; sixteen is that twice over, and
+/// past it the last band takes the rest.
+const max_bands = 16;
+
+/// As many rows as the band search looks at. A page of prose is fifty and a
+/// dense table a few hundred; a page past this is read as one band, rather
+/// than costing an allocation per page to hold its rows.
+const max_rows = 1024;
+
+/// How many rows a stretch has to run for before it is worth asking whether
+/// it has columns: the same eight `findGutters` asks of a whole page.
+const min_band_rows = 8;
+
+/// A run of whole rows of the page, and the gutters that divide it.
+const Band = struct {
+    /// One past its last box, in the page's top-to-bottom order. A band
+    /// begins where the one before it ended.
+    end: u32,
+    gutters: [max_columns - 1]f32 = undefined,
+    n: u8 = 0,
+
+    fn cuts(b: *const Band) []const f32 {
+        return b.gutters[0..b.n];
+    }
+};
+
+/// Cuts a page, sorted top to bottom, into bands, with each band's gutters.
+///
+/// A page with a gutter down its whole height is one band, exactly as it was
+/// read before there were bands, and nothing below runs for it. Otherwise the
+/// page is searched for the *stretch* of rows a gutter runs down -- the rows
+/// under a full-width figure and its caption -- and that stretch is a band
+/// with whatever gutters `findGutters` finds in it alone. Above and below it
+/// are searched the same way, so columns, a wide table and columns again are
+/// three bands.
+///
+/// A band's gutter has to pass every test a page's does, run on the band.
+/// The band has to be a quarter of the page tall as well, which is what keeps
+/// a two-column table on a page of prose from being read down its columns.
+fn findBands(boxes: []const Box, out: *[max_bands]Band) []const Band {
+    var whole: Band = .{ .end = @intCast(boxes.len) };
+    whole.n = @intCast(findGutters(boxes, &whole.gutters).len);
+    out[0] = whole;
+    if (whole.n != 0) return out[0..1];
+
+    var rows_buf: [max_rows + 1]u32 = undefined;
+    const rows = rowStarts(boxes, &rows_buf) orelse return out[0..1];
+
+    var page: Bounds = .empty;
+    for (boxes) |b| page = page.unionWith(b.box);
+
+    var list: BandList = .{ .out = out };
+    splitBands(boxes, rows, 0, rows.len - 1, page, &list);
+    if (list.len == 0) {
+        out[0] = whole;
+        return out[0..1];
+    }
+    return out[0..list.len];
+}
+
+/// Where each row of a sorted page begins, grouped the way `findGutters`
+/// groups them, and one past the end. Null past `max_rows`.
+fn rowStarts(boxes: []const Box, out: *[max_rows + 1]u32) ?[]const u32 {
+    var n: usize = 0;
+    var start: usize = 0;
+    for (boxes, 0..) |b, i| {
+        if (i != 0 and overlapsRow(boxes[start].box, b.box)) continue;
+        if (n == max_rows) return null;
+        out[n] = @intCast(i);
+        n += 1;
+        start = i;
+    }
+    out[n] = @intCast(boxes.len);
+    return out[0 .. n + 1];
+}
+
+const BandList = struct {
+    out: *[max_bands]Band,
+    len: usize = 0,
+
+    /// A band with no gutters. Two in a row are one band, so the single-
+    /// column parts of a page cut around its columns read exactly as they
+    /// would have uncut: a subscript still folds into the line above it.
+    fn single(l: *BandList, end: u32) void {
+        if (l.len != 0 and l.out[l.len - 1].n == 0) {
+            l.out[l.len - 1].end = end;
+            return;
+        }
+        l.push(.{ .end = end });
+    }
+
+    /// Past the last slot the last band takes the rest, by its own gutters.
+    fn push(l: *BandList, b: Band) void {
+        if (l.len == max_bands) {
+            l.out[max_bands - 1].end = b.end;
+            return;
+        }
+        l.out[l.len] = b;
+        l.len += 1;
+    }
+};
+
+/// Rows `lo..hi` of the page, as bands, appended in order.
+fn splitBands(
+    boxes: []const Box,
+    rows: []const u32,
+    lo: usize,
+    hi: usize,
+    page: Bounds,
+    list: *BandList,
+) void {
+    if (lo >= hi) return;
+    const found = columnStretch(boxes, rows, lo, hi, page) orelse return list.single(rows[hi]);
+    splitBands(boxes, rows, lo, found.lo, page, list);
+    list.push(found.band);
+    splitBands(boxes, rows, found.hi, hi, page, list);
+}
+
+const Stretch = struct { lo: usize, hi: usize, band: Band };
+
+/// The longest run of rows in `lo..hi` that some slice of x is never crossed
+/// in, when that run has columns.
+///
+/// One pass down the rows counts, for every slice, the longest run of rows
+/// that leave it empty. A gutter is a slice with a long one. So is the space
+/// between two plots of a figure, which is why each candidate is put to
+/// `findGutters` before it is believed -- longest first, and only a few:
+/// the fifth-longest channel on a page is not its gutter.
+///
+/// A slice rather than the whole gutter, because an equation that pokes a
+/// few points past the left column's edge breaks the run of the slices it
+/// reaches and not of the rest.
+///
+/// Each glyph is widened by a third of its own height first, which closes a
+/// word space and leaves a gutter open. Without it a caption or a running
+/// title across the page has a word gap somewhere over the gutter, the run
+/// goes straight through it, and the line is cut in two mid-word. Its own
+/// height and not the page's, because the page's is a figure's tick labels
+/// as often as it is the text.
+fn columnStretch(boxes: []const Box, rows: []const u32, lo: usize, hi: usize, page: Bounds) ?Stretch {
+    if (hi - lo < min_band_rows) return null;
+
+    var region: Bounds = .empty;
+    for (boxes[rows[lo]..rows[hi]]) |b| region = region.unionWith(b.box);
+    const step = region.width() / bins;
+    if (!(step > 0)) return null;
+
+    var run: [bins]u16 = @splat(0);
+    var longest: [bins]u16 = @splat(0);
+    // One past the last row of each slice's longest run, counted from `lo`.
+    var ends: [bins]u16 = @splat(0);
+    var seen: [bins]bool = undefined;
+    for (lo..hi) |r| {
+        seen = @splat(false);
+        // A line's glyphs arrive left to right and overlap once widened, so
+        // they are merged into one span and marked once -- rather than every
+        // slice under a line being written by the three glyphs over it.
+        var span_lo: f32 = 0;
+        var span_hi: f32 = -std.math.floatMax(f32);
+        for (boxes[rows[r]..rows[r + 1]]) |b| {
+            const widen = b.box.height() * 0.3;
+            const x0 = b.box.min_x - widen;
+            const x1 = b.box.max_x + widen;
+            if (x0 <= span_hi and x1 >= span_lo) {
+                span_lo = @min(span_lo, x0);
+                span_hi = @max(span_hi, x1);
+                continue;
+            }
+            if (span_hi >= span_lo) markSpan(&seen, span_lo, span_hi, region.min_x, step);
+            span_lo = x0;
+            span_hi = x1;
+        }
+        if (span_hi >= span_lo) markSpan(&seen, span_lo, span_hi, region.min_x, step);
+        for (&run, &longest, &ends, seen) |*n, *best, *end, s| {
+            n.* = if (s) 0 else n.* + 1;
+            if (n.* > best.*) {
+                best.* = n.*;
+                end.* = @intCast(r + 1 - lo);
+            }
+        }
+    }
+
+    for (0..4) |_| {
+        // The longest channel left, away from the region's edges: a slice
+        // at either edge is a margin.
+        var pick: usize = 1;
+        for (2..bins - 1) |bin| {
+            if (longest[bin] > longest[pick]) pick = bin;
+        }
+        const length = longest[pick];
+        if (length < min_band_rows) return null;
+        const end = ends[pick];
+        // Every slice that ran down exactly these rows is this candidate.
+        for (&longest, ends) |*l, e| {
+            if (l.* == length and e == end) l.* = 0;
+        }
+
+        const r1 = lo + end;
+        const r0 = r1 - length;
+        const slice = boxes[rows[r0]..rows[r1]];
+        var extent: Bounds = .empty;
+        for (slice) |b| extent = extent.unionWith(b.box);
+        if (extent.height() < page.height() * 0.25) continue;
+
+        // The channel itself as the cut, before `findGutters` is paid for.
+        // On a page of one column every candidate is a ragged edge or an
+        // indent, with a sliver of text on one side, and fails here in one
+        // pass over the glyphs; a scanned book is five hundred such pages.
+        const channel = region.min_x + (@as(f32, @floatFromInt(pick)) + 0.5) * step;
+        if (!columnsOfText(boxes, rows, r0, r1, &.{channel}, page.width())) continue;
+
+        var band: Band = .{ .end = rows[r1] };
+        band.n = @intCast(findGutters(slice, &band.gutters).len);
+        if (band.n == 0) continue;
+
+        // A line across a gutter is not in a column. `findGutters` lets a few
+        // through, which is right inside a band -- an equation that pokes
+        // into the gutter is still the left column's -- and wrong at its
+        // ends, where the line is the running title above a figure, and cut
+        // into the figure's columns it no longer reads as a title or finds
+        // in a search. Those go to the band beside this one.
+        var top = r0;
+        var foot = r1;
+        while (top < foot and crosses(boxes[rows[top]..rows[top + 1]], band.cuts())) top += 1;
+        while (foot > top and crosses(boxes[rows[foot - 1]..rows[foot]], band.cuts())) foot -= 1;
+        if (foot - top < min_band_rows) continue;
+        if (!columnsOfText(boxes, rows, top, foot, band.cuts(), page.width())) continue;
+        band.end = rows[foot];
+        return .{ .lo = top, .hi = foot, .band = band };
+    }
+    return null;
+}
+
+/// Whether every column of a band is text set in columns: a sixth of the
+/// page wide or more, and a third of its lines or more at least half its
+/// width, which is what a paragraph's lines are.
+///
+/// The gaps between a figure's plots and between the words of a diagram are
+/// gutters by every other test here. Read down them, a plot's tick labels
+/// come out a subplot at a time, which is harmless, and a click in the white
+/// beside a figure finds a label rather than the line it was level with,
+/// which is not. Bands are for the columns of a paper, and only for them.
+fn columnsOfText(
+    boxes: []const Box,
+    rows: []const u32,
+    lo: usize,
+    hi: usize,
+    cuts: []const f32,
+    page_w: f32,
+) bool {
+    const n = cuts.len + 1;
+    const far = std.math.floatMax(f32);
+
+    var left: [max_columns]f32 = @splat(far);
+    var right: [max_columns]f32 = @splat(-far);
+    for (boxes[rows[lo]..rows[hi]]) |b| {
+        const c = columnOf(cuts, b);
+        left[c] = @min(left[c], b.box.min_x);
+        right[c] = @max(right[c], b.box.max_x);
+    }
+    for (0..n) |c| {
+        if (!(right[c] - left[c] >= page_w / 6)) return false;
+    }
+
+    var used: [max_columns]u32 = @splat(0);
+    var wide: [max_columns]u32 = @splat(0);
+    for (lo..hi) |r| {
+        var a: [max_columns]f32 = @splat(far);
+        var z: [max_columns]f32 = @splat(-far);
+        for (boxes[rows[r]..rows[r + 1]]) |b| {
+            const c = columnOf(cuts, b);
+            a[c] = @min(a[c], b.box.min_x);
+            z[c] = @max(z[c], b.box.max_x);
+        }
+        for (0..n) |c| {
+            if (z[c] < a[c]) continue;
+            used[c] += 1;
+            if (z[c] - a[c] >= (right[c] - left[c]) * 0.5) wide[c] += 1;
+        }
+    }
+    for (0..n) |c| {
+        if (wide[c] * 3 < used[c]) return false;
+    }
+    return true;
+}
+
+fn markSpan(seen: *[bins]bool, x0: f32, x1: f32, origin: f32, step: f32) void {
+    const a = binOf(x0, origin, step);
+    const z = binOf(x1, origin, step);
+    @memset(seen[a .. z + 1], true);
+}
+
+/// Whether a row of glyphs runs across any of `cuts`, word spaces closed the
+/// way `columnStretch` closes them.
+fn crosses(row: []const Box, cuts: []const f32) bool {
+    for (row) |b| {
+        const widen = b.box.height() * 0.3;
+        for (cuts) |cut| {
+            if (b.box.min_x - widen < cut and cut < b.box.max_x + widen) return true;
+        }
+    }
+    return false;
 }
 
 /// The typical height of a glyph box, which stands in for the size of the
@@ -1187,6 +1547,146 @@ test "one column of the same text stays one column" {
 
     try testing.expectEqual(@as(usize, rows), page.lines.len);
     for (page.lines) |l| try testing.expectEqual(@as(u32, 0), l.column);
+}
+
+/// A block of lines for `blocksOf`: `count` lines fourteen points apart from
+/// `top` down, each `per_line` glyphs ten points apart, drawn once at every x
+/// in `at`.
+const Block = struct { top: f32, count: u32, per_line: u32, at: []const f32 };
+
+/// A page made of blocks of lines, emitted a row at a time across the page,
+/// which is the interleaved order that fuses two columns if nothing stops it.
+fn blocksOf(gpa: Allocator, blocks: []const Block) !DisplayList {
+    var n_glyphs: u32 = 0;
+    var n_runs: u32 = 0;
+    for (blocks) |b| {
+        n_glyphs += b.count * b.per_line * @as(u32, @intCast(b.at.len));
+        n_runs += b.count * @as(u32, @intCast(b.at.len));
+    }
+    const glyphs = try gpa.alloc(DisplayList.Glyph, n_glyphs);
+    errdefer gpa.free(glyphs);
+    const cmds = try gpa.alloc(DisplayList.DrawCmd, n_runs);
+
+    var g: u32 = 0;
+    var c: u32 = 0;
+    for (blocks) |b| {
+        for (0..b.count) |r| {
+            for (b.at) |x| {
+                for (0..b.per_line) |i| glyphs[g + i] = .{
+                    .code = 'a',
+                    .offset = .{ .x = 10 * @as(f32, @floatFromInt(i)), .y = 0 },
+                };
+                cmds[c] = .{ .text = .{
+                    .size = 10,
+                    .transform = .translation(x, b.top - 14 * @as(f32, @floatFromInt(r))),
+                    .glyphs = .{ .start = g, .count = b.per_line },
+                    .advance = 10 * @as(f32, @floatFromInt(b.per_line)),
+                } };
+                g += b.per_line;
+                c += 1;
+            }
+        }
+    }
+    return .{ .glyphs = glyphs, .cmds = cmds };
+}
+
+test "two columns under a full-width figure are still two columns" {
+    // The page the author found this on: a figure and its caption across the
+    // top of a two-column paper. Their lines cross the gutter, no gutter runs
+    // the height of the page, and before bands the page was one column -- the
+    // two columns fused at every height, and a drag down the left one took
+    // the right one with it. It was reported as a regression; keep this.
+    //
+    // The caption is two lines under a solid figure, with a word space right
+    // over the gutter -- page 8 of the paper it came from. Two lines is few
+    // enough for a gutter to be allowed across, so if the word space opened
+    // a way down, the caption would be taken into the columns and cut in two
+    // mid-word.
+    const gpa = testing.allocator;
+    const list = try blocksOf(gpa, &.{
+        .{ .top = 700, .count = 8, .per_line = 44, .at = &.{60} },
+        .{ .top = 588, .count = 2, .per_line = 22, .at = &.{ 60, 283 } },
+        .{ .top = 546, .count = 30, .per_line = 20, .at = &.{ 60, 300 } },
+    });
+    defer {
+        gpa.free(list.glyphs);
+        gpa.free(list.cmds);
+    }
+
+    var page = try build(gpa, list);
+    defer page.deinit(gpa);
+
+    // The figure's and the caption's ten lines, then thirty down the left,
+    // then thirty down the right: nothing fused, the caption whole, and the
+    // columns in reading order.
+    try testing.expectEqual(@as(usize, 10 + 30 + 30), page.lines.len);
+    for (page.lines[0..10]) |l| {
+        try testing.expectEqual(@as(u32, 0), l.band);
+        try testing.expect(l.box.max_x > 490);
+    }
+    for (page.lines[10..40]) |l| {
+        try testing.expectEqual(@as(u32, 1), l.band);
+        try testing.expect(l.box.max_x < 290);
+    }
+    for (page.lines[40..]) |l| {
+        try testing.expectEqual(@as(u32, 1), l.band);
+        try testing.expect(l.box.min_x > 290);
+    }
+    try testing.expect(page.lines[10].column != page.lines[40].column);
+
+    // A drag down the left column stays in it: the line under the pointer at
+    // the foot of the page is the left column's, so everything between the
+    // two ends of the drag is too.
+    const top = page.lineAt(100, 546);
+    const foot = page.lineAt(100, 546 - 14 * 29);
+    try testing.expectEqual(@as(u32, 10), top);
+    try testing.expectEqual(@as(u32, 39), foot);
+    for (page.lines[top .. foot + 1]) |l| try testing.expect(l.box.max_x < 290);
+
+    // The right column at the same height, and the caption above either.
+    try testing.expectEqual(@as(u32, 40), page.lineAt(400, 546));
+    try testing.expectEqual(@as(u32, 8), page.lineAt(400, 588));
+}
+
+test "columns either side of a full-width block are two bands of columns" {
+    // Columns, a table across the page, and columns again: read down the
+    // first pair, across the table, then down the second pair -- not down the
+    // left of both pairs as though the table were not there. Six rows of
+    // table, because a page-wide gutter tolerates an eighth of the rows
+    // crossing it and this has to be a page it gives up on.
+    const gpa = testing.allocator;
+    const list = try blocksOf(gpa, &.{
+        .{ .top = 700, .count = 16, .per_line = 20, .at = &.{ 60, 300 } },
+        .{ .top = 460, .count = 6, .per_line = 44, .at = &.{60} },
+        .{ .top = 360, .count = 16, .per_line = 20, .at = &.{ 60, 300 } },
+    });
+    defer {
+        gpa.free(list.glyphs);
+        gpa.free(list.cmds);
+    }
+
+    var page = try build(gpa, list);
+    defer page.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 16 * 2 + 6 + 16 * 2), page.lines.len);
+    const expect = [_]struct { first: usize, n: usize, left: bool, wide: bool }{
+        .{ .first = 0, .n = 16, .left = true, .wide = false },
+        .{ .first = 16, .n = 16, .left = false, .wide = false },
+        .{ .first = 32, .n = 6, .left = true, .wide = true },
+        .{ .first = 38, .n = 16, .left = true, .wide = false },
+        .{ .first = 54, .n = 16, .left = false, .wide = false },
+    };
+    for (expect) |e| {
+        for (page.lines[e.first..][0..e.n]) |l| {
+            if (e.wide) {
+                try testing.expect(l.box.max_x > 490);
+            } else if (e.left) {
+                try testing.expect(l.box.max_x < 290);
+            } else {
+                try testing.expect(l.box.min_x > 290);
+            }
+        }
+    }
 }
 
 test "a page's text is its lines in reading order, one newline between them" {
