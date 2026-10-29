@@ -62,7 +62,9 @@ pub const usage =
     \\                   one run over one set of pixels.
     \\    --path P       Which rasteriser fills an outline: stencil (the
     \\                   default), slug, or both -- which renders the page
-    \\                   twice and reports how far the two disagree.
+    \\                   twice and reports how far the two disagree. glyphs
+    \\                   is slug for text and stencil for the rest, which is
+    \\                   what `fenrir read` draws.
     \\    --jobs N       With --all, render N pages at once, on N threads.
     \\                   0 means one per core. Defaults to 1, because this
     \\                   command is also the benchmark: see OPTIMIZING.md.
@@ -158,15 +160,9 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
                 return ctx.fail("not a thread count: {s}", .{argv[i]});
         } else if (std.mem.eql(u8, arg, "--path")) {
             i += 1;
-            if (i == argv.len) return ctx.fail("--path needs stencil, slug or both", .{});
-            path_choice = if (std.mem.eql(u8, argv[i], "stencil"))
-                .stencil
-            else if (std.mem.eql(u8, argv[i], "slug"))
-                .slug
-            else if (std.mem.eql(u8, argv[i], "both"))
-                .both
-            else
-                return ctx.fail("--path wants stencil, slug or both, not {s}", .{argv[i]});
+            if (i == argv.len) return ctx.fail("--path needs stencil, slug, both or glyphs", .{});
+            path_choice = std.meta.stringToEnum(PathChoice, argv[i]) orelse
+                return ctx.fail("--path wants stencil, slug, both or glyphs, not {s}", .{argv[i]});
         } else if (std.mem.eql(u8, arg, "--ascii")) {
             i += 1;
             if (i == argv.len) return ctx.fail("--ascii needs x,y,w,h", .{});
@@ -278,8 +274,9 @@ const Job = struct {
 
 /// Which rasteriser fills the page's outlines. `both` renders it twice and
 /// says how far apart the two came out, which is how the analytic one is
-/// checked against the one that is known to be right.
-const PathChoice = enum { stencil, slug, both };
+/// checked against the one that is known to be right. `glyphs` is the
+/// reader's mix, so what it shows can be reproduced and timed here.
+const PathChoice = enum { stencil, slug, both, glyphs };
 
 /// What `--time` measures, in nanoseconds, summed over the pages it saw.
 ///
@@ -627,6 +624,7 @@ fn one(
     options.glyphs = glyphs.source();
     options.images = images.source();
     options.path_backend = if (job.path == .slug) .slug else .stencil;
+    options.analytic_glyphs = job.path == .glyphs;
 
     const stats = replay.render(
         gpa,

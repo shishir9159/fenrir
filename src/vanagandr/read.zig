@@ -1780,12 +1780,18 @@ const Session = struct {
         var images: Images = .init(gpa, b.doc, b.pages[page].resources);
         defer images.deinit();
 
+        // Text through the analytic fill, and not the stencil the figures
+        // use. The author compared a displayed equation here against Acrobat
+        // and the eight-sample glyphs were a staircase beside it: nine grey
+        // levels, which on an italic at a reading size is the whole edge.
+        // Do not fold this back into one backend for tidiness; see
+        // `replay.Options.analytic_glyphs`.
         _ = try replay.render(
             gpa,
             &canvas,
             list,
             replay.pageTransform(list.page, zoom).concat(.translation(shift[0] * zoom, shift[1] * zoom)),
-            .{ .glyphs = glyphs.source(), .images = images.source() },
+            .{ .glyphs = glyphs.source(), .images = images.source(), .analytic_glyphs = true },
         );
         return canvas;
     }

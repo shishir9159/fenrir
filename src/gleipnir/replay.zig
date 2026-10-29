@@ -154,6 +154,18 @@ pub const Options = struct {
     max_clip_depth: u32 = 64,
     /// Which rasteriser fills an outline.
     path_backend: PathBackend = .stencil,
+    /// Glyphs through the analytic fill, whatever `path_backend` says.
+    ///
+    /// Separate because text is where eight samples show. Stencil coverage
+    /// has nine levels, and a stem or the slant of an italic at a reading
+    /// size is one or two pixels across, so those nine levels are the whole
+    /// of its edge: a displayed equation comes out visibly stepped next to
+    /// any other reader. The analytic fill's coverage is continuous, and its
+    /// known errors -- stroke pieces counted twice where they overlap, the
+    /// corner of a rectangle -- are not in a glyph. So a page can have its
+    /// text drawn analytically and its figures by stencil, which is what the
+    /// reader does.
+    analytic_glyphs: bool = false,
     /// How far a quadratic may stray from the cubic it stands in for, in the
     /// path's own units rather than in pixels.
     ///
@@ -802,7 +814,7 @@ const Replayer = struct {
             // The analytic rasteriser takes the outline as curves, in em
             // units, once per glyph -- however many times the glyph appears
             // and at whatever sizes. See `drawGlyphOutline`.
-            if (r.options.path_backend == .slug) {
+            if (r.options.analytic_glyphs or r.options.path_backend == .slug) {
                 const em_place: Transform = .{
                     .a = tr.size,
                     .d = tr.size,
@@ -1795,6 +1807,49 @@ test "the stencil and analytic backends draw a curve, a stroke and glyphs alike"
             try testing.expect(@abs(a.ink) < ink);
         }
     }
+}
+
+/// Pixels whose ink is not a whole number of eighths: none under eight-sample
+/// stencil coverage, and most of a glyph's edge under the analytic fill.
+fn offEighths(r: Rendered) u32 {
+    var n: u32 = 0;
+    var y: u32 = 0;
+    while (y < r.canvas.height()) : (y += 1) {
+        var x: u32 = 0;
+        while (x < r.canvas.width()) : (x += 1) {
+            const k = r.ink(x, y) * 8;
+            if (@abs(k - @round(k)) > 1e-3) n += 1;
+        }
+    }
+    return n;
+}
+
+test "the reader's mix: text by the analytic fill, figures by stencil" {
+    // The author set a displayed equation beside Acrobat and fenrir's was a
+    // staircase: nine levels of grey, which at a reading size is the whole
+    // edge of a stem. `analytic_glyphs` is the fix, and this pins both halves
+    // of it -- the text is off the eighths and is exactly the analytic fill's,
+    // and a stroke on the same settings is exactly the stencil's.
+    const gpa = testing.allocator;
+    var glyphs: Squares = .{};
+    const mixed: Options = .{ .glyphs = glyphs.source(), .analytic_glyphs = true };
+
+    var stencil_text = try Rendered.initOn(gpa, .{}, 60, 60, 1, .{ .glyphs = glyphs.source() }, words);
+    defer stencil_text.deinit(gpa);
+    try testing.expectEqual(@as(u32, 0), offEighths(stencil_text));
+
+    var text = try Rendered.initOn(gpa, .{}, 60, 60, 1, mixed, words);
+    defer text.deinit(gpa);
+    var slug_text = try Rendered.initOn(gpa, .{}, 60, 60, 1, .{ .glyphs = glyphs.source(), .path_backend = .slug }, words);
+    defer slug_text.deinit(gpa);
+    try testing.expect(offEighths(text) > 0);
+    try testing.expectEqual(@as(f32, 0), software.Difference.of(text.canvas.fb, slug_text.canvas.fb).?.worst);
+
+    var figure = try Rendered.initOn(gpa, .{}, 60, 60, 1, mixed, zigzag);
+    defer figure.deinit(gpa);
+    var stencil_figure = try Rendered.initOn(gpa, .{}, 60, 60, 1, .{}, zigzag);
+    defer stencil_figure.deinit(gpa);
+    try testing.expectEqual(@as(f32, 0), software.Difference.of(figure.canvas.fb, stencil_figure.canvas.fb).?.worst);
 }
 
 test "a clip past max_clip_depth is counted, and what it would have hidden is drawn" {
