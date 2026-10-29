@@ -248,7 +248,8 @@ These are already right. Change them only when a profile names them.
 ## The GPU path
 
 Everything above measures `raster`, which never opens a device. The reader
-has a second rasteriser, and none of it has been measured:
+has a second rasteriser. Its first measurements are in the ledger, under
+"The GPU path, first measured". It works like this:
 - `replay.record` walks the same display list into a `Scene`: outlines as
   quadratics, instances that place them, and a clip chain;
 - `PathRenderer` puts the scene in eight storage buffers;
@@ -300,6 +301,14 @@ confirm it. F1 and F4 are about correctness; the others are about cost.
   - The buffers are host-visible and only *prefer* device-local. On a card
     without resizable BAR (this one), that is a 256 MB heap. When it is full,
     `allocateMemory` fails instead of falling back to system memory.
+  - **Confirmed by `--bench`.** On this card the heap reports 214 MiB.
+    *Nanite_2021* under `--path gpu --bench scroll` or `flip` asks for a
+    128 MiB texel buffer for the second frame in flight, beside 68 MiB of path
+    buffers already there, including the first frame's 64 MiB copy of the same
+    texels. The allocation fails with `OutOfDeviceMemory`, and the reader
+    exits with status 1 and no message: `main` exits quietly on any error that
+    nothing reported. It happened in eight of ten runs; the other two were cut
+    short before reaching that page.
 - **F4. The texel budget is per page.** `max_texels` is 128 MiB, the smallest
   `maxStorageBufferRange` Vulkan promises. `Scene.drawImage` enforces it while
   a page records, but `Scene.merge` does not. Twelve pages of a scan can
@@ -312,6 +321,14 @@ confirm it. F1 and F4 are about correctness; the others are about cost.
 - **F6. Two gathers per curve.** A fragment reads a band, then an index, then
   the curve, and recomputes the reach to decide the early exit. This is Tier 3
   item 11, on both sides.
+- **F7. Overlapping stroke pieces are counted twice at an edge.** Found by the
+  stencil-against-slug test in `replay.zig`, not by reading. The stroker
+  unions its pieces under nonzero. Where two of them have an edge in the same
+  pixel, each ray adds both partial crossings, so the pixel comes out covered
+  where it is half covered. A 4 pt round-joined zigzag gets 1.9% more ink than
+  stencil-and-cover at 72 dpi, and 0.6% more at 3×. A stroker that emits one
+  outline rather than a union of pieces would fix it, and so would evaluating
+  strokes as distance to the centreline.
 
 ### How to measure it
 
@@ -323,16 +340,22 @@ The same rules apply, with a different oracle.
   - the CPU's frame time;
   - the time spent in `placeVisible`;
   - bytes uploaded per frame.
-- **A scripted workload.** `read F --bench scroll|zoom|flip --vsync off --time`.
-  - `scroll` moves a fixed fraction of a page each frame, to the end.
-  - `zoom` cycles from 50% to 800% and back on one page.
-  - `flip` pages through the document, which exercises F3.
+- **A scripted workload.** `read F --bench scroll|zoom|flip --vsync off`,
+  which implies `--time`.
+  - `scroll` moves a twentieth of a page each frame, to the end.
+  - `zoom` goes from 50% to `View.max_zoom` and back, twice, on one page, by
+    5% a step. The limit is 8 pixels a point: eight times the scale a page is
+    recorded at, which the reader's status line calls 600% at 96 dpi.
+  - `flip` shows every page in turn, which exercises F3.
 
-  Each step waits for its pages, so frame cost and page arrival are separate
-  numbers. Run it under both `--path cpu` and `--path gpu`: that is how a
-  re-render is compared with a matrix.
-- **Where the buffers live.** `--time` also prints whether they are
-  device-local, host-visible, or both.
+  Each step waits for the pages it brings into view, and a page is drawn for
+  one frame after it arrives. So frame cost and page arrival are separate
+  numbers: `frame` counts only frames with nothing missing, and `arrival`
+  times a step to its last page. The device timers count every frame. Run it
+  under both `--path cpu` and `--path gpu`: that is how a re-render is
+  compared with a matrix.
+- **Where the buffers live.** `--time` also prints the path buffers' memory
+  type and the size of its heap.
 - **Output.** Take a GPU shot hash before and after (see "The method").
   `scene.modelFrame` runs the fragment shader over a whole recorded frame on
   the CPU, so a `Scene` can be checked against `replay.render` without a
@@ -343,9 +366,10 @@ RenderDoc stays the tool for finding *why* a frame is slow. These say
 
 ### The GPU worklist
 
-**G0: the harness.** The timers, the workloads and the memory report. Also
-the tests that hold the scene format still: merge and eviction, placement,
-the clip chain, and the model against `render`.
+**G0: the harness.** Built: the timers, the workloads and the memory report,
+and the tests that hold the scene format still (merge and eviction,
+placement, the clip chain, and the model against `render`). The baseline is
+in the ledger.
 
 **G1: correct before default.** Each item changes GPU pixels and needs shots.
 - Clips through `slug.fromPath` rather than flattened.
@@ -382,11 +406,19 @@ prose, a page of line art, and the scatter plot of 1,635 clips.
 **G4: startup.** A `VkPipelineCache` kept beside the database, measured
 against the `renderer` and `paths` stages.
 
-Budgets, with numbers set once G0 has a baseline:
-- a scroll uploads no instances;
-- a flip past the cache moves one page's bytes, not twelve;
-- the path draw on a page of prose costs a stated fraction of a frame at the
-  refresh rate.
+Budgets. The baseline behind them is in the ledger under "The GPU path, first
+measured".
+- **Scroll.** A scroll uploads no instances: 542 KiB of path data a frame on
+  *Pretrained Transformers* today, and under 1 KiB after. A scroll frame costs
+  no more than the CPU path's, which is 0.26 ms today, against 0.46.
+- **Flip.** A flip past the cache moves one page's bytes, not twelve. Averaged
+  over a flip of the paper that is 377 KiB a frame today. A page's arrival
+  stays under the 4.6 ms median it has now.
+- **Nothing fails.** Every workload runs on *Nanite_2021* and the scan. Two
+  fail today.
+- **The path draw.** On a page of prose it stays under 2% of a 60 Hz frame
+  (0.33 ms) at the 95th percentile. It is 0.20 ms on `scroll` and 0.28 on
+  `zoom` today.
 
 ## The ledger
 
@@ -468,6 +500,83 @@ binary, the two `--path` values interleaved, best of five:
 The analytic model renders this paper in **half the time** of eight-sample
 stencil-and-cover. Each hash held across all five runs. The reader's CPU path
 draws with stencil. See item 8 under "Added after review".
+
+**The GPU path, first measured.** The setup:
+- **Binary:** ReleaseFast at `b7b122b`, running
+  `read F --path P --bench W --vsync off --clean` in a 1000×900 window.
+- **Rounds:** five, interleaved. Each round runs every document, workload and
+  backend once.
+- **Numbers:** each is the best of the five, meaning the lowest median and the
+  lowest 95th percentile, given as median / p95 in milliseconds.
+- **Columns:**
+  - `frame` is the time between two frames with nothing missing;
+  - `gpu` and `paths` are the device's own timestamps, over every frame;
+  - `arrival` runs from a step to its last page arriving;
+  - `upload` is KiB of path data a frame, averaged over the run.
+
+Six runs ended before their workload did. Five had their window closed
+partway through, and one stalled until the 20-minute timeout. They were run
+again, and every cell below has five complete runs.
+
+On the GPU:
+
+| | | frame | gpu | paths | place | arrival | upload |
+|---|---|---|---|---|---|---|---|
+| *Pretrained Transformers* | scroll | 0.46 / 1.39 | 0.25 / 0.33 | 0.12 / 0.20 | 0.04 | 1.1 / 7.4 | 542 |
+| | zoom | 0.57 / 0.93 | 0.30 / 0.42 | 0.17 / 0.28 | 0.03 | first page only | 197 |
+| | flip | 0.74 / 4.06 | 0.13 / 0.25 | 0 / 0.12 | 0.01 | 4.6 / 7.7 | 377 |
+| *Nanite_2021* | scroll | fails | | | | | |
+| | zoom | 0.22 / 0.62 | 0.13 / 0.37 | 0 / 0.24 | 0.01 | first page only | 32 |
+| | flip | fails | | | | | |
+| *kolmbook-eng-scan* | scroll | 2.29 / 3.15 | 0.32 / 0.37 | 0.16 / 0.21 | 0.19 | 1.8 / 4.4 | 537 |
+| | zoom | 0.50 / 0.82 | 0.17 / 0.18 | 0.01 / 0.02 | 0.00 | first page only | 13 |
+| | flip | 1.81 / 2.92 | 0.13 / 0.27 | 0 / 0.14 | 0.06 | 8.6 / 15.0 | 221 |
+
+On the CPU, the same runs:
+
+| | | frame | arrival |
+|---|---|---|---|
+| *Pretrained Transformers* | scroll | 0.26 / 0.92 | 98.5 / 127.3 |
+| | zoom | 2.45 / 14.64 | 424 / 1,959 |
+| | flip | 0.80 / 1.87 | 105.1 / 131.7 |
+| *Nanite_2021* | scroll | 0.29 / 0.88 | 191.5 / 563.3 |
+| | zoom | 0.22 / 3.30 | 960 / 3,958 |
+| | flip | 0.24 / 0.72 | 187.3 / 584.6 |
+| *kolmbook-eng-scan* | scroll | 1.88 / 2.32 | 94.7 / 197.7 |
+| | zoom | 2.07 / 11.15 | 87.4 / 415.9 |
+| | flip | 1.16 / 2.16 | 111.3 / 221.6 |
+
+What it says:
+- **Zoom is where the GPU path earns its place.** It never waits for a page:
+  each step is a matrix, and a frame costs 0.2–0.6 ms. The CPU path
+  rasterises the page again at every step. That is a median of 424 ms on the
+  paper and 960 ms on *Nanite_2021*, with p95 of 2.0 and 4.0 s. The paper's
+  205-step zoom takes 105 s of wall time on the CPU and about one on the GPU.
+- **Scrolling costs more on the GPU path than on the CPU path.** On the
+  paper a frame is 0.46 ms against 0.26; on the scan it is 2.29 against 1.88.
+  That is F2, measured: every frame re-places every instance and uploads
+  542 KiB of path data. The device's own share is small. The paths take
+  0.12 ms, under 1% of a 60 Hz frame.
+- **A page arrives 13 to 23 times sooner.** Recording is the walk without
+  the rasteriser. A flip takes 4.6 ms against 105 on the paper, and 8.6
+  against 111 on the scan. That includes F3's rebuild once the cache is full.
+- **Two workloads fail.** *Nanite_2021* runs out of the BAR heap under
+  `scroll` and `flip`; see F3.
+- **A long document costs the CPU on every frame, on both backends.** A
+  scroll frame on the scan's 519 pages takes 1.9–2.3 ms, against 0.26–0.46
+  on the paper's 26, and the device is busy for 0.32 ms of it. A lead, unmeasured:
+  `View.visiblePages` calls `pageTop(i)` for each page before the viewport,
+  and `pageTop` sums every page before `i`. That is quadratic in the page
+  number.
+
+The GPU shot of page 3 at 150% (`--page 3 --zoom 1.5 --shot`) is the same
+twice in a row for each document:
+
+| | sha256 |
+|---|---|
+| *Pretrained Transformers* | `cda52ad5bb7b3c0e` |
+| *Nanite_2021* | `78a5a3595f146e79` |
+| *kolmbook-eng-scan* | `12a3c2faf54519cc` |
 
 ## The graveyard
 
