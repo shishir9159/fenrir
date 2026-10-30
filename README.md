@@ -1,3 +1,6 @@
+[Jimmy Lefevre – How to make a text box: A crash course in Unicode and OpenType – BSC 2026 - Better Software Conference](https://www.youtube.com/watch?v=7Tr0ty9-yeQ)
+https://github.com/btzy/nativefiledialog-extended
+
 # fenrir
 
 A PDF reader written from scratch in Zig and drawn with Vulkan. No parsing
