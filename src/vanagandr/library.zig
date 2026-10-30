@@ -154,8 +154,9 @@ pub const marks_usage =
     \\                    [--ink PAGE X Y X Y ... [COLOUR]] [--db FILE]
     \\
     \\    The marks made on a document, which `fenrir read` draws and keeps
-    \\    here rather than writing into the PDF: the highlights dragged over
-    \\    its text, and the ink drawn on it in draw mode.
+    \\    here rather than writing into the PDF: the highlights made with m
+    \\    or a palette colour, and the ink drawn in draw mode. A selection is
+    \\    not a mark and is never stored.
     \\
     \\    fenrir marks paper.pdf              list them
     \\    fenrir marks paper.pdf --clear      remove every one, ink included
@@ -166,7 +167,7 @@ pub const marks_usage =
     \\
     \\    Pages are numbered from 1. Boxes and strokes alike are in PDF points
     \\    on the page as it is displayed, measured from its bottom-left corner
-    \\    -- the same numbers `read` stores when you drag over text.
+    \\    -- the same numbers `read` stores when it makes a highlight.
 ;
 
 pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {

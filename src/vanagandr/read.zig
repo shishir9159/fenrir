@@ -224,7 +224,9 @@ pub const usage =
     \\visual mode (selecting), from v or V:
     \\    any motion           extend the selection
     \\    o                    go to the other end of the selection
-    \\    m, y, enter          highlight it in the default colour
+    \\    m, enter             highlight it in the default colour
+    \\    y                    put it away; there is no clipboard yet, and a
+    \\                         selection is never stored
     \\    1 .. 8               highlight it in that colour: default, yellow,
     \\                         green, blue, pink, orange, purple, red
     \\    d, x                 remove the highlights it touches
@@ -2465,9 +2467,9 @@ const Session = struct {
         s.drag = null;
     }
 
-    /// Visual mode's `m`, `y`, enter or a digit -- and the same keys over a
-    /// selection the mouse made, which is how a drag becomes a highlight now
-    /// that letting go of one no longer does it by itself.
+    /// Visual mode's `m`, enter or a digit -- and `m` over a selection the
+    /// mouse made, which is the only way a drag becomes a highlight: letting
+    /// go of one does not, and `y` does not.
     fn highlightSelection(s: *Session, colour: ?u8) void {
         const v = s.view();
         const sel = s.activeSelection(v) orelse return;
@@ -4148,6 +4150,12 @@ const Session = struct {
                 v.scrollToCursor();
             },
             .highlight_selection => |colour| s.highlightSelection(colour),
+            .yank_selection => {
+                // The selection goes and nothing is written: a selection is
+                // the interface's, never a mark, whichever key ends it.
+                s.clearSelection();
+                s.status = "nothing copied -- there is no clipboard yet; m highlights";
+            },
             .unhighlight_selection => s.unhighlightSelection(),
 
             .toggle_highlight => s.toggleMark(),
@@ -4290,6 +4298,11 @@ const Session = struct {
         if (!down) {
             // Letting go keeps the words selected. A drag that never left the
             // glyph it started on is a click, and a click selects nothing.
+            //
+            // And nothing is written. This used to make the drag a highlight
+            // in the database, and the author asked for it gone: a selection
+            // belongs to the interface. Do not "save the user a keypress" by
+            // highlighting here -- `m` is the keypress.
             if (s.drag) |*d| {
                 if (std.meta.eql(d.from, d.to)) s.drag = null else d.held = false;
             }
@@ -7395,6 +7408,15 @@ test "letting go of a drag leaves a selection, not a highlight" {
     try testing.expect(std.meta.eql(s.drag.?.from, s.drag.?.to));
     s.pointer(.{ .mouse = at, .buttons = .{} });
     try testing.expect(s.drag == null);
+
+    // `y` puts it away and writes nothing either. It used to highlight, and
+    // the author had that taken out along with the highlight on letting go.
+    s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = to, .buttons = .{ .left = true } });
+    s.pointer(.{ .mouse = to, .buttons = .{} });
+    _ = s.apply(.yank_selection);
+    try testing.expect(s.drag == null);
+    try testing.expectEqual(@as(usize, 0), s.buffer(0).marks.count());
 
     // `m` is what makes a highlight of it, and puts the selection away.
     s.pointer(.{ .mouse = at, .buttons = .{ .left = true } });

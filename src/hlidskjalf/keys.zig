@@ -182,6 +182,10 @@ pub const Command = union(enum) {
     swap_selection_ends,
     /// Highlight the selection, in the accent colour or a palette colour.
     highlight_selection: ?u8,
+    /// `y`, Vim's yank. There is no clipboard yet -- `lyngvi.Window` leaves
+    /// it out on purpose -- so this copies nothing and says so. What it must
+    /// never do is highlight: see `visualKey`.
+    yank_selection,
     /// Remove every highlight the selection touches.
     unhighlight_selection,
 
@@ -638,9 +642,17 @@ fn visualKey(state: *State, c: u21, out: *Result) void {
     }
     const cmd: Command = switch (c) {
         'o' => .swap_selection_ends,
-        'm', 'y' => blk: {
+        'm' => blk: {
             state.mode = .normal;
             break :blk .{ .highlight_selection = null };
+        },
+        // Not a highlight, though it was one. Somebody who selects and presses
+        // `y` wants the words copied, and turning a selection into a stored
+        // highlight is what the author has had to have taken out twice -- once
+        // from letting go of a drag, and this. Do not fold it back into `m`.
+        'y' => blk: {
+            state.mode = .normal;
+            break :blk .yank_selection;
         },
         'd', 'x' => blk: {
             state.mode = .normal;
@@ -894,6 +906,14 @@ test "the same key means one thing in normal mode and another in visual" {
     state.mode = .visual;
     try testing.expectEqual(Command.unhighlight_selection, command(&state, typing("d")).items()[0]);
     try testing.expectEqual(Mode.normal, state.mode);
+}
+
+test "y in visual mode is a yank, never a highlight" {
+    var state: State = .{};
+    const out = command(&state, typing("vjy"));
+    try testing.expectEqual(Command.yank_selection, out.items()[2]);
+    try testing.expectEqual(Mode.normal, state.mode);
+    for (out.items()) |c| try testing.expect(c != .highlight_selection);
 }
 
 test "a digit in visual mode highlights in that colour" {
