@@ -423,6 +423,23 @@ what to plan with.
 
 ### Open gaps
 
+- **Every tooltip is drawn in boxes.** `Chrome.tips` is the last thing built
+  in a frame (`read.zig`, after the palette), outside every `pushStyle`.
+  `tooltips` pushes a size and a background and nothing else, so its text
+  takes the root style, which `UI.begin` resets to `.{}`: font 0,
+  `Fonts.fallback_font`, Týr's box-drawing stand-in. Every other piece of
+  chrome pushes `Chrome.face` first. The rails call `hint` inside their
+  scope, but the tip is drawn after the scope has closed. The same gap
+  gives the tooltip the default colours, so it ignores the light theme.
+  - **The fix is in Þviti, not at the call site.** `Tips` gains `font`, `fg`
+    and `bg`. `hint` copies them from `ui.style()`, the scope the control
+    was built in, and `tooltips` pushes them. `sig.box.style` is the wrong
+    source, because an icon button's own font is the icon face.
+  - One fix covers the rails, the `fenrir ui` demo and a plugin's button,
+    since each tooltip carries the look of the place that asked for it.
+  - The test: build the rail under a pushed face and check the tip's
+    `style.font`. It fails today. About 30 lines, and nothing per frame,
+    because `hint` returns at once unless the pointer is resting.
 - **`--shot --path cpu` draws no chrome.** `CpuTextures.sample` cannot sample
   the single-channel atlas. Fixing it is about 35 lines: an atlas branch there,
   and a `Chrome` in `shoot`.
@@ -457,7 +474,7 @@ what to plan with.
   stroke again. The status line reads `comment 2/5: <note>` or `mark 3/9`,
   and says when a jump wraps round.
 - **Styles are PDF's four text-markup subtypes** (Highlight, Underline,
-  StrikeOut, Squiggly), so writing them into a PDF (phase 16) maps one to one.
+  StrikeOut, Squiggly), so writing them into a PDF (phase 13) maps one to one.
   - In visual mode `_` underlines, `-` strikes through and `~` squiggles; `m`
     still highlights. In edit mode the same keys restyle the mark in hand.
   - Underline and strike-through are one rect each. The squiggle is ink's
@@ -475,14 +492,19 @@ and for people who read in order to work: researchers, educators and
 students. Touch can come later, because `Session.apply` takes commands, not
 keystrokes.
 
+A PDF is shared by sending it, so the comments, their links and the canvas
+are written into the file. The same file opened on another machine shows the
+same canvas, and other readers still show the comments.
+
 **Already decided.**
 - `Layout`'s leaf is a `Pane` union (phase 5), so a canvas is another
   variant, not a second layout system.
 - Panels are overlays, so a canvas pane does not compete with them.
 - Anything shown from a page is a clipped replay of the `Scene` that
   `Recorded` in `read.zig` caches.
-- New Mímir tables take an `id INTEGER PRIMARY KEY` and name documents by
-  `path`.
+- New Mímir tables take an `id INTEGER PRIMARY KEY`, and name documents by
+  `path` and by the file's trailer `/ID`. A path changes when a file is
+  moved or sent; the `/ID` does not.
 
 ### The model
 
@@ -504,39 +526,173 @@ keystrokes.
 
 ### Where it is stored
 
-Each document is either `library` (the default) or `pdf`. The user chooses
-with `:set store=library|pdf`; the global default and each document's choice
-are kept in the library, beside the other preferences.
+**In the PDF.** A document is shared by sending the file, so the file holds
+its anchors, comments, links and canvas. The library journals each change as
+it settles, and the PDF takes them as one incremental update on `:w` and on
+close. `:set store=library` keeps a document's marks out of its file; the
+setting and each document's choice are kept in the library.
 
-| | `library` | `pdf` |
+| | in the PDF | other readers |
 |---|---|---|
-| anchor | a mark row, with its `style` | `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly` or `/Ink`; an arrow is a `/Line` with an arrowhead |
-| comment | a `comment` row: anchor, text, image, canvas position | a `/Text` annotation replying to its anchor through `/IRT`, so other readers show a thread; an image comment is a `/Stamp` whose appearance is the image |
-| link | a `link` row: two comment ids and a label | the linked comments' `/NM` names, in an array under a private key on the comment's annotation |
-| canvas position | on the `comment` row | a private key on the annotation |
-| links across documents | yes | no: a PDF cannot safely name another file's annotation, so these stay in the library |
-| when written | as each change settles | journaled in the library as it settles, then written into the PDF as one incremental update on `:w` or on close |
+| anchor | `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly` or `/Ink`; an arrow is a `/Line` with an arrowhead | draw it |
+| its first comment | the anchor's own `/Contents` | show it as the anchor's note |
+| more comments | a `/Text` annotation replying to the anchor through `/IRT` | show a thread |
+| an image comment | a `/Stamp` replying to the anchor, the image its appearance | draw it |
+| cards and links | fenrir's page data, under `/PieceInfo` on the anchor's page | keep it, and do not read it |
+| a link to another file | the same, naming the other file by its `/ID` | keep it, and do not read it |
+| camera, scroll, folds, the docked canvas | nothing: these are the library's | — |
 
-**Links live beside the comments, in whichever store holds them.** A link
-costs one name in an array: no object of its own, and other readers ignore
-the key.
+- **The first comment is the anchor's `/Contents`**, as Acrobat and Zotero
+  write a highlight's note. Most anchors carry one comment, and it costs them
+  no annotation of its own.
+- **Where you are looking never changes the file.** Panning the canvas and
+  scrolling are the library's, so a document that is only read is never
+  written.
 
+**Fenrir's page data.** ISO 32000 (§14.5) gives an application a place for
+data other programs keep and do not read: a page's `/PieceInfo`, under the
+application's name. Each page with cards on it carries:
+
+```
+/PieceInfo << /Fenrir 812 0 R >>  /LastModified (D:…)    on the page, once
+812 0 obj << /LastModified (D:…) /Private (…) >>         the page's cards
+```
+
+- **A string, not a stream.** A string can go into the save's object stream
+  and be compressed with everything else the save writes. A stream is an
+  object of its own, with a dictionary and a cross-reference entry, and
+  cannot.
+- **Moving a card rewrites that one object.** The page names it and does not
+  change. The page's `/LastModified` is written when `/PieceInfo` first is,
+  because the standard requires the one with the other.
+
+The string is a version byte and three sections, each a count and then its
+entries. Integers are LEB128 and signed ones zig-zagged. In the literal
+string only `\`, `(`, `)` and CR are escaped.
+
+| Section | Each entry |
+|---|---|
+| documents | the 16 bytes of another file's `/ID`, and its file name |
+| cards, by id | the id, as a step from the last; x and y in whole points, as steps; the width (0 is the default) and height; a byte of swatch and flags; a `/NM` string, for another program's annotation only |
+| links, by from and to | from, as a step; to; a byte of swatch, arrowheads, "has a label" and "elsewhere"; the label and the document, when the byte says so |
+
+- A card lives on its anchor's page, and a link with its first card.
+- **What can be worked out is not stored.** A link's route, and the sides it
+  leaves and arrives by, are the router's.
+- **A card's size is stored, not measured.** Measured, it would be a
+  different height on a machine with a different face, and overlap the card
+  below it.
+- About 7 bytes a card and 4 a link, before compression.
+
+**Identity is `/NM`, never an object number.** A program that rewrites a
+file renumbers every object and keeps `/NM`.
+- Fenrir's `/NM` is `f` and a base-36 number, and the page data holds only
+  the number. The next is one past the highest in the file, so two people
+  annotating a file in turn never repeat one.
+- Journal rows replayed onto a newer copy of the file are renumbered where
+  they collide.
+- Another program's annotation keeps its own `/NM`. One without is given one
+  the first time it is linked, which rewrites it once.
+
+**Keeping each save small.** Every save is appended, and nothing fenrir
+wrote is ever cut or replaced, so the file keeps each save as a revision.
+What a save appends is the whole cost, and it is only what changed.
+- A save with nothing changed writes nothing, and closing an unchanged
+  document leaves its file alone.
+- One object stream and a cross-reference stream a save, when the file is
+  PDF 1.5 or later, so every dictionary the save writes is compressed
+  together. An older file gets a classic table. A file's version is never
+  raised to save bytes.
+- The first write to a page makes its `/Annots` an indirect array, so a later
+  save rewrites a list and not the page.
+- Defaults are left out: `/RT /R`, a zero `/F`, a card at the default width,
+  a link with no label.
+- Numbers are written in the fewest digits that hold them to 1/100 point.
+- `/Contents` is PDFDocEncoding when every character has a byte there, and
+  UTF-16BE otherwise.
+
+**Appearances are shared wherever the drawing is.** Other readers draw only
+`/AP`, so everything carries one, but:
+- a comment's note icon is one form per colour, named by every comment in it;
+- a mark of one rectangle has a unit square per colour and style, which the
+  reader stretches to the annotation's `/Rect` (§12.5.5);
+- only a mark of several lines, and ink, has an appearance of its own. It is
+  left unfiltered below about 100 bytes, where zlib's header and checksum
+  cost more than they save, and all of them name one shared `/Resources`
+  holding the multiply blend.
+
+**Images are copied, not encoded again.**
+- A JPEG goes in as its bytes, under `/DCTDecode`.
+- A PNG with no alpha and no interlacing goes in as its IDAT, under
+  `/FlateDecode` with the PNG predictor, which PDF has.
+- A PNG with alpha is decoded, to split out the `/SMask`.
+- Two images with the same bytes are one object, found by hash.
+- **A snip stays vector.** One form per snipped page holds that page's
+  content once and uses the page's own resources, and each snip's `/Stamp`
+  clips it. Ten snips from one page cost one copy.
+
+**Keeping it right.**
+- **What no longer matches is dropped quietly, then said once.** A card
+  whose annotation was deleted in another reader is not drawn, and neither
+  are its links; they are pruned the next time their page is written. The
+  status line says `2 links lost their comments`. An annotation with no card
+  is placed by the placement rule.
+- **What fenrir cannot read is kept, never rewritten.** Page data with a
+  newer version byte stays as it is, and its cards are read-only.
+- **Another program's save is found before fenrir writes.** Fenrir records
+  the length and `startxref` it read. If the file changed on disk (a second
+  reader, a sync client), it reads it again, applies the journal by `/NM`,
+  and appends to what is there now. It never appends to bytes it has not
+  parsed.
+- **A write that fails keeps the journal.** Acrobat holding the file open on
+  Windows, a read-only folder, a full disk: the change stays in the library,
+  the status line says so, and the next `:w` or close tries again.
+- **A torn append is repaired.** Before appending, the library records the
+  file's length and the length it will have. A record still there at the
+  next open means the reader died writing:
+  - at the new length the save finished, and the record is cleared;
+  - between the two it was torn, and fenrir cuts the file back to the old
+    length and saves again;
+  - anything else is not fenrir's tail, and is left alone with a message.
+- **A stripped canvas comes back, on this machine.** A program that rewrites
+  a whole file may drop what it does not understand, `/PieceInfo` included.
+  The comments survive as annotations. The library keeps the page data it
+  last wrote, keyed by `/ID` and `/NM`, and puts the cards and links back
+  where the ids still match. On another machine they are gone, and the
+  comments remain.
+- **Links across documents travel with the file that holds their first
+  card**, naming the other by the first half of its `/ID`, which a revision
+  keeps, and by its file name. On open, the `/ID` is looked up in the
+  library, then by name in the file's own folder, and checked. A link whose
+  document is not found is drawn as a stub naming it. A file with no `/ID`
+  is given one by fenrir's first save. So a folder of papers sent together
+  keeps its links.
+- **The library is the journal.** A reader killed before a save loses
+  nothing: the next open applies the unwritten rows again and says so, and
+  the next save writes them.
+- **When the PDF is not written**, the library is used and the status line
+  says why:
+  - the file is encrypted (not supported yet);
+  - DocMDP (`/Perms`) forbids changes, at P=1 or P=2;
+  - it is signed at P=3, which permits annotations and not pages: the
+    anchors and comments are written, and the page data stays in the
+    library;
+  - it is read-only or locked.
 - **An incremental update, not a rewrite.** New and changed objects are
-  appended after `%%EOF` with their own xref section and `/Prev`. The
-  original bytes stay untouched, the write is proportional to the change, and
-  a signature over the earlier revision stays valid.
-- **The library is the journal.** A reader killed before `:w` loses nothing:
-  the next open finds the unwritten rows and offers them.
-- **`pdf` is refused, and the library used, with a message**, when the file
-  is encrypted (not supported yet), forbids changes (DocMDP `/Perms`), or is
-  read-only.
+  appended after `%%EOF` with their own cross-reference section and `/Prev`.
+  The original bytes stay untouched, and a signature over an earlier
+  revision stays valid.
 - **Everything fenrir writes carries:**
   - `/NM`, its identity in links;
   - `/T`, the `author` setting;
   - `/M`, when it was changed;
   - an `/AP` appearance stream, because other readers draw only that.
 - **Reading `/Annots` back is the other half.** Comments made in Acrobat or
-  Zotero become fenrir comments, with `/IRT` threads kept.
+  Zotero become fenrir comments, with `/IRT` threads kept and a markup's
+  `/Contents` as its first comment.
+- **Not settled on paper:** a reply's `/F` flags and its `/Rect`. Open a
+  file fenrir wrote in Acrobat, pdf.js and Zotero, and set them by what each
+  shows.
 
 ### The arrangement
 
@@ -573,7 +729,7 @@ From Obsidian Canvas, including what it lacks without plugins:
 | no automatic layout | `:arrange` |
 | no linear export | Markdown, in reading order |
 | slows with hundreds of cards | the instance pipeline, culled against the camera |
-| the JSON Canvas file | not taken: it would be a second copy of the data beside a document that can hold it, and its vocabulary has no anchors |
+| the JSON Canvas file | an export (phase 17), never the store: it would be a second file beside a document that can hold the data, and its vocabulary has no anchors |
 
 Who each part is for:
 - **Researchers:** comments across papers linked into an argument, tags, a
@@ -586,10 +742,14 @@ Who each part is for:
 
 | Commit | Files | ~ |
 |---|---|---|
-| comments and links in mímir, many to an anchor | `mimir/Library.zig` schema v5, `vanagandr/library.zig` | 500 |
+| comments and links in mímir, many to an anchor, named by /NM | `mimir/Library.zig` schema v5, `vanagandr/library.zig` | 550 |
 | a comment made on a selection with c | `Marks.zig`, `keys.zig`, `read.zig` | 450 |
 | the arrow anchor, as a setting | `settings.zig`, `read.zig` | 300 |
 
+- **The ids the PDF will hold, from the first commit.** A comment row
+  carries its `/NM`, and a document its trailer `/ID` beside its path, so the
+  library and the PDF never translate one id into another. A link row names
+  its two comments by `/NM`, and the other document by `/ID`.
 - A mark's `note` migrates into its first `comment` row. `fenrir marks`
   prints the comments and links.
 - In visual mode, `c` makes the anchor and opens a comment. In edit mode, `c`
@@ -599,11 +759,46 @@ Who each part is for:
 - Plugins: `fenrir.comments()` and `fenrir.comment{anchor, text}` under the
   document capabilities, and `CommentAdd`/`Remove`/`Change` events.
 
-### Phase 13 — the canvas pane and the margins
+### Phase 13 — comments in the PDF
+
+Before the canvas, so that every later phase lands with its PDF form rather
+than having one retrofitted under it.
+
+| Commit | Files | ~ |
+|---|---|---|
+| annotations read back as marks and comments | `src/gjoll/annots.zig`, `read.zig` | 550 |
+| an incremental update, as bytes | `src/gjoll/Writer.zig` | 650 |
+| appearances, shared wherever the drawing is | `gjoll/annots.zig` | 450 |
+| the journal, :w and close, and when the pdf is refused | `mimir/Library.zig`, `settings.zig`, `commands.zig`, `read.zig` | 550 |
+| marks moved between the stores, and what each save cost | `vanagandr/library.zig` | 350 |
+
+- **Reading:** `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly`,
+  `/Ink`, `/Line`, `/Text`, `/Stamp` and `/FreeText`. An `/IRT` thread becomes
+  the comments on one anchor, a markup's `/Contents` is its first comment,
+  and `/NM` is each annotation's identity.
+- **Writing:** `Writer` returns bytes and the CLI appends them, because the
+  library layer opens no files. It writes:
+  - one object stream and a cross-reference stream, or a classic table for a
+    file older than PDF 1.5;
+  - `/Prev`, and `/ID`, keeping the first half or making one;
+  - free entries for what was deleted.
+
+  `DocSave`, reserved in phase 8, fires.
+- **A saved file is checked by what reads it.** Gjöll opens every file the
+  writer makes, and `trace --all --hash` is the same before and after: a save
+  adds annotations and changes no page.
+- **Moving a document:** `fenrir marks F --store pdf` moves its marks into the
+  PDF. `--store library` moves them out, with an update that drops them from
+  `/Annots`. The round trip gives back the same rows.
+- **`fenrir marks F --bytes`** prints each revision fenrir appended, its
+  size, and what is in it. It is the check on "Keeping each save small".
+
+### Phase 14 — the canvas pane and the margins
 
 | Commit | Files | ~ |
 |---|---|---|
 | a canvas model: cards on a plane, a camera, a hit test | `src/hlidskjalf/Canvas.zig` | 450 |
+| cards as page data, a few bytes each, under /PieceInfo | `src/hlidskjalf/pagedata.zig`, `gjoll/annots.zig` | 450 |
 | the canvas beside the document, on gc | `Layout.zig` (`Pane.canvas`), `read.zig` | 450 |
 | moving about a canvas from the keyboard | `keys.zig`, `Canvas.zig`, `read.zig` | 400 |
 | a text field over several lines, for comments | `thviti/widgets/field.zig` | 450 |
@@ -621,59 +816,53 @@ Who each part is for:
   the PDF pans the canvas to the card. `:canvas follow` toggles it.
 - **Placement.** A new card goes beside the previous card from the same page,
   or else at the first free spot near the camera's centre. It never lands on
-  another card.
+  another card. Positions snap to whole points, which is what the page data
+  holds.
+- **Page data is bytes to Gjöll.** Gjöll hands each page's `/Fenrir` string
+  up and takes one back, and does not know what a card is. `pagedata.zig` is
+  the encoding, bytes in and cards out, tested by round trip and on every
+  truncation of a valid string. Its first version already has the links and
+  documents sections, empty, so phase 15 does not change the format.
 
-### Phase 14 — links
+### Phase 15 — links
 
 | Commit | Files | ~ |
 |---|---|---|
-| links between comments, drawn and stored | `Canvas.zig`, `Library.zig`, `read.zig` | 450 |
+| links between comments, drawn and stored | `Canvas.zig`, `pagedata.zig`, `Library.zig`, `read.zig` | 500 |
 | labels on links, and `:arrange` | `Canvas.zig`, `read.zig` | 400 |
+| links across documents, by the other file's /ID | `pagedata.zig`, `Library.zig`, `read.zig` | 400 |
 
 - To link two comments, press `L` on a card, move to the target with `hjkl`,
   and press enter; or drag from a card's edge to the other card.
+- **To link across documents**, open both, press `L` on a card, move to the
+  other document's canvas as between any two windows, and press enter. The
+  link is stored with its first card, and found again as "Where it is
+  stored" says.
 - **Links are orthogonal**: horizontal and vertical runs with rounded elbows,
   three rect instances each. The instance pipeline does not rotate, and a
   capsule primitive is a shader change no profile has asked for.
 - `:arrange reading` lays cards out in their anchors' reading order;
   `:arrange column` and `:arrange grid` are the other two.
 
-### Phase 15 — images in comments
+### Phase 16 — images in comments
 
 | Commit | Files | ~ |
 |---|---|---|
 | a rectangle selection, on ctrl-v | `View.zig`, `keys.zig`, `read.zig` | 350 |
-| a snip of the page in a comment | `Canvas.zig`, `read.zig` | 450 |
+| a snip of the page in a comment | `Canvas.zig`, `read.zig`, `gjoll/annots.zig` | 500 |
 | a png decoder, and an image file in a comment | `gleipnir/png.zig`, `read.zig` | 400 |
 
 - `<C-v>` is Vim's visual block, and on a page a block is a rectangle: a
   figure, an equation, a table. `m` highlights the area and `c` comments on
   it.
 - **A snip is the anchor's rectangle replayed from the recorded `Scene`**:
-  vector, sharp at any zoom, never re-interpreted. Stored in a PDF, it is an
-  image XObject in the `/Stamp`'s appearance.
+  vector, sharp at any zoom, never re-interpreted. Stored in a PDF it is
+  still vector: the page's own content, clipped (see "Images are copied, not
+  encoded again").
 - **Image files:** JPEG goes through `gjoll/filter/jpeg.zig`. PNG needs a
   decoder of about 250 lines on `std.compress.flate` and
   `filter/predictor.zig`, which is the real need "recommended against" said
-  to wait for.
-
-### Phase 16 — where marks live: the library or the PDF
-
-| Commit | Files | ~ |
-|---|---|---|
-| annotations read back as marks and comments | `src/gjoll/annots.zig`, `read.zig` | 550 |
-| an incremental update, as bytes | `src/gjoll/Writer.zig` | 600 |
-| appearance streams for what fenrir writes | `gjoll/annots.zig` | 450 |
-| the store setting, the journal, and :w | `mimir/Library.zig`, `settings.zig`, `commands.zig`, `read.zig` | 450 |
-
-- **Reading:** `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly`,
-  `/Ink`, `/Line`, `/Text`, `/Stamp` and `/FreeText`. An `/IRT` thread becomes
-  the comments on one anchor, and `/NM` is each annotation's identity.
-- **Writing:** `Writer` returns bytes and the CLI writes the file, because
-  the library layer opens no files. `DocSave`, reserved in phase 8, fires.
-- **Moving a document:** `fenrir marks F --store pdf` moves its marks into the
-  PDF. `--store library` moves them out, with an update that drops them from
-  `/Annots`.
+  to wait for. In a PDF the file's bytes are copied, not encoded again.
 
 ### Phase 17 — getting work out
 
@@ -681,6 +870,7 @@ Who each part is for:
 |---|---|---|
 | searching comments, on / in the canvas | `Canvas.zig`, `find.zig` | 250 |
 | comments as markdown, in reading order | `src/vanagandr/canvas.zig` | 450 |
+| the canvas as a json canvas file, for obsidian | `vanagandr/canvas.zig` | 300 |
 | folds: a document reduced to its marks | `View.zig`, `keys.zig`, `read.zig` | 450 |
 | comments and links for plugins | `galdr/Runtime.zig`, `Host.zig` | 350 |
 
@@ -690,6 +880,10 @@ Who each part is for:
   - each anchor's comments beneath it;
   - links as references;
   - snips as PNGs, through the existing writer.
+- **`fenrir canvas F --export canvas`** writes JSON Canvas 1.0, for Obsidian:
+  a text node per comment quoting its anchor with (title, p. N), an edge per
+  link with its label, and the positions and sizes the page data holds. It
+  is a copy going out, and is never read back.
 - **Folds are LiquidText's collapse, done with keys.**
   - `zM` shows only the anchored passages, stacked as clipped replays in
     reading order.
@@ -713,12 +907,25 @@ Who each part is for:
 - **Budget:** seed 1,000 comments and 1,000 links with `fenrir run`, dock the
   canvas, and `read --frames 1200 --vsync off` must stay within noise of the
   reader without the canvas.
+- **Size budget**, read off `fenrir marks F --bytes`:
+  - the page data of 1,000 cards and 1,000 links over 100 pages is at most
+    16 KB;
+  - moving one card and saving appends at most 512 bytes;
+  - a save with nothing changed appends nothing.
+
+  These are ceilings from an estimate. Print the real numbers, then tighten
+  them.
 
 **Not in these phases:**
 - presenting a canvas as a path, for lectures;
 - the clipboard, for copying a comment with its citation (Lyngvi has none);
 - maths in comments;
-- touch.
+- touch;
+- merging two copies of a file annotated in parallel. Their `/NM`s may
+  collide, and a merge would renumber one side;
+- `--compact`, a rewrite that drops superseded revisions. It is a
+  whole-file writer that breaks signatures, and the size budget keeps what
+  each save appends small enough to wait for it.
 
 ## Recommended against
 
@@ -726,8 +933,16 @@ Who each part is for:
   do better.
 - **Full inline SVG.** The `d=` subset covers every icon set worth having.
   Groups, transforms, gradients and CSS would be a second document format.
-- **PNG icons.** The PNG decoder arrives with phase 15, for images in
+- **PNG icons.** The PNG decoder arrives with phase 16, for images in
   comments. `.path` and `.glyph` still do icons better at every size.
+- **A sidecar file as the store** (`paper.pdf.fenrir`, or a JSON Canvas
+  file). There would be two files to send, and one gets lost.
+- **Canvas data as private keys on each annotation.** Moving a card would
+  rewrite its whole annotation, and every link would repeat a comment's name.
+  Page data costs a few bytes a card, and a move rewrites one string.
+- **Rewriting the whole file to keep it small.** It renumbers every object
+  and breaks a signature over an earlier revision. Every save appends, and
+  the rules in "Where it is stored" keep what it appends small.
 - **A `PageRender` hook per frame.** It would allocate per frame and put a Lua
   state on the rasterising thread, which owns the `Document`.
 
@@ -780,6 +995,10 @@ Who each part is for:
   lands where nobody asked.
 - **A floating box has to be told what is above it** (`Chrome.top`). Tests
   pass zero, so only a picture checks it.
+- **Whatever is built at the end of the frame is outside every scope.** It
+  gets the root style: font 0, which is Týr's boxes, and the default
+  colours. A tooltip recorded inside the rail and drawn after it has to
+  carry the rail's look with it.
 - **Early in the frame, ask the widget's state, not the tree.** Input comes
   before the chrome is built, so "is a menu open" is `menu.open`.
 - **A control that appears wanting the keyboard asks for focus**, by a key
@@ -881,6 +1100,8 @@ fenrir trace F --text | --lines         # the page as words, with or without geo
 fenrir trace F --all --find Q           # every match and its boxes
 fenrir marks F [--db D]                 # every mark as stored
 fenrir marks F --ink P X Y X Y ...      # seed a stroke for a shot
+fenrir marks F --store pdf|library      # move a document's marks between stores
+fenrir marks F --bytes                  # each revision fenrir appended, and what is in it
 fenrir health | plugins [--api]         # what the build has; what a configuration did
 fenrir run S.lua F.pdf                  # a plugin over a document, no window
 fenrir trace F --all --hash             # each page's hash, which diff compares
@@ -891,6 +1112,14 @@ fenrir diff A B --shot s.png --path cpu # the comparison view, no display
 
 Tests go where no window, device or font is needed: Þviti's solver, `keys`,
 `Layout`, `Marks`, the parsers.
+
+**A saved PDF is checked by what reads it.** Write to a copy, never the only
+one, and:
+- open it again with Gjöll;
+- compare `trace --all --hash` before and after, because a save adds
+  annotations and must change no page;
+- run `--store pdf` then `--store library`, and check the same rows come back;
+- open it once in another reader, to see the comments and the threads.
 
 **A shot cannot open a popup.** Add two lines at the top of the session
 (`menu.show(…)`, `settings.show()`, `showPalette()`, or `startPlugins` without
