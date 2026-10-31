@@ -18,3 +18,4 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+!src/tyr/backend/*.h

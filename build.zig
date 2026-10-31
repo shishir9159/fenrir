@@ -190,8 +190,12 @@ pub fn build(b: *std.Build) void {
     // `windows.h` anywhere in this project -- but the symbols still have to
     // resolve, and `user32` is where they live. `kernel32` is linked for every
     // Windows target already.
+    //
+    // pkg-config is turned off for the same reason `linkC` turns it off: it is
+    // asked by default, it cannot describe a Windows system library, and on
+    // 0.17 its absence is a build error rather than a fallback.
     if (target.result.os.tag == .windows) {
-        fenrir.linkSystemLibrary("user32", .{});
+        fenrir.linkSystemLibrary("user32", .{ .use_pkg_config = .no });
     }
 
     // Lyngvi's Wayland backend, and the Vulkan loader on every Unix, open
@@ -217,11 +221,35 @@ pub fn build(b: *std.Build) void {
         linkC(fenrir, "harfbuzz", "harfbuzz", harfbuzz_include, harfbuzz_lib);
     }
     if (want_stb) {
-        // Header-only, so nothing to link: the implementation is compiled into
-        // the backend's translation unit by STB_TRUETYPE_IMPLEMENTATION.
+        // Header-only, so nothing to link: the implementation is translated
+        // with the declarations by STB_TRUETYPE_IMPLEMENTATION, below.
         fenrir.link_libc = true;
-        fenrir.addIncludePath(b.path("vendor/stb"));
     }
+
+    // The three C backends' headers. Each is a module because 0.17 removed
+    // `@cImport`, and each is present whether or not its flag is on.
+    cHeader(b, fenrir, target, optimize, .{
+        .name = "freetype_c",
+        .header = "freetype.h",
+        .wanted = want_freetype,
+        .include = if (freetype_include) |dir| b.graph.cwdRelativePath(dir) else null,
+    });
+    cHeader(b, fenrir, target, optimize, .{
+        .name = "harfbuzz_c",
+        .header = "harfbuzz.h",
+        .wanted = want_harfbuzz,
+        .include = if (harfbuzz_include) |dir| b.graph.cwdRelativePath(dir) else null,
+    });
+    cHeader(b, fenrir, target, optimize, .{
+        .name = "stb_c",
+        .header = "stb.h",
+        .wanted = want_stb,
+        .include = b.path("vendor/stb"),
+        .defines = &.{
+            .{ "STB_TRUETYPE_IMPLEMENTATION", "1" },
+            .{ "STBTT_STATIC", "1" },
+        },
+    });
 
     // The `fenrir` CLI is a thin shell over the library. Keeping them in
     // separate modules keeps accidental I/O dependencies out of the core.
@@ -238,7 +266,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run the fenrir CLI").dependOn(&run_cmd.step);
 
     const lib_tests = b.addRunArtifact(b.addTest(.{ .root_module = fenrir }));
@@ -402,7 +430,7 @@ fn compileShaders(
         .glsl => return compileGlsl(b, glsl_compiler) orelse
             fatal("-Dshaders=glsl needs glslc or glslang on PATH (or pick -Dshaders=spirv)", .{}),
         .slang => {
-            const exe = slangc_path orelse (b.findProgram(&.{"slangc"}, &.{}) catch
+            const exe = slangc_path orelse (b.findProgram(.{ .names = &.{"slangc"} }) orelse
                 fatal("-Dshaders=slang needs slangc on PATH, or -Dslangc=<path>", .{}));
             return compileSlang(b, exe);
         },
@@ -435,28 +463,21 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 /// still is in a Linux distribution's `glslang-tools` package.
 fn compileGlsl(b: *std.Build, which: GlslCompiler) ?Shaders {
     if (which != .glslang) {
-        if (b.findProgram(&.{"glslc"}, &.{})) |exe| {
+        if (b.findProgram(.{ .names = &.{"glslc"} })) |exe| {
             return compileGlslWith(b, .glslc, exe);
-        } else |_| {
+        } else {
             if (which == .glslc) fatal("-Dglsl-compiler=glslc: glslc is not on PATH", .{});
         }
     }
-    if (b.findProgram(&.{ "glslang", "glslangValidator" }, &.{})) |exe| {
+    if (b.findProgram(.{ .names = &.{ "glslang", "glslangValidator" } })) |exe| {
         return compileGlslWith(b, .glslang, exe);
-    } else |_| {
+    } else {
         if (which == .glslang) fatal("-Dglsl-compiler=glslang: glslang is not on PATH", .{});
     }
     return null;
 }
 
 fn compileGlslWith(b: *std.Build, which: GlslCompiler, exe: []const u8) Shaders {
-    // Absolute. The step runs with the cache directory as its working
-    // directory and is handed an absolute path to the shader, so a relative
-    // include path resolves against the wrong root and the only symptom is
-    // `'#include' : must be followed by a header name` about a file that is
-    // plainly there.
-    const include = b.pathFromRoot(shader_dir);
-
     var out: Shaders = .{
         .spv = undefined,
         .compiled = true,
@@ -468,18 +489,26 @@ fn compileGlslWith(b: *std.Build, which: GlslCompiler, exe: []const u8) Shaders 
             // `-O` is shaderc's optimiser. glslang has no equivalent without
             // linking SPIRV-Tools, and the difference is a few hundred bytes
             // of module that the driver's own compiler folds away anyway.
-            .glslc, .auto => b.addSystemCommand(&.{ exe, "-I", include, "--target-env=vulkan1.2", "-O" }),
-            // glslang wants the include directory attached to the flag, and
-            // rejects it as a separate argument.
+            .glslc, .auto => b.addSystemCommand(&.{ exe, "--target-env=vulkan1.2", "-O" }),
             .glslang => b.addSystemCommand(&.{
                 exe,
                 "-V",
                 "--quiet",
                 "--target-env",
                 "vulkan1.2",
-                b.fmt("-I{s}", .{include}),
             }),
         };
+        run.addDirectoryArg2(b.path(shader_dir), .{
+            // Attached to the flag. glslang rejects the directory as a separate
+            // argument; glslc takes it either way.
+            .prefix = "-I",
+            // Absolute, because the step runs with the cache directory as its
+            // working directory and is handed an absolute path to the shader: a
+            // relative include resolves against the wrong root, and the only
+            // symptom is `'#include' : must be followed by a header name`
+            // about a file that is plainly there.
+            .make_absolute = true,
+        });
         run.addFileArg(b.path(b.fmt("{s}/{s}", .{ shader_dir, stage })));
         for (shader_headers) |header| {
             run.addFileInput(b.path(b.fmt("{s}/{s}", .{ shader_dir, header })));
@@ -518,7 +547,7 @@ fn prebuilt(b: *std.Build) ?Shaders {
     var out: Shaders = .{ .spv = undefined, .compiled = true, .compiler = "spirv" };
     for (shader_stages, 0..) |stage, i| {
         const sub = b.fmt("{s}/spirv/{s}.spv", .{ shader_dir, stage });
-        b.build_root.handle.access(b.graph.io, sub, .{}) catch return null;
+        if (!exists(b, sub)) return null;
         out.spv[i] = b.path(sub);
     }
     return out;
@@ -528,8 +557,76 @@ fn prebuilt(b: *std.Build) ?Shaders {
 /// which reports the failure as a Zig compile error three layers deep with no
 /// hint that a download is what is missing.
 fn hasStbHeader(b: *std.Build) bool {
-    b.build_root.handle.access(b.graph.io, "vendor/stb/stb_truetype.h", .{}) catch return false;
+    return exists(b, "vendor/stb/stb_truetype.h");
+}
+
+/// Whether a file is in the source tree, asked at configure time.
+///
+/// Against the working directory, which is the build root because this package
+/// is always the root one -- 0.17 removed `b.build_root`, and the directory
+/// handle it carried with it. Do not "simplify" this into a `LazyPath`: both
+/// callers have to answer now, before the step graph exists, because what they
+/// decide is which steps there are.
+fn exists(b: *std.Build, sub_path: []const u8) bool {
+    std.Io.Dir.cwd().access(b.graph.io, sub_path, .{}) catch return false;
     return true;
+}
+
+/// A C header as a module, which is what 0.17 leaves instead of `@cImport`.
+///
+/// `tyr/backend/{freetype,harfbuzz,stb}.zig` each import theirs by name. A
+/// build that did not ask for one gets an empty module instead: the file still
+/// has to parse, and nothing in it is analysed, because `tyr/registry.zig`
+/// names a backend only when its flag turned it on.
+///
+/// Do not "simplify" this into a conditional `@import` in the Zig source. A
+/// module named in an `@import` has to exist whether or not the comptime branch
+/// around it is taken, so the choice has to be made here.
+const CHeader = struct {
+    /// What the backend file imports.
+    name: []const u8,
+    /// The header beside it, which the step reads.
+    header: []const u8,
+    wanted: bool,
+    /// Where the library's own headers are, when they are not on the default
+    /// search path.
+    include: ?std.Build.LazyPath = null,
+    /// What `@cDefine` used to say.
+    defines: []const [2][]const u8 = &.{},
+};
+
+/// What the empty module says, for anyone who finds it in the cache.
+const stub_doc =
+    \\//! No C library: this backend is off in this build. The header is
+    \\//! translated only when its flag turns it on -- see `cHeader` in
+    \\//! build.zig.
+    \\
+;
+
+fn cHeader(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    h: CHeader,
+) void {
+    if (!h.wanted) {
+        // Written rather than kept in the tree, because a file may be the root
+        // of only one module and one stub on disk cannot be all three.
+        const empty = b.addWriteFiles();
+        module.addAnonymousImport(h.name, .{
+            .root_source_file = empty.add(b.fmt("{s}.zig", .{h.name}), stub_doc),
+        });
+        return;
+    }
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path(b.fmt("src/tyr/backend/{s}", .{h.header})),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (h.include) |dir| tc.addIncludePath(dir);
+    for (h.defines) |d| tc.defineCMacro(d[0], d[1]);
+    module.addImport(h.name, tc.createModule());
 }
 
 /// Links a C library either through pkg-config or through paths given by hand.

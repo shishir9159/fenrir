@@ -94,7 +94,7 @@ The interface plan is [`ui.md`](ui.md); performance work is
 
 | Needed | For | |
 |---|---|---|
-| **Zig 0.16.0** | everything | The only hard requirement. `winget install zig.zig` on Windows. `zig version` must print `0.16.0`; the standard library changes between releases. |
+| **Zig 0.17.0** | everything | The only hard requirement. `winget install zig.zig` on Windows. `zig version` must print `0.17.0`; the standard library changes between releases. |
 | **Network, once** | SQLite and Lua | Two archives (2.9 MB and 0.4 MB) fetched on the first build and never again. Not needed for one you turn off, or if you fetch by hand. |
 | A Vulkan driver | `read`, `view` | Not for building. Any current GPU driver ships the loader. |
 | A shader compiler | changing a shader | Optional; the SPIR-V is committed. See *Shaders*. |
@@ -249,7 +249,7 @@ is needed to build or for the commands that open no window.
 | `failed to create temporary zip file: FileNotFound` | A `--global-cache-dir` that does not exist. Create it and its `tmp`. |
 | An explicit `-Dshaders` whose compiler is missing | Install one, use `-Dshaders=spirv`, or leave the option out. |
 | `-Dshaders=spirv needs .../spirv/*.spv` | A checkout without the committed SPIR-V. Run `zig build spirv` where a compiler is installed. |
-| `no member named ...` in the standard library | The wrong Zig. It must be `0.16.0`. |
+| `no member named ...` in the standard library | The wrong Zig. It must be `0.17.0`. |
 | Builds, but `read` says "no Vulkan loader" | Install the GPU driver. `--shot` with `--path cpu` needs no device. |
 
 ### Which path rasteriser

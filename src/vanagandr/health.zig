@@ -208,8 +208,8 @@ fn configuration(r: *Report, dir_arg: ?[]const u8) !?[]u8 {
 fn events(r: *Report) void {
     r.section("events");
     var reserved: usize = 0;
-    inline for (@typeInfo(galdr.Runtime.Event).@"enum".fields) |f| {
-        const e: galdr.Runtime.Event = @enumFromInt(f.value);
+    inline for (@typeInfo(galdr.Runtime.Event).@"enum".field_values) |value| {
+        const e: galdr.Runtime.Event = @enumFromInt(value);
         if (e.fires()) {
             r.line(.ok, @tagName(e), "fires", .{});
         } else {
@@ -222,8 +222,8 @@ fn events(r: *Report) void {
     // sentences about it.
     r.ctx.out.print("  {s} {s: <22}", .{ Mark.off.text(), "reserved" }) catch {};
     var first = true;
-    inline for (@typeInfo(galdr.Runtime.Event).@"enum".fields) |f| {
-        const e: galdr.Runtime.Event = @enumFromInt(f.value);
+    inline for (@typeInfo(galdr.Runtime.Event).@"enum".field_values) |value| {
+        const e: galdr.Runtime.Event = @enumFromInt(value);
         if (!e.fires()) {
             r.ctx.out.print("{s}{s}", .{ if (first) "" else " ", @tagName(e) }) catch {};
             first = false;
@@ -234,8 +234,8 @@ fn events(r: *Report) void {
 
 fn capabilities(r: *Report) void {
     r.section("capabilities");
-    inline for (@typeInfo(galdr.Runtime.Capability).@"enum".fields) |f| {
-        const c: galdr.Runtime.Capability = @enumFromInt(f.value);
+    inline for (@typeInfo(galdr.Runtime.Capability).@"enum".field_values) |value| {
+        const c: galdr.Runtime.Capability = @enumFromInt(value);
         r.line(
             if (c.reserved()) .off else .ok,
             c.name(),
@@ -470,12 +470,12 @@ test "every event and every capability has a line of its own" {
     // The registries this phase added, checked from the side that prints
     // them: a name added to either enum without a word for it here is a
     // health check that says less than it did.
-    inline for (@typeInfo(galdr.Runtime.Event).@"enum".fields) |f| {
-        const e: galdr.Runtime.Event = @enumFromInt(f.value);
+    inline for (@typeInfo(galdr.Runtime.Event).@"enum".field_values) |value| {
+        const e: galdr.Runtime.Event = @enumFromInt(value);
         try testing.expect(@tagName(e).len != 0);
     }
-    inline for (@typeInfo(galdr.Runtime.Capability).@"enum".fields) |f| {
-        const c: galdr.Runtime.Capability = @enumFromInt(f.value);
+    inline for (@typeInfo(galdr.Runtime.Capability).@"enum".field_values) |value| {
+        const c: galdr.Runtime.Capability = @enumFromInt(value);
         try testing.expect(c.name().len != 0);
         try testing.expectEqual(c, galdr.Runtime.Capability.parse(c.name()).?);
     }

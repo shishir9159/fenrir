@@ -724,7 +724,8 @@ test "the caret scrolls into view when the text is longer than the field" {
     var f: Field = .init(&store);
 
     // Sixty characters at seven pixels is far wider than three hundred.
-    f.set("x" ** 60);
+    const sixty: [60]u8 = @splat('x');
+    f.set(&sixty);
     _ = try oneFrame(&ui, &f, .{});
     _ = try oneFrame(&ui, &f, .{});
     try testing.expect(f.offset > 0);

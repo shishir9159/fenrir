@@ -671,8 +671,8 @@ test "a message longer than the window cannot push the page number off it" {
     var ui: UI = .init(testing.allocator, UI.fixed_metrics);
     defer ui.deinit();
 
-    const long = "x" ** 600;
-    try solve(&ui, .{ .message = long, .title = "a.pdf", .page = 3, .pages = 9 });
+    const long: [600]u8 = @splat('x');
+    try solve(&ui, .{ .message = &long, .title = "a.pdf", .page = 3, .pages = 9 });
 
     const left = group(&ui, "left");
     const right = group(&ui, "right");

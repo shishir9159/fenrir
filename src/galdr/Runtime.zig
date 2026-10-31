@@ -189,8 +189,8 @@ pub const Capability = enum {
     }
 
     pub fn parse(text: []const u8) ?Capability {
-        inline for (@typeInfo(Capability).@"enum".fields) |f| {
-            const c: Capability = @enumFromInt(f.value);
+        inline for (@typeInfo(Capability).@"enum".field_values) |value| {
+            const c: Capability = @enumFromInt(value);
             if (std.mem.eql(u8, text, c.name())) return c;
         }
         return null;
@@ -933,7 +933,7 @@ fn report(rt: *Runtime, what: []const u8, message: []const u8) void {
 /// it.
 fn runChunk(rt: *Runtime, name: []const u8, source: []const u8, env: c_int) bool {
     var chunk: [256]u8 = undefined;
-    const chunkname = std.fmt.bufPrintZ(&chunk, "@{s}", .{name}) catch "@?";
+    const chunkname = std.fmt.bufPrintSentinel(&chunk, "@{s}", .{name}, 0) catch "@?";
     if (lua.luaL_loadbufferx(rt.L, source.ptr, source.len, chunkname, "t") != lua.ok) {
         rt.report(name, lua.toString(rt.L, -1) orelse "cannot load");
         lua.pop(rt.L, 1);
@@ -1061,7 +1061,7 @@ const ManifestJob = struct {
 fn manifestTrampoline(L: ?*lua.State) callconv(.c) c_int {
     const job: *const ManifestJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
     var chunk: [512]u8 = undefined;
-    const chunkname = std.fmt.bufPrintZ(&chunk, "@{s}", .{job.name}) catch "@plugin.lua";
+    const chunkname = std.fmt.bufPrintSentinel(&chunk, "@{s}", .{job.name}, 0) catch "@plugin.lua";
     if (lua.luaL_loadbufferx(L, job.source.ptr, job.source.len, chunkname, "t") != lua.ok) {
         _ = lua.lua_error(L);
     }
@@ -1620,7 +1620,7 @@ fn apiLoad(L: ?*lua.State) callconv(.c) c_int {
     const name_arg = lua.optString(L, 2) orelse "=(load)";
 
     var chunk: [256]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&chunk, "{s}", .{name_arg[0..@min(name_arg.len, 200)]}) catch "=(load)";
+    const name = std.fmt.bufPrintSentinel(&chunk, "{s}", .{name_arg[0..@min(name_arg.len, 200)]}, 0) catch "=(load)";
     // Always text, whatever mode the caller asked for.
     if (lua.luaL_loadbufferx(L, source.ptr, source.len, name, "t") != lua.ok) {
         // `load` returns nil and the message rather than raising.
@@ -1670,7 +1670,7 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
         // raise, so the file's bytes are never held across a `longjmp`.
         const source = rt.host.readFile(rt.gpa, path) orelse continue;
         var chunk: [520]u8 = undefined;
-        const chunkname = std.fmt.bufPrintZ(&chunk, "@{s}", .{path}) catch unreachable;
+        const chunkname = std.fmt.bufPrintSentinel(&chunk, "@{s}", .{path}, 0) catch unreachable;
         const status = lua.luaL_loadbufferx(L, source.ptr, source.len, chunkname, "t");
         rt.gpa.free(source);
         if (status != lua.ok) _ = lua.lua_error(L);
@@ -3254,8 +3254,8 @@ test "a rail button is behind the ui capability" {
 }
 
 test "every capability name survives the round trip" {
-    inline for (@typeInfo(Capability).@"enum".fields) |f| {
-        const c: Capability = @enumFromInt(f.value);
+    inline for (@typeInfo(Capability).@"enum".field_values) |value| {
+        const c: Capability = @enumFromInt(value);
         try testing.expectEqual(c, Capability.parse(c.name()).?);
         var set: Caps = .{};
         set.add(c);

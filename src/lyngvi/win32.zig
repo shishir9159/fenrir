@@ -487,7 +487,7 @@ fn utf16(gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![:0]u16 
         error.OutOfMemory => error.OutOfMemory,
         // Not UTF-8 at all. A title is cosmetic; refusing to open the window
         // over it would be absurd.
-        else => gpa.dupeZ(u16, std.unicode.utf8ToUtf16LeStringLiteral("fenrir")),
+        else => gpa.dupeSentinel(u16, std.unicode.utf8ToUtf16LeStringLiteral("fenrir"), 0),
     };
 }
 

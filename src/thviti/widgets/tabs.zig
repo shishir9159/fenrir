@@ -321,7 +321,7 @@ test "too many tabs share the shortfall rather than one of them taking it" {
     defer ui.deinit();
 
     // Ten tabs wanting a hundred and eighty pixels each, in eight hundred.
-    const many = [_][]const u8{"a.pdf"} ** 10;
+    const many: [10][]const u8 = @splat("a.pdf");
     _ = try oneFrame(&ui, &many, .{});
     _ = try oneFrame(&ui, &many, .{});
 

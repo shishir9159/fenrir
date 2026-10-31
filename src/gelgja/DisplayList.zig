@@ -622,7 +622,7 @@ fn feedBytes(h: *std.hash.Wyhash, bytes: []const u8) void {
 fn feed(h: *std.hash.Wyhash, value: anytype) void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .@"struct" => |s| inline for (s.fields) |f| feed(h, @field(value, f.name)),
+        .@"struct" => |s| inline for (s.field_names) |name| feed(h, @field(value, name)),
         .@"enum" => feed(h, @intFromEnum(value)),
         .bool => h.update(&.{@intFromBool(value)}),
         .int, .float => h.update(std.mem.asBytes(&value)),

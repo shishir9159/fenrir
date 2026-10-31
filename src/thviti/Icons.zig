@@ -91,7 +91,7 @@ pub const Slot = enum {
     }
 };
 
-const slot_count = @typeInfo(Slot).@"enum".fields.len;
+const slot_count = @typeInfo(Slot).@"enum".field_names.len;
 
 /// What an icon is drawn from, as whoever registers it says so.
 pub const Source = union(enum) {

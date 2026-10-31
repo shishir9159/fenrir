@@ -239,7 +239,7 @@ pub fn scoreRow(query: []const u8, r: Row) ?i32 {
         }
     }
     // A substring and not a subsequence: see the note at the top.
-    if (best == null and std.ascii.indexOfIgnoreCase(r.about, query) != null) best = -60;
+    if (best == null and std.ascii.findIgnoreCase(r.about, query) != null) best = -60;
     return best;
 }
 

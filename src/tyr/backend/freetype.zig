@@ -27,11 +27,10 @@ const format = @import("../format.zig");
 
 const GlyphIndex = Face.GlyphIndex;
 
-const c = @cImport({
-    @cInclude("ft2build.h");
-    @cInclude("freetype/freetype.h");
-    @cInclude("freetype/ftoutln.h");
-});
+// The headers, translated by the build rather than by `@cImport`, which 0.17
+// removed. `freetype.h` beside this file is what the step reads; a build
+// without `-Dfreetype` gets an empty module here instead.
+const c = @import("freetype_c");
 
 // Spelled out rather than taken from the header: these are `( 1L << n )`
 // macros, which translate-c renders inconsistently across FreeType versions.

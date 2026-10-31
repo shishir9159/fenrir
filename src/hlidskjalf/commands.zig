@@ -221,7 +221,7 @@ test "every id is in the table exactly once" {
         }
         try testing.expectEqual(@as(usize, 1), seen);
     }
-    try testing.expectEqual(@typeInfo(Id).@"enum".fields.len, table.len);
+    try testing.expectEqual(@typeInfo(Id).@"enum".field_names.len, table.len);
 }
 
 test "no two commands answer to the same word" {

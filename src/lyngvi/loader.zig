@@ -110,21 +110,22 @@ const FromDevice = struct {
 /// Fills `T` from `source`, which is either of the two lookups above.
 fn fill(comptime T: type, missing: *?[]const u8, source: anytype) T {
     var table: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        const name = comptime symbolName(f.name);
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |field, Field| {
+        const name = comptime symbolName(field);
         const found = source.get(name);
-        const optional = @typeInfo(f.type) == .optional;
+        const optional = @typeInfo(Field) == .optional;
         if (found) |p| {
-            @field(table, f.name) = @ptrCast(p);
+            @field(table, field) = @ptrCast(p);
         } else if (optional) {
-            @field(table, f.name) = null;
+            @field(table, field) = null;
         } else {
             // Recorded rather than returned, so the caller can name the symbol
             // in its error message. A missing core entry point means a broken
             // or ancient loader, and "MissingEntryPoint" on its own sends
             // nobody anywhere.
             if (missing.* == null) missing.* = name;
-            @field(table, f.name) = undefined;
+            @field(table, field) = undefined;
         }
     }
     return table;
@@ -423,15 +424,15 @@ test "every entry in every table is a function pointer of the matching kind" {
     // names are checked by the test above and by the fact that a wrong name
     // returns null and is reported.
     inline for (.{ Global, InstanceTable, DeviceTable }) |T| {
-        inline for (@typeInfo(T).@"struct".fields) |f| {
-            const inner = switch (@typeInfo(f.type)) {
+        inline for (@typeInfo(T).@"struct".field_types) |Field| {
+            const inner = switch (@typeInfo(Field)) {
                 .optional => |o| o.child,
-                else => f.type,
+                else => Field,
             };
             const info = @typeInfo(inner);
             try testing.expect(info == .pointer);
             try testing.expect(@typeInfo(info.pointer.child) == .@"fn");
-            try testing.expectEqual(std.builtin.CallingConvention.c, @typeInfo(info.pointer.child).@"fn".calling_convention);
+            try testing.expectEqual(std.builtin.CallingConvention.c, @typeInfo(info.pointer.child).@"fn".attrs.@"callconv");
         }
     }
 }

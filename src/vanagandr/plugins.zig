@@ -101,8 +101,8 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         if (p.manifest.declared) {
             ctx.out.print("          asks for", .{}) catch {};
             var any = false;
-            inline for (@typeInfo(galdr.Runtime.Capability).@"enum".fields) |f| {
-                const c: galdr.Runtime.Capability = @enumFromInt(f.value);
+            inline for (@typeInfo(galdr.Runtime.Capability).@"enum".field_values) |value| {
+                const c: galdr.Runtime.Capability = @enumFromInt(value);
                 if (p.manifest.caps.has(c)) {
                     ctx.out.print(" {s}{s}", .{ c.name(), if (c.reserved()) " (reserved)" else "" }) catch {};
                     any = true;
@@ -223,8 +223,8 @@ fn writeApi(ctx: *Context) !void {
     );
 
     try group(ctx, "always", null);
-    inline for (@typeInfo(Runtime.Capability).@"enum".fields) |f| {
-        const c: Runtime.Capability = @enumFromInt(f.value);
+    inline for (@typeInfo(Runtime.Capability).@"enum".field_values) |value| {
+        const c: Runtime.Capability = @enumFromInt(value);
         try group(ctx, c.name(), c);
     }
 

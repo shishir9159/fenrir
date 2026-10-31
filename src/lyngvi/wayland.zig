@@ -111,8 +111,8 @@ const Client = struct {
         }
         if (c.handle == null) return null;
 
-        inline for (@typeInfo(Client).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "handle")) continue;
+        inline for (@typeInfo(Client).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "handle")) continue;
 
             // `wl_` and the field name is the symbol: `display_connect` is
             // `wl_display_connect`, `surface_interface` is
@@ -122,14 +122,14 @@ const Client = struct {
             // The `_interface` entries are data, not functions: the symbol's
             // address *is* the `struct wl_interface`, so the cast is to a
             // pointer to one and not to a pointer to a pointer.
-            const found = std.c.dlsym(c.handle, "wl_" ++ field.name) orelse {
+            const found = std.c.dlsym(c.handle, "wl_" ++ field) orelse {
                 // Closed by hand: this returns an optional and not an error,
                 // so an `errdefer` would never run and the library would stay
                 // mapped for the life of the process.
                 c.unload();
                 return null;
             };
-            @field(c, field.name) = @ptrCast(@alignCast(found));
+            @field(c, field) = @ptrCast(@alignCast(found));
         }
         return c;
     }

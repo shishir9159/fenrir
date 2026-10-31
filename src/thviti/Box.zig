@@ -296,8 +296,8 @@ pub const StylePatch = struct {
 
 pub fn applyPatch(s: Style, p: StylePatch) Style {
     var out = s;
-    inline for (@typeInfo(StylePatch).@"struct".fields) |f| {
-        if (@field(p, f.name)) |v| @field(out, f.name) = v;
+    inline for (@typeInfo(StylePatch).@"struct".field_names) |name| {
+        if (@field(p, name)) |v| @field(out, name) = v;
     }
     return out;
 }
@@ -435,13 +435,13 @@ test "the patch covers every style field, with the same types" {
     // The guarantee the hand-written `StylePatch` needs and cannot state:
     // a `Style` field with no counterpart here is a field nobody can push,
     // which fails silently at every call site rather than loudly at one.
-    const style_fields = @typeInfo(Style).@"struct".fields;
-    const patch_fields = @typeInfo(StylePatch).@"struct".fields;
-    try testing.expectEqual(style_fields.len, patch_fields.len);
+    const style = @typeInfo(Style).@"struct";
+    const patch = @typeInfo(StylePatch).@"struct";
+    try testing.expectEqual(style.field_names.len, patch.field_names.len);
 
-    inline for (style_fields) |sf| {
-        const pf = @typeInfo(@FieldType(StylePatch, sf.name)).optional.child;
-        try testing.expectEqual(sf.type, pf);
+    inline for (style.field_names, style.field_types) |name, Field| {
+        const pushed = @typeInfo(@FieldType(StylePatch, name)).optional.child;
+        try testing.expectEqual(Field, pushed);
     }
 }
 

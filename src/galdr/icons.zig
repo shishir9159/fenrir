@@ -112,7 +112,7 @@ pub fn read(
     lua.lua_sethook(L, hook, lua.mask_count, step_limit);
 
     var chunk: [128]u8 = undefined;
-    const chunkname = std.fmt.bufPrintZ(&chunk, "@{s}", .{name}) catch "@theme";
+    const chunkname = std.fmt.bufPrintSentinel(&chunk, "@{s}", .{name}, 0) catch "@theme";
     // "t" is text only: a theme must not be precompiled bytecode, which is
     // not validated by the Lua VM and can crash it.
     if (lua.luaL_loadbufferx(L, source.ptr, source.len, chunkname, "t") != lua.ok) {

@@ -340,9 +340,10 @@ fn grid(ui: *UI, icons: *Icons) !void {
 
         // One button per slot, left to right, so that the sizes can be
         // compared against each other as well as looked at.
-        inline for (@typeInfo(Icons.Slot).@"enum".fields) |f| {
-            const slot: Icons.Slot = @enumFromInt(f.value);
-            _ = try w.iconButton(ui, f.name, icons.resolve(id, slot), .{ .size = 30 });
+        const slots = @typeInfo(Icons.Slot).@"enum";
+        inline for (slots.field_names, slots.field_values) |name, value| {
+            const slot: Icons.Slot = @enumFromInt(value);
+            _ = try w.iconButton(ui, name, icons.resolve(id, slot), .{ .size = 30 });
             try w.spacer(ui, .px(6));
         }
     }

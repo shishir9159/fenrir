@@ -209,8 +209,8 @@ fn expectLayouts(module_: spirv.Module, comptime checks: []const Check) !void {
             // the offset of *some* Zig field.
             for (layout.memberOffsets()) |offset| {
                 var found = false;
-                inline for (@typeInfo(c.T).@"struct".fields) |f| {
-                    if (@offsetOf(c.T, f.name) == offset) found = true;
+                inline for (@typeInfo(c.T).@"struct".field_names) |name| {
+                    if (@offsetOf(c.T, name) == offset) found = true;
                 }
                 if (!found) {
                     std.debug.print("binding {d}: a member at offset {d} lines up with no field of {s}\n", .{

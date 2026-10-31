@@ -128,8 +128,8 @@ test "the GLSL instance struct still names every Zig field" {
     // A field added to `rect.Instance` and forgotten in `rect.glsl` shifts
     // every member after it, and the symptom is a frame of garbage rather
     // than an error, so this at least catches the omission.
-    inline for (@typeInfo(rect.Instance).@"struct".fields) |f| {
-        const name = comptime if (std.mem.eql(u8, f.name, "texture")) "texture_id" else f.name;
+    inline for (@typeInfo(rect.Instance).@"struct".field_names) |field| {
+        const name = comptime if (std.mem.eql(u8, field, "texture")) "texture_id" else field;
         try testing.expect(std.mem.indexOf(u8, shared_source, name) != null);
     }
 }

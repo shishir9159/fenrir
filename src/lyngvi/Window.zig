@@ -171,6 +171,6 @@ test "the vtable is the whole platform surface" {
     // Fifteen functions was the estimate. If this number grows, something that
     // belongs in Þviti has been pushed down into the platform layer -- which
     // is how a portable program acquires three subtly different behaviours.
-    const n = @typeInfo(VTable).@"struct".fields.len;
+    const n = @typeInfo(VTable).@"struct".field_names.len;
     try testing.expect(n <= 15);
 }

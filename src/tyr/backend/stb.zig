@@ -32,11 +32,10 @@ const geom = @import("../../gelgja/geom.zig");
 const GlyphIndex = Face.GlyphIndex;
 const Point = geom.Point;
 
-const c = @cImport({
-    @cDefine("STB_TRUETYPE_IMPLEMENTATION", "1");
-    @cDefine("STBTT_STATIC", "1");
-    @cInclude("stb_truetype.h");
-});
+// Translated by the build rather than by `@cImport`, which 0.17 removed. The
+// two defines moved with it, so the implementation is still translated here and
+// not compiled as C. See `stb.h` beside this file, and `cHeader` in build.zig.
+const c = @import("stb_c");
 
 pub const backend: Face.Backend = .{
     .name = "stb",

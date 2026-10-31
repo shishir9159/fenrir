@@ -114,7 +114,7 @@ pub fn open(gpa: Allocator, path: []const u8) Error!Db {
     if (!available) return error.NoDatabase;
     if (sqlite3_initialize() != ok) return error.CannotOpen;
 
-    const z = try gpa.dupeZ(u8, path);
+    const z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(z);
 
     var db: Db = .{};

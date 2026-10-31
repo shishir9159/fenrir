@@ -178,7 +178,7 @@ fn migrate(lib: *Library, from: i64) Error!void {
     }
 
     var buf: [64]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d}", .{schema_version}) catch return error.Failed;
+    const sql = std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{schema_version}, 0) catch return error.Failed;
     try lib.db.exec(sql);
 }
 

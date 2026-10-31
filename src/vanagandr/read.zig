@@ -460,10 +460,10 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
     // for one that runs until you close it. It also has to be safe to call
     // from the rasterising thread, which an arena is not.
     var heap: std.heap.DebugAllocator(.{}) = .init;
-    defer if (builtin.mode == .Debug) {
+    defer if (builtin.mode == .debug) {
         if (heap.deinit() == .leak) ctx.note("the reader leaked memory", .{});
     };
-    const gpa: Allocator = if (builtin.mode == .Debug)
+    const gpa: Allocator = if (builtin.mode == .debug)
         heap.allocator()
     else
         std.heap.smp_allocator;
@@ -2690,7 +2690,7 @@ const Session = struct {
 
     /// `gd` and `gD`: round the ways of showing a comparison.
     fn turnComparison(s: *Session, delta: i32) void {
-        const n: i32 = @typeInfo(Showing).@"enum".fields.len;
+        const n: i32 = @typeInfo(Showing).@"enum".field_names.len;
         const next = @mod(@as(i32, @intFromEnum(s.diff_showing)) + delta, n);
         s.showComparison(@enumFromInt(next));
     }

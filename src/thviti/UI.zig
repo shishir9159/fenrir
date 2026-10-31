@@ -391,11 +391,11 @@ pub fn next(ui: *UI, n: Next) void {
 /// and a widget that overwrote the pending override would silently discard it.
 /// Every helper in `widgets.zig` goes through here for exactly that reason.
 pub fn nextDefaults(ui: *UI, n: Next) void {
-    inline for (@typeInfo(Next).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "flags")) {
+    inline for (@typeInfo(Next).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "flags")) {
             ui.pending.flags = ui.pending.flags.merge(n.flags);
-        } else if (@field(ui.pending, f.name) == null) {
-            @field(ui.pending, f.name) = @field(n, f.name);
+        } else if (@field(ui.pending, name) == null) {
+            @field(ui.pending, name) = @field(n, name);
         }
     }
 }

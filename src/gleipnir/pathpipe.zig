@@ -365,9 +365,9 @@ test "the GLSL push constant still names every Zig field, in order" {
     // is a page drawn at the wrong place in the wrong colour rather than an
     // error.
     var at: usize = 0;
-    inline for (@typeInfo(PushConstants).@"struct".fields) |f| {
-        const found = std.mem.indexOfPos(u8, shared_source, at, f.name) orelse {
-            std.debug.print("shader/path.glsl never mentions '{s}'\n", .{f.name});
+    inline for (@typeInfo(PushConstants).@"struct".field_names) |name| {
+        const found = std.mem.indexOfPos(u8, shared_source, at, name) orelse {
+            std.debug.print("shader/path.glsl never mentions '{s}'\n", .{name});
             return error.TestUnexpectedResult;
         };
         at = found;

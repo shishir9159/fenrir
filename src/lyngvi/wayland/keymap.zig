@@ -193,14 +193,14 @@ const Xkb = struct {
         }
         if (x.handle == null) return null;
 
-        inline for (@typeInfo(Xkb).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "handle")) continue;
-            const symbol = "xkb_" ++ field.name;
+        inline for (@typeInfo(Xkb).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "handle")) continue;
+            const symbol = "xkb_" ++ field;
             const found = std.c.dlsym(x.handle, symbol) orelse {
                 _ = std.c.dlclose(x.handle.?);
                 return null;
             };
-            @field(x, field.name) = @ptrCast(@alignCast(found));
+            @field(x, field) = @ptrCast(@alignCast(found));
         }
         return x;
     }

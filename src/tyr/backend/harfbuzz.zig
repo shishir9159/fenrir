@@ -22,9 +22,9 @@ const Allocator = std.mem.Allocator;
 const Face = @import("../Face.zig");
 const Shaper = @import("../Shaper.zig");
 
-const c = @cImport({
-    @cInclude("hb.h");
-});
+// Translated by the build rather than by `@cImport`, which 0.17 removed. See
+// `harfbuzz.h` beside this file, and `cHeader` in build.zig.
+const c = @import("harfbuzz_c");
 
 pub const name = "harfbuzz";
 
