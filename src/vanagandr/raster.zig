@@ -67,7 +67,8 @@ pub const usage =
     \\                   what `fenrir read` draws.
     \\    --jobs N       With --all, render N pages at once, on N threads.
     \\                   0 means one per core. Defaults to 1, because this
-    \\                   command is also the benchmark: see OPTIMIZING.md.
+    \\                   command is also the benchmark, and a benchmark
+    \\                   that uses every core measures the scheduler.
     \\
     \\    Text and images are drawn: Tyr reads TrueType, CFF and Type 1
     \\    outlines, and Gjoll decodes Flate and baseline JPEG images through

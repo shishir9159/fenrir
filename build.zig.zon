@@ -25,5 +25,6 @@
         "build.zig.zon",
         "src",
         "README.md",
+        "myths.md",
     },
 }
