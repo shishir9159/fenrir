@@ -89,6 +89,16 @@ pub const Result = union(enum) {
 /// quarter of a gigabyte at the limit.
 pub const max_pixels: u64 = 64 << 20;
 
+/// How many `/SMask` levels one decode may go down.
+///
+/// A mask is an image and may legally have a mask of its own, so this is a
+/// depth and not a ban. It has to exist because an image whose mask is
+/// itself, or a pair naming each other, recurses until the stack or the heap
+/// is gone: `Document.fetch` answers from its object cache before its
+/// `in_progress` cycle guard is reached, so every resolve of the cycle hands
+/// back the same stream with no error.
+const max_mask_depth = 4;
+
 /// Decodes an image XObject.
 ///
 /// `arena` is the document's, for the colour space; `gpa` owns the returned
@@ -100,6 +110,17 @@ pub fn decode(
     doc: *Document,
     stream: *const Stream,
     resources: ?Dict,
+) Error!Result {
+    return decodeAt(gpa, arena, doc, stream, resources, 0);
+}
+
+fn decodeAt(
+    gpa: Allocator,
+    arena: Allocator,
+    doc: *Document,
+    stream: *const Stream,
+    resources: ?Dict,
+    depth: u8,
 ) Error!Result {
     const dict = stream.dict;
 
@@ -130,7 +151,7 @@ pub fn decode(
                     else => return .{ .skipped = .jpeg_variant },
                 };
                 defer img.deinit(gpa);
-                return fromJpeg(gpa, arena, doc, dict, resources, img, w, h);
+                return fromJpeg(gpa, arena, doc, dict, resources, img, w, h, depth);
             },
             else => return .{ .skipped = .codec },
         }
@@ -148,7 +169,7 @@ pub fn decode(
     var bmp: Bitmap = .{ .pixels = pixels, .width = w, .height = h };
     errdefer bmp.deinit(gpa);
 
-    try applySoftMask(gpa, arena, doc, dict, resources, &bmp);
+    try applySoftMask(gpa, arena, doc, dict, resources, &bmp, depth);
     return .{ .bitmap = bmp };
 }
 
@@ -167,6 +188,7 @@ fn fromJpeg(
     img: jpeg.Image,
     want_w: u32,
     want_h: u32,
+    depth: u8,
 ) Error!Result {
     const space = try loadSpace(arena, doc, dict, resources) orelse switch (img.components) {
         1 => ColorSpace.device_gray,
@@ -210,7 +232,7 @@ fn fromJpeg(
 
     var bmp: Bitmap = .{ .pixels = pixels, .width = want_w, .height = want_h };
     errdefer bmp.deinit(gpa);
-    try applySoftMask(gpa, arena, doc, dict, resources, &bmp);
+    try applySoftMask(gpa, arena, doc, dict, resources, &bmp, depth);
     return .{ .bitmap = bmp };
 }
 
@@ -390,12 +412,14 @@ fn applySoftMask(
     dict: Dict,
     resources: ?Dict,
     bmp: *Bitmap,
+    depth: u8,
 ) Error!void {
+    if (depth >= max_mask_depth) return;
     const entry = try doc.get(dict, "SMask") orelse return;
     const resolved = try doc.resolve(entry);
     const stream = resolved.asStream() orelse return;
 
-    const result = decode(gpa, arena, doc, stream, resources) catch return;
+    const result = decodeAt(gpa, arena, doc, stream, resources, depth + 1) catch return;
     const mask = switch (result) {
         .bitmap => |b| b,
         .skipped => return,
@@ -530,4 +554,66 @@ test "a four-bit greyscale image unpacks two pixels a byte" {
     // 8 of 15 is just over half.
     try testing.expect(pixels[8] > 128 and pixels[8] < 145);
     try testing.expectEqual(@as(u8, 0), pixels[12]);
+}
+
+test "an image whose soft mask is itself still decodes" {
+    // A `/SMask` is decoded as an image, which applies its own `/SMask`: a
+    // self-reference, or a pair naming each other, allocated until the stack
+    // or the heap was gone. `Document.fetch` does not catch it -- the object
+    // cache answers before its cycle guard -- so the bound is `max_mask_depth`
+    // here. The decode is expected to finish and to come out masked, not to
+    // be refused.
+    const gpa = testing.allocator;
+    const src =
+        \\%PDF-1.4
+        \\1 0 obj
+        \\<< /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray
+        \\   /SMask 1 0 R /Length 1 >>
+        \\stream
+        \\A
+        \\endstream
+        \\endobj
+        \\2 0 obj
+        \\<< /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray
+        \\   /SMask 3 0 R /Length 1 >>
+        \\stream
+        \\A
+        \\endstream
+        \\endobj
+        \\3 0 obj
+        \\<< /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray
+        \\   /SMask 2 0 R /Length 1 >>
+        \\stream
+        \\A
+        \\endstream
+        \\endobj
+        \\trailer
+        \\<< /Size 4 >>
+        \\startxref
+        \\0
+        \\%%EOF
+    ;
+
+    var doc = try Document.open(gpa, try gpa.dupe(u8, src));
+    defer doc.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    for ([_]u32{ 1, 2 }) |num| {
+        const obj = try doc.resolve(.{ .ref = .{ .num = num, .gen = 0 } });
+        const stream = obj.asStream() orelse return error.TestExpectedStream;
+        const result = try decode(gpa, arena_state.allocator(), &doc, stream, null);
+        const bmp = switch (result) {
+            .bitmap => |b| b,
+            .skipped => return error.TestExpectedBitmap,
+        };
+        defer bmp.deinit(gpa);
+
+        try testing.expectEqual(@as(u32, 1), bmp.width);
+        // 'A' is 65, so the one sample is grey 65 and the mask that each
+        // level reads off it takes the alpha down from opaque.
+        try testing.expectEqual(@as(u8, 65), bmp.pixels[0]);
+        try testing.expect(bmp.pixels[3] < 255);
+    }
 }

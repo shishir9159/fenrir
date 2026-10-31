@@ -41,6 +41,13 @@ const max_stack = 100;
 const max_nodes = 8192;
 const max_block_depth = 32;
 
+/// How deep a type 3 function may nest before we decide the file is playing
+/// games. Loading is where this has to be caught: `/Functions [self 0 R]`
+/// never finishes, and the limits on calculator nodes and on execution are a
+/// later stage than the one that would have exhausted the stack. The same
+/// count `color.zig` keeps, for the same reason.
+const max_load_depth = 8;
+
 pub const Error = Document.Error;
 
 pub const Kind = enum { sampled, exponential, stitching, postscript };
@@ -610,7 +617,8 @@ fn bitwise(stack: *[max_stack]f64, top: *usize, comptime f: fn (i64, i64) i64) v
 /// is not a function, or is one this cannot make sense of; every caller has a
 /// documented answer for null, because a missing tint transform is common
 /// enough that erroring on it would reject real files.
-pub fn load(arena: Allocator, doc: *Document, obj: Object) Error!?Function {
+pub fn load(arena: Allocator, doc: *Document, obj: Object, depth: u8) Error!?Function {
+    if (depth > max_load_depth) return null;
     const resolved = try doc.resolve(obj);
     const dict = resolved.asDict() orelse return null;
 
@@ -680,7 +688,7 @@ pub fn load(arena: Allocator, doc: *Document, obj: Object) Error!?Function {
             var subs: std.ArrayList(Function) = .empty;
             var outputs: u8 = 0;
             for (list) |entry| {
-                const sub = try load(arena, doc, entry) orelse continue;
+                const sub = try load(arena, doc, entry, depth + 1) orelse continue;
                 outputs = @max(outputs, sub.outputs);
                 try subs.append(arena, sub);
             }
@@ -721,16 +729,16 @@ pub fn load(arena: Allocator, doc: *Document, obj: Object) Error!?Function {
 /// Loads either one function of `n` outputs or an array of `n` functions of
 /// one output each. Shadings and `/SMask` transfer functions are specified
 /// both ways and mean the same thing (§8.7.4.5.2).
-pub fn loadCombined(arena: Allocator, doc: *Document, obj: Object) Error!?[]const Function {
+pub fn loadCombined(arena: Allocator, doc: *Document, obj: Object, depth: u8) Error!?[]const Function {
     const resolved = try doc.resolve(obj);
     if (resolved.asArray()) |list| {
         var out: std.ArrayList(Function) = .empty;
         for (list) |entry| {
-            if (try load(arena, doc, entry)) |f| try out.append(arena, f);
+            if (try load(arena, doc, entry, depth)) |f| try out.append(arena, f);
         }
         return if (out.items.len == 0) null else out.items;
     }
-    const single = try load(arena, doc, resolved) orelse return null;
+    const single = try load(arena, doc, resolved, depth) orelse return null;
     const one = try arena.alloc(Function, 1);
     one[0] = single;
     return one;
@@ -738,16 +746,26 @@ pub fn loadCombined(arena: Allocator, doc: *Document, obj: Object) Error!?[]cons
 
 /// Evaluates a combined function list into `out`, concatenating the outputs
 /// of a list of single-output functions.
-pub fn evalCombined(fns: []const Function, x: f64, out: []f64) []const f64 {
-    if (fns.len == 1) return fns[0].eval(&.{x}, out);
+///
+/// Takes the whole input vector, because a `/DeviceN` tint transform has one
+/// input per colorant and handing it only the first silently dropped every
+/// later ink -- `eval` substitutes domain minima for the inputs it is not
+/// given, so a four-ink space came out as the first ink alone.
+pub fn evalCombined(fns: []const Function, in: []const f64, out: []f64) []const f64 {
+    if (fns.len == 1) return fns[0].eval(in, out);
 
     var written: usize = 0;
     for (fns) |*f| {
         if (written == out.len) break;
-        const got = f.eval(&.{x}, out[written..][0..@min(1, out.len - written)]);
+        const got = f.eval(in, out[written..][0..@min(1, out.len - written)]);
         written += got.len;
     }
     return out[0..written];
+}
+
+/// The one-input case: a shading's ramp, which is a function of `t` alone.
+pub fn evalCombinedOne(fns: []const Function, x: f64, out: []f64) []const f64 {
+    return evalCombined(fns, &.{x}, out);
 }
 
 fn numbers(arena: Allocator, doc: *Document, dict: object.Dict, key: []const u8) Error!?[]const f64 {
@@ -919,6 +937,63 @@ test "a stitching function picks the interval and re-maps into it" {
     try testing.expectApproxEqAbs(@as(f64, 0.5), f.evalOne(0.25), 1e-9);
     // Above it: the second, with 0.5..1 stretched the same way.
     try testing.expectApproxEqAbs(@as(f64, 15), f.evalOne(0.75), 1e-9);
+}
+
+test "a cyclic stitching function is refused instead of loaded forever" {
+    // Every `/Functions` entry calls `load` again, and `Document.fetch`
+    // answers from its object cache before the `in_progress` guard is
+    // reached -- so a function that names itself handed back the same
+    // dictionary for ever. The depth is what stops it, and the file that
+    // needs it is three lines long.
+    const gpa = testing.allocator;
+    const src =
+        \\%PDF-1.4
+        \\1 0 obj
+        \\<< /FunctionType 3 /Domain [0 1] /Functions [1 0 R] /Encode [0 1] >>
+        \\endobj
+        \\2 0 obj
+        \\<< /FunctionType 3 /Domain [0 1] /Functions [3 0 R] /Encode [0 1] >>
+        \\endobj
+        \\3 0 obj
+        \\<< /FunctionType 3 /Domain [0 1] /Functions [2 0 R] /Encode [0 1] >>
+        \\endobj
+        \\4 0 obj
+        \\<< /FunctionType 3 /Domain [0 1] /Functions [5 0 R] /Encode [0 1] >>
+        \\endobj
+        \\5 0 obj
+        \\<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>
+        \\endobj
+        \\trailer
+        \\<< /Size 6 >>
+        \\startxref
+        \\0
+        \\%%EOF
+    ;
+
+    var doc = try Document.open(gpa, try gpa.dupe(u8, src));
+    defer doc.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ref = struct {
+        fn of(num: u32) Object {
+            return .{ .ref = .{ .num = num, .gen = 0 } };
+        }
+    }.of;
+
+    // A function that is its own only sub-function, and a pair naming each
+    // other: both run out of depth, which leaves every level with no
+    // sub-function it could load, so the whole thing is null.
+    try testing.expect(try load(arena, &doc, ref(1), 0) == null);
+    try testing.expect(try load(arena, &doc, ref(2), 0) == null);
+
+    // And a type 3 that stitches something real still loads, because the
+    // bound is on depth and not on nesting.
+    const nested = try load(arena, &doc, ref(4), 0) orelse return error.TestExpectedLoad;
+    try testing.expectEqual(Kind.stitching, nested.kind);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), nested.evalOne(0.5), 1e-9);
 }
 
 test "a sampled function interpolates between its two nearest entries" {

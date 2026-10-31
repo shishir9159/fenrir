@@ -879,13 +879,13 @@ fn shadingOf(it: *Interpreter, obj: Object, ref: u32) Error!paint.Shading {
     if (try it.doc.get(dict, "ColorSpace")) |cs_obj| {
         if (try color.load(it.arena(), it.doc, cs_obj, null, 0)) |space| {
             if (try it.doc.get(dict, "Function")) |fn_obj| {
-                if (try function.loadCombined(it.arena(), it.doc, fn_obj)) |fns| {
+                if (try function.loadCombined(it.arena(), it.doc, fn_obj, 0)) |fns| {
                     // The midpoint of the ramp: a single colour that is wrong
                     // everywhere and badly wrong nowhere, which is exactly
                     // what a placeholder should be.
                     var comps: [color.max_components]f64 = @splat(0);
                     const n = @min(space.components, color.max_components);
-                    const produced = function.evalCombined(fns, 0.5, comps[0..n]);
+                    const produced = function.evalCombinedOne(fns, 0.5, comps[0..n]);
                     approximation = space.toColor(produced);
                 }
             }

@@ -166,7 +166,10 @@ pub const ColorSpace = struct {
             if (cs.tint.len != 0) {
                 var out: [max_components]f64 = @splat(0);
                 const n = @min(alt.components, max_components);
-                const produced = function.evalCombined(cs.tint, at(comps, 0), out[0..n]);
+                // Every component, not just the first: a `/DeviceN` arrives
+                // here with all of its inks and the transform takes one
+                // input per ink.
+                const produced = function.evalCombined(cs.tint, comps, out[0..n]);
                 if (produced.len != 0) return alt.toColorDepth(produced, depth + 1);
             }
         }
@@ -394,7 +397,7 @@ fn separation(
     alt.* = alt_space;
 
     const tint = if (list.len >= 4)
-        try function.loadCombined(arena, doc, list[3]) orelse &[_]Function{}
+        try function.loadCombined(arena, doc, list[3], 0) orelse &[_]Function{}
     else
         &[_]Function{};
 
@@ -556,6 +559,44 @@ test "a separation runs its tint transform into the alternate space" {
     try testing.expectApproxEqAbs(@as(f32, 0), full.r, 1e-5);
     const none = cs.toColor(&.{0});
     try testing.expectApproxEqAbs(@as(f32, 1), none.r, 1e-5);
+}
+
+test "a DeviceN tint transform is given every colorant, not just the first" {
+    // Two inks through one two-input transform. The tint used to be handed
+    // `comps[0]` alone, and `Function.eval` fills the inputs it is not given
+    // with their domain minima -- so no ink after the first could change the
+    // colour, and a four-ink space printed as its first plate.
+    //
+    // The sampled table below returns its *second* input: samples are laid
+    // out with the first input varying fastest, so this is 0, 0, 1, 1.
+    const samples = [_]u8{ 0, 0, 255, 255 };
+    const tint = [_]Function{.{
+        .kind = .sampled,
+        .domain = &.{ 0, 1, 0, 1 },
+        .range = &.{ 0, 1 },
+        .inputs = 2,
+        .outputs = 1,
+        .body = .{ .sampled = .{
+            .samples = &samples,
+            .size = &.{ 2, 2 },
+            .bits = 8,
+            .encode = &.{},
+            .decode = &.{ 0, 1 },
+        } },
+    }};
+    const alt: ColorSpace = .device_gray;
+    const cs: ColorSpace = .{
+        .kind = .separation,
+        .components = 2,
+        .tint = &tint,
+        .alternate = &alt,
+    };
+
+    // Nothing of the first ink and all of the second: the transform says 1,
+    // which is white in the alternate space.
+    try testing.expectApproxEqAbs(@as(f32, 1), cs.toColor(&.{ 0, 1 }).r, 1e-5);
+    // And the other way round is black -- the answer the bug gave for both.
+    try testing.expectApproxEqAbs(@as(f32, 0), cs.toColor(&.{ 1, 0 }).r, 1e-5);
 }
 
 test "a separation with no transform darkens with its tint" {

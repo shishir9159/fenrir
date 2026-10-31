@@ -41,6 +41,9 @@ pub const Stream = struct {
 };
 
 const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
+/// `maxInt(i64)` has no exact `f64`, so this rounds *up*, to 2^63 -- one past
+/// what an `i64` holds. The comparison against it is `>=` for that reason;
+/// `min_i64_f` is exact and its own is strict.
 const max_i64_f: f64 = @floatFromInt(std.math.maxInt(i64));
 
 pub const Object = union(enum) {
@@ -112,7 +115,7 @@ pub const Object = union(enum) {
                 // `@intFromFloat` traps on non-integral or out-of-range input,
                 // and PDF files are full of both.
                 if (!std.math.isFinite(r) or r != @trunc(r)) break :blk null;
-                if (r < min_i64_f or r > max_i64_f) break :blk null;
+                if (r < min_i64_f or r >= max_i64_f) break :blk null;
                 break :blk @as(i64, @intFromFloat(r));
             },
             else => null,
@@ -194,4 +197,28 @@ test "reals that are exactly integral convert" {
 
     const fractional: Object = .{ .real = 7.5 };
     try std.testing.expectEqual(@as(?i64, null), fractional.asInt());
+}
+
+test "a real at the edge of i64 is refused rather than converted" {
+    // 2^63 is what `max_i64_f` rounds to, and it is one past the largest
+    // `i64`: a `>` here let it through to `@intFromFloat`, which panicked in
+    // a safe build and was undefined in a fast one. A PDF with that number in
+    // it is three characters of work for whoever writes it.
+    const too_big: Object = .{ .real = 9223372036854775808.0 };
+    try std.testing.expectEqual(@as(?i64, null), too_big.asInt());
+
+    // The largest real that does convert is the one below it: 2^63 - 1024,
+    // which is the previous representable `f64`.
+    const biggest: Object = .{ .real = 9223372036854774784.0 };
+    try std.testing.expectEqual(@as(?i64, 9223372036854774784), biggest.asInt());
+
+    // The bottom end is exact, so the bound itself converts and the step
+    // below it does not.
+    const lowest: Object = .{ .real = -9223372036854775808.0 };
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), lowest.asInt());
+    const under: Object = .{ .real = -9223372036854777856.0 };
+    try std.testing.expectEqual(@as(?i64, null), under.asInt());
+
+    const infinite: Object = .{ .real = std.math.inf(f64) };
+    try std.testing.expectEqual(@as(?i64, null), infinite.asInt());
 }
