@@ -68,6 +68,20 @@ pub const Error = path.Error;
 /// What a `layer_push` saved, restored by its `layer_pop`.
 const SavedLayer = struct { alpha: f32, blend: paint.BlendMode };
 
+/// What a `clip_push` did, which is what its `clip_pop` has to undo.
+const Clip = enum {
+    /// Nothing was installed and everything inside still draws: a path the
+    /// flattener gave up on, or one past `max_clip_depth`. Wrong in the safe
+    /// direction -- too much ink rather than a page that comes out blank.
+    open,
+    /// A real clip, in the sink.
+    installed,
+    /// An empty path, which hides everything until it is popped. Counted
+    /// rather than installed, because neither sink has a clip-to-nothing
+    /// primitive.
+    empty,
+};
+
 /// One glyph's outline, in the font program's own units.
 ///
 /// Expressed in Gelgja's vocabulary -- the same verbs and points a display
@@ -362,9 +376,12 @@ const Replayer = struct {
     /// from a few hundred outlines rather than converting one per glyph.
     glyphs: std.AutoHashMapUnmanaged(scene_mod.GlyphKey, u32) = .empty,
 
-    /// One entry per open clip, so `clip_pop` knows whether its `clip_push`
-    /// actually took effect.
-    clip_stack: std.ArrayList(bool) = .empty,
+    /// One entry per open clip, so `clip_pop` knows what its `clip_push`
+    /// actually did.
+    clip_stack: std.ArrayList(Clip) = .empty,
+    /// How many open clips are empty paths. Non-zero means nothing inside
+    /// them can make a mark; see `pushClip`.
+    blind: u32 = 0,
     /// The blend mode in force. See `setBlend`.
     blend: paint.BlendMode = .normal,
     /// Constant alpha, multiplied down by every open transparency group.
@@ -411,6 +428,9 @@ const Replayer = struct {
 
     fn fill(r: *Replayer, p: DisplayList.Path, rule: FillRule, pnt: paint.Paint) Error!void {
         r.stats.fills += 1;
+        // Nothing inside an empty clip can make a mark. Counted first, so
+        // that the statistics still say what the page contained.
+        if (r.blind != 0) return;
         const color = solid(pnt) orelse {
             r.stats.unsupported_paint += 1;
             return;
@@ -557,6 +577,9 @@ const Replayer = struct {
         ctm: Transform,
     ) Error!void {
         r.stats.strokes += 1;
+        // Nothing inside an empty clip can make a mark. Counted first, so
+        // that the statistics still say what the page contained.
+        if (r.blind != 0) return;
         const color = solid(pnt) orelse {
             r.stats.unsupported_paint += 1;
             return;
@@ -634,25 +657,37 @@ const Replayer = struct {
 
     fn pushClip(r: *Replayer, p: DisplayList.Path, rule: FillRule) Error!void {
         r.stats.clips += 1;
+        // Inside a clip that already hides everything, a further clip can only
+        // hide more, so it is not worth flattening.
+        if (r.blind != 0) return r.clip_stack.append(r.gpa, .open);
+
         if (r.clip_stack.items.len >= r.options.max_clip_depth) {
             r.stats.clips_dropped += 1;
             // Still pushed, so the matching pop stays balanced. A dropped clip
             // draws too much rather than too little, which is the safer way to
             // be wrong: content appears where it should have been hidden,
             // rather than a page coming out blank.
-            try r.clip_stack.append(r.gpa, false);
+            try r.clip_stack.append(r.gpa, .open);
             return;
         }
 
         const flat = r.flatten(p) orelse {
-            try r.clip_stack.append(r.gpa, false);
+            try r.clip_stack.append(r.gpa, .open);
             return;
         };
         if (flat.isEmpty()) {
             // An empty clip path clips everything away, which is not the same
             // as no clip at all -- `W n` with a degenerate path is how some
             // generators hide content.
-            try r.clip_stack.append(r.gpa, false);
+            //
+            // Neither sink has a clip-to-nothing primitive, so this is a
+            // count the draw commands consult rather than a clip installed in
+            // the sink: `blind`. It used to push the same token the
+            // `max_clip_depth` bail-out uses, which means *draw everything* --
+            // the exact opposite of what the comment above says and of what
+            // the file asked for.
+            try r.clip_stack.append(r.gpa, .empty);
+            r.blind += 1;
             return;
         }
 
@@ -671,15 +706,17 @@ const Replayer = struct {
                 try s.pushClip(r.gpa, r.curves.items, rule, r.base);
             },
         }
-        try r.clip_stack.append(r.gpa, true);
+        try r.clip_stack.append(r.gpa, .installed);
     }
 
     fn popClip(r: *Replayer) void {
-        const pushed = r.clip_stack.pop() orelse return;
-        if (!pushed) return;
-        switch (r.sink) {
-            .canvas => |c| c.popClip(r.gpa),
-            .scene => |s| s.popClip(),
+        switch (r.clip_stack.pop() orelse return) {
+            .open => {},
+            .empty => r.blind -= 1,
+            .installed => switch (r.sink) {
+                .canvas => |c| c.popClip(r.gpa),
+                .scene => |s| s.popClip(),
+            },
         }
     }
 
@@ -730,6 +767,9 @@ const Replayer = struct {
         r.stats.text_runs += 1;
         const glyphs = r.list.glyphsOf(tr);
         r.stats.glyphs += @intCast(glyphs.len);
+        // Nothing inside an empty clip can make a mark. Counted first, so
+        // that the statistics still say what the page contained.
+        if (r.blind != 0) return;
 
         // Mode 3 is how every scanned document carries its OCR layer: real
         // text, positioned over the page image, painting nothing. Drawing it
@@ -956,6 +996,9 @@ const Replayer = struct {
 
     fn image(r: *Replayer, img: DisplayList.Image) Error!void {
         r.stats.images += 1;
+        // Nothing inside an empty clip can make a mark. Counted first, so
+        // that the statistics still say what the page contained.
+        if (r.blind != 0) return;
 
         if (img.isInline()) {
             // The samples are in the list. Decoded here, drawn, and freed:
@@ -1879,6 +1922,106 @@ test "a clip past max_clip_depth is counted, and what it would have hidden is dr
         // Right of the dropped clip's edge: drawn, which is too much.
         try testing.expectApproxEqAbs(@as(f32, 1), r.ink(30, 20), 0.01);
         try testing.expectApproxEqAbs(@as(f32, 1), r.ink(10, 20), 0.01);
+    }
+}
+
+/// The body of the clip tests below: a fill that must not appear, and one
+/// after the pop that must.
+fn clippedAwayThenNot(b: *Builder) !void {
+    try box(b, 0, 0, 40, 40);
+    try b.fill(.nonzero, .{ .solid = .black });
+    try b.popClip();
+    // Clear of the clip again, so this one draws: the bottom half of the page,
+    // which is the bottom half of the image.
+    try box(b, 0, 0, 40, 20);
+    try b.fill(.nonzero, .{ .solid = .black });
+}
+
+/// `W n` with no path at all, which is what a generator writes to hide what
+/// follows until the `Q`.
+fn emptyClip(b: *Builder) !void {
+    try b.pushClip(.nonzero);
+    try clippedAwayThenNot(b);
+}
+
+test "an empty clip path hides everything inside it" {
+    // Not the same as no clip at all: the empty branch used to push the token
+    // the `max_clip_depth` bail-out uses, which means *draw everything*, so
+    // the content came out visible in both sinks. Neither sink has a
+    // clip-to-nothing primitive, so what hides it is `blind` -- a count the
+    // draw commands consult. Do not "simplify" that back to a stack entry.
+    const gpa = testing.allocator;
+    for ([_]PathBackend{ .stencil, .slug }) |backend| {
+        var r = try Rendered.init(gpa, 40, 40, 1, .{ .path_backend = backend }, emptyClip);
+        defer r.deinit(gpa);
+
+        try testing.expectEqual(@as(u32, 1), r.stats.clips);
+        try testing.expectEqual(@as(u32, 0), r.stats.clips_dropped);
+        // Both fills are counted: the statistics say what the page held, and
+        // one of them being hidden is not a failure to draw it.
+        try testing.expectEqual(@as(u32, 2), r.stats.fills);
+        try testing.expect(r.stats.complete());
+
+        // Nothing of the clipped fill, above the half the second one covers.
+        try testing.expectApproxEqAbs(@as(f32, 0), r.ink(20, 10), 0.01);
+        try testing.expectApproxEqAbs(@as(f32, 0), r.ink(2, 2), 0.01);
+        // And the page is drawable again after the pop.
+        try testing.expectApproxEqAbs(@as(f32, 1), r.ink(20, 30), 0.01);
+    }
+
+    // The same through the recording sink, where "hidden" means the fill
+    // never becomes an instance -- so no later frame can draw it either.
+    var b: Builder = .init(gpa, .fromRect(0, 0, 40, 40));
+    errdefer b.deinit();
+    try emptyClip(&b);
+    var list = try b.finish();
+    defer list.deinit(gpa);
+
+    var scene: Scene = .{};
+    defer scene.deinit(gpa);
+    scene.reset(.{ 40, 40 });
+    const stats = try record(gpa, &scene, list, pageTransform(list.page, 1), .{});
+    try testing.expectEqual(@as(u32, 2), stats.fills);
+    try testing.expectEqual(@as(usize, 1), scene.instances.items.len);
+}
+
+test "a clip whose path has no area hides everything too" {
+    // One step along from the empty path: a dot and a zero-area line do have
+    // a subpath, so they are flattened and meshed like any other clip -- and
+    // the mesh comes out with no triangles, which is a clip that meets the
+    // page nowhere. Reading its bounds used to index an empty list and panic,
+    // and it is reached by `W n` on a path a producer left degenerate.
+    const gpa = testing.allocator;
+    const cases = [_]struct { name: []const u8, build: *const fn (*Builder) anyerror!void }{
+        .{ .name = "a dot", .build = struct {
+            fn build(b: *Builder) !void {
+                try b.moveTo(.{ .x = 5, .y = 5 });
+                try b.pushClip(.nonzero);
+                try clippedAwayThenNot(b);
+            }
+        }.build },
+        .{ .name = "a zero-area line", .build = struct {
+            fn build(b: *Builder) !void {
+                try b.moveTo(.{ .x = 5, .y = 5 });
+                try b.lineTo(.{ .x = 35, .y = 5 });
+                try b.closePath();
+                try b.pushClip(.nonzero);
+                try clippedAwayThenNot(b);
+            }
+        }.build },
+    };
+
+    for (cases) |case| {
+        for ([_]PathBackend{ .stencil, .slug }) |backend| {
+            var r = try Rendered.init(gpa, 40, 40, 1, .{ .path_backend = backend }, case.build);
+            defer r.deinit(gpa);
+            errdefer std.debug.print("{s}, {t}\n", .{ case.name, backend });
+
+            try testing.expectEqual(@as(u32, 1), r.stats.clips);
+            try testing.expectApproxEqAbs(@as(f32, 0), r.ink(20, 10), 0.01);
+            try testing.expectApproxEqAbs(@as(f32, 0), r.ink(2, 2), 0.01);
+            try testing.expectApproxEqAbs(@as(f32, 1), r.ink(20, 30), 0.01);
+        }
     }
 }
 

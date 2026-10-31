@@ -368,7 +368,11 @@ pub const Canvas = struct {
     /// outside the path there is no coverage, and outside the old box there
     /// was no clip. So a clip costs its own area and not the page's.
     pub fn pushClip(c: *Canvas, gpa: Allocator, m: Mesh, xform: Transform, rule: FillRule) Allocator.Error!void {
-        const want = Box.fromBounds(meshBounds(m, xform), c.clip_box);
+        // A mesh with no triangles -- a line, a dot, a subpath of two points
+        // -- has no cover quad, so there are no bounds to read: `meshBounds`
+        // would index an empty list. Such a path meets the page nowhere,
+        // which is the case immediately below.
+        const want: Box = if (m.isEmpty()) .{} else Box.fromBounds(meshBounds(m, xform), c.clip_box);
 
         try c.clip_stack.append(gpa, .{ .mask = c.clip, .box = c.clip_box });
         errdefer _ = c.clip_stack.pop();

@@ -1031,7 +1031,12 @@ fn escape(s: *State, op: u8) Face.Error!void {
             if (s.n >= 9) {
                 const y = s.y;
                 try s.curveTo(s.stack[0], s.stack[1], s.stack[2], s.stack[3], s.stack[4], 0);
-                try s.curveTo(s.stack[5], 0, s.stack[6], s.stack[7], s.stack[8], @as(f64, y) - @as(f64, s.y));
+                // The endpoint returns to the starting y, and `dy5` is a
+                // control delta `curveTo` has already accumulated by then, so
+                // it comes off the endpoint too -- as `flex1` does below.
+                // Assigning `s.y` after the call would repair the interpreter
+                // and leave the outline with the discontinuity in it.
+                try s.curveTo(s.stack[5], 0, s.stack[6], s.stack[7], s.stack[8], @as(f64, y) - @as(f64, s.y) - s.stack[7]);
                 s.y = y;
             }
             s.clear();
@@ -1389,6 +1394,59 @@ test "a charstring draws what it says" {
     try testing.expectEqual(@as(f32, 140), o.points.items[1].x);
     try testing.expectEqual(@as(f32, 140), o.points.items[2].y);
     try testing.expectEqual(Verb.close, o.verbs.items[o.verbs.items.len - 1]);
+}
+
+test "the flex operators end where the specification says they end" {
+    // `hflex1` used to end at `y + dy5`: it put the compensating delta on the
+    // endpoint without taking off the control delta `curveTo` had already
+    // accumulated, and then assigned `s.y` -- which repaired the interpreter
+    // and left the outline with a silent discontinuity in it. So the endpoint
+    // is asserted here, and so is the line after it, which is where the error
+    // used to show. The two siblings are in the same test because they are
+    // what the fix was checked against.
+    const gpa = testing.allocator;
+    var c: Cff = .{ .gpa = gpa, .data = &.{}, .charstrings = .{}, .gsubrs = .{}, .strings = .{} };
+
+    for ([_]struct { name: []const u8, code: []const u8, x: f32 }{
+        // 0 0 rmoveto  10 10 7 10 10 10 10 hflex  0 20 rlineto  endchar
+        .{ .name = "hflex", .x = 60, .code = &.{
+            139,      139,      21,
+            139 + 10, 139 + 10, 139 + 7,  139 + 10, 139 + 10, 139 + 10, 139 + 10, 12, 34,
+            139,      139 + 20, 5,
+            14,
+        } },
+        // 0 0 rmoveto  10 5 10 7 10 10 10 9 10 hflex1  0 20 rlineto  endchar
+        .{ .name = "hflex1", .x = 60, .code = &.{
+            139,      139,     21,
+            139 + 10, 139 + 5, 139 + 10, 139 + 7, 139 + 10, 139 + 10, 139 + 10, 139 + 9, 139 + 10, 12, 36,
+            139,      139 + 20, 5,
+            14,
+        } },
+        // The horizontal arm of flex1, which already subtracted both control
+        // deltas and is the model the fix followed.
+        .{ .name = "flex1", .x = 120, .code = &.{
+            139,      139,     21,
+            139 + 20, 139 + 5, 139 + 20, 139 - 5, 139 + 20, 139 + 5,
+            139 + 20, 139 - 5, 139 + 20, 139 + 5, 139 + 20, 12, 37,
+            139,      139 + 20, 5,
+            14,
+        } },
+    }) |case| {
+        var o: Outline = .{};
+        defer o.deinit(gpa);
+        o.reset(1000);
+        var s: State = .{ .cff = &c, .gpa = gpa, .out = &o, .lsubrs = .{} };
+        try run(&s, case.code, 0);
+
+        // Two curves of three points each after the move, then the line.
+        try testing.expectEqual(@as(usize, 8), o.points.items.len);
+        const end = o.points.items[6];
+        errdefer std.debug.print("{s} ended at ({d}, {d})\n", .{ case.name, end.x, end.y });
+        try testing.expectApproxEqAbs(@as(f32, 0), end.y, 1e-4);
+        try testing.expectApproxEqAbs(case.x, end.x, 1e-4);
+        // And the segment after it starts from there, not from the drift.
+        try testing.expectApproxEqAbs(@as(f32, 20), o.points.items[7].y, 1e-4);
+    }
 }
 
 test "a leading width argument is recognised by parity and dropped" {
