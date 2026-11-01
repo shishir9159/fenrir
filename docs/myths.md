@@ -42,6 +42,45 @@ Directory and identifier names are ASCII-folded (`gjoll`, `tyr`); diacritics
 live only in prose. Zig accepts UTF-8 identifiers; build systems, shells and
 filesystems on three platforms are less reliable about it.
 
+## What each one does
+
+Across a 400-document corpus every glyph on every first page is accounted
+for: drawn, blank, or an invisible OCR layer over a scan.
+
+- **Gjöll** reads the whole container and interprets all 73 content-stream
+  operators into a display list, including colour spaces, functions, form
+  XObjects, inline images, patterns, Type 3 glyphs and annotation appearance
+  streams.
+- **Gleipnir** draws paths two ways. Stencil-then-cover runs on the CPU and
+  models a GPU stencil buffer down to its eight-bit wraparound. The analytic
+  rasteriser computes coverage from the curves themselves, after Eric
+  Lengyel's [Slug](https://github.com/EricLengyel/Slug), on the CPU or the
+  GPU. On the GPU a page is a few draw calls and a zoom is a matrix, not a
+  re-render. Rects are a signed distance field: one instance format, one draw
+  call a frame.
+- **Týr** parses `glyf`, CFF/Type 2 and Type 1 itself; FreeType and
+  stb_truetype stay optional. A glyph's outline goes to the device once, in em
+  units, and each occurrence is a matrix naming it: one page of a paper is
+  3,805 glyphs from 5,683 curves rather than 121,651.
+- **Images** decode through Flate and the byte filters, and `/DCTDecode`
+  through a baseline JPEG decoder written for this. JPEG 2000, CCITT and JBIG2
+  are counted and skipped.
+- **Lyngvi** opens a window on Win32 or Wayland and loads Vulkan at run time
+  through hand-written bindings: no SDK, no headers, and no C linked by
+  default.
+- **Mímir** keeps, per document, the place (a page and how far down it in
+  points, so another zoom lands on the same line) and the marks, and keeps the
+  reader's settings. `-Dsqlite=false` builds a reader that forgets.
+- **Hliðskjálf** follows Vim: a buffer per document, windows as views onto
+  one, splits and tabpages. The cursor regroups glyphs into lines by position,
+  so `j` walks a two-column paper the way you read it. Marks belong to the
+  buffer, so every window on a document shows the same ones.
+- **Galdr** is Neovim's plugin model (`init.lua`, `plugins/`, a `fenrir`
+  table) in a sandbox with no files, no processes, and limits on memory and
+  time. Every registration and every suspended callback carries the plugin
+  that made it, and every event hands over the document it happened to, so a
+  handler writes where it was told to however long it takes to come back.
+
 ## Source layout
 
 ```
