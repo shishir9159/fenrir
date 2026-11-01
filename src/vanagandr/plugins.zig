@@ -295,12 +295,12 @@ const Headless = struct {
             }
         }.f,
         .document = struct {
-            fn f(_: *anyopaque) ?Host.Document {
+            fn f(_: *anyopaque, _: Host.Handle) ?Host.Document {
                 return null;
             }
         }.f,
         .page = struct {
-            fn f(_: *anyopaque) ?u32 {
+            fn f(_: *anyopaque, _: Host.Handle) ?u32 {
                 return null;
             }
         }.f,
@@ -323,32 +323,32 @@ const Headless = struct {
             }
         }.f,
         .cursor = struct {
-            fn f(_: *anyopaque) ?Host.Position {
+            fn f(_: *anyopaque, _: Host.Handle) ?Host.Position {
                 return null;
             }
         }.f,
         .selection = struct {
-            fn f(_: *anyopaque) ?[2]Host.Position {
+            fn f(_: *anyopaque, _: Host.Handle) ?[2]Host.Position {
                 return null;
             }
         }.f,
         .highlightCount = struct {
-            fn f(_: *anyopaque) usize {
+            fn f(_: *anyopaque, _: Host.Handle) usize {
                 return 0;
             }
         }.f,
         .highlightAt = struct {
-            fn f(_: *anyopaque, _: usize) ?Host.Highlight {
+            fn f(_: *anyopaque, _: Host.Handle, _: usize) ?Host.Highlight {
                 return null;
             }
         }.f,
         .addHighlight = struct {
-            fn f(_: *anyopaque, _: Host.Highlight) ?u64 {
+            fn f(_: *anyopaque, _: Host.Handle, _: Host.Highlight) ?u64 {
                 return null;
             }
         }.f,
         .removeHighlight = struct {
-            fn f(_: *anyopaque, _: u64) bool {
+            fn f(_: *anyopaque, _: Host.Handle, _: u64) bool {
                 return false;
             }
         }.f,

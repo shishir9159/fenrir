@@ -1266,11 +1266,29 @@ const Session = struct {
     mode_buf: [96]u8 = undefined,
     /// A highlight's colour as text, for the one `highlightAt` being answered.
     hex_buf: [7]u8 = undefined,
-    /// What events were last reported with, so that the three that are a
+    /// What events were last reported with, so that the ones that are a
     /// difference fire on a change and not on every frame.
+    ///
+    /// `reported_doc` is which document the reports are *about*: page and
+    /// selection are differences within one document, so a move to another
+    /// is `DocEnter` and a new baseline rather than a page that appears to
+    /// have changed. `reported_window` is the same question for a window,
+    /// because two windows on one document are at two scrolls and the
+    /// baseline is the focused one's.
+    reported_doc: galdr.Host.Handle = galdr.Host.focused,
+    reported_window: u32 = std.math.maxInt(u32),
     reported_page: u32 = std.math.maxInt(u32),
     reported_mode: keys.Mode = .normal,
     reported_selection: ?[2]galdr.Host.Position = null,
+
+    /// What each open document is called from Lua, in `buffers`' order.
+    ///
+    /// Beside the list rather than on `Buffer`: a handle is what the plugin
+    /// API needs and a buffer is Hlidskjalf's, which knows nothing about
+    /// plugins. Handed out once each and never reused, so a handle a
+    /// handler kept over a yield names its own document or names nothing.
+    doc_handles: std.ArrayList(galdr.Host.Handle) = .empty,
+    next_doc_handle: galdr.Host.Handle = 0,
 
     slots: [cache_slots]Slot = @splat(.{}),
     stamp: u64 = 0,
@@ -1361,6 +1379,7 @@ const Session = struct {
         s.stroking.deinit(s.gpa);
         s.rows.deinit(s.gpa);
         s.palette_rows.deinit(s.gpa);
+        s.doc_handles.deinit(s.gpa);
         s.rail_left.deinit(s.gpa);
         s.rail_right.deinit(s.gpa);
         s.plugin_settings.deinit(s.gpa);
@@ -1410,6 +1429,9 @@ const Session = struct {
             .outline = fenrir.outline.all(doc, pages) catch &.{},
         });
 
+        s.next_doc_handle += 1;
+        try s.doc_handles.append(gpa, s.next_doc_handle);
+
         const id: u32 = @intCast(s.buffers.items.len - 1);
         s.loadMarks(id);
         return id;
@@ -1417,6 +1439,41 @@ const Session = struct {
 
     fn buffer(s: *Session, index: u32) *Buffer {
         return &s.buffers.items[index];
+    }
+
+    /// What a plugin calls the document in this buffer.
+    fn handleOf(s: *Session, index: u32) galdr.Host.Handle {
+        if (index >= s.doc_handles.items.len) return galdr.Host.focused;
+        return s.doc_handles.items[index];
+    }
+
+    /// Which buffer a handle names, or the focused window's for `focused`.
+    /// Null for a handle whose document is not open, which is what stops a
+    /// suspended handler writing on whatever is in front now.
+    fn bufferFor(s: *Session, doc: galdr.Host.Handle) ?u32 {
+        if (s.buffers.items.len == 0) return null;
+        if (doc == galdr.Host.focused) return s.view().buffer;
+        for (s.doc_handles.items, 0..) |h, i| {
+            if (h == doc) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// A window showing that document: the focused one when it is showing
+    /// it, and otherwise the first that is.
+    ///
+    /// Page, cursor and selection are a window's and a handle names a
+    /// document, so two windows on one file have to be resolved somehow.
+    /// The focused one first, because that is the one a person means.
+    fn viewFor(s: *Session, doc: galdr.Host.Handle) ?*View {
+        const want = s.bufferFor(doc) orelse return null;
+        const focused = s.view();
+        if (focused.buffer == want) return focused;
+        var it = s.layout().iterator();
+        while (it.next()) |v| {
+            if (v.buffer == want) return v;
+        }
+        return null;
     }
 
     /// The tabpage on screen. Every window command means this one.
@@ -2099,6 +2156,7 @@ const Session = struct {
         const rt = s.plugins orelse return;
         rt.emit(.{
             .event = .PageRender,
+            .doc = s.handleOf(job.buffer),
             .path = s.buffer(job.buffer).path,
             .data = .{ .page = job.page + 1 },
         });
@@ -3196,7 +3254,7 @@ const Session = struct {
     /// after the commands, so that a burst of edits is written as it settles
     /// rather than one statement per keystroke inside the handler.
     fn applyEffects(s: *Session) void {
-        for (s.buffers.items) |*b| {
+        for (s.buffers.items, 0..) |*b, at| {
             if (b.marks.takeEffects().len == 0) continue;
 
             // Taken out of the buffer before anything is told about them: a
@@ -3208,7 +3266,7 @@ const Session = struct {
 
             for (effects) |e| {
                 s.writeEffect(b, e);
-                s.announceEffect(b, e);
+                s.announceEffect(@intCast(at), b, e);
             }
         }
     }
@@ -3261,7 +3319,7 @@ const Session = struct {
         }
     }
 
-    fn announceEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
+    fn announceEffect(s: *Session, at: u32, b: *Buffer, e: Marks.Effect) void {
         const rt = s.plugins orelse return;
         // Three events rather than one with an `action` field: a plugin that
         // only cares about a highlight being made should not have to be told
@@ -3272,7 +3330,7 @@ const Session = struct {
             .delete => |m| .{ .AnnotationRemove, m },
         };
         var hex: [7]u8 = undefined;
-        rt.emit(.{ .event = event, .path = b.path, .data = .{ .highlight = .{
+        rt.emit(.{ .event = event, .doc = s.handleOf(at), .path = b.path, .data = .{ .highlight = .{
             .id = mark.key,
             .page = mark.page + 1,
             .x0 = mark.box.min_x,
@@ -3336,8 +3394,10 @@ const Session = struct {
             for (rt.messages.items) |m| s.ctx.note("{s}", .{m});
         }
 
-        for (s.buffers.items) |b| {
-            rt.emit(.{ .event = .DocOpen, .path = b.path, .data = .{ .document = .{
+        for (s.buffers.items, 0..) |b, at| {
+            const doc = s.handleOf(@intCast(at));
+            rt.emit(.{ .event = .DocOpen, .doc = doc, .path = b.path, .data = .{ .document = .{
+                .handle = doc,
                 .path = b.path,
                 .title = b.title,
                 .pages = @intCast(b.pages.len),
@@ -3815,15 +3875,21 @@ const Session = struct {
         return hostSession(ptr).execFrom(line, .plugin);
     }
 
-    fn hostDocument(ptr: *anyopaque) ?galdr.Host.Document {
+    fn hostDocument(ptr: *anyopaque, doc: galdr.Host.Handle) ?galdr.Host.Document {
         const s = hostSession(ptr);
-        if (s.buffers.items.len == 0) return null;
-        const b = s.buffer(s.view().buffer);
-        return .{ .path = b.path, .title = b.title, .pages = @intCast(b.pages.len) };
+        const at = s.bufferFor(doc) orelse return null;
+        const b = s.buffer(at);
+        return .{
+            .handle = s.handleOf(at),
+            .path = b.path,
+            .title = b.title,
+            .pages = @intCast(b.pages.len),
+        };
     }
 
-    fn hostPage(ptr: *anyopaque) ?u32 {
-        return hostSession(ptr).view().currentPage() + 1;
+    fn hostPage(ptr: *anyopaque, doc: galdr.Host.Handle) ?u32 {
+        const v = hostSession(ptr).viewFor(doc) orelse return null;
+        return v.currentPage() + 1;
     }
 
     fn hostGoTo(ptr: *anyopaque, page: u32, offset: f32) bool {
@@ -3851,15 +3917,15 @@ const Session = struct {
         return .{ .page = p.page + 1, .line = p.line + 1, .column = p.column + 1 };
     }
 
-    fn hostCursor(ptr: *anyopaque) ?galdr.Host.Position {
-        const v = hostSession(ptr).view();
+    fn hostCursor(ptr: *anyopaque, doc: galdr.Host.Handle) ?galdr.Host.Position {
+        const v = hostSession(ptr).viewFor(doc) orelse return null;
         if (!v.cursor.visible) return null;
         return fromOne(v.cursor.position());
     }
 
-    fn hostSelection(ptr: *anyopaque) ?[2]galdr.Host.Position {
+    fn hostSelection(ptr: *anyopaque, doc: galdr.Host.Handle) ?[2]galdr.Host.Position {
         const s = hostSession(ptr);
-        return s.hostSelectionOf(s.view());
+        return s.hostSelectionOf(s.viewFor(doc) orelse return null);
     }
 
     /// What a plugin sees selected in a window, in its numbering.
@@ -3873,14 +3939,16 @@ const Session = struct {
         return .{ fromOne(sel[0]), fromOne(sel[1]) };
     }
 
-    fn hostHighlightCount(ptr: *anyopaque) usize {
+    fn hostHighlightCount(ptr: *anyopaque, doc: galdr.Host.Handle) usize {
         const s = hostSession(ptr);
-        return s.buffer(s.view().buffer).marks.count();
+        const at = s.bufferFor(doc) orelse return 0;
+        return s.buffer(at).marks.count();
     }
 
-    fn hostHighlightAt(ptr: *anyopaque, index: usize) ?galdr.Host.Highlight {
+    fn hostHighlightAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host.Highlight {
         const s = hostSession(ptr);
-        const marks = s.buffer(s.view().buffer).marks.items();
+        const at = s.bufferFor(doc) orelse return null;
+        const marks = s.buffer(at).marks.items();
         if (index >= marks.len) return null;
         const m = marks[index];
         return .{
@@ -3898,11 +3966,11 @@ const Session = struct {
         };
     }
 
-    fn hostAddHighlight(ptr: *anyopaque, h: galdr.Host.Highlight) ?u64 {
+    fn hostAddHighlight(ptr: *anyopaque, doc: galdr.Host.Handle, h: galdr.Host.Highlight) ?u64 {
         const s = hostSession(ptr);
-        const v = s.view();
-        if (h.page < 1 or h.page > v.pages.len) return null;
-        const b = s.buffer(v.buffer);
+        const at = s.bufferFor(doc) orelse return null;
+        const b = s.buffer(at);
+        if (h.page < 1 or h.page > b.pages.len) return null;
         const color = if (h.color.len == 0) s.highlight else Library.parseColor(h.color) orelse s.highlight;
 
         b.marks.beginGroup();
@@ -3916,9 +3984,14 @@ const Session = struct {
         return b.marks.items()[index].key;
     }
 
-    fn hostRemoveHighlight(ptr: *anyopaque, id: u64) bool {
+    /// Against the document the caller named, which is the half of this
+    /// that matters: `Marks.next_key` starts at 1 in every document, so an
+    /// id saved from A and removed against "whatever is focused now" takes
+    /// an unrelated mark out of an unrelated file.
+    fn hostRemoveHighlight(ptr: *anyopaque, doc: galdr.Host.Handle, id: u64) bool {
         const s = hostSession(ptr);
-        const b = s.buffer(s.view().buffer);
+        const at = s.bufferFor(doc) orelse return false;
+        const b = s.buffer(at);
         const index = b.marks.indexOf(id) orelse return false;
         b.marks.beginGroup();
         defer b.marks.beginGroup();
@@ -4058,22 +4131,39 @@ const Session = struct {
         return c.grabbing();
     }
 
-    /// Fires the three events that are a difference rather than an act, when
+    /// Fires the events that are a difference rather than an act, when
     /// either half of the difference has moved since it was last reported.
     fn reportChanges(s: *Session) void {
         const rt = s.plugins orelse return;
         if (s.buffers.items.len == 0) return;
         const v = s.view();
+        const doc = s.handleOf(v.buffer);
         const path = s.buffer(v.buffer).path;
+
+        // Which document is in front is its own event, and it comes first.
+        // Page and selection are differences *within* a document: moving
+        // between two files that are open at the same page with the same
+        // selection moves neither of them, so a panel that followed the
+        // person by watching those two was left showing the file before.
+        // Entering re-bases both rather than reporting them as changes,
+        // which is the same reason: they did not change, the document did.
+        const window = (@as(u32, s.tabs.active) << 16) | s.layout().currentIndex();
+        if (doc != s.reported_doc or window != s.reported_window) {
+            s.reported_doc = doc;
+            s.reported_window = window;
+            s.reported_page = v.currentPage();
+            s.reported_selection = s.hostSelectionOf(v);
+            rt.emit(.{ .event = .DocEnter, .doc = doc, .path = path });
+        }
 
         const page = v.currentPage();
         if (page != s.reported_page) {
             s.reported_page = page;
-            rt.emit(.{ .event = .PageChanged, .path = path, .data = .{ .page = page + 1 } });
+            rt.emit(.{ .event = .PageChanged, .doc = doc, .path = path, .data = .{ .page = page + 1 } });
         }
         if (s.keymap.mode != s.reported_mode) {
             s.reported_mode = s.keymap.mode;
-            rt.emit(.{ .event = .ModeChanged, .path = path, .data = .{ .mode = @tagName(s.keymap.mode) } });
+            rt.emit(.{ .event = .ModeChanged, .doc = doc, .path = path, .data = .{ .mode = @tagName(s.keymap.mode) } });
         }
         // The selection is read out of the view rather than kept beside it:
         // it moves with a key, with a drag and with a command, and a flag set
@@ -4081,7 +4171,7 @@ const Session = struct {
         const selection = s.hostSelectionOf(v);
         if (!std.meta.eql(selection, s.reported_selection)) {
             s.reported_selection = selection;
-            rt.emit(.{ .event = .SelectionChanged, .path = path, .data = .{ .selection = selection } });
+            rt.emit(.{ .event = .SelectionChanged, .doc = doc, .path = path, .data = .{ .selection = selection } });
         }
     }
 
@@ -6060,7 +6150,11 @@ const Session = struct {
         // Before the place is written, so a plugin that moves on `quit` is
         // remembered where it left the reader.
         if (s.plugins) |rt| {
-            rt.emit(.{ .event = .Quit, .path = s.buffer(s.view().buffer).path });
+            rt.emit(.{
+                .event = .Quit,
+                .doc = s.handleOf(s.view().buffer),
+                .path = s.buffer(s.view().buffer).path,
+            });
             s.applyEffects();
         }
         s.rememberAll();
@@ -6176,6 +6270,8 @@ fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !S
         .title = "a.pdf",
         .pages = pages,
     });
+    s.next_doc_handle += 1;
+    try s.doc_handles.append(gpa, s.next_doc_handle);
     try s.tabs.init(gpa, .{ .buffer = 0, .pages = pages, .zoom = zoom });
     s.tabs.arrange(.fromRect(0, 0, w, h));
     return s;
@@ -6187,6 +6283,7 @@ fn closeSession(s: *Session) void {
     s.stroking.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.palette_rows.deinit(s.gpa);
+    s.doc_handles.deinit(s.gpa);
     s.rail_left.deinit(s.gpa);
     s.rail_right.deinit(s.gpa);
     s.plugin_settings.deinit(s.gpa);
@@ -7334,11 +7431,18 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
         \\fenrir.on("AnnotationAdd", note)
         \\fenrir.on("AnnotationRemove", note)
         \\fenrir.on("PageChanged", function(e) last_page = e.page end)
+        \\fenrir.on("DocEnter", function(e) entered = (entered or 0) + 1 end)
         \\fenrir.keymap("n", "g", function() fenrir.go(fenrir.document().pages) end)
         \\fenrir.command("Mark", function(args)
         \\  fenrir.highlight{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", note = "from lua" }
         \\end)
     ));
+
+    // The first report, as the reader makes it once the window is up: it
+    // says which document is in front and sets the baseline that the
+    // differences are measured against.
+    s.reportChanges();
+    try testing.expect(s.exec("lua assert(entered == 1, tostring(entered))"));
 
     // The binding, through the keymap, as a key press would reach it.
     const out = keys.commandWith(&s.keymap, .{ .events = &.{.{ .text = "g" }} }, rt.lookup());
@@ -7397,6 +7501,53 @@ test "a plugin's exec runs a command and not the console's lua" {
     try testing.expect(rt.runString("split", "fenrir.exec('vsplit')"));
     try testing.expect(s.exec("lua direct = true"));
     try testing.expect(rt.runString("check", "assert(direct == true)"));
+}
+
+test "moving between two documents at the same place still says so" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // A second document, open at the same page with the same selection:
+    // `PageChanged` and `SelectionChanged` are differences *within* a
+    // document and neither of them moves, so before `DocEnter` a panel
+    // following the focused file was left showing the first one.
+    try s.buffers.append(gpa, .{
+        .path = try gpa.dupe(u8, "/docs/b.pdf"),
+        .title = "b.pdf",
+        .pages = s.buffer(0).pages,
+    });
+    s.next_doc_handle += 1;
+    try s.doc_handles.append(gpa, s.next_doc_handle);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    s.plugins = rt;
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    try testing.expect(rt.runString("init.lua",
+        \\seen, pages = {}, 0
+        \\fenrir.on("DocEnter", function(e) seen[#seen + 1] = e.path end)
+        \\fenrir.on("PageChanged", function() pages = pages + 1 end)
+    ));
+
+    s.reportChanges();
+    s.showBuffer(1);
+    s.reportChanges();
+    s.showBuffer(-1);
+    s.reportChanges();
+
+    try testing.expect(rt.runString("check",
+        \\assert(#seen == 3, #seen)
+        \\assert(seen[2]:find("b.pdf", 1, true), seen[2])
+        \\assert(seen[3]:find("a.pdf", 1, true), seen[3])
+        \\assert(pages == 0, "entering a document reported a page that did not change")
+    ));
+    try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
 }
 
 test "a press in text moves the caret there and a drag carries it along" {

@@ -24,9 +24,20 @@ const Host = @This();
 ptr: *anyopaque,
 vtable: *const VTable,
 
+/// What a script holds a document by.
+///
+/// Not an index into anything: a number the host hands out once and never
+/// hands out again, so a handle kept across a yield either names the
+/// document it was taken from or names nothing. `focused` is the one
+/// exception -- "whichever window has the focus now" -- which is right for a
+/// key binding and wrong for anything that suspends.
+pub const Handle = u64;
+pub const focused: Handle = 0;
+
 /// A document, as a script sees it. Pages are numbered from 1 here and
 /// everywhere else in the Lua API, as a person numbers them.
 pub const Document = struct {
+    handle: Handle = focused,
     path: []const u8,
     title: []const u8,
     pages: u32,
@@ -72,21 +83,27 @@ pub const VTable = struct {
     /// such command or it failed; the host has already said why.
     exec: *const fn (ptr: *anyopaque, line: []const u8) bool,
 
-    document: *const fn (ptr: *anyopaque) ?Document,
-    page: *const fn (ptr: *anyopaque) ?u32,
+    /// Every one of these takes the document it is about. `focused` means
+    /// whichever window has the focus when the call is made; any other value
+    /// is a handle, and a handle whose document has closed answers null or
+    /// false rather than finding whatever is in front now.
+    document: *const fn (ptr: *anyopaque, doc: Handle) ?Document,
+    page: *const fn (ptr: *anyopaque, doc: Handle) ?u32,
     /// Scrolls the focused window to a page, and `offset` points down it.
+    /// Focus-following on purpose: moving the view is the interactive act,
+    /// so it means the window the person is looking at.
     goTo: *const fn (ptr: *anyopaque, page: u32, offset: f32) bool,
     /// The zoom as the title bar shows it: a percentage of true size.
     zoom: *const fn (ptr: *anyopaque) ?f32,
     setZoom: *const fn (ptr: *anyopaque, percent: f32) void,
     mode: *const fn (ptr: *anyopaque) []const u8,
-    cursor: *const fn (ptr: *anyopaque) ?Position,
-    selection: *const fn (ptr: *anyopaque) ?[2]Position,
+    cursor: *const fn (ptr: *anyopaque, doc: Handle) ?Position,
+    selection: *const fn (ptr: *anyopaque, doc: Handle) ?[2]Position,
 
-    highlightCount: *const fn (ptr: *anyopaque) usize,
-    highlightAt: *const fn (ptr: *anyopaque, index: usize) ?Highlight,
-    addHighlight: *const fn (ptr: *anyopaque, h: Highlight) ?u64,
-    removeHighlight: *const fn (ptr: *anyopaque, id: u64) bool,
+    highlightCount: *const fn (ptr: *anyopaque, doc: Handle) usize,
+    highlightAt: *const fn (ptr: *anyopaque, doc: Handle, index: usize) ?Highlight,
+    addHighlight: *const fn (ptr: *anyopaque, doc: Handle, h: Highlight) ?u64,
+    removeHighlight: *const fn (ptr: *anyopaque, doc: Handle, id: u64) bool,
 
     /// A plugin's persistent value, or null. The caller owns the result and
     /// frees it with `gpa`.
@@ -114,12 +131,18 @@ pub fn exec(h: Host, line: []const u8) bool {
     return h.vtable.exec(h.ptr, line);
 }
 
-pub fn document(h: Host) ?Document {
-    return h.vtable.document(h.ptr);
+pub fn document(h: Host, doc: Handle) ?Document {
+    return h.vtable.document(h.ptr, doc);
 }
 
-pub fn page(h: Host) ?u32 {
-    return h.vtable.page(h.ptr);
+pub fn page(h: Host, doc: Handle) ?u32 {
+    return h.vtable.page(h.ptr, doc);
+}
+
+/// Whether a handle still names an open document. `focused` answers true
+/// while anything is open at all.
+pub fn open(h: Host, doc: Handle) bool {
+    return h.vtable.document(h.ptr, doc) != null;
 }
 
 pub fn goTo(h: Host, p: u32, offset: f32) bool {
@@ -138,28 +161,28 @@ pub fn mode(h: Host) []const u8 {
     return h.vtable.mode(h.ptr);
 }
 
-pub fn cursor(h: Host) ?Position {
-    return h.vtable.cursor(h.ptr);
+pub fn cursor(h: Host, doc: Handle) ?Position {
+    return h.vtable.cursor(h.ptr, doc);
 }
 
-pub fn selection(h: Host) ?[2]Position {
-    return h.vtable.selection(h.ptr);
+pub fn selection(h: Host, doc: Handle) ?[2]Position {
+    return h.vtable.selection(h.ptr, doc);
 }
 
-pub fn highlightCount(h: Host) usize {
-    return h.vtable.highlightCount(h.ptr);
+pub fn highlightCount(h: Host, doc: Handle) usize {
+    return h.vtable.highlightCount(h.ptr, doc);
 }
 
-pub fn highlightAt(h: Host, index: usize) ?Highlight {
-    return h.vtable.highlightAt(h.ptr, index);
+pub fn highlightAt(h: Host, doc: Handle, index: usize) ?Highlight {
+    return h.vtable.highlightAt(h.ptr, doc, index);
 }
 
-pub fn addHighlight(h: Host, hl: Highlight) ?u64 {
-    return h.vtable.addHighlight(h.ptr, hl);
+pub fn addHighlight(h: Host, doc: Handle, hl: Highlight) ?u64 {
+    return h.vtable.addHighlight(h.ptr, doc, hl);
 }
 
-pub fn removeHighlight(h: Host, id: u64) bool {
-    return h.vtable.removeHighlight(h.ptr, id);
+pub fn removeHighlight(h: Host, doc: Handle, id: u64) bool {
+    return h.vtable.removeHighlight(h.ptr, doc, id);
 }
 
 pub fn storeGet(h: Host, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {

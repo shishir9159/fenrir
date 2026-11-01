@@ -347,12 +347,12 @@ const Headless = struct {
             }
         }.f,
         .document = struct {
-            fn f(_: *anyopaque) ?galdr.Host.Document {
+            fn f(_: *anyopaque, _: galdr.Host.Handle) ?galdr.Host.Document {
                 return null;
             }
         }.f,
         .page = struct {
-            fn f(_: *anyopaque) ?u32 {
+            fn f(_: *anyopaque, _: galdr.Host.Handle) ?u32 {
                 return null;
             }
         }.f,
@@ -375,32 +375,32 @@ const Headless = struct {
             }
         }.f,
         .cursor = struct {
-            fn f(_: *anyopaque) ?galdr.Host.Position {
+            fn f(_: *anyopaque, _: galdr.Host.Handle) ?galdr.Host.Position {
                 return null;
             }
         }.f,
         .selection = struct {
-            fn f(_: *anyopaque) ?[2]galdr.Host.Position {
+            fn f(_: *anyopaque, _: galdr.Host.Handle) ?[2]galdr.Host.Position {
                 return null;
             }
         }.f,
         .highlightCount = struct {
-            fn f(_: *anyopaque) usize {
+            fn f(_: *anyopaque, _: galdr.Host.Handle) usize {
                 return 0;
             }
         }.f,
         .highlightAt = struct {
-            fn f(_: *anyopaque, _: usize) ?galdr.Host.Highlight {
+            fn f(_: *anyopaque, _: galdr.Host.Handle, _: usize) ?galdr.Host.Highlight {
                 return null;
             }
         }.f,
         .addHighlight = struct {
-            fn f(_: *anyopaque, _: galdr.Host.Highlight) ?u64 {
+            fn f(_: *anyopaque, _: galdr.Host.Handle, _: galdr.Host.Highlight) ?u64 {
                 return null;
             }
         }.f,
         .removeHighlight = struct {
-            fn f(_: *anyopaque, _: u64) bool {
+            fn f(_: *anyopaque, _: galdr.Host.Handle, _: u64) bool {
                 return false;
             }
         }.f,

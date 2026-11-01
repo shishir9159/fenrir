@@ -91,8 +91,16 @@ const Runtime = @This();
 pub const Event = enum {
     /// Every plugin is loaded and the window is open.
     Start,
-    /// A document was opened. `{path, title, pages}`.
+    /// A document was opened. `{doc, path, title, pages}`.
     DocOpen,
+    /// A document or a view took the focus. `{doc, path}`.
+    ///
+    /// The one to listen on to follow the person. `PageChanged` and
+    /// `SelectionChanged` are differences *within* a document, so moving
+    /// between two documents open at the same page with the same selection
+    /// moves neither -- and a panel that tracked the focused document by
+    /// those two was left showing the one before.
+    DocEnter,
     /// The focused window's current page changed. `{page}`, from 1.
     PageChanged,
     /// The mode changed. `{mode}`: "normal", "visual", "edit", ...
@@ -155,6 +163,15 @@ pub const Data = union(enum) {
 /// matches.
 pub const Payload = struct {
     event: Event,
+    /// The document it happened to, as a handle the handler may keep.
+    ///
+    /// A path is what a pattern matches and is not an address: two windows
+    /// can show one file, a handler may yield and come back to find the
+    /// focus elsewhere, and mark ids start from 1 in every document, so a
+    /// removal resolved against "the focused view" on resume takes an
+    /// unrelated mark out of an unrelated file. `focused` for the events
+    /// that are the reader's rather than a document's.
+    doc: Host.Handle = Host.focused,
     path: []const u8 = "",
     data: Data = .none,
 };
@@ -1068,21 +1085,21 @@ pub const api = [_]Entry{
     },
     .{ .name = "refresh", .func = apiRefresh, .cap = .ui, .about = "the lists this plugin declared are out of date" },
 
-    .{ .name = "document", .func = apiDocument, .cap = .document_read, .returns = "{ path, title, pages }", .about = "the document in the focused window, or nil" },
-    .{ .name = "page", .func = apiPage, .cap = .document_read, .returns = "n", .about = "the page it is showing, from 1" },
-    .{ .name = "cursor", .func = apiCursor, .cap = .document_read, .returns = "{ page, line, column }", .about = "where the caret is, or nil" },
-    .{ .name = "selection", .func = apiSelection, .cap = .document_read, .returns = "{ from, to }", .about = "what is selected, either way it was made, or nil" },
-    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read, .returns = "list", .about = "every mark in the focused document; kind is \"block\" or \"ink\"" },
+    .{ .name = "document", .func = apiDocument, .cap = .document_read, .args = "(doc)", .returns = "{ doc, path, title, pages }", .about = "a document by handle, or the focused one, or nil" },
+    .{ .name = "page", .func = apiPage, .cap = .document_read, .args = "(doc)", .returns = "n", .about = "the page it is showing, from 1" },
+    .{ .name = "cursor", .func = apiCursor, .cap = .document_read, .args = "(doc)", .returns = "{ page, line, column }", .about = "where the caret is, or nil" },
+    .{ .name = "selection", .func = apiSelection, .cap = .document_read, .args = "(doc)", .returns = "{ from, to }", .about = "what is selected, either way it was made, or nil" },
+    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read, .args = "(doc)", .returns = "list", .about = "every mark in a document; kind is \"block\" or \"ink\"" },
 
     .{
         .name = "highlight",
         .func = apiHighlight,
         .cap = .document_write,
-        .args = "{ page =, x0 =, y0 =, x1 =, y1 =, color =, note = }",
+        .args = "{ doc =, page =, x0 =, y0 =, x1 =, y1 =, color =, note = }",
         .returns = "id",
         .about = "makes one, in PDF points, so it survives zoom and reopening",
     },
-    .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write, .args = "(id)", .returns = "ok", .about = "removes one, by the id fenrir.highlight gave back" },
+    .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write, .args = "(id, doc)", .returns = "ok", .about = "removes one, by the id fenrir.highlight gave back" },
 };
 
 /// `fenrir.store`, which every plugin has: its own key space in the library,
@@ -1813,6 +1830,13 @@ fn pushPayload(L: ?*lua.State, payload: Payload) void {
     lua.lua_setfield(L, -2, "event");
     lua.pushString(L, payload.path);
     lua.lua_setfield(L, -2, "path");
+    // The handle, for the events that have one. A handler that keeps it can
+    // read and write the document it was told about however long it takes
+    // to come back to it.
+    if (payload.doc != Host.focused) {
+        lua.lua_pushinteger(L, @bitCast(payload.doc));
+        lua.lua_setfield(L, -2, "doc");
+    }
 
     switch (payload.data) {
         .none => {},
@@ -2045,6 +2069,26 @@ pub fn runRail(rt: *Runtime, id: u32) void {
 }
 
 // -- the fenrir table ---------------------------------------------------------
+
+/// The document an argument names: a handle an event gave the plugin, or
+/// the focused one when it gave none.
+///
+/// A handle whose document has closed is an error and never a quiet fall
+/// back to whatever is in front now. That is the whole of what a handle
+/// buys: the difference between a handler writing on the file it was told
+/// about and a handler writing on the file the person happens to have
+/// moved to while it was suspended.
+fn checkDoc(L: ?*lua.State, arg: c_int) Host.Handle {
+    switch (lua.typeOf(L, arg)) {
+        .nil, .none => return Host.focused,
+        else => {},
+    }
+    const given = lua.luaL_checkinteger(L, arg);
+    if (given <= 0) lua.raise(L, "galdr: a document handle is the one an event gave you");
+    const doc: Host.Handle = @bitCast(given);
+    if (!of(L).host.open(doc)) lua.raise(L, "galdr: that document is not open any more");
+    return doc;
+}
 
 /// A store key: short, and made of the characters a namespaced key can be
 /// built from without one key reaching into another's.
@@ -2800,7 +2844,9 @@ fn apiUnrail(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn pushDocument(L: ?*lua.State, d: Host.Document) void {
-    lua.lua_createtable(L, 0, 3);
+    lua.lua_createtable(L, 0, 4);
+    lua.lua_pushinteger(L, @bitCast(d.handle));
+    lua.lua_setfield(L, -2, "doc");
     lua.pushString(L, d.path);
     lua.lua_setfield(L, -2, "path");
     lua.pushString(L, d.title);
@@ -2811,7 +2857,8 @@ fn pushDocument(L: ?*lua.State, d: Host.Document) void {
 
 fn apiDocument(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
-    const d = of(L).host.document() orelse {
+    const doc = checkDoc(L, 1);
+    const d = of(L).host.document(doc) orelse {
         lua.lua_pushnil(L);
         return 1;
     };
@@ -2821,7 +2868,8 @@ fn apiDocument(L: ?*lua.State) callconv(.c) c_int {
 
 fn apiPage(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
-    if (of(L).host.page()) |p| lua.lua_pushinteger(L, p) else lua.lua_pushnil(L);
+    const doc = checkDoc(L, 1);
+    if (of(L).host.page(doc)) |p| lua.lua_pushinteger(L, p) else lua.lua_pushnil(L);
     return 1;
 }
 
@@ -2867,13 +2915,15 @@ fn pushPosition(L: ?*lua.State, p: Host.Position) void {
 
 fn apiCursor(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
-    if (of(L).host.cursor()) |p| pushPosition(L, p) else lua.lua_pushnil(L);
+    const doc = checkDoc(L, 1);
+    if (of(L).host.cursor(doc)) |p| pushPosition(L, p) else lua.lua_pushnil(L);
     return 1;
 }
 
 fn apiSelection(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
-    const sel = of(L).host.selection() orelse {
+    const doc = checkDoc(L, 1);
+    const sel = of(L).host.selection(doc) orelse {
         lua.lua_pushnil(L);
         return 1;
     };
@@ -2912,13 +2962,14 @@ fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
 
 fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
+    const doc = checkDoc(L, 1);
     const rt = of(L);
-    const n = rt.host.highlightCount();
+    const n = rt.host.highlightCount(doc);
     lua.lua_createtable(L, @intCast(@min(n, 1 << 20)), 0);
     var i: usize = 0;
     var out: lua.Integer = 1;
     while (i < n) : (i += 1) {
-        const h = rt.host.highlightAt(i) orelse continue;
+        const h = rt.host.highlightAt(doc, i) orelse continue;
         pushHighlight(L, h);
         lua.lua_rawseti(L, -2, out);
         out += 1;
@@ -2932,6 +2983,12 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
     var h: Host.Highlight = .{ .page = 0, .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+
+    // Which document, before anything is read out of it: a handler that
+    // yielded and came back to another file writes where it was told to.
+    _ = lua.lua_getfield(L, 1, "doc");
+    const doc = checkDoc(L, -1);
+    lua.pop(L, 1);
 
     _ = lua.lua_getfield(L, 1, "page");
     const page = lua.lua_tointegerx(L, -1, null);
@@ -2954,14 +3011,21 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
     _ = lua.lua_getfield(L, 1, "note");
     h.note = lua.toString(L, -1) orelse "";
 
-    if (of(L).host.addHighlight(h)) |id| lua.lua_pushinteger(L, @intCast(id)) else lua.lua_pushnil(L);
+    if (of(L).host.addHighlight(doc, h)) |id| lua.lua_pushinteger(L, @intCast(id)) else lua.lua_pushnil(L);
     return 1;
 }
 
+/// `fenrir.unhighlight(id, doc)`.
+///
+/// The handle matters most here. Mark ids start from 1 in every document,
+/// so an id read from A and removed against whatever is focused now takes
+/// an unrelated mark out of an unrelated file -- which is a loss, not a
+/// mistake that can be seen and undone.
 fn apiUnhighlight(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     const id = lua.luaL_checkinteger(L, 1);
-    const removed = id > 0 and of(L).host.removeHighlight(@intCast(id));
+    const doc = checkDoc(L, 2);
+    const removed = id > 0 and of(L).host.removeHighlight(doc, @intCast(id));
     lua.lua_pushboolean(L, @intFromBool(removed));
     return 1;
 }
@@ -2997,17 +3061,33 @@ const testing = std.testing;
 
 /// A host made of fields: what a script asked for is written down, and what
 /// it reads comes from here.
+///
+/// Two documents' worth, because the questions this has to answer are about
+/// *which* document: a handler that yielded over A and came back while B had
+/// the focus, and a mark id that names one thing in each.
 const FakeHost = struct {
     notes: std.ArrayList([]u8) = .empty,
     execs: std.ArrayList([]u8) = .empty,
     files: []const [2][]const u8 = &.{},
     page_now: u32 = 3,
     zoom_now: f32 = 100,
-    highlights: std.ArrayList(Host.Highlight) = .empty,
-    next_key: u64 = 1,
+    docs: std.ArrayList(Doc) = .empty,
+    at: usize = 0,
+    next_handle: Host.Handle = 0,
     stored: std.ArrayList(Kept) = .empty,
 
-    /// One value a plugin kept, under the namespace the host gave it.
+    /// One open document. `next_key` starts at 1 in each, exactly as
+    /// `Marks` does, so a test that removes A's id against B removes
+    /// something.
+    const Doc = struct {
+        handle: Host.Handle,
+        path: []const u8,
+        title: []const u8,
+        pages: u32 = 12,
+        highlights: std.ArrayList(Host.Highlight) = .empty,
+        next_key: u64 = 1,
+    };
+
     const Kept = struct {
         space: []u8,
         key: []u8,
@@ -3020,13 +3100,53 @@ const FakeHost = struct {
         f.notes.deinit(gpa);
         for (f.execs.items) |n| gpa.free(n);
         f.execs.deinit(gpa);
-        f.highlights.deinit(gpa);
+        for (f.docs.items) |*d| d.highlights.deinit(gpa);
+        f.docs.deinit(gpa);
         for (f.stored.items) |k| {
             gpa.free(k.space);
             gpa.free(k.key);
             gpa.free(k.value);
         }
         f.stored.deinit(gpa);
+    }
+
+    fn open(f: *FakeHost, path: []const u8, title: []const u8) Host.Handle {
+        f.next_handle += 1;
+        f.docs.append(testing.allocator, .{
+            .handle = f.next_handle,
+            .path = path,
+            .title = title,
+        }) catch @panic("out of memory in a test host");
+        return f.next_handle;
+    }
+
+    /// Closes it, as a reader closing a tab would: the handle names nothing
+    /// from here on.
+    fn close(f: *FakeHost, doc: Host.Handle) void {
+        for (f.docs.items, 0..) |*d, i| {
+            if (d.handle != doc) continue;
+            d.highlights.deinit(testing.allocator);
+            _ = f.docs.orderedRemove(i);
+            if (f.at >= f.docs.items.len) f.at = 0;
+            return;
+        }
+    }
+
+    fn focus(f: *FakeHost, doc: Host.Handle) void {
+        for (f.docs.items, 0..) |d, i| {
+            if (d.handle == doc) f.at = i;
+        }
+    }
+
+    fn find(f: *FakeHost, doc: Host.Handle) ?*Doc {
+        if (doc == Host.focused) {
+            if (f.at >= f.docs.items.len) return null;
+            return &f.docs.items[f.at];
+        }
+        for (f.docs.items) |*d| {
+            if (d.handle == doc) return d;
+        }
+        return null;
     }
 
     fn value(f: *FakeHost, space: []const u8, key: []const u8) ?[]const u8 {
@@ -3057,13 +3177,16 @@ const FakeHost = struct {
             }
         }.f,
         .document = struct {
-            fn f(_: *anyopaque) ?Host.Document {
-                return .{ .path = "/docs/paper.pdf", .title = "paper.pdf", .pages = 12 };
+            fn f(ptr: *anyopaque, doc: Host.Handle) ?Host.Document {
+                const d = self(ptr).find(doc) orelse return null;
+                return .{ .handle = d.handle, .path = d.path, .title = d.title, .pages = d.pages };
             }
         }.f,
         .page = struct {
-            fn f(ptr: *anyopaque) ?u32 {
-                return self(ptr).page_now;
+            fn f(ptr: *anyopaque, doc: Host.Handle) ?u32 {
+                const fake = self(ptr);
+                if (fake.find(doc) == null) return null;
+                return fake.page_now;
             }
         }.f,
         .goTo = struct {
@@ -3088,46 +3211,48 @@ const FakeHost = struct {
             }
         }.f,
         .cursor = struct {
-            fn f(_: *anyopaque) ?Host.Position {
+            fn f(ptr: *anyopaque, doc: Host.Handle) ?Host.Position {
+                if (self(ptr).find(doc) == null) return null;
                 return .{ .page = 3, .line = 7, .column = 2 };
             }
         }.f,
         .selection = struct {
-            fn f(_: *anyopaque) ?[2]Host.Position {
+            fn f(_: *anyopaque, _: Host.Handle) ?[2]Host.Position {
                 return null;
             }
         }.f,
         .highlightCount = struct {
-            fn f(ptr: *anyopaque) usize {
-                return self(ptr).highlights.items.len;
+            fn f(ptr: *anyopaque, doc: Host.Handle) usize {
+                const d = self(ptr).find(doc) orelse return 0;
+                return d.highlights.items.len;
             }
         }.f,
         .highlightAt = struct {
-            fn f(ptr: *anyopaque, i: usize) ?Host.Highlight {
-                const hs = self(ptr).highlights.items;
-                return if (i < hs.len) hs[i] else null;
+            fn f(ptr: *anyopaque, doc: Host.Handle, i: usize) ?Host.Highlight {
+                const d = self(ptr).find(doc) orelse return null;
+                return if (i < d.highlights.items.len) d.highlights.items[i] else null;
             }
         }.f,
         .addHighlight = struct {
-            fn f(ptr: *anyopaque, h: Host.Highlight) ?u64 {
-                const fake = self(ptr);
+            fn f(ptr: *anyopaque, doc: Host.Handle, h: Host.Highlight) ?u64 {
+                const d = self(ptr).find(doc) orelse return null;
                 var copy = h;
-                copy.id = fake.next_key;
+                copy.id = d.next_key;
                 // Strings are borrowed from Lua for the length of the call;
                 // a real host copies them, and this one forgets them.
                 copy.color = "";
                 copy.note = "";
-                fake.highlights.append(testing.allocator, copy) catch return null;
-                fake.next_key += 1;
+                d.highlights.append(testing.allocator, copy) catch return null;
+                d.next_key += 1;
                 return copy.id;
             }
         }.f,
         .removeHighlight = struct {
-            fn f(ptr: *anyopaque, id: u64) bool {
-                const fake = self(ptr);
-                for (fake.highlights.items, 0..) |h, i| {
+            fn f(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
+                const d = self(ptr).find(doc) orelse return false;
+                for (d.highlights.items, 0..) |h, i| {
                     if (h.id != id) continue;
-                    _ = fake.highlights.orderedRemove(i);
+                    _ = d.highlights.orderedRemove(i);
                     return true;
                 }
                 return false;
@@ -3197,6 +3322,7 @@ const FakeHost = struct {
 };
 
 fn start(fake: *FakeHost) !*Runtime {
+    _ = fake.open("/docs/paper.pdf", "paper.pdf");
     return create(testing.allocator, fake.host(), .{});
 }
 
@@ -3945,6 +4071,81 @@ test "a capability taken away stops a function that was already captured" {
 
 // -- which document -----------------------------------------------------------
 
+test "a suspended handler reads and writes the document it was told about" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const a = fake.open("/a.pdf", "a.pdf");
+    const b = fake.open("/b.pdf", "b.pdf");
+    const rt = try create(testing.allocator, fake.host(), .{});
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.on("DocOpen", function(e)
+        \\  local doc = e.doc
+        \\  coroutine.yield()
+        \\  held = fenrir.document(doc).path
+        \\  loose = fenrir.document().path
+        \\  fenrir.highlight{ doc = doc, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
+        \\end)
+    ));
+    rt.emit(.{ .event = .DocOpen, .doc = a, .path = "/a.pdf", .data = .{ .document = .{
+        .handle = a,
+        .path = "/a.pdf",
+        .title = "a.pdf",
+        .pages = 3,
+    } } });
+    try testing.expectEqual(@as(usize, 1), rt.waiting());
+
+    // The person moved on while it was suspended.
+    fake.focus(b);
+    var frames: usize = 0;
+    while (rt.waiting() != 0 and frames < 100) : (frames += 1) rt.pump();
+
+    try testing.expect(rt.runString("check",
+        \\assert(held == "/a.pdf", tostring(held))
+        \\assert(loose == "/b.pdf", "the focus-following answer followed nothing")
+    ));
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].highlights.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[1].highlights.items.len);
+    try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
+}
+
+test "a mark id is removed from the document it belongs to, or from none" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const a = fake.open("/a.pdf", "a.pdf");
+    const b = fake.open("/b.pdf", "b.pdf");
+    const rt = try create(testing.allocator, fake.host(), .{});
+    defer rt.destroy();
+
+    // One mark in each, so that id 1 is live in both: `Marks.next_key`
+    // starts at 1 in every document, which is what makes a removal
+    // resolved against the wrong file take out something real.
+    var buf: [320]u8 = undefined;
+    try testing.expect(rt.runString("marks", try std.fmt.bufPrint(&buf,
+        \\A, B = {d}, {d}
+        \\a_id = fenrir.highlight{{ doc = A, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }}
+        \\b_id = fenrir.highlight{{ doc = B, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }}
+    , .{ a, b })));
+    try testing.expect(rt.runString("check", "assert(a_id == 1 and b_id == 1, a_id .. ' ' .. b_id)"));
+
+    // B has the focus and A's id is removed against A's handle: A's mark
+    // goes and B's, which has the same id, stays.
+    fake.focus(b);
+    try testing.expect(rt.runString("remove", "assert(fenrir.unhighlight(a_id, A))"));
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].highlights.items.len);
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[1].highlights.items.len);
+
+    // And a handle whose document has closed names nothing at all, rather
+    // than finding whatever is in front now.
+    fake.close(a);
+    try testing.expect(!rt.runString("stale", "fenrir.unhighlight(b_id, A)"));
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[rt.messages.items.len - 1], "not open") != null);
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].highlights.items.len);
+}
+
 // -- the limits ---------------------------------------------------------------
 
 test "removing a handler cancels the callback that is part way through" {
@@ -3975,7 +4176,7 @@ test "removing a handler cancels the callback that is part way through" {
 
     try testing.expectEqual(@as(usize, 0), rt.waiting());
     try testing.expect(rt.runString("check", "assert(wrote == nil, tostring(wrote))"));
-    try testing.expectEqual(@as(usize, 0), fake.highlights.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].highlights.items.len);
 
     // A new handler under the same name cannot bring the old job back.
     try testing.expect(rt.runString("again", "fenrir.on('Start', function() end, 'mine')"));
@@ -4079,7 +4280,7 @@ test "unloading a plugin takes everything of it, jobs included" {
     try testing.expectEqual(@as(?u32, 3), rt.unload("guest"));
     var frames: usize = 0;
     while (rt.waiting() != 0 and frames < 10) : (frames += 1) rt.pump();
-    try testing.expectEqual(@as(usize, 0), fake.highlights.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].highlights.items.len);
     try testing.expectEqual(@as(?bool, null), rt.runCommand("Guest", ""));
 
     // A built-in key the plugin had shadowed is the reader's again, and a

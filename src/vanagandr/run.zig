@@ -130,16 +130,24 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     const ok = rt.runPlugin(path, source);
 
     // The reader's order, so that a plugin that listens rather than doing its
-    // work at the top level runs the same way it would in a window.
+    // work at the top level runs the same way it would in a window. Each
+    // event carries that document's handle, so a handler that yields and is
+    // resumed after the focus has moved on still reads and writes the file
+    // it was told about.
     for (driver.documents.items, 0..) |d, index| {
         driver.at = index;
-        rt.emit(.{ .event = .DocOpen, .path = d.path, .data = .{ .document = .{
+        rt.emit(.{ .event = .DocOpen, .doc = d.handle, .path = d.path, .data = .{ .document = .{
+            .handle = d.handle,
             .path = d.path,
             .title = d.title,
             .pages = @intCast(d.pages.len),
         } } });
+        rt.emit(.{ .event = .DocEnter, .doc = d.handle, .path = d.path });
     }
     driver.at = 0;
+    if (driver.current()) |first| {
+        rt.emit(.{ .event = .DocEnter, .doc = first.handle, .path = first.path });
+    }
     rt.emit(.{ .event = .Start });
     driver.settle();
     rt.emit(.{ .event = .Quit, .path = driver.currentPath() });
@@ -154,6 +162,10 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
 
 /// One open document, and where the script is in it.
 const Open = struct {
+    /// What a script holds it by. Handed out once and never again, so a
+    /// handle a handler kept over a yield still names this document and
+    /// not whichever one came into focus meanwhile.
+    handle: Host.Handle,
     path: []const u8,
     title: []const u8,
     doc: *fenrir.Document,
@@ -173,8 +185,13 @@ const Driver = struct {
     runtime: ?*galdr.Runtime = null,
 
     documents: std.ArrayList(Open) = .empty,
+    next_handle: Host.Handle = 0,
     /// Which document is the focused one. A window has one; this has the
     /// first, until a plugin's handler is being told about another.
+    ///
+    /// Only what `focused` resolves to. Every event hands over a handle, so
+    /// a handler that yielded and came back reads and writes the document
+    /// it was told about rather than whichever one this happens to say now.
     at: usize = 0,
     /// Marks read for the document being asked about, so that `highlightAt`
     /// can answer by index the way the reader's does.
@@ -223,7 +240,9 @@ const Driver = struct {
             return ctx.fail("cannot open {s}: {t}", .{ file, err });
         };
         const pages = fenrir.pages.all(doc) catch &.{};
+        d.next_handle += 1;
         try d.documents.append(gpa, .{
+            .handle = d.next_handle,
             // The real path, which is the key `read` and `marks` use: a
             // script that keyed a document by what was typed would write
             // highlights neither of the others could ever find.
@@ -238,6 +257,17 @@ const Driver = struct {
     fn current(d: *Driver) ?*Open {
         if (d.at >= d.documents.items.len) return null;
         return &d.documents.items[d.at];
+    }
+
+    /// The document a handle names, or the focused one for `focused`. Null
+    /// for a handle whose document has gone, which the caller turns into
+    /// the error a script sees.
+    fn find(d: *Driver, doc: Host.Handle) ?*Open {
+        if (doc == Host.focused) return d.current();
+        for (d.documents.items) |*o| {
+            if (o.handle == doc) return o;
+        }
+        return null;
     }
 
     fn currentPath(d: *Driver) []const u8 {
@@ -309,12 +339,12 @@ const Driver = struct {
             }
         }.f,
         .cursor = struct {
-            fn f(_: *anyopaque) ?Host.Position {
+            fn f(_: *anyopaque, _: Host.Handle) ?Host.Position {
                 return null;
             }
         }.f,
         .selection = struct {
-            fn f(_: *anyopaque) ?[2]Host.Position {
+            fn f(_: *anyopaque, _: Host.Handle) ?[2]Host.Position {
                 return null;
             }
         }.f,
@@ -341,13 +371,13 @@ const Driver = struct {
         return false;
     }
 
-    fn document(ptr: *anyopaque) ?Host.Document {
-        const o = of(ptr).current() orelse return null;
-        return .{ .path = o.path, .title = o.title, .pages = @intCast(o.pages.len) };
+    fn document(ptr: *anyopaque, doc: Host.Handle) ?Host.Document {
+        const o = of(ptr).find(doc) orelse return null;
+        return .{ .handle = o.handle, .path = o.path, .title = o.title, .pages = @intCast(o.pages.len) };
     }
 
-    fn page(ptr: *anyopaque) ?u32 {
-        const o = of(ptr).current() orelse return null;
+    fn page(ptr: *anyopaque, doc: Host.Handle) ?u32 {
+        const o = of(ptr).find(doc) orelse return null;
         return o.page + 1;
     }
 
@@ -373,9 +403,9 @@ const Driver = struct {
     ///
     /// Read rather than held from the start because a script may add one and
     /// then ask for the list, and the list it gets should have it in.
-    fn loadMarks(d: *Driver) void {
+    fn loadMarks(d: *Driver, doc: Host.Handle) void {
         const lib = d.library orelse return;
-        const o = d.current() orelse return;
+        const o = d.find(doc) orelse return;
         if (std.mem.eql(u8, d.marks_for, o.path) and d.marks_for.len != 0) return;
         lib.freeHighlights(d.marks, d.marks.len);
         lib.freeStrokes(d.ink, d.ink.len);
@@ -393,15 +423,17 @@ const Driver = struct {
         d.marks_for = "";
     }
 
-    fn highlightCount(ptr: *anyopaque) usize {
+    fn highlightCount(ptr: *anyopaque, doc: Host.Handle) usize {
         const d = of(ptr);
-        d.loadMarks();
+        if (d.find(doc) == null) return 0;
+        d.loadMarks(doc);
         return d.marks.len + d.ink.len;
     }
 
-    fn highlightAt(ptr: *anyopaque, index: usize) ?Host.Highlight {
+    fn highlightAt(ptr: *anyopaque, doc: Host.Handle, index: usize) ?Host.Highlight {
         const d = of(ptr);
-        d.loadMarks();
+        if (d.find(doc) == null) return null;
+        d.loadMarks(doc);
         if (index >= d.marks.len) return d.strokeAt(index - d.marks.len);
         const list = d.marks;
         const h = list[index];
@@ -447,10 +479,10 @@ const Driver = struct {
         };
     }
 
-    fn addHighlight(ptr: *anyopaque, h: Host.Highlight) ?u64 {
+    fn addHighlight(ptr: *anyopaque, doc: Host.Handle, h: Host.Highlight) ?u64 {
         const d = of(ptr);
         const lib = d.library orelse return null;
-        const o = d.current() orelse return null;
+        const o = d.find(doc) orelse return null;
         if (h.page == 0 or h.page > o.pages.len) return null;
         const id = lib.addHighlight(o.path, .{
             .page = h.page - 1,
@@ -465,9 +497,13 @@ const Driver = struct {
         return @intCast(id);
     }
 
-    fn removeHighlight(ptr: *anyopaque, id: u64) bool {
+    fn removeHighlight(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
         const d = of(ptr);
         const lib = d.library orelse return false;
+        // Against the document the caller named. A mark id is the library's
+        // and is unique there, so this cannot hit the wrong file -- but a
+        // handle to a document that has gone is still an answer of no.
+        if (d.find(doc) == null) return false;
         if (id == 0 or id > std.math.maxInt(i64)) return false;
         lib.removeHighlight(@intCast(id)) catch return false;
         d.forget();
