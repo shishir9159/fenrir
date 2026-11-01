@@ -1634,6 +1634,7 @@ const Session = struct {
                 .points = k.points,
                 .width = if (k.width > 0) k.width else default_pen_width,
                 .color = Library.parseColor(k.color) orelse ink_colour,
+                .note = k.note,
             }, true) catch return;
         }
     }
@@ -3237,6 +3238,7 @@ const Session = struct {
                         .color = @constCast(hexOf(mark.color, &hex)),
                         .width = mark.width,
                         .points = @constCast(mark.points),
+                        .note = @constCast(mark.note),
                     }, s.now()) catch return,
                 };
                 b.marks.setId(key, id);
@@ -3251,7 +3253,7 @@ const Session = struct {
                 var hex: [7]u8 = undefined;
                 switch (mark.kind) {
                     .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note) catch {},
-                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex)) catch {},
+                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex), mark.note) catch {},
                 }
             },
         }
@@ -7959,6 +7961,64 @@ test "a drag in draw mode is a stroke, and it is a mark like any other" {
     try testing.expect(b.marks.canUndo());
     s.undoMarks(false);
     try testing.expectEqual(@as(usize, 0), b.marks.count());
+}
+
+test "a note typed on a stroke is written to the library and comes back" {
+    // A stroke is focusable, so `note` mode accepts a note on one -- and the
+    // ink arm of the writer was `updateStroke(id, colour)`, with no column
+    // behind it. The note lived for the session and was gone at the next
+    // open. It is persisted now; do not drop it from either arm again.
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    s.library = lib;
+
+    // Drawn with the pen, so the mark and its row are made by the calls a
+    // drag makes.
+    _ = s.apply(keys.enter(&s.keymap, .draw));
+    const v = s.view();
+    s.pointer(.{ .mouse = v.windowPoint(0, .{ .x = 100, .y = 700 }).?, .buttons = .{ .left = true } });
+    var x: f32 = 110;
+    while (x <= 300) : (x += 10) {
+        s.pointer(.{ .mouse = v.windowPoint(0, .{ .x = x, .y = 700 }).?, .buttons = .{ .left = true } });
+    }
+    s.pointer(.{ .mouse = v.windowPoint(0, .{ .x = 300, .y = 700 }).?, .buttons = .{} });
+    s.applyEffects();
+    try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    try testing.expect(s.focusedMarkIndex() != null);
+    s.keymap.mode = .note;
+    _ = s.apply(.enter_note);
+    for ("the margin") |c| _ = s.apply(.{ .note_char = c });
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    s.applyEffects();
+
+    {
+        const rows = try lib.strokes(s.buffer(0).path);
+        defer lib.freeStrokes(rows, rows.len);
+        try testing.expectEqual(@as(usize, 1), rows.len);
+        try testing.expectEqualStrings("the margin", rows[0].note);
+    }
+
+    // And the next open has it.
+    var reopened = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&reopened);
+    reopened.library = lib;
+    reopened.loadMarks(0);
+
+    const marks = reopened.buffer(0).marks.items();
+    try testing.expectEqual(@as(usize, 1), marks.len);
+    try testing.expectEqual(Marks.Kind.ink, marks[0].kind);
+    try testing.expectEqualStrings("the margin", marks[0].note);
 }
 
 test "a press in draw mode that goes nowhere leaves nothing behind" {

@@ -442,6 +442,7 @@ const Driver = struct {
                 @memcpy(d.hex[0..k.color.len], k.color);
                 break :blk d.hex[0..k.color.len];
             } else "",
+            .note = k.note,
             .kind = "ink",
         };
     }

@@ -164,7 +164,15 @@ pub const State = struct {
         // means by "next".
         if (!s.landed) {
             s.landed = true;
-            s.current = if (back) @intCast(n - 1) else 0;
+            // Backwards, the last hit may be the tail of a match that wrapped
+            // a line, and `split` marks only a match's first hit. Landing on
+            // the tail sent the next `N` to its own head instead of to the
+            // match before it, so this walks back to the start the way the
+            // steady-state loop below does. Forwards needs no walk: `hits[0]`
+            // is a first hit by construction.
+            var i: usize = if (back) n - 1 else 0;
+            while (back and i > 0 and !s.hits.items[i].starts) i -= 1;
+            s.current = @intCast(i);
             return s.hits.items[s.current];
         }
 
@@ -386,6 +394,14 @@ test "a phrase over a line break matches, as two hits and one match" {
     try testing.expect(!hits.items[1].starts);
     try testing.expectEqual(@as(u32, 0), hits.items[0].line);
     try testing.expectEqual(@as(u32, 1), hits.items[1].line);
+
+    // And the first `N` on that pair lands on the match and not on its tail.
+    // It used to take `hits[n - 1]` with no `starts` test, which put the
+    // reader on the second line of the match and the next `N` on its first.
+    var st: State = .{ .hits = hits, .pages = 1, .scanned = 1 };
+    const first = st.step(true).?;
+    try testing.expect(first.starts);
+    try testing.expectEqual(@as(u32, 0), first.line);
 }
 
 test "the scan starts where the cursor is and wraps, so n walks forward" {

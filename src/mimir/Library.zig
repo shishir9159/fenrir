@@ -53,7 +53,7 @@ pub const Error = Db.Error;
 /// forward on open; one from a *newer* version is left alone and opened
 /// read-only in effect, because a later fenrir may have added a column this
 /// one would drop on write.
-pub const schema_version: i64 = 3;
+pub const schema_version: i64 = 4;
 
 gpa: Allocator,
 db: Db,
@@ -173,6 +173,21 @@ fn migrate(lib: *Library, from: i64) Error!void {
             \\    created_at INTEGER NOT NULL DEFAULT 0
             \\);
             \\CREATE INDEX IF NOT EXISTS ink_by_doc ON ink (path, page);
+            \\COMMIT;
+        );
+    }
+
+    if (from < 4) {
+        // A note on a stroke.
+        //
+        // `Marks.setNote` has always taken one on either kind of mark, and a
+        // stroke is focusable, so the reader accepted a note on ink and had
+        // nowhere to write it: the ink arm of the writer was
+        // `updateStroke(id, colour)` and there was no column for it. The note
+        // lived for the session and was gone at the next open.
+        try lib.db.exec(
+            \\BEGIN;
+            \\ALTER TABLE ink ADD COLUMN note TEXT NOT NULL DEFAULT '';
             \\COMMIT;
         );
     }
@@ -576,6 +591,9 @@ pub const Stroke = struct {
     color: []u8 = &.{},
     width: f32 = 0,
     points: []Point = &.{},
+    /// A line of text on the stroke, the way a highlight has one. Empty for
+    /// most of them.
+    note: []u8 = &.{},
 };
 
 /// How many characters a point takes at the precision `writePoints` uses,
@@ -601,8 +619,8 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     const encoded = writePoints(text, k.points);
 
     var s = try lib.db.prepare(
-        \\INSERT INTO ink (path, page, color, width, points, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        \\INSERT INTO ink (path, page, color, width, points, note, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -610,20 +628,22 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     s.bindText(3, k.color);
     s.bindFloat(4, k.width);
     s.bindText(5, encoded);
-    s.bindInt(6, now);
+    s.bindText(6, k.note);
+    s.bindInt(7, now);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
 
-/// Rewrites what can change about a stroke once it exists: its colour. Where
-/// the pen went is not editable -- a line drawn somewhere else is a different
-/// line, and is removed and drawn again as one.
-pub fn updateStroke(lib: Library, id: i64, color: []const u8) Error!void {
+/// Rewrites what can change about a stroke once it exists: its colour and its
+/// note. Where the pen went is not editable -- a line drawn somewhere else is
+/// a different line, and is removed and drawn again as one.
+pub fn updateStroke(lib: Library, id: i64, color: []const u8, note: []const u8) Error!void {
     if (lib.future) return;
-    var s = try lib.db.prepare("UPDATE ink SET color = ?2 WHERE id = ?1");
+    var s = try lib.db.prepare("UPDATE ink SET color = ?2, note = ?3 WHERE id = ?1");
     defer s.finalize();
     s.bindInt(1, id);
     s.bindText(2, color);
+    s.bindText(3, note);
     try s.exec();
 }
 
@@ -651,7 +671,7 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
     errdefer lib.freeStrokes(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, color, width, points FROM ink
+        \\SELECT id, page, color, width, points, note FROM ink
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -671,12 +691,15 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
             lib.gpa.free(points);
             continue;
         }
+        errdefer lib.gpa.free(points);
+        const note = try lib.gpa.dupe(u8, s.columnText(5));
         try out.append(lib.gpa, .{
             .id = s.columnInt(0),
             .page = @intCast(@max(0, s.columnInt(1))),
             .color = color,
             .width = @floatCast(s.columnFloat(3)),
             .points = points,
+            .note = note,
         });
     }
     return out.toOwnedSlice(lib.gpa);
@@ -685,6 +708,7 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
 pub fn freeStroke(lib: Library, k: Stroke) void {
     lib.gpa.free(k.color);
     lib.gpa.free(k.points);
+    lib.gpa.free(k.note);
 }
 
 pub fn freeStrokes(lib: Library, list: []Stroke, n: usize) void {
@@ -1095,6 +1119,78 @@ test "a stroke of one point, or one whose points will not parse, is not a stroke
     const list = try lib.strokes("a.pdf");
     defer lib.freeStrokes(list, list.len);
     try testing.expectEqual(@as(usize, 0), list.len);
+}
+
+test "a stroke's note survives the file, and can be changed in place" {
+    // The reader lets a note be typed on a focused mark and a stroke can be
+    // the focused mark, so this is the other half of that: before the `note`
+    // column the ink arm of the writer was `updateStroke(id, colour)`, and
+    // what was typed was gone at the next open.
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    var points = [_]Point{ .{ .x = 10, .y = 20 }, .{ .x = 30, .y = 40 } };
+    const id = try lib.addStroke("a.pdf", .{
+        .page = 1,
+        .points = &points,
+        .note = @constCast("the derivation is wrong here"),
+    }, 7);
+
+    {
+        const list = try lib.strokes("a.pdf");
+        defer lib.freeStrokes(list, list.len);
+        try testing.expectEqual(@as(usize, 1), list.len);
+        try testing.expectEqualStrings("the derivation is wrong here", list[0].note);
+    }
+
+    try lib.updateStroke(id, "#c04040", "no, it is fine");
+    {
+        const list = try lib.strokes("a.pdf");
+        defer lib.freeStrokes(list, list.len);
+        try testing.expectEqualStrings("#c04040", list[0].color);
+        try testing.expectEqualStrings("no, it is fine", list[0].note);
+    }
+}
+
+test "a version-3 file gains the note column without losing its ink" {
+    if (!Db.available) return error.SkipZigTest;
+
+    var lib = try memory();
+    defer lib.close();
+
+    // The ink table as the previous release left it, with a stroke in it.
+    try lib.db.exec(
+        \\BEGIN;
+        \\DROP TABLE ink;
+        \\CREATE TABLE ink (
+        \\    id         INTEGER PRIMARY KEY,
+        \\    path       TEXT NOT NULL,
+        \\    page       INTEGER NOT NULL,
+        \\    color      TEXT NOT NULL DEFAULT '',
+        \\    width      REAL NOT NULL DEFAULT 0,
+        \\    points     TEXT NOT NULL DEFAULT '',
+        \\    created_at INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\INSERT INTO ink (path, page, color, width, points, created_at)
+        \\VALUES ('old.pdf', 1, '#c04040', 2, '10.00 20.00 30.00 40.00', 1);
+        \\COMMIT;
+    );
+    try lib.db.exec("PRAGMA user_version = 3");
+    try lib.migrate(3);
+    try testing.expectEqual(schema_version, try lib.userVersion());
+
+    const list = try lib.strokes("old.pdf");
+    defer lib.freeStrokes(list, list.len);
+    try testing.expectEqual(@as(usize, 1), list.len);
+    try testing.expectEqual(@as(usize, 2), list[0].points.len);
+    // Nothing was written where there was nothing to write.
+    try testing.expectEqualStrings("", list[0].note);
+
+    try lib.updateStroke(list[0].id, "#c04040", "a note on an old stroke");
+    const after = try lib.strokes("old.pdf");
+    defer lib.freeStrokes(after, after.len);
+    try testing.expectEqualStrings("a note on an old stroke", after[0].note);
 }
 
 test "a version-2 file gains the ink table without losing its highlights" {

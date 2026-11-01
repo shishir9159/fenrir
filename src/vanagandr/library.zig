@@ -345,6 +345,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         }) catch {};
         if (k.color.len != 0) ctx.out.print("  {s}", .{k.color}) catch {};
         if (k.width != 0) ctx.out.print("  w{d:.2}", .{k.width}) catch {};
+        if (k.note.len != 0) ctx.out.print("  \"{s}\"", .{k.note}) catch {};
         ctx.out.print("\n", .{}) catch {};
     }
 }

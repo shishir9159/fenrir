@@ -429,12 +429,20 @@ fn travel(m: *Marks, gpa: Allocator, from: *std.ArrayList(Change), to: *std.Arra
     // A group is applied in reverse order when undoing and in the original
     // order when redoing, so that indices recorded for a run of removals
     // still point where they did.
+    //
+    // Popping gives both of those with no reordering here, and a
+    // `std.mem.reverse` on the redo path is wrong however obvious it looks:
+    // `record` appends chronologically, so an undo pops the group reversed
+    // and pushes it to the redo stack that way, and popping it back off is
+    // already chronological. Reversing it again replayed six insertions at
+    // indices 6,5,4,3,2,1 against a list growing 1,2,3 -- wrong stacking
+    // order, the wrong note restored, and the undo stack left reversed so
+    // the next undo was wrong too.
     var moved: std.ArrayList(Change) = .empty;
     defer moved.deinit(gpa);
     while (from.items.len != 0 and from.items[from.items.len - 1].group == group) {
         try moved.append(gpa, from.pop().?);
     }
-    if (!backwards) std.mem.reverse(Change, moved.items);
 
     for (moved.items) |change| {
         const take_out = (change.kind == .added) == backwards;
@@ -688,9 +696,13 @@ test "a removal is undone into the same place in the drawing order" {
     try testing.expectEqual(@as(?usize, null), m.indexOf(middle));
 }
 
-test "a group is undone as one step" {
+test "a group is undone as one step, and redone in the order it was made" {
     // Highlighting a six-line selection makes six marks, and one `u` takes
     // all six back.
+    //
+    // The order is asserted and not only the count: this test passed while
+    // `travel` reversed the redo path, because six marks are six marks
+    // whichever way round they go back in. See the comment in `travel`.
     const gpa = testing.allocator;
     var m: Marks = .{};
     defer m.deinit(gpa);
@@ -698,7 +710,10 @@ test "a group is undone as one step" {
     m.beginGroup();
     _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 1, 1) }, false);
     m.beginGroup();
-    for (0..6) |i| _ = try m.add(gpa, .{ .page = 1, .box = box(0, @floatFromInt(i), 1, 1) }, false);
+    for (0..6) |i| {
+        const y: f32 = @floatFromInt(i);
+        _ = try m.add(gpa, .{ .page = 1, .box = box(0, y, 1, y + 1) }, false);
+    }
     try testing.expectEqual(@as(usize, 7), m.count());
 
     try testing.expect(try m.undo(gpa));
@@ -711,6 +726,37 @@ test "a group is undone as one step" {
     try testing.expectEqual(@as(usize, 1), m.count());
     try testing.expect(try m.redo(gpa));
     try testing.expectEqual(@as(usize, 7), m.count());
+    for (0..6) |i| {
+        try testing.expectEqual(@as(f32, @floatFromInt(i)), m.items()[i + 1].box.min_y);
+    }
+
+    // And the undo stack the redo rebuilt is in the same order the first one
+    // was, so a second round trip lands in the same place.
+    try testing.expect(try m.undo(gpa));
+    try testing.expectEqual(@as(usize, 1), m.count());
+    try testing.expect(try m.redo(gpa));
+    for (0..6) |i| {
+        try testing.expectEqual(@as(f32, @floatFromInt(i)), m.items()[i + 1].box.min_y);
+    }
+}
+
+test "a note changed twice in one group redoes to the last of them" {
+    // The other half of the reversal: a `.changed` run replayed backwards
+    // restores the first value instead of the last.
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 1, 1) }, false);
+    m.beginGroup();
+    try m.setNote(gpa, 0, "first");
+    try m.setNote(gpa, 0, "second");
+    try testing.expectEqualStrings("second", m.items()[0].note);
+
+    try testing.expect(try m.undo(gpa));
+    try testing.expectEqualStrings("", m.items()[0].note);
+    try testing.expect(try m.redo(gpa));
+    try testing.expectEqualStrings("second", m.items()[0].note);
 }
 
 test "a new change after an undo forgets what could have been redone" {
