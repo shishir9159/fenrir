@@ -27,9 +27,19 @@
 //! There is no global `fenrir`. Every chunk runs with an environment of its
 //! own -- an empty table whose metatable reads and writes through to `_G` --
 //! and `fenrir` is a field of *that* table. So a plugin that declares a
-//! manifest asking for less gets a smaller table, and the enforcement is
-//! structural rather than a check per call: **an ungranted function is not
-//! refused, it is `nil`**.
+//! manifest asking for less gets a smaller table: **an ungranted function is
+//! not refused, it is `nil`**.
+//!
+//! That is the shape of it, and it is not the whole of it. Every function in
+//! the table carries its plugin and its capability as upvalues, and checks
+//! them when it is called -- see `Owner` and `authority`. The table says what
+//! a plugin has; the upvalue says who is using it. Three things need the
+//! second: a function captured before an inline `fenrir.manifest` narrowed
+//! the table, a function belonging to a plugin that has since been unloaded,
+//! and `require`, which gives a module the environment of whoever required
+//! it. A field of the runtime saying "whose code is running" cannot answer
+//! any of them, because a suspended callback resumed three frames later has
+//! no such moment.
 //!
 //! A manifest is `plugins/<name>/plugin.lua` returning a table, or a
 //! `fenrir.manifest{...}` call at the top of a single-file plugin. A plugin
@@ -38,10 +48,13 @@
 //! says which plugins have.
 //!
 //! One state means one set of globals, so a plugin that asks for little can
-//! still be *handed* a function by one that asked for much. That is the price
-//! of Neovim's model and it is not worth a state per plugin: the manifest is
-//! a statement of what a plugin intends, checked against what it can reach,
-//! and it is read by a person before the plugin is installed.
+//! still be *handed* a function by one that asked for much -- and it runs at
+//! the authority of the plugin that wrote it, not the one that called it, so
+//! what the narrow plugin got is a favour and not a promotion. Whether that
+//! favour should be possible at all is the price of Neovim's model, and it is
+//! stated rather than defended: **a manifest is isolation about what a plugin
+//! can reach through its own table, and a declaration of intent about what it
+//! can be given.**
 //!
 //! Two limits keep a script from taking the reader down with it. **Memory**:
 //! every byte Lua allocates is counted, and past `memory_limit` an allocation
@@ -261,6 +274,44 @@ pub const Options = struct {
     resume_limit: u32 = 100_000,
 };
 
+/// Who a registration, a pending callback or a host call belongs to.
+///
+/// Never a name the plugin chose. `fenrir.clear` takes a group and a group
+/// is a label, which two plugins may both write; this is the host's own
+/// answer to "whose is this", and it is what every contribution, every
+/// module and every suspended job is tagged with. The id is stable across
+/// reloads and the generation is not, so a registration left over from the
+/// load before last can tell itself apart from the one that replaced it.
+pub const Owner = packed struct(u64) {
+    /// One more than the plugin's place in `plugins`. Zero is the console:
+    /// `:lua`, `runString`, and the tests.
+    id: u32 = 0,
+    generation: u32 = 0,
+
+    pub const console: Owner = .{};
+
+    pub fn eql(a: Owner, b: Owner) bool {
+        return a.id == b.id and a.generation == b.generation;
+    }
+
+    /// As Lua keeps it: one integer upvalue on every function in a plugin's
+    /// table, which is what makes authority a property of the closure
+    /// rather than of whatever the runtime last wrote down.
+    pub fn bits(o: Owner) lua.Integer {
+        return @bitCast(o);
+    }
+
+    pub fn fromBits(v: lua.Integer) Owner {
+        return @bitCast(v);
+    }
+};
+
+/// The longest string a registration will take: a pattern, a label, a
+/// description, one choice. An instruction hook counts Lua instructions and
+/// not the time a host call spends copying, so what the host copies is
+/// bounded by what it will accept.
+pub const max_text = 512;
+
 const ModeSet = packed struct(u8) {
     normal: bool = false,
     visual: bool = false,
@@ -285,6 +336,12 @@ const ModeSet = packed struct(u8) {
 
 /// One `fenrir.keymap`, as the runtime keeps it.
 pub const Keymap = struct {
+    /// Its own name, not its place in the list: a sweep moves the list and
+    /// the keymap the reader looked up a moment ago has to be the one that
+    /// runs.
+    id: u32,
+    owner: Owner,
+    group: []u8,
     modes: ModeSet,
     key: keys.Key,
     /// The Lua function, or `lua.no_ref` when the binding is a command line.
@@ -297,17 +354,21 @@ pub const Keymap = struct {
 };
 
 pub const UserCommand = struct {
+    owner: Owner,
+    group: []u8,
     name: []u8,
     ref: c_int,
     description: []u8,
     /// A registered icon name, or empty. The palette draws a picture beside
     /// every row and a plugin's rows all looked the same without one.
     icon: []u8,
+    live: bool = true,
 };
 
 /// One `fenrir.on`, as the runtime keeps it.
 pub const Handler = struct {
     id: u32,
+    owner: Owner,
     event: Event,
     /// The glob the event's path has to match. Owned; `*` for every path,
     /// which is what a handler that gave none gets.
@@ -330,6 +391,7 @@ pub const Side = enum { left, right };
 /// is missing rather than a button that is missing.
 pub const RailButton = struct {
     id: u32,
+    owner: Owner,
     side: Side,
     icon: []u8,
     label: []u8,
@@ -350,6 +412,7 @@ pub const RailButton = struct {
 /// that it is different now.
 pub const Panel = struct {
     id: u32,
+    owner: Owner,
     /// The plugin's own name for it. For the commands that print panels; the
     /// reader addresses one by `id`.
     name: []u8,
@@ -388,8 +451,13 @@ pub const PanelRow = struct {
 /// and the values they may take, so that the page can draw a row for it and
 /// the plugin can go on reading it with `fenrir.store.get`.
 pub const Setting = struct {
-    /// The store key. Owned.
+    owner: Owner,
+    /// The store key, as the plugin wrote it. Owned.
     key: []u8,
+    /// `<plugin>.<key>`: the key the value actually lives under, which is
+    /// the host's namespace and not the plugin's. Owned, and what the
+    /// settings page has to use or it would read another plugin's value.
+    scoped: []u8,
     about: []u8,
     /// The values it cycles through on a click, each owned. Empty for a row
     /// that is typed into instead.
@@ -406,18 +474,45 @@ const Pending = struct {
     /// between one resumption and the next.
     ref: c_int,
     thread: *lua.State,
+    /// Which `fenrir.on` it came from, and which plugin owns that. A job
+    /// whose handler was turned off, or whose plugin was unloaded, is never
+    /// resumed: removing a handler that cannot be cancelled is not removing
+    /// it.
     id: u32,
+    owner: Owner,
     event: Event,
     resumes: u32 = 0,
+    live: bool = true,
 };
 
 pub const Plugin = struct {
+    /// The host's name for it, and the namespace its store lives in. Owned.
     name: []u8,
+    /// One more than its place in `plugins`, which is what an `Owner`
+    /// carries. A plugin is never taken out of the list -- an unloaded one
+    /// keeps its place -- so a plugin reloaded is the same plugin, and the
+    /// values it kept are still its own.
+    id: u32,
+    /// Which load this is. A contribution tagged with an older one is dead.
+    generation: u32 = 0,
     /// Whether its chunk ran to the end. Set after it has, so a plugin that
     /// is still loading -- which is when a manifest is declared -- is already
     /// in the list for `fenrir.manifest` to find.
     ok: bool = false,
+    /// Whether a generation of it is active at all. False before the first
+    /// load and after an unload.
+    loaded: bool = false,
     manifest: Manifest = .{},
+    /// What it may do *now*. The manifest is what it said; this is what is
+    /// checked, on every call, against the closure's own owner -- so a
+    /// function captured before a manifest narrowed the table stops working
+    /// when the manifest is read, and a function handed to another plugin
+    /// keeps the authority of the plugin that made it.
+    caps: Caps = .all,
+    /// Whether it has called anything but `fenrir.manifest`. A manifest
+    /// after that is refused: a declaration that arrives once a plugin has
+    /// acted describes what it did rather than limiting it.
+    acted: bool = false,
 };
 
 gpa: Allocator,
@@ -439,8 +534,13 @@ keymaps: std.ArrayList(Keymap) = .empty,
 commands: std.ArrayList(UserCommand) = .empty,
 handlers: std.ArrayList(Handler) = .empty,
 next_handler: u32 = 1,
+next_keymap: u32 = 1,
 /// The handlers that are part way through, oldest first. See `pump`.
 pending: std.ArrayList(Pending) = .empty,
+/// `galdr.loaded`: a table of tables, one per generation of one plugin.
+/// Held by reference so that reaching it allocates nothing, which matters
+/// where it is read outside a protected call.
+loaded_ref: c_int = lua.no_ref,
 
 /// What plugins have put in the interface, and a number that changes when
 /// any of it does.
@@ -472,11 +572,16 @@ plugins: std.ArrayList(Plugin) = .empty,
 /// The environment `runString` and `:lua` use: everything granted, and the
 /// one that outlives any particular plugin.
 console_env: c_int = lua.no_ref,
-/// The environment of the chunk running now. What `require` gives a module,
-/// and what `fenrir.manifest` narrows.
-env_ref: c_int = lua.no_ref,
-/// Which of `plugins` is being loaded, for `fenrir.manifest` to write on.
-loading: ?usize = null,
+/// The plugin being loaded, and the environment of its chunk.
+///
+/// Not "the environment of whatever is running": that is what a callback
+/// cannot be told from, and a module required inside one was given the
+/// console's table because of it. Every chunk's environment now reaches its
+/// code through the closure that loaded it, and this pair exists only so
+/// that `fenrir.manifest` can narrow the table it is being called from --
+/// which can only happen while a plugin is loading.
+loading: ?Owner = null,
+loading_env: c_int = lua.no_ref,
 
 pub const max_messages = 100;
 pub const max_event_depth = 4;
@@ -511,40 +616,18 @@ pub fn destroy(rt: *Runtime) void {
     if (!lua.available) return;
     const gpa = rt.gpa;
     lua.lua_close(rt.L);
-    for (rt.keymaps.items) |k| {
-        gpa.free(k.line);
-        gpa.free(k.spec);
-        gpa.free(k.description);
-    }
+    for (rt.keymaps.items) |k| rt.freeKeymap(k);
     rt.keymaps.deinit(gpa);
-    for (rt.commands.items) |c| {
-        gpa.free(c.name);
-        gpa.free(c.description);
-        gpa.free(c.icon);
-    }
+    for (rt.commands.items) |c| rt.freeCommand(c);
     rt.commands.deinit(gpa);
-    for (rt.handlers.items) |h| {
-        gpa.free(h.pattern);
-        gpa.free(h.group);
-    }
+    for (rt.handlers.items) |h| rt.freeHandler(h);
     rt.handlers.deinit(gpa);
     rt.pending.deinit(gpa);
-    for (rt.rails.items) |b| {
-        gpa.free(b.icon);
-        gpa.free(b.label);
-        gpa.free(b.line);
-        gpa.free(b.group);
-    }
+    for (rt.rails.items) |b| rt.freeRail(b);
     rt.rails.deinit(gpa);
-    for (rt.settings.items) |*s| freeSetting(gpa, s);
+    for (rt.settings.items) |*row| rt.freeSetting(row);
     rt.settings.deinit(gpa);
-    for (rt.panels.items) |p| {
-        gpa.free(p.name);
-        gpa.free(p.title);
-        gpa.free(p.icon);
-        gpa.free(p.empty);
-        gpa.free(p.group);
-    }
+    for (rt.panels.items) |panel| rt.freePanel(panel);
     rt.panels.deinit(gpa);
     rt.rows.deinit(gpa);
     rt.rows_arena.deinit();
@@ -597,6 +680,243 @@ fn allocate(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callc
     return moved;
 }
 
+/// A copy of a string a plugin handed over. Null when there is no memory,
+/// which the caller turns into the same "out of memory" a Lua allocation
+/// gives.
+fn dupeText(rt: *Runtime, text: []const u8) ?[]u8 {
+    return rt.gpa.dupe(u8, text) catch null;
+}
+
+fn freeText(rt: *Runtime, text: []u8) void {
+    if (text.len == 0) return;
+    rt.gpa.free(text);
+}
+
+fn release(rt: *Runtime, ref: *c_int) void {
+    if (ref.* == lua.no_ref) return;
+    lua.luaL_unref(rt.L, lua.registry_index, ref.*);
+    ref.* = lua.no_ref;
+}
+
+fn freeKeymap(rt: *Runtime, k: Keymap) void {
+    rt.freeText(k.line);
+    rt.freeText(k.spec);
+    rt.freeText(k.description);
+    rt.freeText(k.group);
+}
+
+fn freeCommand(rt: *Runtime, c: UserCommand) void {
+    rt.freeText(c.name);
+    rt.freeText(c.description);
+    rt.freeText(c.icon);
+    rt.freeText(c.group);
+}
+
+fn freeHandler(rt: *Runtime, h: Handler) void {
+    rt.freeText(h.pattern);
+    rt.freeText(h.group);
+}
+
+fn freeRail(rt: *Runtime, b: RailButton) void {
+    rt.freeText(b.icon);
+    rt.freeText(b.label);
+    rt.freeText(b.line);
+    rt.freeText(b.group);
+}
+
+fn freePanel(rt: *Runtime, p: Panel) void {
+    rt.freeText(p.name);
+    rt.freeText(p.title);
+    rt.freeText(p.icon);
+    rt.freeText(p.empty);
+    rt.freeText(p.group);
+}
+
+fn freeSetting(rt: *Runtime, row: *Setting) void {
+    rt.freeText(row.key);
+    rt.freeText(row.scoped);
+    rt.freeText(row.about);
+    rt.freeText(row.unset);
+    rt.freeText(row.group);
+    for (row.choices.items) |c| rt.freeText(@constCast(c));
+    row.choices.deinit(rt.gpa);
+}
+
+/// The modules one generation of one plugin loaded, forgotten.
+///
+/// Reached by reference and written raw, because this runs outside a
+/// protected call: nothing here may allocate.
+fn forgetModules(rt: *Runtime, owner: Owner) void {
+    if (owner.id == 0 or rt.loaded_ref == lua.no_ref) return;
+    _ = lua.lua_rawgeti(rt.L, lua.registry_index, rt.loaded_ref);
+    lua.lua_pushinteger(rt.L, owner.bits());
+    lua.lua_pushnil(rt.L);
+    lua.lua_rawset(rt.L, -3);
+    lua.pop(rt.L, 1);
+}
+
+/// Everything one generation of a plugin registered, out of service.
+///
+/// Marked and not freed. The reader borrows these strings -- the rails, the
+/// settings page, a panel's title -- and freeing one in the middle of a
+/// callback frees what an open menu is about to draw. `sweep` gives the
+/// memory back at a moment the reader has agreed to.
+fn retire(rt: *Runtime, owner: Owner) u32 {
+    var n: u32 = 0;
+    for (rt.keymaps.items) |*k| {
+        if (!k.live or !k.owner.eql(owner)) continue;
+        k.live = false;
+        rt.release(&k.ref);
+        n += 1;
+    }
+    for (rt.commands.items) |*c| {
+        if (!c.live or !c.owner.eql(owner)) continue;
+        c.live = false;
+        rt.release(&c.ref);
+        n += 1;
+    }
+    for (rt.handlers.items) |*h| {
+        if (!h.live or !h.owner.eql(owner)) continue;
+        h.live = false;
+        rt.release(&h.ref);
+        n += 1;
+    }
+    for (rt.rails.items) |*b| {
+        if (!b.live or !b.owner.eql(owner)) continue;
+        b.live = false;
+        rt.release(&b.ref);
+        n += 1;
+    }
+    for (rt.settings.items) |*row| {
+        if (!row.live or !row.owner.eql(owner)) continue;
+        row.live = false;
+        n += 1;
+    }
+    for (rt.panels.items) |*panel| {
+        if (!panel.live or !panel.owner.eql(owner)) continue;
+        panel.live = false;
+        rt.release(&panel.rows_ref);
+        rt.release(&panel.choose_ref);
+        n += 1;
+    }
+    // A callback that yielded and whose plugin has gone is never resumed.
+    // A plugin that can be unloaded and still write to a document has not
+    // been unloaded.
+    for (rt.pending.items) |*job| {
+        if (job.owner.eql(owner)) job.live = false;
+    }
+    rt.forgetModules(owner);
+    if (n != 0) rt.revision +%= 1;
+    return n;
+}
+
+/// Whether a suspended job should still be resumed.
+fn jobLive(rt: *Runtime, job: Pending) bool {
+    if (!job.live or !rt.ownerLive(job.owner)) return false;
+    for (rt.handlers.items) |h| {
+        if (h.id == job.id) return h.live;
+    }
+    return false;
+}
+
+/// Gives back what dead registrations are holding, and drops the jobs whose
+/// handler or plugin has gone.
+///
+/// At a defined point rather than where the registration died. The reader
+/// borrows Galdr's strings and rebuilds what it borrowed when `revision`
+/// moves, so the one safe moment to free is a moment the reader has agreed
+/// to: the top of `pump`, which runs once a frame, after the input and
+/// before anything is drawn.
+pub fn sweep(rt: *Runtime) void {
+    if (!lua.available) return;
+    // Pending first: a job whose handler is about to be taken out of the
+    // list has to be found while the handler is still in it.
+    var i: usize = 0;
+    while (i < rt.pending.items.len) {
+        if (rt.jobLive(rt.pending.items[i])) {
+            i += 1;
+            continue;
+        }
+        rt.finish(i);
+    }
+
+    var freed = false;
+    i = 0;
+    while (i < rt.keymaps.items.len) {
+        if (rt.keymaps.items[i].live) {
+            i += 1;
+            continue;
+        }
+        rt.freeKeymap(rt.keymaps.orderedRemove(i));
+        freed = true;
+    }
+    i = 0;
+    while (i < rt.commands.items.len) {
+        if (rt.commands.items[i].live) {
+            i += 1;
+            continue;
+        }
+        rt.freeCommand(rt.commands.orderedRemove(i));
+        freed = true;
+    }
+    i = 0;
+    while (i < rt.handlers.items.len) {
+        if (rt.handlers.items[i].live) {
+            i += 1;
+            continue;
+        }
+        rt.freeHandler(rt.handlers.orderedRemove(i));
+        freed = true;
+    }
+    i = 0;
+    while (i < rt.rails.items.len) {
+        if (rt.rails.items[i].live) {
+            i += 1;
+            continue;
+        }
+        rt.freeRail(rt.rails.orderedRemove(i));
+        freed = true;
+    }
+    i = 0;
+    while (i < rt.settings.items.len) {
+        if (rt.settings.items[i].live) {
+            i += 1;
+            continue;
+        }
+        var row = rt.settings.orderedRemove(i);
+        rt.freeSetting(&row);
+        freed = true;
+    }
+    i = 0;
+    while (i < rt.panels.items.len) {
+        if (rt.panels.items[i].live) {
+            i += 1;
+            continue;
+        }
+        rt.freePanel(rt.panels.orderedRemove(i));
+        freed = true;
+    }
+    if (freed) rt.revision +%= 1;
+}
+
+/// `:plugin unload <name>`: every generation of it, gone.
+///
+/// Returns how many registrations went, or null when nothing is called
+/// that. A built-in key a plugin had shadowed comes back by itself:
+/// `findKey` passes over a dead binding and the reader's own table answers.
+pub fn unload(rt: *Runtime, name: []const u8) ?u32 {
+    if (!lua.available) return null;
+    for (rt.plugins.items) |*p| {
+        if (!std.mem.eql(u8, p.name, name)) continue;
+        if (!p.loaded) return 0;
+        const n = rt.retire(.{ .id = p.id, .generation = p.generation });
+        p.loaded = false;
+        p.ok = false;
+        return n;
+    }
+    return null;
+}
+
 fn hook(L: ?*lua.State, _: ?*lua.Debug) callconv(.c) void {
     const rt = of(L);
     rt.steps += 1;
@@ -633,16 +953,24 @@ fn setup(L: ?*lua.State) callconv(.c) c_int {
     lua.lua_setglobal(L, "load");
     lua.lua_pushcclosure(L, apiPrint, 0);
     lua.lua_setglobal(L, "print");
-    lua.lua_pushcclosure(L, apiRequire, 0);
+
+    // There is no global `require`. It is a field of every environment,
+    // bound to the plugin whose environment it is, so that a module is
+    // loaded with its requirer's authority and cached in its requirer's
+    // namespace -- a global one would have to be bound to nobody, and a
+    // module required inside a callback would be given whatever the runtime
+    // last wrote down.
+    lua.lua_pushnil(L);
     lua.lua_setglobal(L, "require");
 
-    // Modules `require` has loaded, by name.
-    lua.newTable(L);
-    lua.lua_setfield(L, lua.registry_index, "galdr.loaded");
-
+    // Modules `require` has loaded: one table per generation of one plugin,
+    // keyed by the whole of its `Owner`, so that the first loader's
+    // authority is not what every later one gets and a reload does not have
+    // to clear everybody's cache to clear its own.
     const rt = of(L);
-    rt.console_env = newEnv(L, .all);
-    rt.env_ref = rt.console_env;
+    lua.newTable(L);
+    rt.loaded_ref = lua.luaL_ref(L, lua.registry_index);
+    rt.console_env = newEnv(L, .all, .console);
     return 0;
 }
 
@@ -700,7 +1028,7 @@ pub const api = [_]Entry{
         .name = "keymap",
         .func = apiKeymap,
         .cap = .ui,
-        .args = "(modes, key, action, description)",
+        .args = "(modes, key, action, description, group)",
         .about = "binds a key in normal, visual, edit or draw mode; action is a function or a : line",
     },
     .{ .name = "unmap", .func = apiUnmap, .cap = .ui, .args = "(modes, key)", .about = "takes a binding away" },
@@ -708,7 +1036,7 @@ pub const api = [_]Entry{
         .name = "command",
         .func = apiCommand,
         .cap = .ui,
-        .args = "(name, fn, description, icon)",
+        .args = "(name, fn, description, icon, group)",
         .about = "adds a :name args command, which the palette then lists and ranks",
     },
     .{ .name = "go", .func = apiGo, .cap = .ui, .args = "(page, offset)", .returns = "ok", .about = "scrolls the focused window to a page, numbered from 1" },
@@ -783,13 +1111,38 @@ pub const globals = [_]Entry{
 /// "attempt to call a nil value" -- rather than a refusal this file would
 /// have to invent, and a plugin can ask `if fenrir.highlight then` without
 /// anything else being added for it to ask with.
-fn pushFenrir(L: ?*lua.State, caps: Caps) void {
+/// What a function's second upvalue says: the capability it needs, nothing,
+/// or that it is the manifest -- the one call a plugin makes before it has
+/// said what it may do.
+const no_cap: lua.Integer = 0;
+const manifest_cap: lua.Integer = -1;
+
+fn capBits(entry: Entry) lua.Integer {
+    if (entry.cap) |c| return @intFromEnum(c) + 1;
+    return if (std.mem.eql(u8, entry.name, "manifest")) manifest_cap else no_cap;
+}
+
+/// One function of the table, with its owner and its capability on it.
+///
+/// The upvalues are the whole of how authority travels. A closure carries
+/// who made it, so a callback resumed three frames later, a module required
+/// from inside one, and a function one plugin handed to another all run as
+/// the plugin whose table they came out of -- which no field of the runtime
+/// could say, because the runtime has only one of each field and the
+/// question has one answer per closure.
+fn pushBound(L: ?*lua.State, f: lua.CFunction, owner: Owner, cap: lua.Integer) void {
+    lua.lua_pushinteger(L, owner.bits());
+    lua.lua_pushinteger(L, cap);
+    lua.lua_pushcclosure(L, f, 2);
+}
+
+fn pushFenrir(L: ?*lua.State, caps: Caps, owner: Owner) void {
     lua.lua_createtable(L, 0, api.len + 3);
     for (api) |entry| {
         if (entry.cap) |c| {
             if (!caps.has(c)) continue;
         }
-        lua.lua_pushcclosure(L, entry.func.?, 0);
+        pushBound(L, entry.func.?, owner, capBits(entry));
         lua.lua_setfield(L, -2, entry.name.ptr);
     }
     lua.pushString(L, "0.0.1");
@@ -797,26 +1150,85 @@ fn pushFenrir(L: ?*lua.State, caps: Caps) void {
     lua.pushString(L, "Lua 5.4");
     lua.lua_setfield(L, -2, "lua");
 
-    // A plugin's own values, always: the key space is the plugin's and
-    // nothing else can be reached through it.
+    // A plugin's own values, always: the key space is the plugin's, derived
+    // from the id the host gave it and never from a prefix the plugin wrote,
+    // so two plugins that both keep `enabled` keep two values.
     lua.lua_createtable(L, 0, store.len);
     for (store) |entry| {
-        lua.lua_pushcclosure(L, entry.func.?, 0);
+        pushBound(L, entry.func.?, owner, capBits(entry));
         lua.lua_setfield(L, -2, entry.name.ptr);
     }
     lua.lua_setfield(L, -2, "store");
 }
 
-/// An environment for one chunk: `fenrir`, and `_G` behind it.
+/// Who is calling, and whether they may.
+///
+/// Checked on every call and not only when the table was built. Both halves
+/// matter: the table a plugin was handed leaves out what it did not ask for,
+/// so an ungranted function is `nil` rather than a refusal -- and this
+/// catches the function that was captured before a manifest narrowed the
+/// table, or handed on by a plugin that has since been unloaded.
+fn authority(L: ?*lua.State) Owner {
+    const owner = Owner.fromBits(lua.lua_tointegerx(L, lua.upvalueIndex(1), null));
+    if (owner.id == 0) return owner;
+
+    const rt = of(L);
+    const p = rt.pluginOf(owner) orelse
+        lua.raise(L, "galdr: the plugin this function came from is not loaded");
+    const want = lua.lua_tointegerx(L, lua.upvalueIndex(2), null);
+    if (want != manifest_cap) p.acted = true;
+    if (want > no_cap) {
+        const c: Capability = @enumFromInt(want - 1);
+        if (!p.caps.has(c)) {
+            var msg: [160]u8 = undefined;
+            lua.raise(L, std.fmt.bufPrint(&msg, "galdr: this plugin did not ask for \"{s}\"", .{
+                c.name(),
+            }) catch "galdr: this plugin did not ask for that");
+        }
+    }
+    return owner;
+}
+
+/// The plugin an owner names, while that generation of it is the live one.
+fn pluginOf(rt: *Runtime, owner: Owner) ?*Plugin {
+    if (owner.id == 0 or owner.id > rt.plugins.items.len) return null;
+    const p = &rt.plugins.items[owner.id - 1];
+    if (!p.loaded or p.generation != owner.generation) return null;
+    return p;
+}
+
+/// Whether a registration or a suspended job this owner made is still its
+/// plugin's. The console's work never goes stale.
+fn ownerLive(rt: *Runtime, owner: Owner) bool {
+    return owner.id == 0 or rt.pluginOf(owner) != null;
+}
+
+/// The namespace a plugin's store keys live in: its name, which the host
+/// gave it. Empty for the console, whose keys are the flat ones.
+fn storeSpace(rt: *Runtime, owner: Owner) []const u8 {
+    if (owner.id == 0 or owner.id > rt.plugins.items.len) return "";
+    return rt.plugins.items[owner.id - 1].name;
+}
+
+/// An environment for one chunk: `fenrir`, `require`, and `_G` behind it.
 ///
 /// Reads fall through to the globals and so do writes, so `x = 1` in a plugin
 /// is still seen by the next one -- which is the shared state Neovim's model
-/// promises. Only `fenrir` is the chunk's own, which is the only thing that
-/// differs between two plugins. Returns the registry reference.
-fn newEnv(L: ?*lua.State, caps: Caps) c_int {
+/// promises. `fenrir` and `require` are the chunk's own, which is the only
+/// thing that differs between two plugins. Returns the registry reference.
+fn newEnv(L: ?*lua.State, caps: Caps, owner: Owner) c_int {
     lua.newTable(L);
-    pushFenrir(L, caps);
+    pushFenrir(L, caps, owner);
     lua.lua_setfield(L, -2, "fenrir");
+
+    // `require`, bound to this plugin and to this very table: a module it
+    // loads is given this environment, so a narrowed plugin cannot widen
+    // itself by requiring, and the cache it is kept in is this plugin's.
+    lua.lua_pushinteger(L, owner.bits());
+    lua.lua_pushinteger(L, no_cap);
+    lua.lua_pushvalue(L, -3);
+    lua.lua_pushcclosure(L, apiRequire, 3);
+    lua.lua_setfield(L, -2, "require");
 
     lua.newTable(L);
     _ = lua.lua_getglobal(L, "_G");
@@ -829,19 +1241,20 @@ fn newEnv(L: ?*lua.State, caps: Caps) c_int {
 
 const EnvJob = struct {
     caps: Caps,
+    owner: Owner,
     ref: c_int = lua.no_ref,
 };
 
 fn envTrampoline(L: ?*lua.State) callconv(.c) c_int {
     const job: *EnvJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
-    job.ref = newEnv(L, job.caps);
+    job.ref = newEnv(L, job.caps, job.owner);
     return 0;
 }
 
 /// An environment, built inside a protected call because building one
 /// allocates. `lua.no_ref` when there was no memory for it.
-fn makeEnv(rt: *Runtime, caps: Caps) c_int {
-    var job: EnvJob = .{ .caps = caps };
+fn makeEnv(rt: *Runtime, caps: Caps, owner: Owner) c_int {
+    var job: EnvJob = .{ .caps = caps, .owner = owner };
     lua.lua_pushcclosure(rt.L, envTrampoline, 0);
     lua.lua_pushlightuserdata(rt.L, &job);
     if (!rt.call(1, 0, "galdr")) return lua.no_ref;
@@ -944,10 +1357,6 @@ fn runChunk(rt: *Runtime, name: []const u8, source: []const u8, env: c_int) bool
     // own `fenrir` without there being a global one.
     _ = lua.lua_rawgeti(rt.L, lua.registry_index, env);
     _ = lua.lua_setupvalue(rt.L, -2, 1);
-
-    const saved = rt.env_ref;
-    rt.env_ref = env;
-    defer rt.env_ref = saved;
     return rt.call(0, 0, name);
 }
 
@@ -1002,37 +1411,70 @@ pub fn loadConfig(rt: *Runtime) void {
 /// The entry goes in before the chunk runs, because `fenrir.manifest` writes
 /// on it while the chunk is running.
 fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8, manifest: ?[]const u8) bool {
-    const owned = rt.gpa.dupe(u8, name) catch return false;
-    rt.plugins.append(rt.gpa, .{ .name = owned }) catch {
-        rt.gpa.free(owned);
-        return false;
-    };
-    const at = rt.plugins.items.len - 1;
+    const at = rt.entryFor(name) orelse return false;
+    const owner = rt.openGeneration(at);
 
-    const env = rt.makeEnv(.all);
+    const env = rt.makeEnv(.all, owner);
     if (env == lua.no_ref) return false;
     // The registry's hold, not the table's life: every closure the plugin
     // makes keeps `_ENV` as an upvalue, so the environment lives exactly as
     // long as the plugin's functions do.
     defer lua.luaL_unref(rt.L, lua.registry_index, env);
 
-    rt.loading = at;
-    rt.env_ref = env;
+    const saved = rt.loading;
+    const saved_env = rt.loading_env;
+    rt.loading = owner;
+    rt.loading_env = env;
     defer {
-        rt.loading = null;
-        rt.env_ref = rt.console_env;
+        rt.loading = saved;
+        rt.loading_env = saved_env;
     }
 
+    var ok = true;
     if (manifest) |rel| {
         if (rt.host.readFile(rt.gpa, rel)) |text| {
             defer rt.gpa.free(text);
             // A manifest that does not parse is a plugin that does not load:
             // it asked for something and the answer cannot be guessed.
-            if (!rt.runManifest(rel, text)) return false;
+            ok = rt.runManifest(rel, text);
         }
     }
-    rt.plugins.items[at].ok = rt.runChunk(path, source, env);
-    return rt.plugins.items[at].ok;
+    if (ok) ok = rt.runChunk(path, source, env);
+    rt.plugins.items[at].ok = ok;
+    return ok;
+}
+
+/// The plugin's place in the list, made if this is the first time.
+///
+/// By name, because a reload is the same plugin: it keeps its id, and so
+/// keeps the store namespace its values are already under.
+fn entryFor(rt: *Runtime, name: []const u8) ?usize {
+    for (rt.plugins.items, 0..) |p, i| {
+        if (std.mem.eql(u8, p.name, name)) return i;
+    }
+    const owned = rt.dupeText(name) orelse return null;
+    const id: u32 = @intCast(rt.plugins.items.len + 1);
+    rt.plugins.append(rt.gpa, .{ .name = owned, .id = id }) catch {
+        rt.freeText(owned);
+        return null;
+    };
+    return rt.plugins.items.len - 1;
+}
+
+/// Opens a generation, retiring the one before it.
+///
+/// Everything the chunk registers is tagged with the number this returns,
+/// so a reload leaves nothing of the load before behind.
+fn openGeneration(rt: *Runtime, at: usize) Owner {
+    const p = &rt.plugins.items[at];
+    if (p.loaded) _ = rt.retire(.{ .id = p.id, .generation = p.generation });
+    p.generation +%= 1;
+    if (p.generation == 0) p.generation = 1;
+    p.loaded = true;
+    p.ok = false;
+    p.acted = false;
+    p.caps = .all;
+    return .{ .id = p.id, .generation = p.generation };
 }
 
 /// Runs a chunk *as a plugin*: its own environment, its own entry in
@@ -1042,9 +1484,13 @@ fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8,
 /// works as a plugin works the same way when it is named on a command line --
 /// including the manifest, which `runString` cannot honour because there is
 /// no plugin for it to be the manifest of.
-pub fn runPlugin(rt: *Runtime, name: []const u8, source: []const u8) bool {
+pub fn runPlugin(rt: *Runtime, path: []const u8, source: []const u8) bool {
     if (!lua.available) return false;
-    return rt.loadOne(name, name, source, null);
+    // Named for the file and not for the path. The name is the plugin's
+    // identity, which is the namespace its stored values live under, and a
+    // namespace with a separator in it is one another key could reach into.
+    // The path is still what errors call it.
+    return rt.loadOne(std.fs.path.basename(path), path, source, null);
 }
 
 const ManifestJob = struct {
@@ -1085,7 +1531,15 @@ const bad_capability = "galdr: capabilities are a list of names like \"document.
 /// Reads a manifest table and narrows the environment to what it asks for.
 fn applyManifest(L: ?*lua.State, index: c_int) void {
     const rt = of(L);
-    const at = rt.loading orelse lua.raise(L, "galdr: a manifest belongs at the top of a plugin");
+    const owner = rt.loading orelse lua.raise(L, "galdr: a manifest belongs at the top of a plugin");
+    const plugin = rt.pluginOf(owner) orelse lua.raise(L, "galdr: a manifest belongs at the top of a plugin");
+    // Capabilities are a permission and not a note, so they have to be read
+    // before the plugin has done anything: a manifest further down would be
+    // describing a plugin that had already made its calls. Capturing a
+    // function above the manifest buys nothing either -- every call checks
+    // the plugin's capabilities as they are *now*, not as they were when
+    // the table was handed over.
+    if (plugin.acted) lua.raise(L, "galdr: a manifest goes at the top of a plugin, before anything else it does");
 
     var caps: Caps = .{};
     _ = lua.lua_getfield(L, index, "capabilities");
@@ -1120,19 +1574,19 @@ fn applyManifest(L: ?*lua.State, index: c_int) void {
     // Written down before the table is rebuilt: the plugin entry owns these
     // bytes, so a raise from the rebuild below frees them at `destroy` rather
     // than losing them.
-    const p = &rt.plugins.items[at];
-    rt.gpa.free(p.manifest.about);
-    rt.gpa.free(p.manifest.version);
-    p.manifest = .{
+    rt.gpa.free(plugin.manifest.about);
+    rt.gpa.free(plugin.manifest.version);
+    plugin.manifest = .{
         .declared = true,
         .caps = caps,
-        .about = rt.gpa.dupe(u8, about) catch &.{},
-        .version = rt.gpa.dupe(u8, version) catch &.{},
+        .about = rt.gpa.dupe(u8, about[0..@min(about.len, max_text)]) catch &.{},
+        .version = rt.gpa.dupe(u8, version[0..@min(version.len, max_text)]) catch &.{},
     };
+    plugin.caps = caps;
     lua.pop(L, 2);
 
-    _ = lua.lua_rawgeti(L, lua.registry_index, rt.env_ref);
-    pushFenrir(L, caps);
+    _ = lua.lua_rawgeti(L, lua.registry_index, rt.loading_env);
+    pushFenrir(L, caps, owner);
     lua.lua_setfield(L, -2, "fenrir");
     lua.pop(L, 1);
 }
@@ -1144,11 +1598,15 @@ pub fn lookup(rt: *Runtime) keys.Lookup {
     return .{ .ptr = rt, .find = findKey };
 }
 
+/// The binding's own id and not its place in the list: a sweep moves the
+/// list, and the binding the reader looked up has to be the one that runs.
+/// A dead binding is passed over, which is how a built-in key a plugin
+/// shadowed comes back the moment that plugin is unloaded.
 fn findKey(ptr: *anyopaque, mode: keys.Mode, key: keys.Key) ?u32 {
     const rt: *Runtime = @ptrCast(@alignCast(ptr));
-    for (rt.keymaps.items, 0..) |k, i| {
+    for (rt.keymaps.items) |k| {
         if (!k.live or !k.modes.has(mode)) continue;
-        if (std.meta.eql(k.key, key)) return @intCast(i);
+        if (std.meta.eql(k.key, key)) return k.id;
     }
     return null;
 }
@@ -1156,16 +1614,17 @@ fn findKey(ptr: *anyopaque, mode: keys.Mode, key: keys.Key) ?u32 {
 /// Runs the binding the keymap reported.
 pub fn runKeymap(rt: *Runtime, id: u32) void {
     if (!lua.available) return;
-    if (id >= rt.keymaps.items.len) return;
-    const k = rt.keymaps.items[id];
-    if (!k.live) return;
-    if (k.ref == lua.no_ref) {
-        _ = rt.host.exec(k.line);
+    for (rt.keymaps.items) |k| {
+        if (k.id != id or !k.live) continue;
+        if (k.ref == lua.no_ref) {
+            _ = rt.host.exec(k.line);
+            return;
+        }
+        var what: [128]u8 = undefined;
+        const label = std.fmt.bufPrint(&what, "key {s}", .{k.spec}) catch "key";
+        _ = rt.invoke(.{ .ref = k.ref }, label);
         return;
     }
-    var what: [128]u8 = undefined;
-    const label = std.fmt.bufPrint(&what, "key {s}", .{k.spec}) catch "key";
-    _ = rt.invoke(.{ .ref = k.ref }, label);
 }
 
 /// Runs a command a plugin registered. Null when there is none by that name,
@@ -1173,7 +1632,7 @@ pub fn runKeymap(rt: *Runtime, id: u32) void {
 pub fn runCommand(rt: *Runtime, name: []const u8, args: []const u8) ?bool {
     if (!lua.available) return null;
     for (rt.commands.items) |c| {
-        if (!std.mem.eql(u8, c.name, name)) continue;
+        if (!c.live or !std.mem.eql(u8, c.name, name)) continue;
         var what: [128]u8 = undefined;
         const label = std.fmt.bufPrint(&what, ":{s}", .{name}) catch "command";
         return rt.invoke(.{ .ref = c.ref, .args = args }, label);
@@ -1204,7 +1663,7 @@ pub fn emit(rt: *Runtime, payload: Payload) void {
         const h = rt.handlers.items[i];
         if (!h.live or h.event != payload.event) continue;
         if (!matches(h.pattern, payload.path)) continue;
-        rt.spawn(h.id, h.ref, payload);
+        rt.spawn(h, payload);
     }
 }
 
@@ -1221,6 +1680,7 @@ pub fn waiting(rt: *const Runtime) usize {
 /// loop until it finished would be refusing to give it.
 pub fn pump(rt: *Runtime) void {
     if (!lua.available) return;
+    rt.sweep();
     var i: usize = 0;
     while (i < rt.pending.items.len) {
         // Re-read every time: a resumed handler can emit, and an emit can
@@ -1287,8 +1747,8 @@ fn spawnTrampoline(L: ?*lua.State) callconv(.c) c_int {
     return 0;
 }
 
-fn spawn(rt: *Runtime, id: u32, ref: c_int, payload: Payload) void {
-    var job: SpawnJob = .{ .ref = ref, .payload = payload };
+fn spawn(rt: *Runtime, handler: Handler, payload: Payload) void {
+    var job: SpawnJob = .{ .ref = handler.ref, .payload = payload };
     lua.lua_pushcclosure(rt.L, spawnTrampoline, 0);
     lua.lua_pushlightuserdata(rt.L, &job);
 
@@ -1307,7 +1767,8 @@ fn spawn(rt: *Runtime, id: u32, ref: c_int, payload: Payload) void {
     rt.pending.append(rt.gpa, .{
         .ref = job.thread_ref,
         .thread = co,
-        .id = id,
+        .id = handler.id,
+        .owner = handler.owner,
         .event = payload.event,
     }) catch lua.luaL_unref(rt.L, lua.registry_index, job.thread_ref);
 }
@@ -1585,7 +2046,19 @@ pub fn runRail(rt: *Runtime, id: u32) void {
 
 // -- the fenrir table ---------------------------------------------------------
 
+/// A store key: short, and made of the characters a namespaced key can be
+/// built from without one key reaching into another's.
+fn checkKey(L: ?*lua.State, arg: c_int) []const u8 {
+    const key = lua.checkString(L, arg);
+    const fine = key.len > 0 and key.len <= 64 and for (key) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') break false;
+    } else true;
+    if (!fine) lua.raise(L, "galdr: a store key is one to sixty-four of letters, digits, _ - or .");
+    return key;
+}
+
 fn apiNotify(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     var len: usize = 0;
     const message = lua.luaL_tolstring(L, 1, &len);
     of(L).host.notify(message[0..len]);
@@ -1636,7 +2109,15 @@ fn apiLoad(L: ?*lua.State) callconv(.c) c_int {
     return 1;
 }
 
+/// `require(name)`, bound to the plugin whose environment it came out of.
+///
+/// Three upvalues: its owner, the capability it needs (none), and that
+/// plugin's environment. A module is loaded into *that* environment and
+/// cached under *that* owner, so requiring from inside a callback cannot
+/// hand a restricted plugin the console's table, and the first requirer's
+/// authority is not what every later plugin inherits.
 fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
+    const owner = authority(L);
     const name = lua.checkString(L, 1);
     for (name) |c| {
         const fine = std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
@@ -1644,8 +2125,20 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
     }
     if (name.len == 0 or name.len > 200) lua.raise(L, "galdr: require takes a module name like \"foo\" or \"foo.bar\"");
 
-    _ = lua.lua_getfield(L, lua.registry_index, "galdr.loaded");
+    const rt = of(L);
+    // This plugin's own cache, made the first time it requires anything.
+    _ = lua.lua_rawgeti(L, lua.registry_index, rt.loaded_ref);
+    const all = lua.lua_gettop(L);
+    lua.lua_pushinteger(L, owner.bits());
+    if (@as(lua.Type, @enumFromInt(lua.lua_rawget(L, all))) != .table) {
+        lua.pop(L, 1);
+        lua.newTable(L);
+        lua.lua_pushinteger(L, owner.bits());
+        lua.lua_pushvalue(L, -2);
+        lua.lua_rawset(L, all);
+    }
     const loaded = lua.lua_gettop(L);
+
     lua.lua_pushvalue(L, 1);
     _ = lua.lua_rawget(L, loaded);
     if (lua.typeOf(L, -1) != .nil) return 1;
@@ -1657,7 +2150,6 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
     std.mem.replaceScalar(u8, dotted[0..name.len], '.', '/');
     const stem = dotted[0..name.len];
 
-    const rt = of(L);
     var first: [512]u8 = undefined;
     var second: [512]u8 = undefined;
     const candidates = [_][]const u8{
@@ -1675,11 +2167,10 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
         rt.gpa.free(source);
         if (status != lua.ok) _ = lua.lua_error(L);
 
-        // The module runs in the environment of whoever required it, so a
-        // narrowed plugin's modules are narrowed too. Modules are cached, so
-        // the first requirer's environment is the one they keep -- the same
-        // wrinkle Neovim has, and for the same reason.
-        _ = lua.lua_rawgeti(L, lua.registry_index, rt.env_ref);
+        // The module runs in the environment of the plugin that required
+        // it: upvalue three, which is this closure's and not whatever the
+        // runtime last wrote down.
+        lua.lua_pushvalue(L, lua.upvalueIndex(3));
         _ = lua.lua_setupvalue(L, -2, 1);
 
         // Marked loaded before it runs, so two modules that require each
@@ -1718,6 +2209,7 @@ fn apiManifest(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn apiExec(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const line = lua.checkString(L, 1);
     lua.lua_pushboolean(L, @intFromBool(of(L).host.exec(line)));
     return 1;
@@ -1739,6 +2231,8 @@ fn apiKeymap(L: ?*lua.State) callconv(.c) c_int {
     const kind = lua.typeOf(L, 3);
     if (kind != .function and kind != .string) lua.raise(L, "galdr: a key binding needs a function or a command line");
     const description = lua.optString(L, 4) orelse "";
+    const group = lua.optString(L, 5) orelse "";
+    const owner = authority(L);
 
     // Every argument is checked. From here, Lua calls come before Zig
     // allocations, and a failed allocation undoes what Lua did.
@@ -1754,11 +2248,15 @@ fn apiKeymap(L: ?*lua.State) callconv(.c) c_int {
 
     // All or nothing, freed by hand: `errdefer` would not run across the
     // `longjmp` that `outOfMemory` ends in.
-    const owned_line = rt.gpa.dupe(u8, line) catch null;
-    const owned_spec = rt.gpa.dupe(u8, spec) catch null;
-    const owned_desc = rt.gpa.dupe(u8, description) catch null;
-    const added = if (owned_line != null and owned_spec != null and owned_desc != null)
+    const owned_line = rt.dupeText(line);
+    const owned_spec = rt.dupeText(spec);
+    const owned_desc = rt.dupeText(description);
+    const owned_group = rt.dupeText(group);
+    const added = if (owned_line != null and owned_spec != null and owned_desc != null and owned_group != null)
         (if (rt.keymaps.append(rt.gpa, .{
+            .id = rt.next_keymap,
+            .owner = owner,
+            .group = owned_group.?,
             .modes = modes,
             .key = key,
             .ref = ref,
@@ -1769,11 +2267,13 @@ fn apiKeymap(L: ?*lua.State) callconv(.c) c_int {
     else
         false;
     if (!added) {
-        if (owned_line) |s| rt.gpa.free(s);
-        if (owned_spec) |s| rt.gpa.free(s);
-        if (owned_desc) |s| rt.gpa.free(s);
+        if (owned_line) |t| rt.freeText(t);
+        if (owned_spec) |t| rt.freeText(t);
+        if (owned_desc) |t| rt.freeText(t);
+        if (owned_group) |t| rt.freeText(t);
         return rt.outOfMemory(L, ref);
     }
+    rt.next_keymap += 1;
     return 0;
 }
 
@@ -1794,12 +2294,12 @@ fn unbind(rt: *Runtime, modes: ModeSet, key: keys.Key) void {
             continue;
         }
         k.live = false;
-        if (k.ref != lua.no_ref) lua.luaL_unref(rt.L, lua.registry_index, k.ref);
-        k.ref = lua.no_ref;
+        rt.release(&k.ref);
     }
 }
 
 fn apiUnmap(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const modes = checkModes(L, 1);
     const spec = lua.checkString(L, 2);
     const key = keyspec.parse(spec) catch lua.raise(L, "galdr: not a key");
@@ -1848,49 +2348,69 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 2, @intFromEnum(lua.Type.function));
     const description = lua.optString(L, 3) orelse "";
     const icon = lua.optString(L, 4) orelse "";
+    const group = lua.optString(L, 5) orelse "";
 
     const valid = name.len > 0 and name.len <= 64 and std.ascii.isAlphabetic(name[0]) and for (name) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') break false;
     } else true;
     if (!valid) lua.raise(L, "galdr: a command name is a letter followed by letters, digits, _ or -");
 
+    const owner = authority(L);
+    const rt = of(L);
+    // A name another plugin has is that plugin's. Collisions are refused
+    // rather than resolved, because the alternative is a reader where which
+    // of two plugins owns `:Read` depends on the order their files sorted.
+    for (rt.commands.items) |c| {
+        if (!c.live or c.owner.id == owner.id or !std.mem.eql(u8, c.name, name)) continue;
+        lua.raise(L, "galdr: another plugin already has a command by that name");
+    }
+
     lua.lua_pushvalue(L, 2);
     const ref = lua.luaL_ref(L, lua.registry_index);
 
-    const rt = of(L);
+    // Redefining replaces, as `:command!` does -- all of it, because a
+    // plugin that changed what a command *does* and was left with the old
+    // sentence beside it in the palette would be the palette lying about
+    // the reader.
     for (rt.commands.items) |*c| {
-        if (!std.mem.eql(u8, c.name, name)) continue;
-        // Redefining a command replaces it, as `:command!` does -- all of
-        // it, because a plugin that changed what a command *does* and was
-        // left with the old sentence beside it in the palette would be the
-        // palette lying about the reader.
-        lua.luaL_unref(L, lua.registry_index, c.ref);
+        if (!c.live or !std.mem.eql(u8, c.name, name)) continue;
+        rt.release(&c.ref);
         c.ref = ref;
-        if (rt.gpa.dupe(u8, description)) |d| {
-            rt.gpa.free(c.description);
+        c.owner = owner;
+        if (rt.dupeText(description)) |d| {
+            rt.freeText(c.description);
             c.description = d;
-        } else |_| {}
-        if (rt.gpa.dupe(u8, icon)) |p| {
-            rt.gpa.free(c.icon);
+        }
+        if (rt.dupeText(icon)) |p| {
+            rt.freeText(c.icon);
             c.icon = p;
-        } else |_| {}
+        }
+        if (rt.dupeText(group)) |g| {
+            rt.freeText(c.group);
+            c.group = g;
+        }
         rt.revision +%= 1;
         return 0;
     }
-    const owned = rt.gpa.dupe(u8, name) catch null;
-    const desc = rt.gpa.dupe(u8, description) catch null;
-    const picture = rt.gpa.dupe(u8, icon) catch null;
-    const added = owned != null and desc != null and picture != null and
+
+    const owned = rt.dupeText(name);
+    const desc = rt.dupeText(description);
+    const picture = rt.dupeText(icon);
+    const owned_group = rt.dupeText(group);
+    const added = owned != null and desc != null and picture != null and owned_group != null and
         (if (rt.commands.append(rt.gpa, .{
+            .owner = owner,
+            .group = owned_group.?,
             .name = owned.?,
             .ref = ref,
             .description = desc.?,
             .icon = picture.?,
         })) true else |_| false);
     if (!added) {
-        if (owned) |s| rt.gpa.free(s);
-        if (desc) |s| rt.gpa.free(s);
-        if (picture) |s| rt.gpa.free(s);
+        if (owned) |t| rt.freeText(t);
+        if (desc) |t| rt.freeText(t);
+        if (picture) |t| rt.freeText(t);
+        if (owned_group) |t| rt.freeText(t);
         return rt.outOfMemory(L, ref);
     }
     rt.revision +%= 1;
@@ -1922,25 +2442,27 @@ fn apiOn(L: ?*lua.State) callconv(.c) c_int {
     const at: c_int = if (shifted) 2 else 3;
     lua.luaL_checktype(L, at, @intFromEnum(lua.Type.function));
     const group = lua.optString(L, at + 1) orelse "";
+    const owner = authority(L);
 
+    const rt = of(L);
     lua.lua_pushvalue(L, at);
     const ref = lua.luaL_ref(L, lua.registry_index);
 
-    const rt = of(L);
-    const owned_pattern = rt.gpa.dupe(u8, pattern) catch null;
-    const owned_group = rt.gpa.dupe(u8, group) catch null;
+    const owned_pattern = rt.dupeText(pattern);
+    const owned_group = rt.dupeText(group);
     const id = rt.next_handler;
     const added = owned_pattern != null and owned_group != null and
         (if (rt.handlers.append(rt.gpa, .{
             .id = id,
+            .owner = owner,
             .event = event,
             .pattern = owned_pattern.?,
             .group = owned_group.?,
             .ref = ref,
         })) true else |_| false);
     if (!added) {
-        if (owned_pattern) |s| rt.gpa.free(s);
-        if (owned_group) |s| rt.gpa.free(s);
+        if (owned_pattern) |t| rt.freeText(t);
+        if (owned_group) |t| rt.freeText(t);
         return rt.outOfMemory(L, ref);
     }
     rt.next_handler += 1;
@@ -1948,13 +2470,21 @@ fn apiOn(L: ?*lua.State) callconv(.c) c_int {
     return 1;
 }
 
+/// `fenrir.off(id)`: the handler stops, and so does the callback of it that
+/// is part way through.
+///
+/// A suspended coroutine holds its own reference to the function, so
+/// dropping the registration is not dropping the work: `jobLive` asks
+/// whether the handler is still there before every resumption, which is
+/// what makes "off" mean off rather than "off after this one finishes".
 fn apiOff(L: ?*lua.State) callconv(.c) c_int {
+    const owner = authority(L);
     const id = lua.luaL_checkinteger(L, 1);
     const rt = of(L);
     for (rt.handlers.items) |*h| {
-        if (h.id != id or !h.live) continue;
+        if (h.id != id or !h.live or h.owner.id != owner.id) continue;
         h.live = false;
-        lua.luaL_unref(L, lua.registry_index, h.ref);
+        rt.release(&h.ref);
     }
     return 0;
 }
@@ -1967,40 +2497,64 @@ fn apiOff(L: ?*lua.State) callconv(.c) c_int {
 /// group is the plugin's name by convention and nothing enforces that: a
 /// group is a label a plugin puts on its own work, not a namespace.
 fn apiClear(L: ?*lua.State) callconv(.c) c_int {
+    const owner = authority(L);
     const group = lua.checkString(L, 1);
     if (group.len == 0) lua.raise(L, "galdr: a group has a name");
     const rt = of(L);
     var cleared: lua.Integer = 0;
+
+    // The caller's own, in that group, and every kind of registration --
+    // commands and keymaps were missing, so a plugin that cleared its group
+    // before registering again was left with its old commands and bindings
+    // live beside the new ones.
+    //
+    // Bounded by who is asking as well as by the label: a group is a name a
+    // plugin wrote and two plugins may write the same one, so ownership is
+    // the host's answer and the group is only how a plugin divides its own
+    // work up.
+    const mine = struct {
+        fn f(o: Owner, g: []const u8, who: Owner, want: []const u8) bool {
+            return o.id == who.id and std.mem.eql(u8, g, want);
+        }
+    }.f;
+
+    for (rt.keymaps.items) |*k| {
+        if (!k.live or !mine(k.owner, k.group, owner, group)) continue;
+        k.live = false;
+        rt.release(&k.ref);
+        cleared += 1;
+    }
+    for (rt.commands.items) |*c| {
+        if (!c.live or !mine(c.owner, c.group, owner, group)) continue;
+        c.live = false;
+        rt.release(&c.ref);
+        cleared += 1;
+    }
     for (rt.handlers.items) |*h| {
-        if (!h.live or !std.mem.eql(u8, h.group, group)) continue;
+        if (!h.live or !mine(h.owner, h.group, owner, group)) continue;
         h.live = false;
-        lua.luaL_unref(L, lua.registry_index, h.ref);
+        rt.release(&h.ref);
         cleared += 1;
     }
     for (rt.rails.items) |*b| {
-        if (!b.live or !std.mem.eql(u8, b.group, group)) continue;
+        if (!b.live or !mine(b.owner, b.group, owner, group)) continue;
         b.live = false;
-        if (b.ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, b.ref);
-        b.ref = lua.no_ref;
-        rt.revision +%= 1;
+        rt.release(&b.ref);
         cleared += 1;
     }
-    for (rt.settings.items) |*s| {
-        if (!s.live or !std.mem.eql(u8, s.group, group)) continue;
-        s.live = false;
-        rt.revision +%= 1;
+    for (rt.settings.items) |*row| {
+        if (!row.live or !mine(row.owner, row.group, owner, group)) continue;
+        row.live = false;
         cleared += 1;
     }
-    for (rt.panels.items) |*p| {
-        if (!p.live or !std.mem.eql(u8, p.group, group)) continue;
-        p.live = false;
-        if (p.rows_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, p.rows_ref);
-        if (p.choose_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, p.choose_ref);
-        p.rows_ref = lua.no_ref;
-        p.choose_ref = lua.no_ref;
-        rt.revision +%= 1;
+    for (rt.panels.items) |*panel| {
+        if (!panel.live or !mine(panel.owner, panel.group, owner, group)) continue;
+        panel.live = false;
+        rt.release(&panel.rows_ref);
+        rt.release(&panel.choose_ref);
         cleared += 1;
     }
+    if (cleared != 0) rt.revision +%= 1;
     lua.lua_pushinteger(L, cleared);
     return 1;
 }
@@ -2034,24 +2588,26 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
     const kind = lua.typeOf(L, -1);
     if (kind != .function and kind != .string) lua.raise(L, "galdr: a rail button needs a function or a command line");
     const line = if (kind == .string) lua.toString(L, -1).? else "";
+    const owner = authority(L);
 
     // Every argument is checked; from here Lua calls come before Zig
     // allocations, as `apiKeymap` does and for the same reason.
     //
     // The strings stay on the stack until they have been copied: `line`
     // borrows the very value `luaL_ref` would have popped.
+    const rt = of(L);
     var ref: c_int = lua.no_ref;
     if (kind == .function) ref = lua.luaL_ref(L, lua.registry_index);
 
-    const rt = of(L);
-    const owned_icon = rt.gpa.dupe(u8, icon) catch null;
-    const owned_label = rt.gpa.dupe(u8, label) catch null;
-    const owned_line = rt.gpa.dupe(u8, line) catch null;
-    const owned_group = rt.gpa.dupe(u8, group) catch null;
+    const owned_icon = rt.dupeText(icon);
+    const owned_label = rt.dupeText(label);
+    const owned_line = rt.dupeText(line);
+    const owned_group = rt.dupeText(group);
     const id = rt.next_contribution;
     const added = owned_icon != null and owned_label != null and owned_line != null and owned_group != null and
         (if (rt.rails.append(rt.gpa, .{
             .id = id,
+            .owner = owner,
             .side = side,
             .icon = owned_icon.?,
             .label = owned_label.?,
@@ -2060,10 +2616,10 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
             .group = owned_group.?,
         })) true else |_| false);
     if (!added) {
-        if (owned_icon) |s| rt.gpa.free(s);
-        if (owned_label) |s| rt.gpa.free(s);
-        if (owned_line) |s| rt.gpa.free(s);
-        if (owned_group) |s| rt.gpa.free(s);
+        if (owned_icon) |t| rt.freeText(t);
+        if (owned_label) |t| rt.freeText(t);
+        if (owned_line) |t| rt.freeText(t);
+        if (owned_group) |t| rt.freeText(t);
         return rt.outOfMemory(L, ref);
     }
     rt.next_contribution += 1;
@@ -2084,22 +2640,32 @@ fn apiSetting(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
 
     _ = lua.lua_getfield(L, 1, "key");
-    const key = lua.toString(L, -1) orelse lua.raise(L, "galdr: a setting needs a key");
-    const fine = key.len > 0 and key.len <= 48 and for (key) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') break false;
-    } else true;
-    if (!fine) lua.raise(L, "galdr: a setting's key is letters, digits, _ - or .");
-
+    const key = checkKey(L, -1);
     _ = lua.lua_getfield(L, 1, "about");
-    const about = lua.toString(L, -1) orelse "";
+    const about = lua.optString(L, -1) orelse "";
     _ = lua.lua_getfield(L, 1, "unset");
-    const unset = lua.toString(L, -1) orelse "not set";
+    const unset = lua.optString(L, -1) orelse "not set";
     _ = lua.lua_getfield(L, 1, "group");
-    const group = lua.toString(L, -1) orelse "";
+    const group = lua.optString(L, -1) orelse "";
 
+    const owner = authority(L);
     const rt = of(L);
+
+    // Where the value actually lives: the host's namespace for this plugin
+    // and the key under it, which is what the settings page has to read or
+    // it would show one plugin's value under another's row.
+    var scope: [512]u8 = undefined;
+    const space = rt.storeSpace(owner);
+    const scoped = if (space.len == 0)
+        key
+    else
+        std.fmt.bufPrint(&scope, "{s}/{s}", .{ space, key }) catch
+            lua.raise(L, "galdr: that plugin's name and key are too long together");
+
     var row: Setting = .{
+        .owner = owner,
         .key = rt.gpa.dupe(u8, key) catch lua.raise(L, "galdr: out of memory"),
+        .scoped = rt.gpa.dupe(u8, scoped) catch &.{},
         .about = rt.gpa.dupe(u8, about) catch &.{},
         .unset = rt.gpa.dupe(u8, unset) catch &.{},
         .group = rt.gpa.dupe(u8, group) catch &.{},
@@ -2121,30 +2687,22 @@ fn apiSetting(L: ?*lua.State) callconv(.c) c_int {
         }
     }
 
-    // Declaring the same key twice replaces it, as redefining a command does:
-    // a plugin reloaded should not leave two rows behind.
+    // Declaring the same key twice replaces it, as redefining a command
+    // does: a plugin reloaded should not leave two rows behind.
     for (rt.settings.items) |*existing| {
-        if (!existing.live or !std.mem.eql(u8, existing.key, key)) continue;
-        freeSetting(rt.gpa, existing);
+        if (!existing.live or existing.owner.id != owner.id) continue;
+        if (!std.mem.eql(u8, existing.key, key)) continue;
+        rt.freeSetting(existing);
         existing.* = row;
         rt.revision +%= 1;
         return 0;
     }
     rt.settings.append(rt.gpa, row) catch {
-        freeSetting(rt.gpa, &row);
+        rt.freeSetting(&row);
         lua.raise(L, "galdr: out of memory");
     };
     rt.revision +%= 1;
     return 0;
-}
-
-fn freeSetting(gpa: Allocator, s: *Setting) void {
-    gpa.free(s.key);
-    gpa.free(s.about);
-    gpa.free(s.unset);
-    gpa.free(s.group);
-    for (s.choices.items) |c| gpa.free(c);
-    s.choices.deinit(gpa);
 }
 
 /// `fenrir.panel{ id =, title =, icon =, empty =, rows = fn, choose = fn }`.
@@ -2176,21 +2734,23 @@ fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
     if (!has_choose and lua.typeOf(L, -1) != .nil) lua.raise(L, "galdr: a panel's choose is a function");
     _ = lua.lua_getfield(L, 1, "rows");
     if (lua.typeOf(L, -1) != .function) lua.raise(L, "galdr: a panel needs a rows function");
+    const owner = authority(L);
 
+    const rt = of(L);
     const rows_ref = lua.luaL_ref(L, lua.registry_index);
     const choose_ref = if (has_choose) lua.luaL_ref(L, lua.registry_index) else lua.no_ref;
 
-    const rt = of(L);
-    const owned_name = rt.gpa.dupe(u8, name) catch null;
-    const owned_title = rt.gpa.dupe(u8, title) catch null;
-    const owned_icon = rt.gpa.dupe(u8, icon) catch null;
-    const owned_empty = rt.gpa.dupe(u8, empty) catch null;
-    const owned_group = rt.gpa.dupe(u8, group) catch null;
+    const owned_name = rt.dupeText(name);
+    const owned_title = rt.dupeText(title);
+    const owned_icon = rt.dupeText(icon);
+    const owned_empty = rt.dupeText(empty);
+    const owned_group = rt.dupeText(group);
     const id = rt.next_contribution;
     const added = owned_name != null and owned_title != null and owned_icon != null and
         owned_empty != null and owned_group != null and
         (if (rt.panels.append(rt.gpa, .{
             .id = id,
+            .owner = owner,
             .name = owned_name.?,
             .title = owned_title.?,
             .icon = owned_icon.?,
@@ -2200,11 +2760,11 @@ fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
             .group = owned_group.?,
         })) true else |_| false);
     if (!added) {
-        if (owned_name) |s| rt.gpa.free(s);
-        if (owned_title) |s| rt.gpa.free(s);
-        if (owned_icon) |s| rt.gpa.free(s);
-        if (owned_empty) |s| rt.gpa.free(s);
-        if (owned_group) |s| rt.gpa.free(s);
+        if (owned_name) |t| rt.freeText(t);
+        if (owned_title) |t| rt.freeText(t);
+        if (owned_icon) |t| rt.freeText(t);
+        if (owned_empty) |t| rt.freeText(t);
+        if (owned_group) |t| rt.freeText(t);
         if (choose_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, choose_ref);
         return rt.outOfMemory(L, rows_ref);
     }
@@ -2221,18 +2781,19 @@ fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
 /// from -- and rebuilding a list nobody has open costs nothing, since the
 /// reader only asks the panel that is showing.
 fn apiRefresh(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     of(L).revision +%= 1;
     return 0;
 }
 
 fn apiUnrail(L: ?*lua.State) callconv(.c) c_int {
+    const owner = authority(L);
     const id = lua.luaL_checkinteger(L, 1);
     const rt = of(L);
     for (rt.rails.items) |*b| {
-        if (b.id != id or !b.live) continue;
+        if (b.id != id or !b.live or b.owner.id != owner.id) continue;
         b.live = false;
-        if (b.ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, b.ref);
-        b.ref = lua.no_ref;
+        rt.release(&b.ref);
         rt.revision +%= 1;
     }
     return 0;
@@ -2249,6 +2810,7 @@ fn pushDocument(L: ?*lua.State, d: Host.Document) void {
 }
 
 fn apiDocument(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const d = of(L).host.document() orelse {
         lua.lua_pushnil(L);
         return 1;
@@ -2258,6 +2820,7 @@ fn apiDocument(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn apiPage(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     if (of(L).host.page()) |p| lua.lua_pushinteger(L, p) else lua.lua_pushnil(L);
     return 1;
 }
@@ -2265,6 +2828,7 @@ fn apiPage(L: ?*lua.State) callconv(.c) c_int {
 /// `fenrir.go(page, offset)`: to a page, from 1, and optionally some points
 /// down it.
 fn apiGo(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const page = lua.luaL_checkinteger(L, 1);
     const offset = lua.luaL_optnumber(L, 2, 0);
     if (page < 1 or page > std.math.maxInt(u32)) lua.raise(L, "galdr: pages are numbered from 1");
@@ -2274,6 +2838,7 @@ fn apiGo(L: ?*lua.State) callconv(.c) c_int {
 
 /// `fenrir.zoom()` is the percentage; `fenrir.zoom(150)` sets it.
 fn apiZoom(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const rt = of(L);
     if (lua.lua_gettop(L) >= 1 and lua.typeOf(L, 1) != .nil) {
         const percent = lua.luaL_checknumber(L, 1);
@@ -2285,6 +2850,7 @@ fn apiZoom(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn apiMode(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     lua.pushString(L, of(L).host.mode());
     return 1;
 }
@@ -2300,11 +2866,13 @@ fn pushPosition(L: ?*lua.State, p: Host.Position) void {
 }
 
 fn apiCursor(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     if (of(L).host.cursor()) |p| pushPosition(L, p) else lua.lua_pushnil(L);
     return 1;
 }
 
 fn apiSelection(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const sel = of(L).host.selection() orelse {
         lua.lua_pushnil(L);
         return 1;
@@ -2343,6 +2911,7 @@ fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
 }
 
 fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const rt = of(L);
     const n = rt.host.highlightCount();
     lua.lua_createtable(L, @intCast(@min(n, 1 << 20)), 0);
@@ -2360,6 +2929,7 @@ fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {
 /// `fenrir.highlight{page=, x0=, y0=, x1=, y1=, color=, note=}`, returning
 /// the new highlight's id.
 fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
     var h: Host.Highlight = .{ .page = 0, .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
 
@@ -2389,6 +2959,7 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn apiUnhighlight(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
     const id = lua.luaL_checkinteger(L, 1);
     const removed = id > 0 and of(L).host.removeHighlight(@intCast(id));
     lua.lua_pushboolean(L, @intFromBool(removed));
@@ -2396,9 +2967,10 @@ fn apiUnhighlight(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn apiStoreGet(L: ?*lua.State) callconv(.c) c_int {
-    const key = lua.checkString(L, 1);
+    const owner = authority(L);
+    const key = checkKey(L, 1);
     const rt = of(L);
-    const value = rt.host.storeGet(rt.gpa, key) orelse {
+    const value = rt.host.storeGet(rt.gpa, rt.storeSpace(owner), key) orelse {
         lua.lua_pushnil(L);
         return 1;
     };
@@ -2411,9 +2983,11 @@ fn apiStoreGet(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn apiStoreSet(L: ?*lua.State) callconv(.c) c_int {
-    const key = lua.checkString(L, 1);
+    const owner = authority(L);
+    const key = checkKey(L, 1);
     const value = if (lua.typeOf(L, 2) == .nil or lua.typeOf(L, 2) == .none) null else lua.checkString(L, 2);
-    lua.lua_pushboolean(L, @intFromBool(of(L).host.storeSet(key, value)));
+    const rt = of(L);
+    lua.lua_pushboolean(L, @intFromBool(rt.host.storeSet(rt.storeSpace(owner), key, value)));
     return 1;
 }
 
@@ -2430,15 +3004,36 @@ const FakeHost = struct {
     page_now: u32 = 3,
     zoom_now: f32 = 100,
     highlights: std.ArrayList(Host.Highlight) = .empty,
-    stored: ?[]u8 = null,
+    next_key: u64 = 1,
+    stored: std.ArrayList(Kept) = .empty,
+
+    /// One value a plugin kept, under the namespace the host gave it.
+    const Kept = struct {
+        space: []u8,
+        key: []u8,
+        value: []u8,
+    };
 
     fn deinit(f: *FakeHost) void {
-        for (f.notes.items) |n| testing.allocator.free(n);
-        f.notes.deinit(testing.allocator);
-        for (f.execs.items) |n| testing.allocator.free(n);
-        f.execs.deinit(testing.allocator);
-        f.highlights.deinit(testing.allocator);
-        if (f.stored) |s| testing.allocator.free(s);
+        const gpa = testing.allocator;
+        for (f.notes.items) |n| gpa.free(n);
+        f.notes.deinit(gpa);
+        for (f.execs.items) |n| gpa.free(n);
+        f.execs.deinit(gpa);
+        f.highlights.deinit(gpa);
+        for (f.stored.items) |k| {
+            gpa.free(k.space);
+            gpa.free(k.key);
+            gpa.free(k.value);
+        }
+        f.stored.deinit(gpa);
+    }
+
+    fn value(f: *FakeHost, space: []const u8, key: []const u8) ?[]const u8 {
+        for (f.stored.items) |k| {
+            if (std.mem.eql(u8, k.space, space) and std.mem.eql(u8, k.key, key)) return k.value;
+        }
+        return null;
     }
 
     fn host(f: *FakeHost) Host {
@@ -2517,12 +3112,13 @@ const FakeHost = struct {
             fn f(ptr: *anyopaque, h: Host.Highlight) ?u64 {
                 const fake = self(ptr);
                 var copy = h;
-                copy.id = fake.highlights.items.len + 1;
+                copy.id = fake.next_key;
                 // Strings are borrowed from Lua for the length of the call;
                 // a real host copies them, and this one forgets them.
                 copy.color = "";
                 copy.note = "";
                 fake.highlights.append(testing.allocator, copy) catch return null;
+                fake.next_key += 1;
                 return copy.id;
             }
         }.f,
@@ -2538,16 +3134,35 @@ const FakeHost = struct {
             }
         }.f,
         .storeGet = struct {
-            fn f(ptr: *anyopaque, gpa: Allocator, _: []const u8) ?[]u8 {
-                const s = self(ptr).stored orelse return null;
-                return gpa.dupe(u8, s) catch null;
+            fn f(ptr: *anyopaque, gpa: Allocator, space: []const u8, key: []const u8) ?[]u8 {
+                const v = self(ptr).value(space, key) orelse return null;
+                return gpa.dupe(u8, v) catch null;
             }
         }.f,
         .storeSet = struct {
-            fn f(ptr: *anyopaque, _: []const u8, value: ?[]const u8) bool {
+            fn f(ptr: *anyopaque, space: []const u8, key: []const u8, v: ?[]const u8) bool {
                 const fake = self(ptr);
-                if (fake.stored) |s| testing.allocator.free(s);
-                fake.stored = if (value) |v| testing.allocator.dupe(u8, v) catch null else null;
+                const gpa = testing.allocator;
+                for (fake.stored.items, 0..) |*k, i| {
+                    if (!std.mem.eql(u8, k.space, space) or !std.mem.eql(u8, k.key, key)) continue;
+                    if (v) |text| {
+                        const next = gpa.dupe(u8, text) catch return false;
+                        gpa.free(k.value);
+                        k.value = next;
+                        return true;
+                    }
+                    gpa.free(k.space);
+                    gpa.free(k.key);
+                    gpa.free(k.value);
+                    _ = fake.stored.orderedRemove(i);
+                    return true;
+                }
+                const text = v orelse return true;
+                fake.stored.append(gpa, .{
+                    .space = gpa.dupe(u8, space) catch return false,
+                    .key = gpa.dupe(u8, key) catch return false,
+                    .value = gpa.dupe(u8, text) catch return false,
+                }) catch return false;
                 return true;
             }
         }.f,
@@ -2980,8 +3595,9 @@ test "init.lua, then plugins by name, and require reads lua/" {
     rt.loadConfig();
     try testing.expect(rt.runString("check",
         \\assert(table.concat(order, ",") == "init,a,b", table.concat(order, ","))
+        \\assert(loads == 1, "a module ran twice for one plugin")
         \\require("util.greet")
-        \\assert(loads == 1, "a module ran twice")
+        \\assert(loads == 2, "the console shares a plugin's module cache")
     ));
 
     try testing.expectEqual(@as(usize, 4), rt.plugins.items.len);
@@ -3096,6 +3712,10 @@ test "a plugin puts buttons on the rails, and takes them away again" {
     // And a reloading plugin drops its own in one call.
     try testing.expect(rt.runString("again", "assert(fenrir.clear('mine') == 2)"));
     for (rt.railList()) |b| try testing.expect(!b.live);
+    // The memory goes back at the sweep and not where the button died: the
+    // rail is drawn from these bytes and a frame may be holding them.
+    rt.sweep();
+    try testing.expectEqual(@as(usize, 0), rt.railList().len);
 
     try testing.expect(!rt.runString("bad", "fenrir.rail{ label = 'x' }"));
     try testing.expect(!rt.runString("bad", "fenrir.rail{ action = 'q' }"));
@@ -3122,12 +3742,13 @@ test "a plugin declares a setting, and its value is the store's" {
     try testing.expectEqualStrings("title", rt.settingList()[1].choices.items[1]);
     // Declaring one stores nothing: the value is the store's, before and
     // after, and `fenrir.store` is still how a plugin reads it.
-    try testing.expect(fake.stored == null);
+    try testing.expectEqual(@as(usize, 0), fake.stored.items.len);
 
     // The same key twice replaces the row rather than adding a second.
     try testing.expect(rt.runString("again",
         \\fenrir.setting{ key = "reading.list", about = "somewhere else" }
     ));
+    rt.sweep();
     try testing.expectEqual(@as(usize, 2), rt.settingList().len);
     try testing.expectEqualStrings("somewhere else", rt.settingList()[0].about);
     // ...and it is no longer in the group, so a reload clears one, not two.
@@ -3155,6 +3776,7 @@ test "a command carries its icon into the palette, and redefining replaces both"
     try testing.expect(rt.runString("again",
         \\fenrir.command("Read", function() end, "close it again", "fenrir.close")
     ));
+    rt.sweep();
     try testing.expectEqual(@as(usize, 2), rt.commandNames().len);
     try testing.expectEqualStrings("close it again", rt.commandNames()[0].description);
     try testing.expectEqualStrings("fenrir.close", rt.commandNames()[0].icon);
@@ -3264,4 +3886,207 @@ test "every capability name survives the round trip" {
     }
     try testing.expect(Capability.parse("document") == null);
     try testing.expectEqual(@as(u8, 0), @as(u8, @bitCast(Caps{})));
+}
+
+// -- ownership ----------------------------------------------------------------
+
+test "a restricted plugin stays restricted in a module it requires" {
+    if (!lua.available) return error.SkipZigTest;
+    // Alphabetical, so `narrow` loads first and `wide` requires the same
+    // module after it: the cache used to be keyed by name alone, and the
+    // first requirer's environment was the one every later plugin got.
+    var fake: FakeHost = .{ .files = &.{
+        .{ "lua/shared.lua", "runs = (runs or 0) + 1 return { mark = function() return fenrir.highlight ~= nil end }" },
+        .{ "plugins/narrow.lua",
+        \\fenrir.manifest{ capabilities = { "ui" } }
+        \\at_load = require("shared").mark()
+        \\fenrir.on("Start", function() in_callback = require("shared").mark() end)
+        },
+        .{ "plugins/wide.lua", "wide_at_load = require('shared').mark()" },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    rt.emit(.{ .event = .Start });
+    try testing.expect(rt.runString("check",
+        \\assert(at_load == false, "a narrowed plugin got document.write at load")
+        \\assert(in_callback == false, "a narrowed plugin got document.write inside a callback")
+        \\assert(wide_at_load == true, "a plugin with no manifest lost something")
+        \\assert(runs == 2, "two plugins shared one module instance: " .. tostring(runs))
+    ));
+    try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
+}
+
+test "a capability taken away stops a function that was already captured" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/late.lua",
+        \\local mark = fenrir.highlight
+        \\fenrir.manifest{ capabilities = { "ui" } }
+        \\captured = pcall(mark, { page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 })
+        },
+        .{ "plugins/after.lua",
+        \\fenrir.notify("hello")
+        \\ordered = pcall(fenrir.manifest, { capabilities = { "ui" } })
+        },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.runString("check",
+        \\assert(captured == false, "a function captured above the manifest still worked")
+        \\assert(ordered == false, "a manifest was taken after the plugin had acted")
+    ));
+}
+
+// -- which document -----------------------------------------------------------
+
+// -- the limits ---------------------------------------------------------------
+
+test "removing a handler cancels the callback that is part way through" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\local function body()
+        \\  coroutine.yield()
+        \\  fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
+        \\  wrote = (wrote or 0) + 1
+        \\end
+        \\by_id = fenrir.on("Start", body)
+        \\fenrir.on("Start", body, "mine")
+    ));
+    rt.emit(.{ .event = .Start });
+    try testing.expectEqual(@as(usize, 2), rt.waiting());
+
+    try testing.expect(rt.runString("stop",
+        \\fenrir.off(by_id)
+        \\assert(fenrir.clear("mine") == 1)
+    ));
+    var frames: usize = 0;
+    while (rt.waiting() != 0 and frames < 10) : (frames += 1) rt.pump();
+
+    try testing.expectEqual(@as(usize, 0), rt.waiting());
+    try testing.expect(rt.runString("check", "assert(wrote == nil, tostring(wrote))"));
+    try testing.expectEqual(@as(usize, 0), fake.highlights.items.len);
+
+    // A new handler under the same name cannot bring the old job back.
+    try testing.expect(rt.runString("again", "fenrir.on('Start', function() end, 'mine')"));
+    rt.pump();
+    try testing.expect(rt.runString("check", "assert(wrote == nil)"));
+}
+
+// -- what a group takes away --------------------------------------------------
+
+test "clear takes a group's commands and keymaps as well as its handlers" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.command("Mine", function() ran = true end, "", "", "mine")
+        \\fenrir.keymap("n", "q", function() end, "", "mine")
+        \\fenrir.on("Start", function() end, "mine")
+        \\fenrir.rail{ label = "Mine", action = "q", group = "mine" }
+        \\fenrir.setting{ key = "mine.on", group = "mine" }
+        \\fenrir.panel{ id = "mine", rows = function() return {} end, group = "mine" }
+    ));
+    const look = rt.lookup();
+    try testing.expect(look.find(look.ptr, .normal, .{ .char = 'q' }) != null);
+    try testing.expectEqual(@as(?bool, true), rt.runCommand("Mine", ""));
+
+    try testing.expect(rt.runString("clear", "assert(fenrir.clear('mine') == 6, fenrir.clear('mine'))"));
+    try testing.expect(look.find(look.ptr, .normal, .{ .char = 'q' }) == null);
+    try testing.expectEqual(@as(?bool, null), rt.runCommand("Mine", ""));
+
+    rt.sweep();
+    try testing.expectEqual(@as(usize, 0), rt.commandNames().len);
+    try testing.expectEqual(@as(usize, 0), rt.keymapList().len);
+}
+
+// -- the store ----------------------------------------------------------------
+
+test "two plugins keeping the same key keep two values" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/one.lua",
+        \\fenrir.store.set("enabled", "yes")
+        \\one_read = fenrir.store.get("enabled")
+        \\fenrir.setting{ key = "enabled" }
+        },
+        .{ "plugins/two.lua",
+        \\two_before = fenrir.store.get("enabled")
+        \\fenrir.store.set("enabled", "no")
+        \\two_read = fenrir.store.get("enabled")
+        \\fenrir.setting{ key = "enabled" }
+        },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.runString("check",
+        \\assert(one_read == "yes", tostring(one_read))
+        \\assert(two_before == nil, "one plugin read another's value")
+        \\assert(two_read == "no", tostring(two_read))
+    ));
+    try testing.expectEqualStrings("yes", fake.value("one", "enabled").?);
+    try testing.expectEqualStrings("no", fake.value("two", "enabled").?);
+
+    // The settings page reads the same namespaced key, so two plugins that
+    // declared `enabled` are two rows and not one.
+    try testing.expectEqual(@as(usize, 2), rt.settingList().len);
+    try testing.expectEqualStrings("one/enabled", rt.settingList()[0].scoped);
+    try testing.expectEqualStrings("two/enabled", rt.settingList()[1].scoped);
+
+    // And no key text a plugin can write reaches out of its namespace.
+    try testing.expect(!rt.runString("escape", "fenrir.store.set('../other/enabled', 'x')"));
+}
+
+// -- what the host holds ------------------------------------------------------
+
+test "unloading a plugin takes everything of it, jobs included" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/guest.lua",
+        \\fenrir.command("Guest", function() end)
+        \\fenrir.keymap("n", "u", function() end)
+        \\escaped = fenrir.highlight
+        \\fenrir.on("Start", function()
+        \\  coroutine.yield()
+        \\  fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
+        \\end)
+        },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    rt.emit(.{ .event = .Start });
+    try testing.expectEqual(@as(usize, 1), rt.waiting());
+
+    try testing.expectEqual(@as(?u32, 3), rt.unload("guest"));
+    var frames: usize = 0;
+    while (rt.waiting() != 0 and frames < 10) : (frames += 1) rt.pump();
+    try testing.expectEqual(@as(usize, 0), fake.highlights.items.len);
+    try testing.expectEqual(@as(?bool, null), rt.runCommand("Guest", ""));
+
+    // A built-in key the plugin had shadowed is the reader's again, and a
+    // function of the plugin's that got out stops working.
+    const look = rt.lookup();
+    try testing.expect(look.find(look.ptr, .normal, .{ .char = 'u' }) == null);
+    try testing.expect(!rt.runString("escaped", "escaped{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }"));
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[rt.messages.items.len - 1], "not loaded") != null);
+    try testing.expectEqual(@as(?u32, null), rt.unload("nobody"));
 }

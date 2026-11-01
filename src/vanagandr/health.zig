@@ -302,9 +302,13 @@ fn plugins(r: *Report, dir: []const u8, db_path: ?[]const u8) void {
     for (rt.keymapList()) |k| {
         if (k.live) live_keys += 1;
     }
+    var live_commands: usize = 0;
+    for (rt.commandNames()) |c| {
+        if (c.live) live_commands += 1;
+    }
     r.line(.ok, "contributed", "{d} keys, {d} commands, {d} handlers, {d} buttons, {d} panels, {d} settings", .{
         live_keys,
-        rt.commandNames().len,
+        live_commands,
         live_handlers,
         live_rails,
         live_panels,
@@ -401,12 +405,12 @@ const Headless = struct {
             }
         }.f,
         .storeGet = struct {
-            fn f(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ?[]u8 {
+            fn f(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) ?[]u8 {
                 return null;
             }
         }.f,
         .storeSet = struct {
-            fn f(_: *anyopaque, _: []const u8, _: ?[]const u8) bool {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
                 return false;
             }
         }.f,

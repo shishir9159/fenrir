@@ -474,26 +474,23 @@ const Driver = struct {
         return true;
     }
 
-    /// Plugin values live in Mímir's settings under `galdr.`, exactly as the
-    /// reader's do, so a script and a window read the same values.
-    fn storeKey(buf: []u8, key: []const u8) ?[]const u8 {
-        return std.fmt.bufPrint(buf, "galdr.{s}", .{key}) catch null;
-    }
-
-    fn storeGet(ptr: *anyopaque, gpa: Allocator, key: []const u8) ?[]u8 {
+    /// Plugin values live in Mímir's settings under `galdr.<plugin>/`,
+    /// exactly as the reader's do, so a script and a window read the same
+    /// values. See `library.pluginKey`.
+    fn storeGet(ptr: *anyopaque, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {
         const d = of(ptr);
         const lib = d.library orelse return null;
-        var buf: [256]u8 = undefined;
-        const full = storeKey(&buf, key) orelse return null;
+        var buf: [320]u8 = undefined;
+        const full = library.pluginKey(&buf, plugin, key) orelse return null;
         const value = (lib.get(full) catch return null) orelse return null;
         defer d.ctx.gpa.free(value);
         return gpa.dupe(u8, value) catch null;
     }
 
-    fn storeSet(ptr: *anyopaque, key: []const u8, value: ?[]const u8) bool {
+    fn storeSet(ptr: *anyopaque, plugin: []const u8, key: []const u8, value: ?[]const u8) bool {
         const lib = of(ptr).library orelse return false;
-        var buf: [256]u8 = undefined;
-        const full = storeKey(&buf, key) orelse return false;
+        var buf: [320]u8 = undefined;
+        const full = library.pluginKey(&buf, plugin, key) orelse return false;
         if (value) |v| lib.set(full, v) catch return false else lib.remove(full) catch return false;
         return true;
     }

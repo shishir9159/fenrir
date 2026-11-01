@@ -65,8 +65,11 @@ pub const Highlight = struct {
 pub const VTable = struct {
     /// Shows a message where the reader shows messages.
     notify: *const fn (ptr: *anyopaque, message: []const u8) void,
-    /// Runs a `:` command line. False when there is no such command or it
-    /// failed; the host has already said why.
+    /// Runs a `:` command line, **at a plugin's authority and never the
+    /// console's**. A host whose commands include one that runs arbitrary
+    /// code -- `:lua` -- refuses that one here, or a plugin granted `ui`
+    /// alone has the whole table back through it. False when there is no
+    /// such command or it failed; the host has already said why.
     exec: *const fn (ptr: *anyopaque, line: []const u8) bool,
 
     document: *const fn (ptr: *anyopaque) ?Document,
@@ -87,9 +90,13 @@ pub const VTable = struct {
 
     /// A plugin's persistent value, or null. The caller owns the result and
     /// frees it with `gpa`.
-    storeGet: *const fn (ptr: *anyopaque, gpa: Allocator, key: []const u8) ?[]u8,
+    ///
+    /// `plugin` is the host's own name for the caller and never a string the
+    /// caller chose: the namespace is the host's answer to "whose key is
+    /// this", so two plugins that both keep `enabled` keep two values.
+    storeGet: *const fn (ptr: *anyopaque, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8,
     /// Sets, or with null removes. False when there is nowhere to store it.
-    storeSet: *const fn (ptr: *anyopaque, key: []const u8, value: ?[]const u8) bool,
+    storeSet: *const fn (ptr: *anyopaque, plugin: []const u8, key: []const u8, value: ?[]const u8) bool,
 
     /// A file under the configuration directory, by a path relative to it.
     /// Null when it does not exist or is outside the directory. Caller frees.
@@ -155,12 +162,12 @@ pub fn removeHighlight(h: Host, id: u64) bool {
     return h.vtable.removeHighlight(h.ptr, id);
 }
 
-pub fn storeGet(h: Host, gpa: Allocator, key: []const u8) ?[]u8 {
-    return h.vtable.storeGet(h.ptr, gpa, key);
+pub fn storeGet(h: Host, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {
+    return h.vtable.storeGet(h.ptr, gpa, plugin, key);
 }
 
-pub fn storeSet(h: Host, key: []const u8, value: ?[]const u8) bool {
-    return h.vtable.storeSet(h.ptr, key, value);
+pub fn storeSet(h: Host, plugin: []const u8, key: []const u8, value: ?[]const u8) bool {
+    return h.vtable.storeSet(h.ptr, plugin, key, value);
 }
 
 pub fn readFile(h: Host, gpa: Allocator, path: []const u8) ?[]u8 {

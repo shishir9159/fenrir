@@ -182,7 +182,10 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
     if (rt.commands.items.len != 0) {
         ctx.out.print("commands:\n", .{}) catch {};
         for (rt.commandNames()) |c| {
-            ctx.out.print("  :{s: <14} {s}\n", .{ c.name, c.description }) catch {};
+            if (!c.live) continue;
+            ctx.out.print("  :{s: <14} {s}", .{ c.name, c.description }) catch {};
+            if (c.group.len != 0) ctx.out.print("  group {s}", .{c.group}) catch {};
+            ctx.out.print("\n", .{}) catch {};
         }
     }
 
@@ -359,20 +362,20 @@ const Headless = struct {
         of(ptr).ctx.out.print("  | {s}\n", .{message}) catch {};
     }
 
-    fn storeGet(ptr: *anyopaque, gpa: Allocator, key: []const u8) ?[]u8 {
+    fn storeGet(ptr: *anyopaque, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {
         const h = of(ptr);
         const lib = h.library orelse return null;
-        var buf: [256]u8 = undefined;
-        const full = std.fmt.bufPrint(&buf, "galdr.{s}", .{key}) catch return null;
+        var buf: [320]u8 = undefined;
+        const full = library.pluginKey(&buf, plugin, key) orelse return null;
         const value = (lib.get(full) catch return null) orelse return null;
         defer h.ctx.gpa.free(value);
         return gpa.dupe(u8, value) catch null;
     }
 
-    fn storeSet(ptr: *anyopaque, key: []const u8, value: ?[]const u8) bool {
+    fn storeSet(ptr: *anyopaque, plugin: []const u8, key: []const u8, value: ?[]const u8) bool {
         const lib = of(ptr).library orelse return false;
-        var buf: [256]u8 = undefined;
-        const full = std.fmt.bufPrint(&buf, "galdr.{s}", .{key}) catch return false;
+        var buf: [320]u8 = undefined;
+        const full = library.pluginKey(&buf, plugin, key) orelse return false;
         if (value) |v| lib.set(full, v) catch return false else lib.remove(full) catch return false;
         return true;
     }

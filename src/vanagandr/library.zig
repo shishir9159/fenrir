@@ -55,6 +55,24 @@ pub fn path(ctx: *Context) ?[]u8 {
 }
 
 /// Seconds since the Unix epoch, from the platform clock the `Io` carries.
+/// Where one plugin's value lives in the settings table.
+///
+/// Under `galdr.` so that `fenrir config` shows it and a plugin cannot
+/// overwrite `author`, and under the plugin's own name inside that, so that
+/// three plugins keeping `enabled` keep three values. The separator is `/`,
+/// which neither a plugin's name -- one component of a directory listing --
+/// nor a key -- letters, digits, `_`, `-` and `.` -- can contain, so no key
+/// a plugin is able to write reaches into another plugin's.
+///
+/// An empty namespace is the console's: `:lua` and `fenrir plugins` keep
+/// the flat keys, which are also the ones written before plugins had a
+/// namespace at all. Those are readable from `:lua` and are not migrated,
+/// because nothing records which plugin wrote them.
+pub fn pluginKey(buf: []u8, plugin: []const u8, key: []const u8) ?[]const u8 {
+    if (plugin.len == 0) return std.fmt.bufPrint(buf, "galdr.{s}", .{key}) catch null;
+    return std.fmt.bufPrint(buf, "galdr.{s}/{s}", .{ plugin, key }) catch null;
+}
+
 pub fn now(io: Io) i64 {
     const t = Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(t.nanoseconds, std.time.ns_per_s));

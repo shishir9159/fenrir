@@ -1502,14 +1502,16 @@ const Session = struct {
 
     /// Where a row's value lives in the library.
     ///
-    /// A plugin's is under `galdr.`, which is where `fenrir.store` already
-    /// puts it -- so a setting declared and a setting stored are the same
-    /// bytes, and a plugin goes on reading its own value with
-    /// `fenrir.store.get` whether a person has ever opened this page.
+    /// A plugin's is under `galdr.<plugin>/`, which is where
+    /// `fenrir.store` already puts it -- so a setting declared and a
+    /// setting stored are the same bytes, and a plugin goes on reading its
+    /// own value with `fenrir.store.get` whether or not a person has ever
+    /// opened this page. A plugin row's `key` is already `<plugin>/<key>`,
+    /// so that two plugins which both declared `enabled` are two rows.
     fn settingKey(s: *Session, buf: []u8, index: usize) ?[]const u8 {
         const opt = s.settings.optionAt(index);
         if (!s.settings.isPlugin(index)) return opt.key;
-        return std.fmt.bufPrint(buf, "galdr.{s}", .{opt.key}) catch null;
+        return library.pluginKey(buf, "", opt.key);
     }
 
     /// The plugins' settings, borrowed from Galdr, rebuilt on a change.
@@ -1526,7 +1528,7 @@ const Session = struct {
         for (rt.settingList()) |row| {
             if (!row.live) continue;
             s.plugin_settings.append(s.gpa, .{
-                .key = row.key,
+                .key = row.scoped,
                 .about = row.about,
                 .choices = row.choices.items,
                 .unset = if (row.unset.len != 0) row.unset else "not set",
@@ -3363,8 +3365,16 @@ const Session = struct {
     /// the palette lists it, so a command that exists here and nowhere else
     /// is not possible.
     ///
+    /// Who asked for a `:` line to run. A plugin's authority is not the
+    /// console's, and the reader is where the difference is known.
+    const Origin = enum { console, plugin };
+
     /// Returns false when the line did nothing, having said why.
     fn exec(s: *Session, raw: []const u8) bool {
+        return s.execFrom(raw, .console);
+    }
+
+    fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
         const line = std.mem.trim(u8, raw, " \t");
         if (line.len == 0) return true;
 
@@ -3508,6 +3518,14 @@ const Session = struct {
                 s.showComparison(want);
             },
             .lua => {
+                // Not from a plugin. `:lua` is arbitrary Lua at the
+                // console's authority, so a plugin that asked for `ui`
+                // alone would have the whole table back through
+                // `fenrir.exec` -- which is why `exec` carries who asked.
+                if (from == .plugin) {
+                    s.say(":lua is the console's and not a plugin's", .{});
+                    return false;
+                }
                 const rt = s.plugins orelse {
                     s.say("plugins are off in this reader", .{});
                     return false;
@@ -3576,6 +3594,7 @@ const Session = struct {
                 if (look.find(look.ptr, .normal, k) != null) row.binding = "";
             }
             for (rt.commandNames()) |c| {
+                if (!c.live) continue;
                 s.palette_rows.append(s.gpa, .{
                     .name = c.name,
                     .about = c.description,
@@ -3785,8 +3804,15 @@ const Session = struct {
         hostSession(ptr).say("{s}", .{message[0..@min(message.len, 480)]});
     }
 
+    /// A plugin's `:` line, which is not the console's.
+    ///
+    /// `:lua` runs arbitrary Lua with everything granted, so a plugin that
+    /// asked for `ui` alone would have the whole table back through it --
+    /// `exec` is documented as running a command and a command is not an
+    /// interpreter. Refused here rather than in Galdr, because which of
+    /// this reader's commands is arbitrary code is this reader's answer.
     fn hostExec(ptr: *anyopaque, line: []const u8) bool {
-        return hostSession(ptr).exec(line);
+        return hostSession(ptr).execFrom(line, .plugin);
     }
 
     fn hostDocument(ptr: *anyopaque) ?galdr.Host.Document {
@@ -3899,17 +3925,11 @@ const Session = struct {
         return (b.marks.removeAt(s.gpa, index) catch null) != null;
     }
 
-    /// Plugin values live in Mímir's settings, under `galdr.`, so that
-    /// `fenrir config` shows them and a plugin cannot overwrite `author`.
-    fn storeKey(buf: []u8, key: []const u8) ?[]const u8 {
-        return std.fmt.bufPrint(buf, "galdr.{s}", .{key}) catch null;
-    }
-
-    fn hostStoreGet(ptr: *anyopaque, gpa: Allocator, key: []const u8) ?[]u8 {
+    fn hostStoreGet(ptr: *anyopaque, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {
         const s = hostSession(ptr);
         const lib = s.library orelse return null;
-        var buf: [256]u8 = undefined;
-        const full = storeKey(&buf, key) orelse return null;
+        var buf: [320]u8 = undefined;
+        const full = library.pluginKey(&buf, plugin, key) orelse return null;
         const value = (lib.get(full) catch return null) orelse return null;
         // The library allocated with the reader's heap; hand back the
         // caller's allocation, as the interface promises.
@@ -3917,11 +3937,11 @@ const Session = struct {
         return gpa.dupe(u8, value) catch null;
     }
 
-    fn hostStoreSet(ptr: *anyopaque, key: []const u8, value: ?[]const u8) bool {
+    fn hostStoreSet(ptr: *anyopaque, plugin: []const u8, key: []const u8, value: ?[]const u8) bool {
         const s = hostSession(ptr);
         const lib = s.library orelse return false;
-        var buf: [256]u8 = undefined;
-        const full = storeKey(&buf, key) orelse return false;
+        var buf: [320]u8 = undefined;
+        const full = library.pluginKey(&buf, plugin, key) orelse return false;
         if (value) |val| {
             lib.set(full, val) catch return false;
         } else {
@@ -4042,8 +4062,11 @@ const Session = struct {
     /// either half of the difference has moved since it was last reported.
     fn reportChanges(s: *Session) void {
         const rt = s.plugins orelse return;
-        const path = s.buffer(s.view().buffer).path;
-        const page = s.view().currentPage();
+        if (s.buffers.items.len == 0) return;
+        const v = s.view();
+        const path = s.buffer(v.buffer).path;
+
+        const page = v.currentPage();
         if (page != s.reported_page) {
             s.reported_page = page;
             rt.emit(.{ .event = .PageChanged, .path = path, .data = .{ .page = page + 1 } });
@@ -4055,7 +4078,7 @@ const Session = struct {
         // The selection is read out of the view rather than kept beside it:
         // it moves with a key, with a drag and with a command, and a flag set
         // at each of those would be three places to forget one.
-        const selection = s.hostSelectionOf(s.view());
+        const selection = s.hostSelectionOf(v);
         if (!std.meta.eql(selection, s.reported_selection)) {
             s.reported_selection = selection;
             rt.emit(.{ .event = .SelectionChanged, .path = path, .data = .{ .selection = selection } });
@@ -7343,6 +7366,37 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
     const bad = keys.commandWith(&s.keymap, .{ .events = &.{.{ .text = "x" }} }, rt.lookup());
     try testing.expect(!s.apply(bad.items()[0]));
     try testing.expect(std.mem.indexOf(u8, s.status, "boom") != null);
+}
+
+test "a plugin's exec runs a command and not the console's lua" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    s.plugins = rt;
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    // `fenrir.exec` is a plugin's command line. `:lua` is arbitrary Lua at
+    // the console's authority, so a plugin granted `ui` alone would have
+    // the whole table back through it.
+    try testing.expect(rt.runString("try", "ok = fenrir.exec('lua reached = true')"));
+    try testing.expect(rt.runString("check",
+        \\assert(ok == false, "a plugin reached :lua through fenrir.exec")
+        \\assert(reached == nil, "the line ran anyway")
+    ));
+    try testing.expect(std.mem.indexOf(u8, s.status, "console") != null);
+
+    // Every other command still goes through, and the console's own `:lua`
+    // is untouched.
+    try testing.expect(rt.runString("split", "fenrir.exec('vsplit')"));
+    try testing.expect(s.exec("lua direct = true"));
+    try testing.expect(rt.runString("check", "assert(direct == true)"));
 }
 
 test "a press in text moves the caret there and a drag carries it along" {

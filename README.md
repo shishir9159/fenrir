@@ -45,7 +45,9 @@ blank, or an invisible OCR layer over a scan.
   buffer, so every window on a document shows the same ones.
 - **Galdr** is Neovim's plugin model (`init.lua`, `plugins/`, a `fenrir`
   table) in a sandbox with no files, no processes, and limits on memory and
-  time.
+  time. Every registration and every suspended callback carries the plugin
+  that made it, so taking one away takes all of it and nothing of anybody
+  else's.
 
 ## Building
 
