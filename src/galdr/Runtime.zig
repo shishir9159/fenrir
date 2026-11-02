@@ -544,6 +544,9 @@ pub const Plugin = struct {
     id: u32,
     /// Which load this is. A contribution tagged with an older one is dead.
     generation: u32 = 0,
+    /// The generation a load in progress is replacing, which stays in
+    /// service until that load works. Zero at every other moment.
+    previous: u32 = 0,
     /// Whether its chunk ran to the end. Set after it has, so a plugin that
     /// is still loading -- which is when a manifest is declared -- is already
     /// in the list for `fenrir.manifest` to find.
@@ -1006,7 +1009,9 @@ pub fn unload(rt: *Runtime, name: []const u8) ?u32 {
     for (rt.plugins.items) |*p| {
         if (!std.mem.eql(u8, p.name, name)) continue;
         if (!p.loaded) return 0;
-        const n = rt.retire(.{ .id = p.id, .generation = p.generation });
+        var n = rt.retire(.{ .id = p.id, .generation = p.generation });
+        if (p.previous != 0) n += rt.retire(.{ .id = p.id, .generation = p.previous });
+        p.previous = 0;
         p.loaded = false;
         p.ok = false;
         return n;
@@ -1415,9 +1420,17 @@ fn pluginOf(rt: *Runtime, owner: Owner) ?*Plugin {
 }
 
 /// Whether a registration or a suspended job this owner made is still its
-/// plugin's. The console's work never goes stale.
+/// plugin's.
+///
+/// Looser than `pluginOf` by one generation: while a reload is staging its
+/// replacement, the generation it is replacing is still in service, because
+/// a reload that fails has to leave the last working one behind.
 fn ownerLive(rt: *Runtime, owner: Owner) bool {
-    return owner.id == 0 or rt.pluginOf(owner) != null;
+    if (owner.id == 0) return true;
+    if (owner.id > rt.plugins.items.len) return false;
+    const p = &rt.plugins.items[owner.id - 1];
+    if (!p.loaded) return false;
+    return owner.generation == p.generation or owner.generation == p.previous;
 }
 
 /// The namespace a plugin's store keys live in: its name, which the host
@@ -1635,10 +1648,13 @@ pub fn loadConfig(rt: *Runtime) void {
 /// on it while the chunk is running.
 fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8, manifest: ?[]const u8) bool {
     const at = rt.entryFor(name) orelse return false;
-    const owner = rt.openGeneration(at);
+    const owner = rt.beginLoad(at);
 
     const env = rt.makeEnv(.all, owner);
-    if (env == lua.no_ref) return false;
+    if (env == lua.no_ref) {
+        rt.endLoad(owner, false);
+        return false;
+    }
     // The registry's hold, not the table's life: every closure the plugin
     // makes keeps `_ENV` as an upvalue, so the environment lives exactly as
     // long as the plugin's functions do.
@@ -1663,7 +1679,7 @@ fn loadOne(rt: *Runtime, name: []const u8, path: []const u8, source: []const u8,
         }
     }
     if (ok) ok = rt.runChunk(path, source, env);
-    rt.plugins.items[at].ok = ok;
+    rt.endLoad(owner, ok);
     return ok;
 }
 
@@ -1684,13 +1700,11 @@ fn entryFor(rt: *Runtime, name: []const u8) ?usize {
     return rt.plugins.items.len - 1;
 }
 
-/// Opens a generation, retiring the one before it.
-///
-/// Everything the chunk registers is tagged with the number this returns,
-/// so a reload leaves nothing of the load before behind.
-fn openGeneration(rt: *Runtime, at: usize) Owner {
+/// Opens a generation. What the chunk registers is tagged with it, and
+/// nothing of it is in service until `endLoad` says the load worked.
+fn beginLoad(rt: *Runtime, at: usize) Owner {
     const p = &rt.plugins.items[at];
-    if (p.loaded) _ = rt.retire(.{ .id = p.id, .generation = p.generation });
+    p.previous = if (p.loaded) p.generation else 0;
     p.generation +%= 1;
     if (p.generation == 0) p.generation = 1;
     p.loaded = true;
@@ -1698,6 +1712,30 @@ fn openGeneration(rt: *Runtime, at: usize) Owner {
     p.acted = false;
     p.caps = .all;
     return .{ .id = p.id, .generation = p.generation };
+}
+
+/// Closes it: the new generation replaces the old, or is discarded and the
+/// old one goes on.
+///
+/// What this cannot undo is what the chunk *did* on its way to failing --
+/// a highlight it made, a value it stored. Registrations are staged; acts
+/// are not, which is why loading is meant to be declarative.
+fn endLoad(rt: *Runtime, owner: Owner, ok: bool) void {
+    const p = &rt.plugins.items[owner.id - 1];
+    p.ok = ok;
+    if (ok) {
+        if (p.previous != 0) _ = rt.retire(.{ .id = p.id, .generation = p.previous });
+        p.previous = 0;
+        return;
+    }
+    _ = rt.retire(owner);
+    if (p.previous != 0) {
+        p.generation = p.previous;
+        p.previous = 0;
+        p.ok = true;
+    } else {
+        p.loaded = false;
+    }
 }
 
 /// Runs a chunk *as a plugin*: its own environment, its own entry in
@@ -2078,16 +2116,44 @@ fn step(rt: *Runtime, co: *lua.State, nargs: c_int, event: Event) c_int {
 
     var what: [64]u8 = undefined;
     const label = std.fmt.bufPrint(&what, "on {s}", .{@tagName(event)}) catch "event";
-    // The traceback is of the coroutine's stack and is built on the main
-    // one, because the coroutine is in an error state and pushing to it is
-    // not a thing to be doing.
-    const message = lua.toString(co, -1) orelse "(no message)";
-    lua.pushString(rt.L, message);
-    lua.luaL_traceback(rt.L, co, @ptrCast(lua.lua_tolstring(rt.L, -1, null)), 0);
-    rt.report(label, lua.toString(rt.L, -1) orelse message);
-    lua.pop(rt.L, 2);
+    rt.trace(co, label, lua.toString(co, -1) orelse "(no message)");
     lua.lua_settop(co, 0);
     return status;
+}
+
+const TraceJob = struct {
+    co: *lua.State,
+    label: []const u8,
+    message: []const u8,
+};
+
+/// Builds the traceback and records it, inside a protected call of its own.
+///
+/// Both halves of this allocate -- pushing the message, and `luaL_traceback`
+/// building the text -- and they run *after* `lua_resume` has returned, so
+/// there is no protected call around them any more. At the memory limit an
+/// allocation that failed here would reach Lua's panic path, which aborts
+/// the process: reporting an error must not be the thing that is fatal.
+fn traceTrampoline(L: ?*lua.State) callconv(.c) c_int {
+    const job: *const TraceJob = @ptrCast(@alignCast(lua.lua_touserdata(L, 1).?));
+    const rt = of(L);
+    lua.pushString(L, job.message);
+    lua.luaL_traceback(L, job.co, @ptrCast(lua.lua_tolstring(L, -1, null)), 0);
+    // Recorded from inside, because the strings it points at are this
+    // call's and are gone the moment it returns.
+    rt.report(job.label, lua.toString(L, -1) orelse job.message);
+    return 0;
+}
+
+fn trace(rt: *Runtime, co: *lua.State, label: []const u8, message: []const u8) void {
+    var job: TraceJob = .{ .co = co, .label = label, .message = message };
+    lua.lua_pushcclosure(rt.L, traceTrampoline, 0);
+    lua.lua_pushlightuserdata(rt.L, &job);
+    if (lua.pcall(rt.L, 1, 0, 0) == lua.ok) return;
+    // The fallback, which allocates nothing of Lua's: no traceback, but the
+    // line that says what went wrong.
+    lua.pop(rt.L, 1);
+    rt.report(label, message);
 }
 
 /// The one table a handler is given.
@@ -2394,6 +2460,17 @@ fn checkKey(L: ?*lua.State, arg: c_int) []const u8 {
     return key;
 }
 
+/// A field of an options table, read without metamethods.
+///
+/// `lua_getfield` runs `__index`, which is Lua, which can raise -- and a
+/// raise in the middle of reading a table jumps over every `defer` in this
+/// frame. Reading raw means the arguments can all be read before anything
+/// is owned.
+fn rawField(L: ?*lua.State, index: c_int, name: [:0]const u8) lua.Type {
+    lua.pushString(L, name);
+    return @enumFromInt(lua.lua_rawget(L, index));
+}
+
 fn apiNotify(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     var len: usize = 0;
@@ -2478,8 +2555,19 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
 
     lua.lua_pushvalue(L, 1);
     _ = lua.lua_rawget(L, loaded);
-    if (lua.typeOf(L, -1) != .nil) return 1;
-    lua.pop(L, 1);
+    switch (lua.typeOf(L, -1)) {
+        .nil => lua.pop(L, 1),
+        // The loading sentinel: this module is already somewhere up the
+        // stack. Said plainly, with the name in it. The old answer was
+        // `true`, which is a module that works until the day it is used.
+        .light_userdata => {
+            var msg: [600]u8 = undefined;
+            lua.raise(L, std.fmt.bufPrint(&msg, "galdr: module '{s}' requires itself", .{
+                name[0..@min(name.len, 200)],
+            }) catch "galdr: a module requires itself");
+        },
+        else => return 1,
+    }
 
     // `foo.bar` is `lua/foo/bar.lua`, or `lua/foo/bar/init.lua`.
     var dotted: [256]u8 = undefined;
@@ -2510,14 +2598,23 @@ fn apiRequire(L: ?*lua.State) callconv(.c) c_int {
         lua.lua_pushvalue(L, lua.upvalueIndex(3));
         _ = lua.lua_setupvalue(L, -2, 1);
 
-        // Marked loaded before it runs, so two modules that require each
-        // other get `true` rather than recursing forever.
+        // Marked as loading before it runs, so that a cycle is an error
+        // with a name in it rather than a recursion with no end.
         lua.lua_pushvalue(L, 1);
-        lua.lua_pushboolean(L, 1);
+        lua.lua_pushlightuserdata(L, rt);
         lua.lua_rawset(L, loaded);
 
+        // Protected: an unprotected error longjmps straight past this frame
+        // and leaves the sentinel behind, so the next `require` reports
+        // success and hands back a module that never ran. Rethrown once the
+        // entry is out, which is the same error in the same place.
         lua.lua_pushvalue(L, 1);
-        lua.lua_callk(L, 1, 1, 0, null);
+        if (lua.pcall(L, 1, 1, 0) != lua.ok) {
+            lua.lua_pushvalue(L, 1);
+            lua.lua_pushnil(L);
+            lua.lua_rawset(L, loaded);
+            _ = lua.lua_error(L);
+        }
         if (lua.typeOf(L, -1) == .nil) {
             lua.pop(L, 1);
             lua.lua_pushboolean(L, 1);
@@ -2706,31 +2803,6 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
     lua.lua_pushvalue(L, 2);
     const ref = lua.luaL_ref(L, lua.registry_index);
 
-    // Redefining replaces, as `:command!` does -- all of it, because a
-    // plugin that changed what a command *does* and was left with the old
-    // sentence beside it in the palette would be the palette lying about
-    // the reader.
-    for (rt.commands.items) |*c| {
-        if (!c.live or !std.mem.eql(u8, c.name, name)) continue;
-        rt.release(&c.ref);
-        c.ref = ref;
-        c.owner = owner;
-        if (rt.own(description)) |d| {
-            rt.disown(c.description);
-            c.description = d;
-        }
-        if (rt.own(icon)) |p| {
-            rt.disown(c.icon);
-            c.icon = p;
-        }
-        if (rt.own(group)) |g| {
-            rt.disown(c.group);
-            c.group = g;
-        }
-        rt.revision +%= 1;
-        return 0;
-    }
-
     const owned = rt.own(name);
     const desc = rt.own(description);
     const picture = rt.own(icon);
@@ -2750,6 +2822,17 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
         if (picture) |t| rt.disown(t);
         if (owned_group) |t| rt.disown(t);
         return rt.outOfMemory(L, ref);
+    }
+    // Redefining replaces, as `:command!` does -- all of it, because a
+    // plugin that changed what a command *does* and was left with the old
+    // sentence beside it in the palette would be the palette lying about
+    // the reader. The old row is retired rather than written over: the
+    // palette borrows those bytes for as long as it is open, and `sweep`
+    // gives them back at a moment nothing is drawing them.
+    for (rt.commands.items[0 .. rt.commands.items.len - 1]) |*c| {
+        if (!c.live or !std.mem.eql(u8, c.name, name)) continue;
+        c.live = false;
+        rt.release(&c.ref);
     }
     rt.revision +%= 1;
     return 0;
@@ -2907,23 +2990,23 @@ fn apiClear(L: ?*lua.State) callconv(.c) c_int {
 fn apiRail(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
 
-    _ = lua.lua_getfield(L, 1, "side");
+    _ = rawField(L, 1, "side");
     const side_text = lua.toString(L, -1) orelse "right";
     const side = std.meta.stringToEnum(Side, side_text) orelse
         lua.raise(L, "galdr: a rail is \"left\" or \"right\"");
     lua.pop(L, 1);
 
-    _ = lua.lua_getfield(L, 1, "label");
+    _ = rawField(L, 1, "label");
     const label = lua.toString(L, -1) orelse lua.raise(L, "galdr: a rail button needs a label");
     if (label.len == 0 or label.len > 64) lua.raise(L, "galdr: a rail button's label is one to sixty-four bytes");
 
-    _ = lua.lua_getfield(L, 1, "icon");
+    _ = rawField(L, 1, "icon");
     const icon = checkText(L, lua.toString(L, -1) orelse "fenrir.unknown", "icon");
 
-    _ = lua.lua_getfield(L, 1, "group");
+    _ = rawField(L, 1, "group");
     const group = checkText(L, lua.toString(L, -1) orelse "", "group");
 
-    _ = lua.lua_getfield(L, 1, "action");
+    _ = rawField(L, 1, "action");
     const kind = lua.typeOf(L, -1);
     if (kind != .function and kind != .string) lua.raise(L, "galdr: a rail button needs a function or a command line");
     const line = if (kind == .string) checkText(L, lua.toString(L, -1).?, "command line") else "";
@@ -2979,22 +3062,47 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
 fn apiSetting(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
 
-    _ = lua.lua_getfield(L, 1, "key");
+    // Every field is read first, raw, and left on the stack; nothing native
+    // is owned until the last thing that can raise has happened. A `defer`
+    // in this frame does not run when a metamethod longjmps over it, so the
+    // way not to leak is to have nothing to leak yet -- and reading raw
+    // means a `__index` cannot run here at all.
+    _ = rawField(L, 1, "key");
     const key = checkKey(L, -1);
-    _ = lua.lua_getfield(L, 1, "about");
-    const about = lua.optString(L, -1) orelse "";
-    _ = lua.lua_getfield(L, 1, "unset");
-    const unset = lua.optString(L, -1) orelse "not set";
-    _ = lua.lua_getfield(L, 1, "group");
-    const group = lua.optString(L, -1) orelse "";
+    _ = rawField(L, 1, "about");
+    const about = checkText(L, lua.optString(L, -1) orelse "", "description");
+    _ = rawField(L, 1, "unset");
+    const unset = checkText(L, lua.optString(L, -1) orelse "not set", "description");
+    _ = rawField(L, 1, "group");
+    const group = checkText(L, lua.optString(L, -1) orelse "", "group");
 
     const owner = authority(L);
     const rt = of(L);
+    rt.room(L, rt.settings.items.len);
+
+    // The choices too, onto the stack and type-checked rather than
+    // converted: `tolstring` on a number writes a string into the table,
+    // which allocates, which can raise.
+    const kind = rawField(L, 1, "choices");
+    const choices_at = lua.lua_gettop(L);
+    var count: usize = 0;
+    if (kind == .table) {
+        const n = @min(lua.lua_rawlen(L, choices_at), max_choices);
+        lua.luaL_checkstack(L, @intCast(n + 4), "galdr: too many choices");
+        var i: lua.Integer = 1;
+        while (i <= n) : (i += 1) {
+            if (@as(lua.Type, @enumFromInt(lua.lua_rawgeti(L, choices_at, i))) != .string)
+                lua.raise(L, "galdr: a setting's choices are strings");
+            count += 1;
+        }
+    } else if (kind != .nil) {
+        lua.raise(L, "galdr: a setting's choices are a list of strings");
+    }
 
     // Where the value actually lives: the host's namespace for this plugin
     // and the key under it, which is what the settings page has to read or
     // it would show one plugin's value under another's row.
-    var scope: [512]u8 = undefined;
+    var scope: [max_text]u8 = undefined;
     const space = rt.storeSpace(owner);
     const scoped = if (space.len == 0)
         key
@@ -3002,40 +3110,48 @@ fn apiSetting(L: ?*lua.State) callconv(.c) c_int {
         std.fmt.bufPrint(&scope, "{s}/{s}", .{ space, key }) catch
             lua.raise(L, "galdr: that plugin's name and key are too long together");
 
+    const o_key = rt.own(key);
+    const o_scoped = rt.own(scoped);
+    const o_about = rt.own(about);
+    const o_unset = rt.own(unset);
+    const o_group = rt.own(group);
     var row: Setting = .{
         .owner = owner,
-        .key = rt.gpa.dupe(u8, key) catch lua.raise(L, "galdr: out of memory"),
-        .scoped = rt.gpa.dupe(u8, scoped) catch &.{},
-        .about = rt.gpa.dupe(u8, about) catch &.{},
-        .unset = rt.gpa.dupe(u8, unset) catch &.{},
-        .group = rt.gpa.dupe(u8, group) catch &.{},
+        .key = o_key orelse &.{},
+        .scoped = o_scoped orelse &.{},
+        .about = o_about orelse &.{},
+        .unset = o_unset orelse &.{},
+        .group = o_group orelse &.{},
     };
-
-    _ = lua.lua_getfield(L, 1, "choices");
-    if (lua.typeOf(L, -1) == .table) {
-        const n: lua.Integer = @intCast(lua.lua_rawlen(L, -1));
-        var i: lua.Integer = 1;
-        while (i <= n) : (i += 1) {
-            _ = lua.lua_rawgeti(L, -1, i);
-            const text = lua.toString(L, -1) orelse "";
-            const owned = rt.gpa.dupe(u8, text) catch break;
-            row.choices.append(rt.gpa, owned) catch {
-                rt.gpa.free(owned);
+    var ok = o_key != null and o_scoped != null and o_about != null and o_unset != null and o_group != null;
+    if (ok) {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const text = lua.toString(L, choices_at + 1 + @as(c_int, @intCast(i))) orelse "";
+            const owned = rt.own(text) orelse {
+                ok = false;
                 break;
             };
-            lua.pop(L, 1);
+            row.choices.append(rt.gpa, owned) catch {
+                rt.disown(owned);
+                ok = false;
+                break;
+            };
         }
+    }
+    if (!ok) {
+        rt.freeSetting(&row);
+        lua.raise(L, "galdr: out of memory");
     }
 
     // Declaring the same key twice replaces it, as redefining a command
-    // does: a plugin reloaded should not leave two rows behind.
+    // does: a plugin reloaded should not leave two rows behind. Retired
+    // rather than written over, because the settings page is borrowing the
+    // old row's bytes for as long as it is open.
     for (rt.settings.items) |*existing| {
         if (!existing.live or existing.owner.id != owner.id) continue;
         if (!std.mem.eql(u8, existing.key, key)) continue;
-        rt.freeSetting(existing);
-        existing.* = row;
-        rt.revision +%= 1;
-        return 0;
+        existing.live = false;
     }
     rt.settings.append(rt.gpa, row) catch {
         rt.freeSetting(&row);
@@ -3054,25 +3170,25 @@ fn apiSetting(L: ?*lua.State) callconv(.c) c_int {
 fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
 
-    _ = lua.lua_getfield(L, 1, "id");
+    _ = rawField(L, 1, "id");
     const name = lua.toString(L, -1) orelse lua.raise(L, "galdr: a panel needs an id");
     if (name.len == 0 or name.len > 64) lua.raise(L, "galdr: a panel's id is one to sixty-four bytes");
 
-    _ = lua.lua_getfield(L, 1, "title");
+    _ = rawField(L, 1, "title");
     const title = checkText(L, lua.toString(L, -1) orelse name, "title");
-    _ = lua.lua_getfield(L, 1, "icon");
+    _ = rawField(L, 1, "icon");
     const icon = checkText(L, lua.toString(L, -1) orelse "fenrir.panel", "icon");
-    _ = lua.lua_getfield(L, 1, "empty");
+    _ = rawField(L, 1, "empty");
     const empty = checkText(L, lua.toString(L, -1) orelse "nothing here", "description");
-    _ = lua.lua_getfield(L, 1, "group");
+    _ = rawField(L, 1, "group");
     const group = checkText(L, lua.toString(L, -1) orelse "", "group");
 
     // Referenced last of the two, and both after every check: a reference
     // taken before a raise is a reference nothing will ever release.
-    _ = lua.lua_getfield(L, 1, "choose");
+    _ = rawField(L, 1, "choose");
     const has_choose = lua.typeOf(L, -1) == .function;
     if (!has_choose and lua.typeOf(L, -1) != .nil) lua.raise(L, "galdr: a panel's choose is a function");
-    _ = lua.lua_getfield(L, 1, "rows");
+    _ = rawField(L, 1, "rows");
     if (lua.typeOf(L, -1) != .function) lua.raise(L, "galdr: a panel needs a rows function");
     const owner = authority(L);
 
@@ -3283,7 +3399,7 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
 
     // Which document, before anything is read out of it: a handler that
     // yielded and came back to another file writes where it was told to.
-    _ = lua.lua_getfield(L, 1, "doc");
+    _ = rawField(L, 1, "doc");
     const doc = checkDoc(L, -1);
     lua.pop(L, 1);
 
@@ -4211,13 +4327,15 @@ test "a plugin declares a setting, and its value is the store's" {
     // after, and `fenrir.store` is still how a plugin reads it.
     try testing.expectEqual(@as(usize, 0), fake.stored.items.len);
 
-    // The same key twice replaces the row rather than adding a second.
+    // The same key twice replaces the row rather than adding a second. The
+    // old row is retired and swept rather than freed where it was replaced,
+    // because the settings page is holding its bytes until it is refilled.
     try testing.expect(rt.runString("again",
         \\fenrir.setting{ key = "reading.list", about = "somewhere else" }
     ));
     rt.sweep();
     try testing.expectEqual(@as(usize, 2), rt.settingList().len);
-    try testing.expectEqualStrings("somewhere else", rt.settingList()[0].about);
+    try testing.expectEqualStrings("somewhere else", rt.settingList()[1].about);
     // ...and it is no longer in the group, so a reload clears one, not two.
     try testing.expect(rt.runString("clear", "assert(fenrir.clear('mine') == 1)"));
 
@@ -4245,8 +4363,8 @@ test "a command carries its icon into the palette, and redefining replaces both"
     ));
     rt.sweep();
     try testing.expectEqual(@as(usize, 2), rt.commandNames().len);
-    try testing.expectEqualStrings("close it again", rt.commandNames()[0].description);
-    try testing.expectEqualStrings("fenrir.close", rt.commandNames()[0].icon);
+    try testing.expectEqualStrings("close it again", rt.commandNames()[1].description);
+    try testing.expectEqualStrings("fenrir.close", rt.commandNames()[1].icon);
 }
 
 test "a panel is a list a plugin builds, asked for when it is wanted" {
@@ -4663,6 +4781,68 @@ test "clear takes a group's commands and keymaps as well as its handlers" {
     try testing.expectEqual(@as(usize, 0), rt.keymapList().len);
 }
 
+test "a plugin that fails leaves nothing of itself behind" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/broken.lua",
+        \\fenrir.command("Half", function() end)
+        \\fenrir.keymap("n", "z", function() end)
+        \\fenrir.rail{ label = "Half", action = "q" }
+        \\fenrir.on("Start", function() ran = true end)
+        \\error("halfway")
+        },
+        .{ "plugins/sound.lua", "fenrir.command('Whole', function() end)" },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(!rt.plugins.items[0].ok);
+    try testing.expect(rt.plugins.items[1].ok);
+
+    rt.emit(.{ .event = .Start });
+    try testing.expect(rt.runString("check", "assert(ran == nil, 'a failed plugin\\'s handler ran')"));
+    try testing.expectEqual(@as(?bool, null), rt.runCommand("Half", ""));
+    try testing.expectEqual(@as(?bool, true), rt.runCommand("Whole", ""));
+
+    const look = rt.lookup();
+    try testing.expect(look.find(look.ptr, .normal, .{ .char = 'z' }) == null);
+    rt.sweep();
+    try testing.expectEqual(@as(usize, 1), rt.commandNames().len);
+    try testing.expectEqual(@as(usize, 0), rt.railList().len);
+}
+
+test "a module that failed is loaded again, and a cycle is said out loud" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "lua/flaky.lua", "if not fixed then error('not yet') end return { ok = true }" },
+        .{ "lua/ring.lua", "require('ring') return {}" },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(!rt.runString("first", "require('flaky')"));
+    // The sentinel that breaks cycles used to be left behind by a failure,
+    // so this one reported success and handed back `true` without running
+    // anything. The module is called protected now, and the entry comes
+    // out before the error is rethrown.
+    try testing.expect(rt.runString("retry",
+        \\local ok, m = pcall(require, "flaky")
+        \\assert(not ok and m:find("not yet", 1, true), tostring(m))
+    ));
+    try testing.expect(rt.runString("fix",
+        \\fixed = true
+        \\assert(require("flaky").ok == true)
+    ));
+
+    try testing.expect(rt.runString("cycle",
+        \\local ok, m = pcall(require, "ring")
+        \\assert(not ok and m:find("requires itself", 1, true), tostring(m))
+    ));
+}
+
 // -- the store ----------------------------------------------------------------
 
 test "two plugins keeping the same key keep two values" {
@@ -4755,6 +4935,59 @@ test "what a registration holds is counted, bounded, and given back" {
     // uncounted copies. It is refused by length now.
     try testing.expect(!rt.runString("huge", "fenrir.on('Quit', string.rep('*', 600), function() end)"));
     try testing.expect(std.mem.indexOf(u8, rt.messages.items[rt.messages.items.len - 1], "at most") != null);
+}
+
+test "a contribution the reader is holding is not freed where it is replaced" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\fenrir.command("Read", function() end, "open the list", "fenrir.bookmark")
+    ));
+    // What the palette borrows when it opens.
+    const borrowed = rt.commandNames()[0].description;
+
+    try testing.expect(rt.runString("again",
+        \\fenrir.command("Read", function() end, "close it again", "fenrir.close")
+    ));
+    // Still readable: the old row is retired, and the bytes go back at the
+    // sweep, which the reader runs where nothing is drawing them.
+    try testing.expectEqualStrings("open the list", borrowed);
+    rt.sweep();
+    try testing.expectEqual(@as(usize, 1), rt.commandNames().len);
+    try testing.expectEqualStrings("close it again", rt.commandNames()[0].description);
+}
+
+test "a table with a metamethod cannot raise in the middle of a registration" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    const baseline = rt.footprint().host;
+    // Every field is read raw, so a `__index` that throws never runs: the
+    // old shape allocated `key`, `about` and `unset` and then read
+    // `choices`, and a raise in the middle of that jumped over the cleanup
+    // -- a `defer` does not run across a `longjmp`.
+    try testing.expect(rt.runString("sneaky",
+        \\local angry = setmetatable({}, { __index = function() error("no") end })
+        \\fenrir.setting{ key = "safe", choices = angry, group = "g" }
+        \\fenrir.setting(setmetatable({ key = "also" }, { __index = function() error("no") end }))
+    ));
+    try testing.expectEqual(@as(usize, 2), rt.settingList().len);
+    try testing.expectEqual(@as(usize, 0), rt.settingList()[0].choices.items.len);
+
+    // A choice that is not a string is refused before anything is owned,
+    // because converting it is what would allocate.
+    try testing.expect(!rt.runString("number", "fenrir.setting{ key = 'n', choices = { 1, 2 } }"));
+    try testing.expect(rt.runString("clear", "assert(fenrir.clear('g') == 1)"));
+    rt.sweep();
+    try testing.expectEqual(@as(usize, 1), rt.settingList().len);
+    try testing.expect(rt.footprint().host > baseline);
 }
 
 test "unloading a plugin takes everything of it, jobs included" {

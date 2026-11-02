@@ -474,6 +474,7 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
         .samples = samples,
         .backend = backend,
         .io = ctx.io,
+        .palette_text = .init(gpa),
     };
     defer session.deinit();
 
@@ -1113,6 +1114,15 @@ const Session = struct {
     /// during a frame. `palette.zig` re-ranks on the same rule.
     palette: palette_mod.State = .{},
     palette_rows: std.ArrayList(palette_mod.Row) = .empty,
+    /// The bytes a plugin's rows point into, copied out of Galdr.
+    ///
+    /// The built-in half of the palette is a table in the binary and needs
+    /// no copy; a plugin's half is Galdr's, and Galdr may replace a command
+    /// while the palette is open -- `rt.pump()` runs a yielded callback
+    /// immediately before the chrome is built, so this is one frame and not
+    /// a race. The rows own what they draw and the arena is reset the next
+    /// time the palette opens.
+    palette_text: std.heap.ArenaAllocator,
 
     /// The search bar, and what it has found.
     ///
@@ -1379,6 +1389,7 @@ const Session = struct {
         s.stroking.deinit(s.gpa);
         s.rows.deinit(s.gpa);
         s.palette_rows.deinit(s.gpa);
+        s.palette_text.deinit();
         s.doc_handles.deinit(s.gpa);
         s.rail_left.deinit(s.gpa);
         s.rail_right.deinit(s.gpa);
@@ -1569,6 +1580,16 @@ const Session = struct {
         const opt = s.settings.optionAt(index);
         if (!s.settings.isPlugin(index)) return opt.key;
         return library.pluginKey(buf, "", opt.key);
+    }
+
+    /// Whether what plugins declared has moved since the page was filled.
+    ///
+    /// Asked every frame the page is open, because a callback can declare,
+    /// replace or clear a setting at any point and the page is holding
+    /// Galdr's bytes until it is refilled.
+    fn pluginSettingsStale(s: *const Session) bool {
+        const rt = s.plugins orelse return false;
+        return s.settings_for != rt.revision;
     }
 
     /// The plugins' settings, borrowed from Galdr, rebuilt on a change.
@@ -3637,6 +3658,7 @@ const Session = struct {
     /// a command does not know either.
     fn showPalette(s: *Session) void {
         s.palette_rows.clearRetainingCapacity();
+        _ = s.palette_text.reset(.retain_capacity);
         s.palette_rows.ensureTotalCapacity(s.gpa, commands.table.len) catch return;
         s.palette_rows.items.len = commands.table.len;
         _ = palette_mod.builtins(s.palette_rows.items);
@@ -3653,16 +3675,24 @@ const Session = struct {
                 const k = galdr.keyspec.parse(row.binding) catch continue;
                 if (look.find(look.ptr, .normal, k) != null) row.binding = "";
             }
+            // Copied, not borrowed. The palette holds its rows from the
+            // frame it opens until the frame it closes, and `rt.pump()`
+            // resumes a yielded callback immediately before the chrome is
+            // built -- so a plugin can redefine a command, or clear its
+            // group, between the two, and a borrowed description would be
+            // freed under an open menu. The copies cost once per opening,
+            // which is not a frame path.
+            const words = s.palette_text.allocator();
             for (rt.commandNames()) |c| {
                 if (!c.live) continue;
                 s.palette_rows.append(s.gpa, .{
-                    .name = c.name,
-                    .about = c.description,
-                    .binding = bindingFor(rt, c.name),
+                    .name = words.dupe(u8, c.name) catch break,
+                    .about = words.dupe(u8, c.description) catch "",
+                    .binding = words.dupe(u8, bindingFor(rt, c.name)) catch "",
                     // The plugin's, when it named one. A registry name it got
                     // wrong draws as the hollow box, which is the answer
                     // everywhere else an icon is asked for by name.
-                    .icon = if (c.icon.len != 0) c.icon else "fenrir.menu",
+                    .icon = if (c.icon.len != 0) words.dupe(u8, c.icon) catch "fenrir.menu" else "fenrir.menu",
                 }) catch break;
             }
         }
@@ -6059,6 +6089,12 @@ const Session = struct {
                 // After the bar, the rails and the panel, so it is over all
                 // of them: a popup is on top by being built last, and nothing
                 // here sorts.
+                //
+                // Refilled first when a plugin changed what it declared
+                // while the page was open. Nothing is read from the library
+                // unless Galdr's revision moved, so an open page costs one
+                // comparison a frame.
+                if (s.settings.open and s.pluginSettingsStale()) s.readSettings();
                 const changed = try settings_page.page(&c.ui, c.face, c.theme, &s.settings);
                 const chosen = try palette_mod.palette(
                     &c.ui,
@@ -6263,7 +6299,7 @@ fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
 /// A session with one buffer of `n` blank pages and one window on it. No
 /// document: everything tested here reads `pages` and the caches.
 fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !Session {
-    var s: Session = .{ .ctx = undefined, .gpa = gpa, .samples = .four };
+    var s: Session = .{ .ctx = undefined, .gpa = gpa, .samples = .four, .palette_text = .init(gpa) };
     errdefer s.deinit();
     try s.buffers.append(gpa, .{
         .path = try gpa.dupe(u8, "/docs/a.pdf"),
@@ -6283,6 +6319,7 @@ fn closeSession(s: *Session) void {
     s.stroking.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.palette_rows.deinit(s.gpa);
+    s.palette_text.deinit();
     s.doc_handles.deinit(s.gpa);
     s.rail_left.deinit(s.gpa);
     s.rail_right.deinit(s.gpa);
