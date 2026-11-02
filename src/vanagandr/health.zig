@@ -129,6 +129,12 @@ fn build(r: *Report) void {
     // The two C dependencies, each of which the build can be told to leave
     // out -- and which everything above them is written to work without.
     r.flag("lua", galdr.available, "5.4, compiled in", "off: no plugins, no init.lua");
+    // What `fenrir.api.version` answers. A plugin written against a later
+    // reader asks this for itself; a person reading a bug report wants it on
+    // the same page as the Zig version and the target.
+    if (galdr.available) {
+        r.line(.ok, "plugin api", "version {d}; `fenrir plugins --api` prints it", .{galdr.Runtime.api_version});
+    }
     r.flag("sqlite", mimir.available, "compiled in", "off: nothing is remembered");
 
     r.flag("window", lyngvi.has_window, "a backend for this target", "no backend for this target");

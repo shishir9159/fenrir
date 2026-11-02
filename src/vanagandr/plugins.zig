@@ -119,21 +119,23 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
         ctx.out.print("keys:\n", .{}) catch {};
         for (rt.keymapList()) |k| {
             if (!k.live) continue;
-            var modes: [3]u8 = undefined;
+            // The four `fenrir.keymap` takes, in the order a person writes
+            // them. Draw mode was left out of this line while it was the one
+            // mode no plugin could bind in; a binding that reports no mode
+            // at all is this listing lying about the reader.
+            var modes: [4]u8 = undefined;
             var n: usize = 0;
-            if (k.modes.normal) {
-                modes[n] = 'n';
+            for ([_]struct { bool, u8 }{
+                .{ k.modes.normal, 'n' },
+                .{ k.modes.visual, 'v' },
+                .{ k.modes.edit, 'e' },
+                .{ k.modes.draw, 'd' },
+            }) |mode| {
+                if (!mode[0]) continue;
+                modes[n] = mode[1];
                 n += 1;
             }
-            if (k.modes.visual) {
-                modes[n] = 'v';
-                n += 1;
-            }
-            if (k.modes.edit) {
-                modes[n] = 'e';
-                n += 1;
-            }
-            ctx.out.print("  {s: <3} {s: <10} {s}\n", .{
+            ctx.out.print("  {s: <4} {s: <10} {s}\n", .{
                 modes[0..n],
                 k.spec,
                 if (k.description.len != 0) k.description else if (k.line.len != 0) k.line else "(function)",
@@ -214,7 +216,7 @@ fn writeApi(ctx: *Context) !void {
     const w = ctx.out;
 
     try w.print("the fenrir table -- {d} functions, {d} of them behind a capability\n", .{
-        Runtime.api.len + Runtime.store.len,
+        Runtime.api.len + Runtime.store.len + countFunctions(&Runtime.reflect),
         countGated(),
     });
     try w.writeAll(
@@ -234,8 +236,21 @@ fn writeApi(ctx: *Context) !void {
     try w.writeAll("\nfenrir.store -- always, and a key space of this plugin's own\n");
     for (Runtime.store) |e| try writeEntry(ctx, "fenrir.store.", e);
 
+    try w.print("\nfenrir.api -- always; this table is version {d}\n", .{Runtime.api_version});
+    for (Runtime.reflect) |e| try writeEntry(ctx, "fenrir.api.", e);
+
     try w.writeAll("\nand in the globals\n");
     for (Runtime.globals) |e| try writeEntry(ctx, "", e);
+}
+
+/// How many of a group's entries are functions. `fenrir.api` holds a field
+/// as well, and a count of functions that counted it would be wrong by one.
+fn countFunctions(list: []const galdr.Runtime.Entry) usize {
+    var n: usize = 0;
+    for (list) |e| {
+        if (e.func != null) n += 1;
+    }
+    return n;
 }
 
 fn countGated() usize {
@@ -441,7 +456,7 @@ test "every function in the fenrir table is documented, and only once" {
     // function added without a sentence, or added twice, is caught here
     // rather than by a reader of `--api` wondering what it does.
     const Runtime = galdr.Runtime;
-    inline for (.{ Runtime.api, Runtime.store, Runtime.globals }) |list| {
+    inline for (.{ Runtime.api, Runtime.store, Runtime.reflect, Runtime.globals }) |list| {
         for (list) |e| {
             try testing.expect(e.name.len != 0);
             try testing.expect(e.about.len != 0);
@@ -464,5 +479,27 @@ test "every function in the fenrir table is documented, and only once" {
         for (Runtime.api) |e| {
             if (std.mem.eql(u8, e.name, name)) try testing.expect(e.cap == null);
         }
+    }
+
+    // `fenrir.api` answers for every name the reference prints, and for the
+    // fields of the table as well as its functions -- a plugin reads
+    // `fenrir.lua` as readily as it calls `fenrir.go`, and a reference that
+    // lists a name `has` denies is two references again.
+    for (Runtime.api) |e| try testing.expect(Runtime.provides(e.name));
+    for (Runtime.store) |e| {
+        var buf: [64]u8 = undefined;
+        try testing.expect(Runtime.provides(try std.fmt.bufPrint(&buf, "store.{s}", .{e.name})));
+    }
+    for (Runtime.reflect) |e| {
+        var buf: [64]u8 = undefined;
+        try testing.expect(Runtime.provides(try std.fmt.bufPrint(&buf, "fenrir.api.{s}", .{e.name})));
+    }
+    for ([_][]const u8{ "version", "lua", "store", "api" }) |field| {
+        try testing.expect(Runtime.provides(field));
+    }
+    // And for nothing else, including the names plugins.md holds open for
+    // later and the globals, which are not in the table.
+    for ([_][]const u8{ "", ".", "comment", "link", "comments", "links", "require", "print", "store.", "store.keys", "api.whatever" }) |name| {
+        try testing.expect(!Runtime.provides(name));
     }
 }

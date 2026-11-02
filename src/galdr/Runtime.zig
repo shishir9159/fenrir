@@ -1314,6 +1314,67 @@ pub const store = [_]Entry{
     .{ .name = "set", .func = apiStoreSet, .args = "(key, value)", .returns = "ok", .about = "keeps one, or with nil removes it" },
 };
 
+/// Which version of the table this is, counted up whenever something is added
+/// to it.
+///
+/// A number and not `fenrir.version`'s string, because a plugin comparing
+/// versions wants `>=` and `"0.10.0" < "0.9.0"` as a string.
+pub const api_version: lua.Integer = 1;
+
+/// `fenrir.api`: the table asked about itself.
+///
+/// In every plugin's table, including one that asked for nothing, because a
+/// plugin that cannot ask what exists has to guess. A nil `fenrir.comment`
+/// says two different things -- this reader has no such function, or this
+/// plugin did not ask for it -- and a plugin written against a later reader
+/// has to tell them apart to say what it needs rather than failing at a
+/// call.
+pub const reflect = [_]Entry{
+    .{ .name = "version", .about = "which version of the fenrir table this reader has, counting up" },
+    .{
+        .name = "has",
+        .func = apiHas,
+        .args = "(name)",
+        .returns = "bool",
+        .about = "whether this reader's table has that name at all, whatever this plugin asked for",
+    },
+};
+
+/// Whether the table has a name, as `fenrir.api.has` answers it.
+///
+/// The reader's whole table and not the caller's. What a plugin was granted
+/// it can already see, by the function being nil; what this answers is the
+/// other question, and answering it per caller would make the two
+/// indistinguishable again.
+///
+/// `store.get` and `api.has` are written with their dot, and a leading
+/// `fenrir.` is allowed because that is how a person says the name.
+pub fn provides(name: []const u8) bool {
+    const want = if (std.mem.startsWith(u8, name, "fenrir.")) name["fenrir.".len..] else name;
+    if (std.mem.indexOfScalar(u8, want, '.')) |dot| {
+        const table: []const Entry = if (std.mem.eql(u8, want[0..dot], "store"))
+            &store
+        else if (std.mem.eql(u8, want[0..dot], "api"))
+            &reflect
+        else
+            return false;
+        for (table) |e| {
+            if (std.mem.eql(u8, e.name, want[dot + 1 ..])) return true;
+        }
+        return false;
+    }
+    for (api) |e| {
+        if (std.mem.eql(u8, e.name, want)) return true;
+    }
+    // What is in the table and is not a function of it. A plugin reads these
+    // as readily as it calls the rest, so a name that answers false for one
+    // of them is the table lying about itself.
+    for ([_][]const u8{ "version", "lua", "store", "api" }) |field| {
+        if (std.mem.eql(u8, want, field)) return true;
+    }
+    return false;
+}
+
 /// What the sandbox leaves in the globals that is not stock Lua's, and the
 /// two fields of the table that are not functions. Listed for the same
 /// reason as the rest: a person writing a plugin needs to know what `require`
@@ -1322,7 +1383,7 @@ pub const globals = [_]Entry{
     .{ .name = "print", .args = "(...)", .about = "stock print, onto the reader's message line" },
     .{ .name = "require", .args = "(name)", .returns = "module", .about = "loads lua/<name>.lua under the configuration directory, and nothing else" },
     .{ .name = "load", .args = "(source, name, mode, env)", .returns = "fn", .about = "stock load, refusing bytecode whatever mode is asked for" },
-    .{ .name = "fenrir.version", .about = "this reader's plugin API version" },
+    .{ .name = "fenrir.version", .about = "this reader's own version, as a string; fenrir.api.version is the table's" },
     .{ .name = "fenrir.lua", .about = "the Lua the sandbox is built on" },
 };
 
@@ -1338,6 +1399,11 @@ pub const globals = [_]Entry{
 /// said what it may do.
 const no_cap: lua.Integer = 0;
 const manifest_cap: lua.Integer = -1;
+/// `fenrir.api`: a question about the table rather than an act on the reader,
+/// so asking one does not use up the plugin's chance to declare a manifest.
+/// A plugin that picks what to ask for by what this reader has would
+/// otherwise have to guess before it was allowed to look.
+const reflect_cap: lua.Integer = -2;
 
 fn capBits(entry: Entry) lua.Integer {
     if (entry.cap) |c| return @intFromEnum(c) + 1;
@@ -1372,6 +1438,19 @@ fn pushFenrir(L: ?*lua.State, caps: Caps, owner: Owner) void {
     lua.pushString(L, "Lua 5.4");
     lua.lua_setfield(L, -2, "lua");
 
+    // The table asked about itself, always and whatever was granted: a
+    // plugin that cannot ask what exists cannot tell "this reader has no
+    // such function" from "I did not ask for it", and has to guess.
+    lua.lua_createtable(L, 0, reflect.len);
+    for (reflect) |entry| {
+        const f = entry.func orelse continue;
+        pushBound(L, f, owner, reflect_cap);
+        lua.lua_setfield(L, -2, entry.name.ptr);
+    }
+    lua.lua_pushinteger(L, api_version);
+    lua.lua_setfield(L, -2, "version");
+    lua.lua_setfield(L, -2, "api");
+
     // A plugin's own values, always: the key space is the plugin's, derived
     // from the id the host gave it and never from a prefix the plugin wrote,
     // so two plugins that both keep `enabled` keep two values.
@@ -1398,7 +1477,10 @@ fn authority(L: ?*lua.State) Owner {
     const p = rt.pluginOf(owner) orelse
         lua.raise(L, "galdr: the plugin this function came from is not loaded");
     const want = lua.lua_tointegerx(L, lua.upvalueIndex(2), null);
-    if (want != manifest_cap) p.acted = true;
+    // The negative ones are the manifest and `fenrir.api`, neither of which
+    // is the plugin doing anything: one is the declaration itself and the
+    // other is a question about what the declaration may ask for.
+    if (want >= no_cap) p.acted = true;
     if (want > no_cap) {
         const c: Capability = @enumFromInt(want - 1);
         if (!p.caps.has(c)) {
@@ -2640,6 +2722,13 @@ fn apiManifest(L: ?*lua.State) callconv(.c) c_int {
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
     applyManifest(L, 1);
     return 0;
+}
+
+/// `fenrir.api.has(name)`.
+fn apiHas(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
+    lua.lua_pushboolean(L, @intFromBool(provides(lua.checkString(L, 1))));
+    return 1;
 }
 
 fn apiExec(L: ?*lua.State) callconv(.c) c_int {
@@ -5024,4 +5113,43 @@ test "unloading a plugin takes everything of it, jobs included" {
     try testing.expect(!rt.runString("escaped", "escaped{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }"));
     try testing.expect(std.mem.indexOf(u8, rt.messages.items[rt.messages.items.len - 1], "not loaded") != null);
     try testing.expectEqual(@as(?u32, null), rt.unload("nobody"));
+}
+
+test "the table answers for itself, before a plugin has said what it wants" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/careful.lua",
+        \\-- Asked above the manifest, which is the point of it: a plugin
+        \\-- choosing what to ask for by what this reader has cannot be made
+        \\-- to guess first, so asking is not one of the things that closes
+        \\-- the door on declaring.
+        \\local want = { "ui" }
+        \\if fenrir.api.has("highlight") then want[#want + 1] = "document.write" end
+        \\assert(not fenrir.api.has("comment"), "comment is not there yet")
+        \\assert(fenrir.api.version >= 1, "a number, so >= works")
+        \\fenrir.manifest{ about = "asks for what is there", capabilities = want }
+        \\asked = #want
+        \\-- And still there once the table has been narrowed.
+        \\assert(fenrir.api.has("store.get") and fenrir.api.has("fenrir.api.has"))
+        \\assert(fenrir.highlight ~= nil, "document.write was asked for")
+        \\assert(fenrir.document == nil, "document.read was not")
+        },
+        .{ "plugins/mute.lua",
+        \\fenrir.manifest{ capabilities = {} }
+        \\-- A plugin that asked for nothing can still tell "this reader has
+        \\-- no such function" from "I did not ask for it".
+        \\narrow = fenrir.api.has("notify") and fenrir.notify == nil
+        },
+    } };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.plugins.items[0].ok);
+    try testing.expect(rt.plugins.items[1].ok);
+    try testing.expect(rt.runString("check", "assert(asked == 2, asked) assert(narrow)"));
+    try testing.expect(rt.plugins.items[0].manifest.declared);
+    try testing.expect(rt.plugins.items[0].caps.has(.document_write));
+    try testing.expect(!rt.plugins.items[0].caps.has(.document_read));
 }
