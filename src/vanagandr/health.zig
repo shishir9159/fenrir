@@ -315,6 +315,16 @@ fn plugins(r: *Report, dir: []const u8, db_path: ?[]const u8) void {
         live_settings,
     });
 
+    // Both numbers, because they run out for different reasons: a plugin
+    // that builds a large table is the first, and a plugin that registers a
+    // thousand patterns is the second, which used to be counted by nothing.
+    const held = rt.footprint();
+    r.line(.ok, "memory", "{d} KiB in Lua, {d} KiB held for plugins, of {d} MiB", .{
+        held.lua / 1024,
+        held.host / 1024,
+        rt.options.memory_limit >> 20,
+    });
+
     if (rt.messages.items.len != 0) {
         r.line(.bad, "messages", "{d}; `fenrir plugins` prints them", .{rt.messages.items.len});
     }

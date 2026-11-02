@@ -76,10 +76,11 @@ for: drawn, blank, or an invisible OCR layer over a scan.
   so `j` walks a two-column paper the way you read it. Marks belong to the
   buffer, so every window on a document shows the same ones.
 - **Galdr** is Neovim's plugin model (`init.lua`, `plugins/`, a `fenrir`
-  table) in a sandbox with no files, no processes, and limits on memory and
-  time. Every registration and every suspended callback carries the plugin
-  that made it, and every event hands over the document it happened to, so a
-  handler writes where it was told to however long it takes to come back.
+  table) in a sandbox with no files, no processes, and limits on memory,
+  instructions and the work one frame will do. Every registration and every
+  suspended callback carries the plugin that made it, and every event hands
+  over the document it happened to, so a handler writes where it was told to
+  however long it takes to come back.
 
 ## Source layout
 

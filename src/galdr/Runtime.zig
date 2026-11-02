@@ -56,12 +56,17 @@
 //! can reach through its own table, and a declaration of intent about what it
 //! can be given.**
 //!
-//! Two limits keep a script from taking the reader down with it. **Memory**:
-//! every byte Lua allocates is counted, and past `memory_limit` an allocation
-//! fails, which Lua turns into an ordinary error. **Time**: a count hook runs
-//! every few thousand instructions, and a single call into Lua that runs past
-//! `step_limit` is stopped with an error -- so `while true do end` in a key
-//! binding costs a fraction of a second, and the reader carries on.
+//! Limits keep a script from taking the reader down with it. **Memory**:
+//! every byte Lua allocates is counted, and so is every byte the host copies
+//! out of Lua for a registration; past `memory_limit` an allocation fails,
+//! which Lua turns into an ordinary error. **Time**: a count hook runs every
+//! few thousand instructions, and a call that runs past `step_limit` is
+//! cancelled -- not raised as an error a script can catch, because `pcall`
+//! round a runaway loop would buy a fresh budget every time round. **A
+//! frame**: `pump` spends at most `frame_step_limit` over every suspended
+//! handler together, which is the bound `step_limit` cannot give when there
+//! are forty of them. **The store**: a quota of its own, because a database
+//! outlives the process and a memory limit cannot bound it.
 //!
 //! ## Errors
 //!
@@ -289,6 +294,26 @@ pub const Options = struct {
     /// gives up on it. A handler that yields once a frame and is still going
     /// after this has been running for minutes and is not coming back.
     resume_limit: u32 = 100_000,
+    /// Hook ticks every suspended handler together may use in one `pump`.
+    ///
+    /// Separate from `step_limit`, which is per resumption: a frame with
+    /// forty pending handlers would otherwise allow forty times a few
+    /// hundred milliseconds against sixteen. Two and a half million
+    /// instructions is a handful of milliseconds of pure Lua; a handler
+    /// that wants more gets it on the next frame, which is what yielding
+    /// asked for.
+    frame_step_limit: u64 = 250,
+    /// How many handlers may be part way through at once. A queue the
+    /// reader walks every frame has to have an end, and a plugin that
+    /// yields in a loop is the thing that gives it one.
+    max_pending: u32 = 256,
+    /// How many live registrations of one kind one runtime may hold.
+    max_registrations: u32 = 1024,
+    /// What one plugin's store may hold, over the keys it has written this
+    /// session. The store is a database and outlives the process, so
+    /// `memory_limit` cannot bound it.
+    store_limit: usize = 1 << 20,
+    store_key_limit: u32 = 512,
 };
 
 /// Who a registration, a pending callback or a host call belongs to.
@@ -328,6 +353,9 @@ pub const Owner = packed struct(u64) {
 /// not the time a host call spends copying, so what the host copies is
 /// bounded by what it will accept.
 pub const max_text = 512;
+
+/// The most values one setting may cycle through.
+pub const max_choices = 64;
 
 const ModeSet = packed struct(u8) {
     normal: bool = false,
@@ -498,6 +526,10 @@ const Pending = struct {
     id: u32,
     owner: Owner,
     event: Event,
+    /// Set when it was started, so that `pump` can leave the jobs an
+    /// earlier job queued for the next frame and come round the queue
+    /// fairly rather than always from the front.
+    seq: u64,
     resumes: u32 = 0,
     live: bool = true,
 };
@@ -530,6 +562,11 @@ pub const Plugin = struct {
     /// after that is refused: a declaration that arrives once a plugin has
     /// acted describes what it did rather than limiting it.
     acted: bool = false,
+    /// The keys it has written this session and how many bytes each holds.
+    /// The store's quota, which the Lua heap's cannot give: a database
+    /// outlives the process.
+    store: std.StringHashMapUnmanaged(u32) = .empty,
+    store_bytes: usize = 0,
 };
 
 gpa: Allocator,
@@ -538,7 +575,21 @@ L: *lua.State,
 options: Options,
 
 memory_used: usize = 0,
+/// Bytes the *host* is holding on plugins' behalf: every pattern, group,
+/// label, description and choice a registration copied out of Lua. Counted
+/// against the same budget, because a limit that bounds half of what a
+/// plugin can make the reader hold is not a limit -- one large Lua string
+/// registered as a thousand patterns is one counted string and a thousand
+/// uncounted copies.
+native_used: usize = 0,
 steps: u64 = 0,
+/// Set when a call ran past its budget and the host took it away.
+///
+/// Not an ordinary error: while it stands the hook raises again on every
+/// tick, and `pcall`, `xpcall` and `coroutine.resume` refuse to swallow it,
+/// so a script cannot convert the end of its budget back into execution.
+/// Only the outermost entry into Lua clears it.
+cancelling: bool = false,
 /// How many calls into Lua are on the stack. The step budget is reset only by
 /// the outermost, so a key binding that runs a command that fires an event is
 /// one budget and not three.
@@ -554,6 +605,17 @@ next_handler: u32 = 1,
 next_keymap: u32 = 1,
 /// The handlers that are part way through, oldest first. See `pump`.
 pending: std.ArrayList(Pending) = .empty,
+next_job: u64 = 1,
+/// The job `pump` starts from, so that a frame whose budget ran out does
+/// not spend the next frame's on the same handlers again.
+pump_from: u64 = 0,
+/// The jobs one pump will consider, by sequence number. Held and cleared
+/// rather than made each frame: resuming a handler can queue another and
+/// finish a third, so the walk is over a snapshot, and a snapshot taken
+/// sixty times a second should not be an allocation.
+pump_order: std.ArrayList(u64) = .empty,
+/// Events that found the queue full, since it was last empty. Said once.
+refused: u64 = 0,
 /// `galdr.loaded`: a table of tables, one per generation of one plugin.
 /// Held by reference so that reaching it allocates nothing, which matters
 /// where it is read outside a protected call.
@@ -640,6 +702,7 @@ pub fn destroy(rt: *Runtime) void {
     for (rt.handlers.items) |h| rt.freeHandler(h);
     rt.handlers.deinit(gpa);
     rt.pending.deinit(gpa);
+    rt.pump_order.deinit(gpa);
     for (rt.rails.items) |b| rt.freeRail(b);
     rt.rails.deinit(gpa);
     for (rt.settings.items) |*row| rt.freeSetting(row);
@@ -650,10 +713,13 @@ pub fn destroy(rt: *Runtime) void {
     rt.rows_arena.deinit();
     for (rt.messages.items) |m| gpa.free(m);
     rt.messages.deinit(gpa);
-    for (rt.plugins.items) |p| {
+    for (rt.plugins.items) |*p| {
         gpa.free(p.name);
         gpa.free(p.manifest.about);
         gpa.free(p.manifest.version);
+        var it = p.store.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        p.store.deinit(gpa);
     }
     rt.plugins.deinit(gpa);
     gpa.destroy(rt);
@@ -686,8 +752,9 @@ fn allocate(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callc
         return null;
     }
     // Growing past the budget fails; shrinking never does, which is a promise
-    // Lua relies on.
-    if (nsize > old and rt.memory_used - old + nsize > rt.options.memory_limit) return null;
+    // Lua relies on. The budget is the Lua heap *and* what the host holds
+    // for plugins, which is one number because it is one limit.
+    if (nsize > old and rt.memory_used - old + nsize + rt.native_used > rt.options.memory_limit) return null;
 
     const moved = std.c.realloc(ptr, nsize) orelse {
         if (nsize <= old) return ptr;
@@ -697,16 +764,29 @@ fn allocate(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callc
     return moved;
 }
 
-/// A copy of a string a plugin handed over. Null when there is no memory,
-/// which the caller turns into the same "out of memory" a Lua allocation
-/// gives.
-fn dupeText(rt: *Runtime, text: []const u8) ?[]u8 {
-    return rt.gpa.dupe(u8, text) catch null;
+/// A copy of a string a plugin handed over, charged to the budget.
+///
+/// Null when there is no room or no memory, which the caller turns into the
+/// same "out of memory" a Lua allocation gives: a plugin cannot tell the two
+/// apart and does not need to.
+fn own(rt: *Runtime, text: []const u8) ?[]u8 {
+    if (text.len > max_text) return null;
+    if (rt.memory_used + rt.native_used + text.len > rt.options.memory_limit) return null;
+    const copy = rt.gpa.dupe(u8, text) catch return null;
+    rt.native_used += copy.len;
+    return copy;
 }
 
-fn freeText(rt: *Runtime, text: []u8) void {
+fn disown(rt: *Runtime, text: []u8) void {
     if (text.len == 0) return;
+    rt.native_used -|= text.len;
     rt.gpa.free(text);
+}
+
+/// What the plugins are holding: the Lua heap, and the host's copies.
+/// Reported as two numbers because they run out for different reasons.
+pub fn footprint(rt: *const Runtime) struct { lua: usize, host: usize } {
+    return .{ .lua = rt.memory_used, .host = rt.native_used };
 }
 
 fn release(rt: *Runtime, ref: *c_int) void {
@@ -716,46 +796,46 @@ fn release(rt: *Runtime, ref: *c_int) void {
 }
 
 fn freeKeymap(rt: *Runtime, k: Keymap) void {
-    rt.freeText(k.line);
-    rt.freeText(k.spec);
-    rt.freeText(k.description);
-    rt.freeText(k.group);
+    rt.disown(k.line);
+    rt.disown(k.spec);
+    rt.disown(k.description);
+    rt.disown(k.group);
 }
 
 fn freeCommand(rt: *Runtime, c: UserCommand) void {
-    rt.freeText(c.name);
-    rt.freeText(c.description);
-    rt.freeText(c.icon);
-    rt.freeText(c.group);
+    rt.disown(c.name);
+    rt.disown(c.description);
+    rt.disown(c.icon);
+    rt.disown(c.group);
 }
 
 fn freeHandler(rt: *Runtime, h: Handler) void {
-    rt.freeText(h.pattern);
-    rt.freeText(h.group);
+    rt.disown(h.pattern);
+    rt.disown(h.group);
 }
 
 fn freeRail(rt: *Runtime, b: RailButton) void {
-    rt.freeText(b.icon);
-    rt.freeText(b.label);
-    rt.freeText(b.line);
-    rt.freeText(b.group);
+    rt.disown(b.icon);
+    rt.disown(b.label);
+    rt.disown(b.line);
+    rt.disown(b.group);
 }
 
 fn freePanel(rt: *Runtime, p: Panel) void {
-    rt.freeText(p.name);
-    rt.freeText(p.title);
-    rt.freeText(p.icon);
-    rt.freeText(p.empty);
-    rt.freeText(p.group);
+    rt.disown(p.name);
+    rt.disown(p.title);
+    rt.disown(p.icon);
+    rt.disown(p.empty);
+    rt.disown(p.group);
 }
 
 fn freeSetting(rt: *Runtime, row: *Setting) void {
-    rt.freeText(row.key);
-    rt.freeText(row.scoped);
-    rt.freeText(row.about);
-    rt.freeText(row.unset);
-    rt.freeText(row.group);
-    for (row.choices.items) |c| rt.freeText(@constCast(c));
+    rt.disown(row.key);
+    rt.disown(row.scoped);
+    rt.disown(row.about);
+    rt.disown(row.unset);
+    rt.disown(row.group);
+    for (row.choices.items) |c| rt.disown(@constCast(c));
     row.choices.deinit(rt.gpa);
 }
 
@@ -937,12 +1017,18 @@ pub fn unload(rt: *Runtime, name: []const u8) ?u32 {
 fn hook(L: ?*lua.State, _: ?*lua.Debug) callconv(.c) void {
     const rt = of(L);
     rt.steps += 1;
-    if (rt.steps > rt.options.step_limit) {
-        // Reset first, or the error handler -- which is Lua code -- trips the
-        // same limit before it can build the message.
-        rt.steps = 0;
-        lua.raise(L, "galdr: the script ran too long and was stopped");
-    }
+    if (!rt.cancelling and rt.steps <= rt.options.step_limit) return;
+    // Raised again on every tick until the host clears it, which it does
+    // only when the outermost call into Lua has returned. With `pcall`,
+    // `xpcall` and `coroutine.resume` refusing to swallow it, that is what
+    // makes the limit something a script cannot catch and carry on from.
+    //
+    // The count is not reset: it is what `pump` charges the frame, and a
+    // call stopped at the limit cost the whole of it. The message handler
+    // is a C function and runs no Lua, so nothing here needs a budget to
+    // report with.
+    rt.cancelling = true;
+    lua.raise(L, "galdr: the script ran too long and was stopped");
 }
 
 // -- setting up the state -----------------------------------------------------
@@ -971,6 +1057,19 @@ fn setup(L: ?*lua.State) callconv(.c) c_int {
     lua.lua_pushcclosure(L, apiPrint, 0);
     lua.lua_setglobal(L, "print");
 
+    // The three places a script can swallow an error, replaced so that they
+    // cannot swallow the one that is not an error. See `hook`.
+    lua.lua_pushcclosure(L, apiPcall, 0);
+    lua.lua_setglobal(L, "pcall");
+    lua.lua_pushcclosure(L, apiXpcall, 0);
+    lua.lua_setglobal(L, "xpcall");
+    _ = lua.lua_getglobal(L, "coroutine");
+    lua.lua_pushcclosure(L, apiResume, 0);
+    lua.lua_setfield(L, -2, "resume");
+    lua.lua_pushcclosure(L, apiWrap, 0);
+    lua.lua_setfield(L, -2, "wrap");
+    lua.pop(L, 1);
+
     // There is no global `require`. It is a field of every environment,
     // bound to the plugin whose environment it is, so that a module is
     // loaded with its requirer's authority and cached in its requirer's
@@ -989,6 +1088,107 @@ fn setup(L: ?*lua.State) callconv(.c) c_int {
     rt.loaded_ref = lua.luaL_ref(L, lua.registry_index);
     rt.console_env = newEnv(L, .all, .console);
     return 0;
+}
+
+// -- the limit a script cannot catch ------------------------------------------
+
+/// The tail of `pcall` and `xpcall`, as Lua's own `finishpcall` is, less the
+/// one error they must not turn into a `false`.
+fn finishPcall(L: ?*lua.State, status: c_int, extra: isize) callconv(.c) c_int {
+    if (status != lua.ok and status != lua.yield) {
+        // The budget ran out: the host took the call away, and handing a
+        // script a fresh one inside the same call is the whole limit undone.
+        if (of(L).cancelling) _ = lua.lua_error(L);
+        lua.lua_pushboolean(L, 0);
+        lua.lua_pushvalue(L, -2);
+        return 2;
+    }
+    return lua.lua_gettop(L) - @as(c_int, @intCast(extra));
+}
+
+/// Stock `pcall`, with a continuation so that a handler can still yield from
+/// inside one.
+fn apiPcall(L: ?*lua.State) callconv(.c) c_int {
+    if (lua.typeOf(L, 1) == .none) lua.raise(L, "bad argument #1 to 'pcall' (value expected)");
+    lua.lua_pushboolean(L, 1);
+    lua.lua_rotate(L, 1, 1);
+    const status = lua.lua_pcallk(L, lua.lua_gettop(L) - 2, lua.multret, 0, 0, finishPcall);
+    return finishPcall(L, status, 0);
+}
+
+fn apiXpcall(L: ?*lua.State) callconv(.c) c_int {
+    const n = lua.lua_gettop(L);
+    lua.luaL_checktype(L, 2, @intFromEnum(lua.Type.function));
+    lua.lua_pushboolean(L, 1);
+    lua.lua_pushvalue(L, 1);
+    lua.lua_rotate(L, 3, 2);
+    const status = lua.lua_pcallk(L, n - 2, lua.multret, 2, 2, finishPcall);
+    return finishPcall(L, status, 2);
+}
+
+/// The hook, put on a thread that is about to run.
+///
+/// Hooks are per thread in Lua 5.4 and a new thread inherits none, so a
+/// coroutine a script made for itself would otherwise be the one place in
+/// the sandbox where `while true do end` runs forever.
+fn hookThread(rt: *Runtime, co: *lua.State) void {
+    lua.lua_sethook(co, hook, lua.mask_count, rt.options.hook_interval);
+}
+
+fn apiResume(L: ?*lua.State) callconv(.c) c_int {
+    const co = lua.lua_tothread(L, 1) orelse lua.raise(L, "bad argument #1 to 'resume' (coroutine expected)");
+    hookThread(of(L), co);
+    const nargs = lua.lua_gettop(L) - 1;
+    if (lua.lua_checkstack(co, nargs + 1) == 0) lua.raise(L, "galdr: too many arguments to resume");
+    lua.lua_xmove(L, co, nargs);
+
+    var results: c_int = 0;
+    const status = lua.lua_resume(co, L, nargs, &results);
+    if (status != lua.ok and status != lua.yield) {
+        lua.lua_xmove(co, L, 1);
+        if (of(L).cancelling) _ = lua.lua_error(L);
+        lua.lua_pushboolean(L, 0);
+        lua.lua_rotate(L, -2, 1);
+        return 2;
+    }
+    if (lua.lua_checkstack(L, results + 1) == 0) {
+        lua.lua_settop(co, 0);
+        lua.raise(L, "galdr: too many results from a coroutine");
+    }
+    lua.lua_pushboolean(L, 1);
+    lua.lua_xmove(co, L, results);
+    return results + 1;
+}
+
+fn apiWrap(L: ?*lua.State) callconv(.c) c_int {
+    lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.function));
+    const co = lua.lua_newthread(L) orelse lua.raise(L, "galdr: no memory for a coroutine");
+    hookThread(of(L), co);
+    lua.lua_pushvalue(L, 1);
+    lua.lua_xmove(L, co, 1);
+    // Upvalue one is the thread, which is what keeps it from collection.
+    lua.lua_pushcclosure(L, wrapped, 1);
+    return 1;
+}
+
+fn wrapped(L: ?*lua.State) callconv(.c) c_int {
+    const co = lua.lua_tothread(L, lua.upvalueIndex(1)) orelse lua.raise(L, "galdr: not a coroutine");
+    const nargs = lua.lua_gettop(L);
+    if (lua.lua_checkstack(co, nargs + 1) == 0) lua.raise(L, "galdr: too many arguments to a coroutine");
+    lua.lua_xmove(L, co, nargs);
+
+    var results: c_int = 0;
+    const status = lua.lua_resume(co, L, nargs, &results);
+    if (status != lua.ok and status != lua.yield) {
+        lua.lua_xmove(co, L, 1);
+        _ = lua.lua_error(L);
+    }
+    if (lua.lua_checkstack(L, results) == 0) {
+        lua.lua_settop(co, 0);
+        lua.raise(L, "galdr: too many results from a coroutine");
+    }
+    lua.lua_xmove(co, L, results);
+    return results;
 }
 
 /// One entry of the `fenrir` table: what Lua calls it, what a manifest has to
@@ -1331,10 +1531,16 @@ fn call(rt: *Runtime, nargs: c_int, nresults: c_int, what: []const u8) bool {
     lua.lua_pushcclosure(L, traceback, 0);
     lua.lua_rotate(L, base, 1);
 
-    if (rt.depth == 0) rt.steps = 0;
+    if (rt.depth == 0) {
+        rt.steps = 0;
+        rt.cancelling = false;
+    }
     rt.depth += 1;
     const status = lua.pcall(L, nargs, nresults, base);
     rt.depth -= 1;
+    // The host's cancellation ends with the host's call: the next entry into
+    // Lua starts with a budget, and nothing a script did can clear it.
+    if (rt.depth == 0) rt.cancelling = false;
 
     // The handler sits under the results, or under the error message.
     lua.lua_rotate(L, base, -1);
@@ -1469,10 +1675,10 @@ fn entryFor(rt: *Runtime, name: []const u8) ?usize {
     for (rt.plugins.items, 0..) |p, i| {
         if (std.mem.eql(u8, p.name, name)) return i;
     }
-    const owned = rt.dupeText(name) orelse return null;
+    const owned = rt.own(name) orelse return null;
     const id: u32 = @intCast(rt.plugins.items.len + 1);
     rt.plugins.append(rt.gpa, .{ .name = owned, .id = id }) catch {
-        rt.freeText(owned);
+        rt.disown(owned);
         return null;
     };
     return rt.plugins.items.len - 1;
@@ -1698,27 +1904,74 @@ pub fn waiting(rt: *const Runtime) usize {
 pub fn pump(rt: *Runtime) void {
     if (!lua.available) return;
     rt.sweep();
-    var i: usize = 0;
-    while (i < rt.pending.items.len) {
-        // Re-read every time: a resumed handler can emit, and an emit can
-        // append here and move the array out from under a pointer.
-        const p = rt.pending.items[i];
+    if (rt.pending.items.len == 0) {
+        rt.pump_from = 0;
+        rt.refused = 0;
+        return;
+    }
+
+    // A snapshot, by sequence number: resuming a handler can queue another
+    // and can finish a third, and a walk over a list the walk extends is a
+    // loop with no end in it. What a resumption queues waits for the next
+    // pump, which is the policy a handler that yields already asked for.
+    const cutoff = rt.next_job;
+    rt.pump_order.clearRetainingCapacity();
+    for (rt.pending.items) |job| {
+        if (job.seq >= cutoff) continue;
+        rt.pump_order.append(rt.gpa, job.seq) catch break;
+    }
+    if (rt.pump_order.items.len == 0) return;
+
+    // Round-robin from where the budget ran out last time, so that the
+    // handlers at the front cannot spend every frame before the ones behind
+    // them are reached.
+    var from: usize = 0;
+    for (rt.pump_order.items, 0..) |seq, at| {
+        if (seq >= rt.pump_from) {
+            from = at;
+            break;
+        }
+    }
+
+    var budget = rt.options.frame_step_limit;
+    rt.pump_from = 0;
+    const n = rt.pump_order.items.len;
+    var round: usize = 0;
+    while (round < n) : (round += 1) {
+        const seq = rt.pump_order.items[(from + round) % n];
+        const at = rt.jobAt(seq) orelse continue;
+        if (budget == 0) {
+            // The frame is spent. The rest keep their place in the queue and
+            // the next pump starts here rather than at the front.
+            rt.pump_from = seq;
+            return;
+        }
+        const p = rt.pending.items[at];
         if (p.resumes >= rt.options.resume_limit) {
             var what: [80]u8 = undefined;
             rt.report(
                 std.fmt.bufPrint(&what, "on {s}", .{@tagName(p.event)}) catch "event",
                 "the handler yielded too many times and was dropped",
             );
-            rt.finish(i);
+            rt.finish(at);
             continue;
         }
-        rt.pending.items[i].resumes += 1;
-        if (rt.step(p.thread, 0, p.event) == lua.yield) {
-            i += 1;
-            continue;
-        }
-        rt.finish(i);
+        rt.pending.items[at].resumes += 1;
+        const status = rt.step(p.thread, 0, p.event);
+        // What the resumption actually cost: `step` zeroes the count and the
+        // hook raises the total, so this is the frame's own arithmetic and
+        // not an estimate.
+        budget -|= rt.steps;
+        if (status == lua.yield) continue;
+        if (rt.jobAt(seq)) |now| rt.finish(now);
     }
+}
+
+fn jobAt(rt: *Runtime, seq: u64) ?usize {
+    for (rt.pending.items, 0..) |job, i| {
+        if (job.seq == seq) return i;
+    }
+    return null;
 }
 
 /// Drops the pending handler at `index`, letting the coroutine be collected.
@@ -1765,6 +2018,14 @@ fn spawnTrampoline(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn spawn(rt: *Runtime, handler: Handler, payload: Payload) void {
+    if (rt.pending.items.len >= rt.options.max_pending) {
+        rt.refused += 1;
+        // Once, not once an event: a queue that is full stays full for a
+        // while, and a message line that says so sixty times a second is
+        // worse than the thing it is reporting.
+        if (rt.refused == 1) rt.report("galdr", "too many handlers are part way through; one was not started");
+        return;
+    }
     var job: SpawnJob = .{ .ref = handler.ref, .payload = payload };
     lua.lua_pushcclosure(rt.L, spawnTrampoline, 0);
     lua.lua_pushlightuserdata(rt.L, &job);
@@ -1781,13 +2042,19 @@ fn spawn(rt: *Runtime, handler: Handler, payload: Payload) void {
         lua.luaL_unref(rt.L, lua.registry_index, job.thread_ref);
         return;
     }
+    const seq = rt.next_job;
     rt.pending.append(rt.gpa, .{
         .ref = job.thread_ref,
         .thread = co,
         .id = handler.id,
         .owner = handler.owner,
         .event = payload.event,
-    }) catch lua.luaL_unref(rt.L, lua.registry_index, job.thread_ref);
+        .seq = seq,
+    }) catch {
+        lua.luaL_unref(rt.L, lua.registry_index, job.thread_ref);
+        return;
+    };
+    rt.next_job += 1;
 }
 
 /// One resumption of a coroutine, with the step budget it is allowed.
@@ -1798,8 +2065,12 @@ fn spawn(rt: *Runtime, handler: Handler, payload: Payload) void {
 /// plain call is stopped as a runaway.
 fn step(rt: *Runtime, co: *lua.State, nargs: c_int, event: Event) c_int {
     rt.steps = 0;
+    if (rt.depth == 0) rt.cancelling = false;
+    rt.depth += 1;
     var results: c_int = 0;
     const status = lua.lua_resume(co, rt.L, nargs, &results);
+    rt.depth -= 1;
+    if (rt.depth == 0) rt.cancelling = false;
     if (status == lua.ok or status == lua.yield) {
         lua.lua_settop(co, 0);
         return status;
@@ -2070,6 +2341,28 @@ pub fn runRail(rt: *Runtime, id: u32) void {
 
 // -- the fenrir table ---------------------------------------------------------
 
+/// A string a registration will keep, bounded.
+///
+/// The instruction hook counts Lua instructions and nothing else, so time
+/// spent inside a host call is time off the budget: one large Lua string
+/// registered a thousand times is one counted string, a thousand uncounted
+/// copies and a thousand uncounted memcpys. What the host copies is bounded
+/// by what it will take.
+fn checkText(L: ?*lua.State, text: []const u8, what: []const u8) []const u8 {
+    if (text.len <= max_text) return text;
+    var msg: [128]u8 = undefined;
+    lua.raise(L, std.fmt.bufPrint(&msg, "galdr: a {s} is at most {d} bytes", .{ what, max_text }) catch
+        "galdr: that is too long to register");
+}
+
+/// Refuses the registration that would take a list past its cap. A list the
+/// reader walks has to have an end, and `fenrir.clear` is how a plugin that
+/// wants another thousand makes room.
+fn room(rt: *Runtime, L: ?*lua.State, n: usize) void {
+    if (n < rt.options.max_registrations) return;
+    lua.raise(L, "galdr: too many registrations; fenrir.clear takes a group away");
+}
+
 /// The document an argument names: a handle an event gave the plugin, or
 /// the focused one when it gave none.
 ///
@@ -2274,8 +2567,8 @@ fn apiKeymap(L: ?*lua.State) callconv(.c) c_int {
     };
     const kind = lua.typeOf(L, 3);
     if (kind != .function and kind != .string) lua.raise(L, "galdr: a key binding needs a function or a command line");
-    const description = lua.optString(L, 4) orelse "";
-    const group = lua.optString(L, 5) orelse "";
+    const description = checkText(L, lua.optString(L, 4) orelse "", "description");
+    const group = checkText(L, lua.optString(L, 5) orelse "", "group");
     const owner = authority(L);
 
     // Every argument is checked. From here, Lua calls come before Zig
@@ -2288,14 +2581,14 @@ fn apiKeymap(L: ?*lua.State) callconv(.c) c_int {
 
     const rt = of(L);
     rt.unbind(modes, key);
-    const line = if (kind == .string) lua.toString(L, 3).? else "";
+    const line = if (kind == .string) checkText(L, lua.toString(L, 3).?, "command line") else "";
 
     // All or nothing, freed by hand: `errdefer` would not run across the
     // `longjmp` that `outOfMemory` ends in.
-    const owned_line = rt.dupeText(line);
-    const owned_spec = rt.dupeText(spec);
-    const owned_desc = rt.dupeText(description);
-    const owned_group = rt.dupeText(group);
+    const owned_line = rt.own(line);
+    const owned_spec = rt.own(spec);
+    const owned_desc = rt.own(description);
+    const owned_group = rt.own(group);
     const added = if (owned_line != null and owned_spec != null and owned_desc != null and owned_group != null)
         (if (rt.keymaps.append(rt.gpa, .{
             .id = rt.next_keymap,
@@ -2311,10 +2604,10 @@ fn apiKeymap(L: ?*lua.State) callconv(.c) c_int {
     else
         false;
     if (!added) {
-        if (owned_line) |t| rt.freeText(t);
-        if (owned_spec) |t| rt.freeText(t);
-        if (owned_desc) |t| rt.freeText(t);
-        if (owned_group) |t| rt.freeText(t);
+        if (owned_line) |t| rt.disown(t);
+        if (owned_spec) |t| rt.disown(t);
+        if (owned_desc) |t| rt.disown(t);
+        if (owned_group) |t| rt.disown(t);
         return rt.outOfMemory(L, ref);
     }
     rt.next_keymap += 1;
@@ -2390,9 +2683,9 @@ fn addMode(L: ?*lua.State, set: *ModeSet, c: u8) void {
 fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
     const name = lua.checkString(L, 1);
     lua.luaL_checktype(L, 2, @intFromEnum(lua.Type.function));
-    const description = lua.optString(L, 3) orelse "";
-    const icon = lua.optString(L, 4) orelse "";
-    const group = lua.optString(L, 5) orelse "";
+    const description = checkText(L, lua.optString(L, 3) orelse "", "description");
+    const icon = checkText(L, lua.optString(L, 4) orelse "", "icon");
+    const group = checkText(L, lua.optString(L, 5) orelse "", "group");
 
     const valid = name.len > 0 and name.len <= 64 and std.ascii.isAlphabetic(name[0]) and for (name) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') break false;
@@ -2401,6 +2694,7 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
 
     const owner = authority(L);
     const rt = of(L);
+    rt.room(L, rt.commands.items.len);
     // A name another plugin has is that plugin's. Collisions are refused
     // rather than resolved, because the alternative is a reader where which
     // of two plugins owns `:Read` depends on the order their files sorted.
@@ -2421,26 +2715,26 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
         rt.release(&c.ref);
         c.ref = ref;
         c.owner = owner;
-        if (rt.dupeText(description)) |d| {
-            rt.freeText(c.description);
+        if (rt.own(description)) |d| {
+            rt.disown(c.description);
             c.description = d;
         }
-        if (rt.dupeText(icon)) |p| {
-            rt.freeText(c.icon);
+        if (rt.own(icon)) |p| {
+            rt.disown(c.icon);
             c.icon = p;
         }
-        if (rt.dupeText(group)) |g| {
-            rt.freeText(c.group);
+        if (rt.own(group)) |g| {
+            rt.disown(c.group);
             c.group = g;
         }
         rt.revision +%= 1;
         return 0;
     }
 
-    const owned = rt.dupeText(name);
-    const desc = rt.dupeText(description);
-    const picture = rt.dupeText(icon);
-    const owned_group = rt.dupeText(group);
+    const owned = rt.own(name);
+    const desc = rt.own(description);
+    const picture = rt.own(icon);
+    const owned_group = rt.own(group);
     const added = owned != null and desc != null and picture != null and owned_group != null and
         (if (rt.commands.append(rt.gpa, .{
             .owner = owner,
@@ -2451,10 +2745,10 @@ fn apiCommand(L: ?*lua.State) callconv(.c) c_int {
             .icon = picture.?,
         })) true else |_| false);
     if (!added) {
-        if (owned) |t| rt.freeText(t);
-        if (desc) |t| rt.freeText(t);
-        if (picture) |t| rt.freeText(t);
-        if (owned_group) |t| rt.freeText(t);
+        if (owned) |t| rt.disown(t);
+        if (desc) |t| rt.disown(t);
+        if (picture) |t| rt.disown(t);
+        if (owned_group) |t| rt.disown(t);
         return rt.outOfMemory(L, ref);
     }
     rt.revision +%= 1;
@@ -2482,18 +2776,19 @@ fn apiOn(L: ?*lua.State) callconv(.c) c_int {
     // Two shapes, told apart by what is in the second place. A string there
     // is a pattern and a function there is the handler.
     const shifted = lua.typeOf(L, 2) == .function;
-    const pattern = if (shifted) "*" else lua.checkString(L, 2);
+    const pattern = checkText(L, if (shifted) "*" else lua.checkString(L, 2), "pattern");
     const at: c_int = if (shifted) 2 else 3;
     lua.luaL_checktype(L, at, @intFromEnum(lua.Type.function));
-    const group = lua.optString(L, at + 1) orelse "";
+    const group = checkText(L, lua.optString(L, at + 1) orelse "", "group");
     const owner = authority(L);
 
     const rt = of(L);
+    rt.room(L, rt.handlers.items.len);
     lua.lua_pushvalue(L, at);
     const ref = lua.luaL_ref(L, lua.registry_index);
 
-    const owned_pattern = rt.dupeText(pattern);
-    const owned_group = rt.dupeText(group);
+    const owned_pattern = rt.own(pattern);
+    const owned_group = rt.own(group);
     const id = rt.next_handler;
     const added = owned_pattern != null and owned_group != null and
         (if (rt.handlers.append(rt.gpa, .{
@@ -2505,8 +2800,8 @@ fn apiOn(L: ?*lua.State) callconv(.c) c_int {
             .ref = ref,
         })) true else |_| false);
     if (!added) {
-        if (owned_pattern) |t| rt.freeText(t);
-        if (owned_group) |t| rt.freeText(t);
+        if (owned_pattern) |t| rt.disown(t);
+        if (owned_group) |t| rt.disown(t);
         return rt.outOfMemory(L, ref);
     }
     rt.next_handler += 1;
@@ -2623,15 +2918,15 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
     if (label.len == 0 or label.len > 64) lua.raise(L, "galdr: a rail button's label is one to sixty-four bytes");
 
     _ = lua.lua_getfield(L, 1, "icon");
-    const icon = lua.toString(L, -1) orelse "fenrir.unknown";
+    const icon = checkText(L, lua.toString(L, -1) orelse "fenrir.unknown", "icon");
 
     _ = lua.lua_getfield(L, 1, "group");
-    const group = lua.toString(L, -1) orelse "";
+    const group = checkText(L, lua.toString(L, -1) orelse "", "group");
 
     _ = lua.lua_getfield(L, 1, "action");
     const kind = lua.typeOf(L, -1);
     if (kind != .function and kind != .string) lua.raise(L, "galdr: a rail button needs a function or a command line");
-    const line = if (kind == .string) lua.toString(L, -1).? else "";
+    const line = if (kind == .string) checkText(L, lua.toString(L, -1).?, "command line") else "";
     const owner = authority(L);
 
     // Every argument is checked; from here Lua calls come before Zig
@@ -2640,13 +2935,14 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
     // The strings stay on the stack until they have been copied: `line`
     // borrows the very value `luaL_ref` would have popped.
     const rt = of(L);
+    rt.room(L, rt.rails.items.len);
     var ref: c_int = lua.no_ref;
     if (kind == .function) ref = lua.luaL_ref(L, lua.registry_index);
 
-    const owned_icon = rt.dupeText(icon);
-    const owned_label = rt.dupeText(label);
-    const owned_line = rt.dupeText(line);
-    const owned_group = rt.dupeText(group);
+    const owned_icon = rt.own(icon);
+    const owned_label = rt.own(label);
+    const owned_line = rt.own(line);
+    const owned_group = rt.own(group);
     const id = rt.next_contribution;
     const added = owned_icon != null and owned_label != null and owned_line != null and owned_group != null and
         (if (rt.rails.append(rt.gpa, .{
@@ -2660,10 +2956,10 @@ fn apiRail(L: ?*lua.State) callconv(.c) c_int {
             .group = owned_group.?,
         })) true else |_| false);
     if (!added) {
-        if (owned_icon) |t| rt.freeText(t);
-        if (owned_label) |t| rt.freeText(t);
-        if (owned_line) |t| rt.freeText(t);
-        if (owned_group) |t| rt.freeText(t);
+        if (owned_icon) |t| rt.disown(t);
+        if (owned_label) |t| rt.disown(t);
+        if (owned_line) |t| rt.disown(t);
+        if (owned_group) |t| rt.disown(t);
         return rt.outOfMemory(L, ref);
     }
     rt.next_contribution += 1;
@@ -2763,13 +3059,13 @@ fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
     if (name.len == 0 or name.len > 64) lua.raise(L, "galdr: a panel's id is one to sixty-four bytes");
 
     _ = lua.lua_getfield(L, 1, "title");
-    const title = lua.toString(L, -1) orelse name;
+    const title = checkText(L, lua.toString(L, -1) orelse name, "title");
     _ = lua.lua_getfield(L, 1, "icon");
-    const icon = lua.toString(L, -1) orelse "fenrir.panel";
+    const icon = checkText(L, lua.toString(L, -1) orelse "fenrir.panel", "icon");
     _ = lua.lua_getfield(L, 1, "empty");
-    const empty = lua.toString(L, -1) orelse "nothing here";
+    const empty = checkText(L, lua.toString(L, -1) orelse "nothing here", "description");
     _ = lua.lua_getfield(L, 1, "group");
-    const group = lua.toString(L, -1) orelse "";
+    const group = checkText(L, lua.toString(L, -1) orelse "", "group");
 
     // Referenced last of the two, and both after every check: a reference
     // taken before a raise is a reference nothing will ever release.
@@ -2781,14 +3077,15 @@ fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
     const owner = authority(L);
 
     const rt = of(L);
+    rt.room(L, rt.panels.items.len);
     const rows_ref = lua.luaL_ref(L, lua.registry_index);
     const choose_ref = if (has_choose) lua.luaL_ref(L, lua.registry_index) else lua.no_ref;
 
-    const owned_name = rt.dupeText(name);
-    const owned_title = rt.dupeText(title);
-    const owned_icon = rt.dupeText(icon);
-    const owned_empty = rt.dupeText(empty);
-    const owned_group = rt.dupeText(group);
+    const owned_name = rt.own(name);
+    const owned_title = rt.own(title);
+    const owned_icon = rt.own(icon);
+    const owned_empty = rt.own(empty);
+    const owned_group = rt.own(group);
     const id = rt.next_contribution;
     const added = owned_name != null and owned_title != null and owned_icon != null and
         owned_empty != null and owned_group != null and
@@ -2804,11 +3101,11 @@ fn apiPanel(L: ?*lua.State) callconv(.c) c_int {
             .group = owned_group.?,
         })) true else |_| false);
     if (!added) {
-        if (owned_name) |t| rt.freeText(t);
-        if (owned_title) |t| rt.freeText(t);
-        if (owned_icon) |t| rt.freeText(t);
-        if (owned_empty) |t| rt.freeText(t);
-        if (owned_group) |t| rt.freeText(t);
+        if (owned_name) |t| rt.disown(t);
+        if (owned_title) |t| rt.disown(t);
+        if (owned_icon) |t| rt.disown(t);
+        if (owned_empty) |t| rt.disown(t);
+        if (owned_group) |t| rt.disown(t);
         if (choose_ref != lua.no_ref) lua.luaL_unref(L, lua.registry_index, choose_ref);
         return rt.outOfMemory(L, rows_ref);
     }
@@ -3051,8 +3348,52 @@ fn apiStoreSet(L: ?*lua.State) callconv(.c) c_int {
     const key = checkKey(L, 1);
     const value = if (lua.typeOf(L, 2) == .nil or lua.typeOf(L, 2) == .none) null else lua.checkString(L, 2);
     const rt = of(L);
+    if (value) |v| {
+        if (v.len > rt.options.store_limit) lua.raise(L, "galdr: that value is larger than this plugin's whole store");
+    }
+    if (!rt.chargeStore(owner, key, if (value) |v| v.len else null)) {
+        lua.raise(L, "galdr: this plugin's store is full");
+    }
     lua.lua_pushboolean(L, @intFromBool(rt.host.storeSet(rt.storeSpace(owner), key, value)));
     return 1;
+}
+
+/// Counts what a plugin is keeping, and refuses the write that would take
+/// it past its quota.
+///
+/// By key, so that writing one key twice costs what the second value costs
+/// and not both -- a plugin that keeps its place in a document writes the
+/// same key all session. What is counted is this session's writes: what is
+/// already on disk is the host's business and Galdr cannot see it, so this
+/// is a bound on what a running plugin can add and is only claimed as that.
+fn chargeStore(rt: *Runtime, owner: Owner, key: []const u8, len: ?usize) bool {
+    if (owner.id == 0 or owner.id > rt.plugins.items.len) return true;
+    const p = &rt.plugins.items[owner.id - 1];
+    const had: ?u32 = if (p.store.get(key)) |n| n else null;
+
+    const want = len orelse {
+        if (p.store.fetchRemove(key)) |gone| {
+            p.store_bytes -|= gone.value;
+            rt.disown(@constCast(gone.key));
+        }
+        return true;
+    };
+    if (want > std.math.maxInt(u32)) return false;
+    const after = p.store_bytes - (had orelse 0) + want;
+    if (after > rt.options.store_limit) return false;
+    if (had == null and p.store.count() >= rt.options.store_key_limit) return false;
+
+    if (p.store.getPtr(key)) |slot| {
+        slot.* = @intCast(want);
+    } else {
+        const owned = rt.own(key) orelse return false;
+        p.store.put(rt.gpa, owned, @intCast(want)) catch {
+            rt.disown(owned);
+            return false;
+        };
+    }
+    p.store_bytes = after;
+    return true;
 }
 
 // -- tests --------------------------------------------------------------------
@@ -4148,6 +4489,114 @@ test "a mark id is removed from the document it belongs to, or from none" {
 
 // -- the limits ---------------------------------------------------------------
 
+test "the instruction limit is not something a script can catch" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try create(testing.allocator, fake.host(), .{ .step_limit = 50 });
+    defer rt.destroy();
+
+    // The probe from the flaw report: a loop that catches the limit and
+    // carries on buys itself a fresh budget every time round, which is the
+    // whole limit undone. The call ends at the first exhaustion instead.
+    try testing.expect(!rt.runString("caught",
+        \\for _ = 1, 3 do
+        \\  pcall(function() while true do end end)
+        \\  rounds = (rounds or 0) + 1
+        \\end
+    ));
+    try testing.expect(rt.runString("check", "assert(rounds == nil, tostring(rounds))"));
+
+    // The other two ways to swallow an error, and a coroutine a script made
+    // for itself -- which in stock Lua inherits no hook at all.
+    try testing.expect(!rt.runString("xpcall",
+        \\xpcall(function() while true do end end, function(m) return m end)
+        \\after_xpcall = true
+    ));
+    try testing.expect(!rt.runString("resume",
+        \\local co = coroutine.create(function() while true do end end)
+        \\coroutine.resume(co)
+        \\after_resume = true
+    ));
+    try testing.expect(!rt.runString("wrap",
+        \\pcall(coroutine.wrap(function() while true do end end))
+        \\after_wrap = true
+    ));
+    try testing.expect(rt.runString("check",
+        \\assert(after_xpcall == nil and after_resume == nil and after_wrap == nil)
+    ));
+
+    // An ordinary error is still ordinary, a budget still comes back, and
+    // yielding from inside a `pcall` still works.
+    try testing.expect(rt.runString("ordinary",
+        \\local ok, m = pcall(function() error("plain") end)
+        \\assert(not ok and m:find("plain", 1, true))
+        \\local co = coroutine.create(function() return pcall(function() coroutine.yield(7) return 8 end) end)
+        \\local _, got = coroutine.resume(co)
+        \\assert(got == 7, tostring(got))
+    ));
+}
+
+test "one pump is bounded however many handlers are waiting" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try create(testing.allocator, fake.host(), .{
+        .hook_interval = 200,
+        .step_limit = 10_000,
+        .frame_step_limit = 2,
+    });
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\runs = {}
+        \\for n = 1, 6 do
+        \\  runs[n] = 0
+        \\  fenrir.on("Start", function()
+        \\    for _ = 1, 3 do
+        \\      local t = 0
+        \\      for i = 1, 4000 do t = t + i end
+        \\      runs[n] = runs[n] + 1
+        \\      coroutine.yield()
+        \\    end
+        \\  end)
+        \\end
+    ));
+    rt.emit(.{ .event = .Start });
+    try testing.expectEqual(@as(usize, 6), rt.waiting());
+
+    rt.pump();
+    try testing.expect(rt.runString("one frame",
+        \\local total = 0
+        \\for _, n in ipairs(runs) do total = total + n end
+        \\assert(total < 12, "one pump resumed every waiting handler: " .. total)
+    ));
+
+    // And nothing starves: the budget comes round rather than being spent
+    // on the front of the queue every frame.
+    var frames: usize = 0;
+    while (rt.waiting() != 0 and frames < 200) : (frames += 1) rt.pump();
+    try testing.expectEqual(@as(usize, 0), rt.waiting());
+    try testing.expect(rt.runString("all",
+        \\for i, n in ipairs(runs) do assert(n == 3, "handler " .. i .. " ran " .. n) end
+    ));
+}
+
+test "a queue that is full refuses rather than growing" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try create(testing.allocator, fake.host(), .{ .max_pending = 4 });
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("init.lua",
+        \\for _ = 1, 10 do fenrir.on("Start", function() coroutine.yield() end) end
+    ));
+    rt.emit(.{ .event = .Start });
+    try testing.expectEqual(@as(usize, 4), rt.waiting());
+    try testing.expectEqual(@as(usize, 1), rt.messages.items.len);
+}
+
 test "removing a handler cancels the callback that is part way through" {
     if (!lua.available) return error.SkipZigTest;
     var fake: FakeHost = .{};
@@ -4254,7 +4703,59 @@ test "two plugins keeping the same key keep two values" {
     try testing.expect(!rt.runString("escape", "fenrir.store.set('../other/enabled', 'x')"));
 }
 
+test "a plugin's store has a quota of its own" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{ .files = &.{
+        .{ "plugins/greedy.lua",
+        \\local block = string.rep("x", 200)
+        \\for i = 1, 200 do
+        \\  local ok = pcall(fenrir.store.set, "k" .. i, block)
+        \\  if not ok then stopped = i break end
+        \\end
+        \\-- the same key again and again costs what the last value costs
+        \\for _ = 1, 50 do fenrir.store.set("k1", block) end
+        },
+    } };
+    defer fake.deinit();
+    const rt = try create(testing.allocator, fake.host(), .{ .store_limit = 2000, .store_key_limit = 64 });
+    defer rt.destroy();
+
+    rt.loadConfig();
+    try testing.expect(rt.plugins.items[0].ok);
+    try testing.expect(rt.runString("check", "assert(stopped ~= nil, 'the store took everything it was offered')"));
+    try testing.expect(rt.plugins.items[0].store_bytes <= 2000);
+}
+
 // -- what the host holds ------------------------------------------------------
+
+test "what a registration holds is counted, bounded, and given back" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    const baseline = rt.footprint().host;
+    for (0..8) |_| {
+        try testing.expect(rt.runString("cycle",
+            \\for i = 1, 100 do
+            \\  fenrir.on("PageChanged", "*/papers/" .. i .. "/*.pdf", function() end, "churn")
+            \\  fenrir.command("C" .. i, function() end, "a description", "fenrir.menu", "churn")
+            \\end
+            \\assert(fenrir.clear("churn") == 200)
+        ));
+        rt.sweep();
+    }
+    // Register and release, over and over: what the host copied comes back,
+    // where before a dead registration kept its native memory until the
+    // runtime was destroyed.
+    try testing.expectEqual(baseline, rt.footprint().host);
+
+    // One large Lua string registered a thousand times was a thousand
+    // uncounted copies. It is refused by length now.
+    try testing.expect(!rt.runString("huge", "fenrir.on('Quit', string.rep('*', 600), function() end)"));
+    try testing.expect(std.mem.indexOf(u8, rt.messages.items[rt.messages.items.len - 1], "at most") != null);
+}
 
 test "unloading a plugin takes everything of it, jobs included" {
     if (!lua.available) return error.SkipZigTest;
