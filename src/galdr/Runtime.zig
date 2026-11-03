@@ -1019,6 +1019,76 @@ pub fn unload(rt: *Runtime, name: []const u8) ?u32 {
     return null;
 }
 
+/// Whether a generation of a plugin by that name is in service.
+pub fn isLoaded(rt: *const Runtime, name: []const u8) bool {
+    for (rt.plugins.items) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.loaded;
+    }
+    return false;
+}
+
+/// How a load ended, which is three answers and not two: a reload that
+/// failed leaves the generation before it running, so "it did not load" and
+/// "there is nothing by that name" are different things to say.
+pub const Outcome = enum { loaded, failed, missing };
+
+/// `:plugin load <name>` and `:plugin reload <name>`: the file again, from
+/// nothing.
+///
+/// One call for both, because the difference is only what the reader says
+/// afterwards. The chunk runs under a fresh generation and its modules are
+/// required again under that generation, so a reload is the plugin from
+/// nothing rather than the plugin patched -- and `endLoad` keeps the last
+/// working generation if this one fails, so a broken edit costs the edit and
+/// not what was already running.
+pub fn load(rt: *Runtime, name: []const u8) Outcome {
+    if (!lua.available) return .missing;
+    if (!plainName(name)) return .missing;
+
+    // `init.lua` is the one plugin that is not under `plugins/`, and it is
+    // the one most likely to be reloaded: it is where a person's own
+    // bindings live. Named as `:plugins` prints it, so the name typed is
+    // the name seen.
+    if (std.mem.eql(u8, name, "init.lua")) {
+        const text = rt.host.readFile(rt.gpa, "init.lua") orelse return .missing;
+        defer rt.gpa.free(text);
+        return if (rt.loadOne(name, "init.lua", text, null)) .loaded else .failed;
+    }
+
+    // A single file first and then a folder, the order `loadConfig` walks
+    // them in, so the same name means the same plugin either way round.
+    var buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "plugins/{s}.lua", .{name})) |path| {
+        if (rt.host.readFile(rt.gpa, path)) |source| {
+            defer rt.gpa.free(source);
+            return if (rt.loadOne(name, path, source, null)) .loaded else .failed;
+        }
+    } else |_| {}
+
+    var manifest_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "plugins/{s}/init.lua", .{name}) catch return .missing;
+    const manifest = std.fmt.bufPrint(&manifest_buf, "plugins/{s}/plugin.lua", .{name}) catch null;
+    const source = rt.host.readFile(rt.gpa, path) orelse return .missing;
+    defer rt.gpa.free(source);
+    return if (rt.loadOne(name, path, source, manifest)) .loaded else .failed;
+}
+
+/// Whether a word names one plugin and nothing else.
+///
+/// A name is the plugin's identity and so the namespace its stored values
+/// live under. A separator in it would reach another plugin's file *and*
+/// another plugin's keys, which is why this is checked here and not left to
+/// `Host.isContained`: that one answers about a path, and this one is about
+/// a namespace.
+fn plainName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_text) return false;
+    if (name[0] == '.') return false;
+    for (name) |c| {
+        if (c == '/' or c == '\\' or c == ':' or c < 0x20) return false;
+    }
+    return true;
+}
+
 fn hook(L: ?*lua.State, _: ?*lua.Debug) callconv(.c) void {
     const rt = of(L);
     rt.steps += 1;
@@ -5152,4 +5222,93 @@ test "the table answers for itself, before a plugin has said what it wants" {
     try testing.expect(rt.plugins.items[0].manifest.declared);
     try testing.expect(rt.plugins.items[0].caps.has(.document_write));
     try testing.expect(!rt.plugins.items[0].caps.has(.document_read));
+}
+
+test "a plugin loads, reloads and unloads by name" {
+    if (!lua.available) return error.SkipZigTest;
+    // Held in a local rather than a literal, because a reload is only worth
+    // testing against a file that changed.
+    var sources = [_][2][]const u8{
+        .{ "plugins/clock.lua", "fenrir.command('Clock', function() end) loads = (loads or 0) + 1" },
+    };
+    var fake: FakeHost = .{ .files = &sources };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(!rt.isLoaded("clock"));
+    try testing.expectEqual(Outcome.loaded, rt.load("clock"));
+    try testing.expect(rt.isLoaded("clock"));
+    try testing.expectEqual(@as(?bool, true), rt.runCommand("Clock", ""));
+
+    sources[0][1] =
+        \\fenrir.command('Clock', function() end)
+        \\fenrir.command('Tick', function() end)
+        \\loads = loads + 1
+    ;
+    try testing.expectEqual(Outcome.loaded, rt.load("clock"));
+    rt.sweep();
+    // The file again and not the file on top of the file: two commands,
+    // because the generation before it was retired whole.
+    try testing.expectEqual(@as(usize, 2), rt.commandNames().len);
+    try testing.expect(rt.runString("check", "assert(loads == 2, loads)"));
+
+    try testing.expect(rt.unload("clock").? >= 2);
+    try testing.expect(!rt.isLoaded("clock"));
+    try testing.expectEqual(@as(?bool, null), rt.runCommand("Clock", ""));
+    try testing.expectEqual(@as(?bool, null), rt.runCommand("Tick", ""));
+
+    // Loaded again under the same id, so the values it kept are still its
+    // own -- which is why a plugin keeps its place in the list.
+    try testing.expectEqual(Outcome.loaded, rt.load("clock"));
+    try testing.expectEqual(@as(usize, 1), rt.plugins.items.len);
+
+    // `init.lua` is reloaded by the name `:plugins` prints, from the
+    // configuration root rather than from `plugins/`.
+    fake.files = &.{.{ "init.lua", "fenrir.keymap('n', 'z', 'page +1')" }};
+    try testing.expectEqual(Outcome.loaded, rt.load("init.lua"));
+    try testing.expect(rt.isLoaded("init.lua"));
+    const look = rt.lookup();
+    try testing.expect(look.find(look.ptr, .normal, .{ .char = 'z' }) != null);
+
+    // A name nothing is called, and three that are not names: the plugin's
+    // name is the namespace its stored values live under, so a separator in
+    // one would reach another plugin's keys as well as its file.
+    try testing.expectEqual(Outcome.missing, rt.load("nobody"));
+    try testing.expectEqual(Outcome.missing, rt.load(""));
+    try testing.expectEqual(Outcome.missing, rt.load("../escape"));
+    try testing.expectEqual(Outcome.missing, rt.load("other/clock"));
+}
+
+test "a reload that fails leaves the generation that worked in service" {
+    if (!lua.available) return error.SkipZigTest;
+    var sources = [_][2][]const u8{
+        .{ "plugins/steady.lua", "fenrir.command('Steady', function() end)" },
+    };
+    var fake: FakeHost = .{ .files = &sources };
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expectEqual(Outcome.loaded, rt.load("steady"));
+    sources[0][1] = "fenrir.command('Broken', function() end) error('halfway')";
+    try testing.expectEqual(Outcome.failed, rt.load("steady"));
+
+    // The broken edit cost the edit. What was running is still running, and
+    // nothing of the half that failed ever became live.
+    try testing.expect(rt.isLoaded("steady"));
+    try testing.expect(rt.plugins.items[0].ok);
+    try testing.expectEqual(@as(?bool, true), rt.runCommand("Steady", ""));
+    try testing.expectEqual(@as(?bool, null), rt.runCommand("Broken", ""));
+
+    // A folder plugin is reached by the same name, manifest and all.
+    var folder = [_][2][]const u8{
+        .{ "plugins/boxed/plugin.lua", "return { about = 'in a folder', capabilities = { 'ui' } }" },
+        .{ "plugins/boxed/init.lua", "fenrir.command('Boxed', function() end)" },
+    };
+    fake.files = &folder;
+    try testing.expectEqual(Outcome.loaded, rt.load("boxed"));
+    try testing.expectEqual(@as(?bool, true), rt.runCommand("Boxed", ""));
+    try testing.expectEqualStrings("in a folder", rt.plugins.items[1].manifest.about);
+    try testing.expect(!rt.plugins.items[1].caps.has(.document_write));
 }

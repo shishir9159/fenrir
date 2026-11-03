@@ -176,6 +176,8 @@ pub const usage =
     \\    :marks, :marks clear how many marks, or remove them all
     \\    :lua CODE            run Lua, with the fenrir table
     \\    :plugins, :messages  what loaded, and what went wrong
+    \\    :plugin reload NAME  that plugin again, from nothing; also load,
+    \\                         unload
     \\    :echo TEXT           show TEXT
     \\    :Name ARGS           a command a plugin registered
     \\
@@ -3635,15 +3637,129 @@ const Session = struct {
                     s.say("plugins are off in this reader", .{});
                     return false;
                 };
-                var w: std.Io.Writer = .fixed(&s.status_buf);
-                w.print("{d} loaded:", .{rt.plugins.items.len}) catch {};
-                for (rt.plugins.items) |p| {
-                    w.print(" {s}{s}", .{ p.name, if (p.ok) "" else " (failed)" }) catch break;
+                s.sayPlugins(rt);
+            },
+            .plugin => {
+                const rt = s.plugins orelse {
+                    s.say("plugins are off in this reader", .{});
+                    return false;
+                };
+                if (args.len == 0) {
+                    s.sayPlugins(rt);
+                    return true;
                 }
-                s.status = s.status_buf[0..w.end];
-                s.dirty_title = true;
+                // The lifecycle verbs are the console's, for the reason
+                // `:lua` is: a plugin that could reload itself would be
+                // running its own chunk underneath its own call, and one
+                // that could unload another would be deciding what else the
+                // reader runs.
+                if (from == .plugin) {
+                    s.say(":plugin load, unload and reload are the console's", .{});
+                    return false;
+                }
+                return s.lifecycle(rt, args);
             },
             .echo => s.say("{s}", .{args[0..@min(args.len, 400)]}),
+        }
+        return true;
+    }
+
+    /// `:plugins`, and `:plugin` with nothing after it.
+    ///
+    /// A plugin keeps its place in Galdr's list once it is unloaded -- that
+    /// is how a reload keeps the store namespace its values are already
+    /// under -- so the count is of what is in service and not of how long
+    /// the list has grown.
+    fn sayPlugins(s: *Session, rt: *galdr.Runtime) void {
+        var live: usize = 0;
+        for (rt.plugins.items) |p| {
+            if (p.loaded) live += 1;
+        }
+        if (rt.plugins.items.len == 0) {
+            s.say("no init.lua and no plugins/ -- nothing to load", .{});
+            return;
+        }
+        var w: std.Io.Writer = .fixed(&s.status_buf);
+        w.print("{d} loaded:", .{live}) catch {};
+        for (rt.plugins.items) |p| {
+            const how = if (!p.loaded) " (unloaded)" else if (!p.ok) " (failed)" else "";
+            w.print(" {s}{s}", .{ p.name, how }) catch break;
+        }
+        s.status = s.status_buf[0..w.end];
+        s.dirty_title = true;
+    }
+
+    /// `:plugin load|unload|reload NAME`.
+    ///
+    /// What the reader borrows from Galdr -- a rail's label, a setting's
+    /// choices, the palette's rows -- is rebuilt when `Runtime.revision`
+    /// moves and the dead storage is given back at the top of `pump`, so
+    /// there is nothing to do here but say what happened: the next frame
+    /// picks it up.
+    fn lifecycle(s: *Session, rt: *galdr.Runtime, args: []const u8) bool {
+        const cut = std.mem.indexOfAny(u8, args, " \t") orelse args.len;
+        const verb = args[0..cut];
+        const who = std.mem.trim(u8, args[cut..], " \t");
+
+        const reloading = std.mem.eql(u8, verb, "reload");
+        const loading = std.mem.eql(u8, verb, "load");
+        if (!reloading and !loading and !std.mem.eql(u8, verb, "unload")) {
+            s.say(":plugin takes load, unload or reload, and a name", .{});
+            return false;
+        }
+        // Trimmed for the line and not for the lookup: a name too long to
+        // print is still the name that was asked for.
+        const short = who[0..@min(who.len, 64)];
+        if (who.len == 0) {
+            s.say(":plugin {s} takes the name of a plugin", .{verb});
+            return false;
+        }
+
+        if (!reloading and !loading) {
+            const n = rt.unload(who) orelse {
+                s.say("no plugin is called {s}", .{short});
+                return false;
+            };
+            if (n == 0) {
+                s.say("{s} is already unloaded", .{short});
+                return false;
+            }
+            s.say("unloaded {s}: {d} registrations gone", .{ short, n });
+            return true;
+        }
+
+        // Two verbs for one call, so that asking for the wrong one is
+        // answered rather than quietly done: `load` is for a plugin added
+        // since the reader opened, `reload` for one already in service.
+        if (rt.isLoaded(who) != reloading) {
+            if (reloading) {
+                s.say("{s} is not loaded: :plugin load {s}", .{ short, short });
+            } else {
+                s.say("{s} is loaded: :plugin reload {s} runs it again", .{ short, short });
+            }
+            return false;
+        }
+
+        switch (rt.load(who)) {
+            .loaded => s.say("{s} {s}", .{ if (reloading) "reloaded" else "loaded", short }),
+            // A reload that fails leaves the generation before it running,
+            // which is the promise worth stating on the line: the person
+            // edited a file, broke it, and still has the plugin they had.
+            .failed => {
+                if (reloading) {
+                    s.say("{s} did not reload; the last working one is still in service -- :messages", .{short});
+                } else {
+                    s.say("{s} failed to load; :messages shows why", .{short});
+                }
+                if (rt.messages.items.len != 0) {
+                    s.ctx.note("{s}", .{rt.messages.items[rt.messages.items.len - 1]});
+                }
+                return false;
+            },
+            .missing => {
+                s.say("no plugins/{s}.lua and no plugins/{s}/init.lua", .{ short, short });
+                return false;
+            },
         }
         return true;
     }
@@ -7538,6 +7654,50 @@ test "a plugin's exec runs a command and not the console's lua" {
     try testing.expect(rt.runString("split", "fenrir.exec('vsplit')"));
     try testing.expect(s.exec("lua direct = true"));
     try testing.expect(rt.runString("check", "assert(direct == true)"));
+}
+
+test "the plugin lifecycle is asked for by name, and only from the console" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    s.plugins = rt;
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    // Bare `:plugin` is `:plugins`, and this reader has no configuration
+    // directory, so neither has anything to list.
+    try testing.expect(s.exec("plugin"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "nothing to load") != null);
+
+    try testing.expect(!s.exec("plugin frobnicate clock"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "load, unload or reload") != null);
+    try testing.expect(!s.exec("plugin unload"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "name of a plugin") != null);
+    try testing.expect(!s.exec("plugin unload clock"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "no plugin is called clock") != null);
+
+    // `reload` is for a plugin in service and `load` for one that is not,
+    // so asking for the wrong verb is answered rather than quietly done.
+    try testing.expect(!s.exec("plugin reload clock"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "is not loaded") != null);
+    try testing.expect(!s.exec("plugin load clock"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "plugins/clock.lua") != null);
+
+    // And the verbs are the console's, for the reason `:lua` is: a plugin
+    // that could reload itself would run its own chunk underneath its own
+    // call, and one that could unload another would decide what else the
+    // reader runs.
+    try testing.expect(rt.runString("try", "ok = fenrir.exec('plugin unload clock')"));
+    try testing.expect(rt.runString("check", "assert(ok == false)"));
+    try testing.expect(std.mem.indexOf(u8, s.status, "console") != null);
+    // Listing is not one of them.
+    try testing.expect(rt.runString("list", "assert(fenrir.exec('plugin'))"));
 }
 
 test "moving between two documents at the same place still says so" {

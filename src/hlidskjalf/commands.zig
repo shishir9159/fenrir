@@ -100,6 +100,7 @@ pub const Id = enum {
     lua,
     messages,
     plugins,
+    plugin,
     echo,
 };
 
@@ -182,6 +183,7 @@ pub const table = [_]Entry{
     .{ .id = .lua, .name = "lua", .args = "CODE", .needs_argument = true, .icon = "fenrir.menu", .about = "run a line of Lua in the plugin runtime" },
     .{ .id = .messages, .name = "messages", .icon = "fenrir.note", .about = "what the plugins have said, and why one failed" },
     .{ .id = .plugins, .name = "plugins", .icon = "fenrir.menu", .about = "which plugins loaded" },
+    .{ .id = .plugin, .name = "plugin", .args = "[load|unload|reload NAME]", .icon = "fenrir.menu", .about = "which plugins loaded, or load, unload or reload one by name" },
     .{ .id = .echo, .name = "echo", .args = "TEXT", .needs_argument = true, .icon = "fenrir.note", .about = "say something on the message line" },
 };
 
