@@ -39,6 +39,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
+
+/// Whether this build asks the device how long a frame took. Off outside
+/// `-Dprofile=debug`: the query pool, the two `vkCmdWriteTimestamp` calls a
+/// frame and the readback after every fence exist to answer a question about
+/// fenrir, and `--time`, which is the only thing that prints the answer, is
+/// not in a binary that has no benchmark driver.
+const instrumented = build_options.instruments;
 
 const Device = @import("Device.zig");
 const Swapchain = @import("Swapchain.zig");
@@ -275,7 +283,7 @@ pub fn init(gpa: Allocator, device: *Device, swapchain: *Swapchain) Error!Render
     try r.createDescriptorPool();
     try r.createSetupPool();
     try r.createFrames();
-    r.createQueryPool();
+    if (instrumented) r.createQueryPool();
 
     // Slot zero of the array is never named by an instance -- ids from
     // `DrawList.registerTexture` are one-based, and zero means "no texture" --
@@ -566,14 +574,14 @@ fn createQueryPool(r: *Renderer) void {
 /// One of this frame's timestamps, written once every command before it has
 /// reached `stage`.
 fn stamp(r: *Renderer, cb: vk.CommandBuffer, stage: u32, which: u32) void {
-    if (r.query_pool == vk.null_handle) return;
+    if (!instrumented or r.query_pool == vk.null_handle) return;
     r.device.dt.cmdWriteTimestamp(cb, stage, r.query_pool, r.index * queries_per_frame + which);
 }
 
 /// Reads back the timestamps frame `i` wrote, if it wrote any. Called after
 /// that frame's fence, so they are there and this does not wait for them.
 fn collectTimestamps(r: *Renderer, i: u32) void {
-    if (!r.queried[i]) return;
+    if (!instrumented or !r.queried[i]) return;
     r.queried[i] = false;
     const d = r.device;
     var ticks: [queries_per_frame]u64 = undefined;
@@ -1132,7 +1140,7 @@ pub fn frameWith(
     };
     try vk.check(d.dt.queueSubmit(d.graphics_queue, 1, @ptrCast(&submit), f.fence));
     s.markInFlight(image.index, f.fence);
-    r.queried[r.index] = r.query_pool != vk.null_handle;
+    r.queried[r.index] = instrumented and r.query_pool != vk.null_handle;
 
     if (capturing) try r.finishCapture(f.fence);
 

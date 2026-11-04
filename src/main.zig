@@ -269,3 +269,25 @@ test "the table holds exactly the commands this configuration has" {
         }
     }
 }
+test "the help text offers no flag this build would reject" {
+    // The parser and the usage read the same capabilities; this is the test
+    // that they go on doing so. A flag in the text that the parser does not
+    // know is a bug report from somebody following the documentation.
+    const u = read.usage;
+    const mentions = struct {
+        fn f(haystack: []const u8, flag: []const u8) bool {
+            return std.mem.indexOf(u8, haystack, flag) != null;
+        }
+    }.f;
+
+    try std.testing.expect(mentions(u, "--page"));
+    try std.testing.expect(mentions(u, "--zoom"));
+    try std.testing.expectEqual(caps.bench, mentions(u, "--bench"));
+    try std.testing.expectEqual(caps.bench, mentions(u, "--time"));
+    try std.testing.expectEqual(caps.diagnostics, mentions(u, "--shot"));
+    try std.testing.expectEqual(caps.splits, mentions(u, "--split "));
+    try std.testing.expectEqual(caps.sqlite, mentions(u, "--db"));
+    try std.testing.expectEqual(caps.lua, mentions(u, "--clean"));
+    try std.testing.expectEqual(caps.instruments, mentions(u, "--validate"));
+    try std.testing.expectEqual(caps.path_cpu and caps.path_gpu, mentions(u, "--path"));
+}

@@ -103,22 +103,75 @@ const search = hlidskjalf.search;
 const text = hlidskjalf.text;
 const Theme = thviti.Theme;
 
+/// What this build contains. `-Dprofile` resolved it once in `build.zig`; the
+/// help text, the options the parser accepts and the features the session has
+/// are all read off the same answer, so none of the three can drift from the
+/// others.
+const caps = fenrir.build_options;
+
 /// Which path rasteriser this binary has, from `-Dpath`.
-const have_cpu = fenrir.build_options.path_cpu;
-const have_gpu = fenrir.build_options.path_gpu;
+const have_cpu = caps.path_cpu;
+const have_gpu = caps.path_gpu;
+
+/// Whether `--path` is a choice. With one rasteriser in the binary there is
+/// nothing to choose, and the flag's answer is already the only answer.
+const have_both = have_cpu and have_gpu;
+
+/// What a feature this build left out is worth holding.
+///
+/// `noreturn` has no values, so `?noreturn` has exactly one -- null -- and
+/// Zig folds `x orelse return` and `if (x) |y|` at comptime. That is what
+/// turns "the reader checks whether it has a database" into "the reader has
+/// no database and the code that used one is not in the binary". The field
+/// types are the switch; the call sites below are written once and read
+/// correctly either way.
+const LibraryIfStored = if (caps.sqlite) Library else noreturn;
+const ComparisonIfCompared = if (caps.compare) *diff_mod.Comparison else noreturn;
+const RuntimeIfScripted = if (caps.lua) *galdr.Runtime else noreturn;
+const BenchKind = if (caps.bench) Bench.Kind else noreturn;
+const BenchDriver = if (caps.bench) Bench else noreturn;
 
 const Backend = enum { cpu, gpu };
 
-pub const usage =
-    \\fenrir read <file>... [--page N] [--zoom N | --dpi N] [--size WxH]
-    \\                      [--samples N] [--vsync on|off|adaptive]
-    \\                      [--validate] [--gpu NAME] [--frames N]
-    \\                      [--time] [--bench scroll|zoom|flip]
+/// The help text, assembled from the parts this configuration has.
+///
+/// Composed rather than written out once because the alternative is a help
+/// text that offers a flag the parser rejects. These are the same comptime
+/// conditions the parser below reads, so the two cannot disagree -- and a
+/// `light` binary's help is short because its surface is short, not because
+/// something was hidden.
+pub const usage = synopsis ++ view_flags ++
+    (if (caps.bench) bench_flags else "") ++
+    (if (caps.diagnostics) shot_flags else "") ++
+    (if (caps.splits) split_flag else "") ++
+    (if (have_both) path_flag else "") ++
+    device_flags ++
+    (if (caps.instruments) validate_flag else "") ++
+    (if (caps.sqlite) db_flag else "") ++
+    (if (caps.lua) plugin_flags else "") ++
+    colon_commands ++
+    (if (caps.splits) window_keys else "") ++
+    normal_mode ++
+    (if (caps.marks) mark_modes else "") ++
+    closing;
+
+const synopsis =
+    \\fenrir <file>... [options]       -- `fenrir read <file>...` is the same
     \\
     \\    Opens the documents in a window and scrolls through them. More than
     \\    one file opens them as buffers; the first is shown and the rest are
+    \\
+++ (if (caps.splits)
     \\    reachable with <C-w>n.
     \\
+    \\
+else
+    \\    reachable with :bn.
+    \\
+    \\
+);
+
+const view_flags =
     \\    --page N     Start at this page, numbered from 1. Without it, the
     \\                 place this document was last left at -- which is a page
     \\                 and how far down it, not just the page.
@@ -129,6 +182,10 @@ pub const usage =
     \\    --size WxH   The window's initial size.
     \\    --samples N  Multisampling for the page raster: 1, 2, 4 or 8.
     \\                 Defaults to 8.
+    \\
+;
+
+const bench_flags =
     \\    --frames N   Run N frames and exit, so the command can be scripted.
     \\    --time       How long startup took, stage by stage, and on exit
     \\                 what the frames cost: between frames, placing the
@@ -139,26 +196,58 @@ pub const usage =
     \\                 the reader goes and back, twice. flip: every page in
     \\                 turn. Each step waits for the pages it shows; that wait
     \\                 is reported apart.
-    \\    --shot F    Write one composed frame to F as a PNG and exit. With
+    \\
+;
+
+const shot_flags =
+    \\    --shot F     Write one composed frame to F as a PNG and exit. With
     \\                 --path cpu there is no window and no device: what the
     \\                 reader would look like, on a machine with no display
     \\                 and in a test. With --path gpu the frame is drawn by
     \\                 the device into a hidden window and read back, once
     \\                 every visible page is ready.
-    \\    --split D    Start with the window split: v, h, or a repeat like
-    \\                 vh. Mostly for scripting a screenshot of a layout.
     \\    --device     With --shot and --path cpu: read the frame back from
     \\                 the device too, rather than modelling it.
+    \\
+;
+
+const split_flag =
+    \\    --split D    Start with the window split: v, h, or a repeat like
+    \\                 vh. Mostly for scripting a screenshot of a layout.
+    \\
+;
+
+const path_flag =
     \\    --path P     Which path rasteriser draws the page: cpu or gpu.
     \\                 Only what this build has; see -Dpath.
+    \\
+;
+
+const device_flags =
     \\    --vsync      on (default), off, or adaptive.
-    \\    --validate   Turn on the Khronos validation layers, if installed.
     \\    --gpu NAME   Prefer a device whose name contains NAME.
+    \\
+;
+
+const validate_flag =
+    \\    --validate   Turn on the Khronos validation layers, if installed.
+    \\
+;
+
+const db_flag =
     \\    --db FILE    Remember recent files, settings and highlights in FILE
     \\                 instead of the default. $FENRIR_DB does the same.
+    \\
+;
+
+const plugin_flags =
     \\    --config DIR Read init.lua and plugins/ from DIR instead of the
     \\                 configuration directory. $FENRIR_CONFIG does the same.
     \\    --clean      Run no plugins and no init.lua.
+    \\
+;
+
+const colon_commands =
     \\
     \\commands, after : in normal mode:
     \\    :12                  page 12
@@ -166,20 +255,37 @@ pub const usage =
     \\    :zoom 150, :fit page a zoom, or the width, the height or a page
     \\    :set theme=light     the colours the interface is drawn in
     \\    :settings            all of them, as a page over the document
+    \\
+++ (if (caps.splits)
     \\    :sp, :vs, :close     split below, split beside, close the window
     \\    :only, :bn, :bp      close the others, next / previous document
     \\    :tabnew, :tabclose   a tabpage of this window, close this tabpage
     \\    :tabonly             close every other tabpage
     \\    :tabn, :tabp         next / previous tabpage; with N, that one
+    \\
+else
+    \\    :bn, :bp             next / previous document
+    \\
+) ++
     \\    :q, :qa              close the window, close the reader
+    \\
+++ (if (caps.marks)
     \\    :undo, :redo         the history of the marks
     \\    :marks, :marks clear how many marks, or remove them all
+    \\
+else "") ++ (if (caps.lua)
     \\    :lua CODE            run Lua, with the fenrir table
     \\    :plugins, :messages  what loaded, and what went wrong
     \\    :plugin reload NAME  that plugin again, from nothing; also load,
     \\                         unload
-    \\    :echo TEXT           show TEXT
     \\    :Name ARGS           a command a plugin registered
+    \\
+else "") ++
+    \\    :echo TEXT           show TEXT
+    \\
+;
+
+const window_keys =
     \\
     \\windows:
     \\    <C-w>v  <C-w>s       split beside / below
@@ -195,6 +301,10 @@ pub const usage =
     \\    <C-w>T               move this window into a tabpage of its own
     \\    the bar at the top   appears as soon as there are two
     \\
+;
+
+const normal_mode =
+    \\
     \\normal mode (reading):
     \\    drag the scrollbar   scroll; a press on the track moves a screen
     \\    wheel, ctrl+wheel    scroll, zoom
@@ -209,6 +319,8 @@ pub const usage =
     \\    n / N                the next and previous match, or the next and
     \\                         previous page when nothing is being searched for
     \\    drag over text       select it; a click puts the selection away
+    \\
+++ (if (caps.marks)
     \\    m                    highlight the selection, or the cursor's line,
     \\                         or remove the highlight under the cursor
     \\    click on a mark      remove it: a highlight, or a line of ink
@@ -216,24 +328,45 @@ pub const usage =
     \\    ]a / [a              the next / previous mark, in reading order
     \\    ]c / [c              the next / previous comment: a mark with a note
     \\    u / ctrl+r           undo / redo a change to the marks
+    \\
+else "") ++
     \\    + / -                zoom in and out
     \\    0 / 1                fit the width / one hundred per cent
     \\    q                    close this window, then the reader
     \\    Q                    close the reader
+    \\
+++ (if (caps.marks)
     \\    v / V / i / d        visual, visual line, edit and draw mode
+    \\
+else
+    \\    v / V                visual and visual line mode
+    \\
+) ++
     \\    :                    the command line
     \\
     \\visual mode (selecting), from v or V:
     \\    any motion           extend the selection
     \\    o                    go to the other end of the selection
+    \\
+++ (if (caps.marks)
     \\    m, enter             highlight it in the default colour
+    \\
+else "") ++
     \\    y                    put it away; there is no clipboard yet, and a
     \\                         selection is never stored
+    \\
+++ (if (caps.marks)
     \\    1 .. 8               highlight it in that colour: default, yellow,
     \\                         green, blue, pink, orange, purple, red
     \\    d, x                 remove the highlights it touches
+    \\
+else "") ++
     \\    v / V                leave, or switch between the two
     \\    escape               leave without doing anything
+    \\
+;
+
+const mark_modes =
     \\
     \\edit mode (changing highlights), from i:
     \\    n / N, j / k, tab    the next and previous highlight
@@ -254,11 +387,24 @@ pub const usage =
     \\    u / ctrl+r           undo / redo the last line
     \\    d, q, escape         back to normal mode; a click there erases
     \\
+;
+
+const closing = (if (caps.marks)
+    \\
     \\    The title bar shows the mode, the highlight in hand, its note, the
     \\    note or command as it is being typed, and messages from plugins.
     \\
+else
+    \\
+    \\    The title bar shows the mode, the page, the zoom and the command as
+    \\    it is being typed.
+    \\
+) ++ (if (caps.lua)
+    \\
     \\    Keys bound by plugins with fenrir.keymap come before these; see
     \\    `fenrir plugins` for what is bound.
+    \\
+else "") ++
     \\
     \\    The percentage in the title bar is relative to the page's true
     \\    physical size on this display: 100% means a 72-point inch is an
@@ -305,7 +451,7 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
 
 /// The reader, and with `comparison` the two documents of a `fenrir diff`
 /// side by side: see `arrangeComparison`.
-pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.Comparison) !void {
+pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?ComparisonIfCompared) !void {
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(ctx.gpa);
 
@@ -324,15 +470,19 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
     var splits: []const u8 = &.{};
     var clean = false;
     var timing = false;
-    var bench: ?Bench.Kind = null;
+    var bench: ?BenchKind = null;
     var config_dir: ?[]const u8 = null;
     var on_device = false;
     var backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu;
 
+    // Every flag below is guarded by the capability it belongs to, and the
+    // guards are comptime-known: a `light` build does not merely refuse
+    // `--bench`, it has no `--bench` to refuse and nothing of the benchmark
+    // driver in it. `unknown option` is then the truth rather than a policy.
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--validate")) {
+        if (caps.instruments and std.mem.eql(u8, arg, "--validate")) {
             validate = true;
         } else if (std.mem.eql(u8, arg, "--page")) {
             i += 1;
@@ -362,50 +512,48 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
                 8 => .eight,
                 else => return ctx.fail("--samples wants 1, 2, 4 or 8", .{}),
             };
-        } else if (std.mem.eql(u8, arg, "--frames")) {
+        } else if (caps.bench and std.mem.eql(u8, arg, "--frames")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--frames needs a count", .{});
             frames = std.fmt.parseInt(u32, args[i], 10) catch
                 return ctx.fail("--frames wants a number, not '{s}'", .{args[i]});
-        } else if (std.mem.eql(u8, arg, "--time")) {
+        } else if (caps.bench and std.mem.eql(u8, arg, "--time")) {
             timing = true;
-        } else if (std.mem.eql(u8, arg, "--bench")) {
+        } else if (caps.bench and std.mem.eql(u8, arg, "--bench")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--bench needs scroll, zoom or flip", .{});
             bench = std.meta.stringToEnum(Bench.Kind, args[i]) orelse
                 return ctx.fail("--bench wants scroll, zoom or flip, not '{s}'", .{args[i]});
             timing = true;
-        } else if (std.mem.eql(u8, arg, "--db")) {
+        } else if (caps.sqlite and std.mem.eql(u8, arg, "--db")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--db needs a file", .{});
             db_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--split")) {
+        } else if (caps.splits and std.mem.eql(u8, arg, "--split")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--split needs v, h, or a run of them", .{});
             for (args[i]) |c| {
                 if (c != 'v' and c != 'h') return ctx.fail("--split wants v and h, not '{c}'", .{c});
             }
             splits = args[i];
-        } else if (std.mem.eql(u8, arg, "--clean")) {
+        } else if (caps.lua and std.mem.eql(u8, arg, "--clean")) {
             clean = true;
-        } else if (std.mem.eql(u8, arg, "--config")) {
+        } else if (caps.lua and std.mem.eql(u8, arg, "--config")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--config needs a directory", .{});
             config_dir = args[i];
-        } else if (std.mem.eql(u8, arg, "--device")) {
+        } else if (caps.diagnostics and std.mem.eql(u8, arg, "--device")) {
             on_device = true;
-        } else if (std.mem.eql(u8, arg, "--shot")) {
+        } else if (caps.diagnostics and std.mem.eql(u8, arg, "--shot")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--shot needs a file", .{});
             shot = args[i];
-        } else if (std.mem.eql(u8, arg, "--path")) {
+        } else if (have_both and std.mem.eql(u8, arg, "--path")) {
             i += 1;
             if (i >= args.len) return ctx.fail("--path needs cpu or gpu", .{});
             if (std.mem.eql(u8, args[i], "cpu")) {
-                if (!have_cpu) return ctx.fail("this build has no CPU path rasteriser", .{});
                 backend = .cpu;
             } else if (std.mem.eql(u8, args[i], "gpu")) {
-                if (!have_gpu) return ctx.fail("this build has no GPU path pipeline", .{});
                 backend = .gpu;
             } else {
                 return ctx.fail("--path wants cpu or gpu, not '{s}'", .{args[i]});
@@ -489,19 +637,21 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
     // Mímir, if this build and this machine have one. A shot is a script
     // writing a file and not a person reading, so it neither reads the
     // remembered position nor records having been there.
-    session.library = library.openWith(ctx, gpa, db_path);
+    if (caps.sqlite) {
+        session.library = library.openWith(ctx, gpa, db_path);
+        if (session.library) |l| {
+            if (l.accent() catch null) |c| {
+                session.chosen_accent = c;
+                session.highlight = c;
+            }
+        }
+    }
     stage.mark("library");
     // A comparison opens at its first difference, wherever either document
     // was last read to, and does not move where they will reopen. A bench
     // ends at the last page and must not leave the reader there.
     session.remembers_place = shot == null and comparison == null and bench == null;
-    session.diff = comparison;
-    if (session.library) |l| {
-        if (l.accent() catch null) |c| {
-            session.chosen_accent = c;
-            session.highlight = c;
-        }
-    }
+    if (caps.compare) session.diff = comparison;
     // After the accent, because the theme carries it: `useTheme` puts the
     // chosen colour back on top of whichever theme was named.
     session.useTheme(session.rememberedTheme());
@@ -534,12 +684,16 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?*diff_mod.C
     // Galdr. Not for a shot, for the same reason a shot does not resume where
     // you were: a script asking for a picture must get the same picture
     // whatever is in your configuration directory.
-    if (shot == null and !clean) session.startPlugins(config_dir);
+    if (caps.lua) {
+        if (shot == null and !clean) session.startPlugins(config_dir);
+    }
     stage.mark("plugins");
 
-    if (shot) |dest| {
-        if (backend == .cpu and !on_device) {
-            return session.shoot(dest, width, height, start_page - 1, splits);
+    if (caps.diagnostics) {
+        if (shot) |dest| {
+            if (backend == .cpu and !on_device) {
+                return session.shoot(dest, width, height, start_page - 1, splits);
+            }
         }
     }
 
@@ -573,7 +727,7 @@ const Settings = struct {
     device: lyngvi.Device.Options,
     /// `--time`: what the frames cost, summarised on exit.
     time: bool = false,
-    bench: ?Bench.Kind = null,
+    bench: ?BenchKind = null,
 };
 
 /// `--bench`: a workload that is the same on every run, so two builds, or the
@@ -1204,7 +1358,16 @@ const Session = struct {
     /// reader who chose a colour still gets it.
     highlight: Color = .gray(0.42),
 
-    library: ?Library = null,
+    /// Mímir, if this build has a database.
+    ///
+    /// `?noreturn` when it has not, which is the whole mechanism: an optional
+    /// that can only ever be null, so every `s.library orelse return` below
+    /// is a comptime `return` and not a branch taken on a null at run time.
+    /// The schema, the statements and the colour parsing behind them are then
+    /// unreferenced, and the exclusion is real rather than nominal. Do not
+    /// "simplify" this to `?Library` with a runtime null: that is the version
+    /// that compiles Mímir into a binary which can never use it.
+    library: ?LibraryIfStored = null,
     /// False for `--shot`: settings still apply, the reading position does
     /// not, and nothing is written back.
     remembers_place: bool = true,
@@ -1234,7 +1397,11 @@ const Session = struct {
     /// `fenrir diff`'s comparison, when this reader is showing one. Buffer 0
     /// is the first document and buffer 1 the second; see
     /// `arrangeComparison`. Borrowed from the command, which outlives this.
-    diff: ?*diff_mod.Comparison = null,
+    ///
+    /// `?noreturn` in a build with no comparison, for the reason given on
+    /// `library`: every `s.diff orelse return` becomes a comptime return and
+    /// the twenty-odd methods behind them leave the binary.
+    diff: ?ComparisonIfCompared = null,
     /// Where each document's window was when the two were last held
     /// together, to tell which one has moved. See `lockComparison`.
     diff_seen: [2]Seen = @splat(.{}),
@@ -1266,7 +1433,8 @@ const Session = struct {
     stage: ?*Stage = null,
 
     /// Galdr, when this build has Lua and plugins were not turned off.
-    plugins: ?*galdr.Runtime = null,
+    /// `?noreturn` when it has no plugin host at all; see `library`.
+    plugins: ?RuntimeIfScripted = null,
     /// Where `init.lua` and `plugins/` are read from. Owned.
     config_dir: ?[]u8 = null,
     /// The `:` line being typed.
@@ -6099,7 +6267,14 @@ const Session = struct {
         var interval: lyngvi.Renderer.Samples = .{};
         var placing: lyngvi.Renderer.Samples = .{};
         var lap: Lap = .start(ctx.io);
-        var bench: ?Bench = if (settings.bench) |kind| .{ .kind = kind } else null;
+        // `?BenchDriver` and not `?Bench`: a build with no benchmark driver
+        // holds an optional that cannot have a value, so the two blocks that
+        // step the workload below fold away rather than testing a null every
+        // frame.
+        var bench: ?BenchDriver = null;
+        if (caps.bench) {
+            if (settings.bench) |kind| bench = .{ .kind = kind };
+        }
 
         while (true) {
             window.pump();
@@ -6395,6 +6570,39 @@ const Session = struct {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+
+test {
+    // The tests of a feature this build left out are left out with it. See
+    // `comparison_tests`.
+    if (caps.compare) _ = comparison_tests;
+}
+
+/// Hands a test session a library, or skips the test in a build with none.
+///
+/// A test cannot write `s.library = lib` directly: in a build with no
+/// database the field has no payload type, by design -- see `Session.library`.
+/// The assignment lives inside the comptime branch so it is analysed only
+/// where it means something, which is what lets `-Dsqlite=false` compile its
+/// test binary and skip rather than fail. `if (!caps.sqlite) return
+/// error.SkipZigTest;` would not do: the line after it would still be
+/// analysed.
+fn giveLibrary(s: *Session, lib: Library) error{SkipZigTest}!void {
+    if (caps.sqlite) {
+        s.library = lib;
+        return;
+    }
+    return error.SkipZigTest;
+}
+
+/// The same, for Galdr. `-Dlua=false` skips these tests rather than failing
+/// to compile them.
+fn givePlugins(s: *Session, rt: *galdr.Runtime) error{SkipZigTest}!void {
+    if (caps.lua) {
+        s.plugins = rt;
+        return;
+    }
+    return error.SkipZigTest;
+}
 
 /// `n` identical Letter-sized pages, with nothing in them: the layout reads
 /// only the boxes, so a page needs no document behind it to be laid out.
@@ -6851,7 +7059,7 @@ test "edit mode walks highlights in reading order, recolours, notes and deletes,
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
     defer closeSession(&s);
-    s.library = lib;
+    try giveLibrary(&s, lib);
 
     // Made bottom first, so reading order and creation order differ.
     s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 600, 200, 612) }}, s.accent);
@@ -7102,206 +7310,215 @@ test "showing another document in a window keeps the place in the first" {
     try testing.expect(was > 0);
 }
 
-/// Six pages against seven: one change a third of the way down page three,
-/// and a seventh page only the second document has. Regions measured at one
-/// pixel a point, so they read as points.
-fn comparedSession(gpa: Allocator, buf: []fenrir.Page, results: *[7]diff_mod.Result, cmp: *diff_mod.Comparison) !Session {
-    var s = try sessionOf(gpa, fakePages(buf, 6), 1, 1000, 800);
-    errdefer closeSession(&s);
-    try s.buffers.append(gpa, .{
-        .path = try gpa.dupe(u8, "/docs/b.pdf"),
-        .title = "b.pdf",
-        .pages = fakePages(buf[6..], 7),
-    });
-    const pairs = try diff_mod.pairByNumber(gpa, 6, 7);
-    errdefer gpa.free(pairs);
-    results.* = @splat(.{ .kind = .same_list });
-    results[2] = .{ .kind = .differ, .pixels = 400, .regions = &.{.{ .x0 = 40, .y0 = 300, .x1 = 240, .y1 = 320 }} };
-    results[6] = .{ .kind = .only_b };
-    cmp.* = try .init(gpa, pairs, results, .{ 6, 7 }, .{ .dpi = 72 });
-    s.diff = cmp;
-    return s;
-}
+/// The comparison tests, which only a build that has a comparison can run.
+///
+/// Nested in a struct the test block below references only when the
+/// capability is on: a test declaration inside a container that is never
+/// analysed is never registered. `error.SkipZigTest` could not have done
+/// this -- the body would still have to compile, and `Session.diff` has no
+/// payload type in a build with no comparison.
+const comparison_tests = struct {
+    /// Six pages against seven: one change a third of the way down page three,
+    /// and a seventh page only the second document has. Regions measured at one
+    /// pixel a point, so they read as points.
+    fn comparedSession(gpa: Allocator, buf: []fenrir.Page, results: *[7]diff_mod.Result, cmp: *diff_mod.Comparison) !Session {
+        var s = try sessionOf(gpa, fakePages(buf, 6), 1, 1000, 800);
+        errdefer closeSession(&s);
+        try s.buffers.append(gpa, .{
+            .path = try gpa.dupe(u8, "/docs/b.pdf"),
+            .title = "b.pdf",
+            .pages = fakePages(buf[6..], 7),
+        });
+        const pairs = try diff_mod.pairByNumber(gpa, 6, 7);
+        errdefer gpa.free(pairs);
+        results.* = @splat(.{ .kind = .same_list });
+        results[2] = .{ .kind = .differ, .pixels = 400, .regions = &.{.{ .x0 = 40, .y0 = 300, .x1 = 240, .y1 = 320 }} };
+        results[6] = .{ .kind = .only_b };
+        cmp.* = try .init(gpa, pairs, results, .{ 6, 7 }, .{ .dpi = 72 });
+        s.diff = cmp;
+        return s;
+    }
 
-fn closeCompared(s: *Session, cmp: *diff_mod.Comparison) void {
-    s.gpa.free(cmp.pairs);
-    cmp.deinit();
-    for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
-    closeSession(s);
-}
+    fn closeCompared(s: *Session, cmp: *diff_mod.Comparison) void {
+        s.gpa.free(cmp.pairs);
+        cmp.deinit();
+        for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
+        closeSession(s);
+    }
 
-test "a comparison opens side by side at its first change, and the windows move together" {
-    const gpa = testing.allocator;
-    var buf: [13]fenrir.Page = undefined;
-    var results: [7]diff_mod.Result = undefined;
-    var cmp: diff_mod.Comparison = undefined;
-    var s = try comparedSession(gpa, &buf, &results, &cmp);
-    defer closeCompared(&s, &cmp);
+    test "a comparison opens side by side at its first change, and the windows move together" {
+        const gpa = testing.allocator;
+        var buf: [13]fenrir.Page = undefined;
+        var results: [7]diff_mod.Result = undefined;
+        var cmp: diff_mod.Comparison = undefined;
+        var s = try comparedSession(gpa, &buf, &results, &cmp);
+        defer closeCompared(&s, &cmp);
 
-    s.arrangeComparison();
-    try testing.expectEqual(@as(u32, 2), s.layout().count());
-    const views = s.comparedViews();
-    const a = views[0].?;
-    const b = views[1].?;
-    // The first document on the left, and focused.
-    try testing.expect(a.rect.min_x < b.rect.min_x);
-    try testing.expectEqual(a, s.view());
+        s.arrangeComparison();
+        try testing.expectEqual(@as(u32, 2), s.layout().count());
+        const views = s.comparedViews();
+        const a = views[0].?;
+        const b = views[1].?;
+        // The first document on the left, and focused.
+        try testing.expect(a.rect.min_x < b.rect.min_x);
+        try testing.expectEqual(a, s.view());
 
-    // At the change, a quarter of the way down, in both.
-    try testing.expectEqual(@as(u32, 2), a.currentPage());
-    const line = a.scroll + a.height() * 0.25;
-    try testing.expectApproxEqAbs(a.pageTop(2) + 300, line, 0.5);
-    try testing.expectEqual(a.scroll, b.scroll);
-    try testing.expectEqualStrings("change 1/2", s.status);
+        // At the change, a quarter of the way down, in both.
+        try testing.expectEqual(@as(u32, 2), a.currentPage());
+        const line = a.scroll + a.height() * 0.25;
+        try testing.expectApproxEqAbs(a.pageTop(2) + 300, line, 0.5);
+        try testing.expectEqual(a.scroll, b.scroll);
+        try testing.expectEqualStrings("change 1/2", s.status);
 
-    // Scrolling or zooming either one moves the other.
-    b.scroll += 120;
-    s.lockComparison();
-    try testing.expectEqual(b.scroll, a.scroll);
-    a.setZoom(1.5);
-    s.lockComparison();
-    try testing.expectEqual(@as(f32, 1.5), b.zoom);
-    try testing.expectEqual(a.currentPage(), b.currentPage());
-}
+        // Scrolling or zooming either one moves the other.
+        b.scroll += 120;
+        s.lockComparison();
+        try testing.expectEqual(b.scroll, a.scroll);
+        a.setZoom(1.5);
+        s.lockComparison();
+        try testing.expectEqual(@as(f32, 1.5), b.zoom);
+        try testing.expectEqual(a.currentPage(), b.currentPage());
+    }
 
-test "]d shows a page only one document has in that document's window, and wraps" {
-    const gpa = testing.allocator;
-    var buf: [13]fenrir.Page = undefined;
-    var results: [7]diff_mod.Result = undefined;
-    var cmp: diff_mod.Comparison = undefined;
-    var s = try comparedSession(gpa, &buf, &results, &cmp);
-    defer closeCompared(&s, &cmp);
-    s.arrangeComparison();
+    test "]d shows a page only one document has in that document's window, and wraps" {
+        const gpa = testing.allocator;
+        var buf: [13]fenrir.Page = undefined;
+        var results: [7]diff_mod.Result = undefined;
+        var cmp: diff_mod.Comparison = undefined;
+        var s = try comparedSession(gpa, &buf, &results, &cmp);
+        defer closeCompared(&s, &cmp);
+        s.arrangeComparison();
 
-    s.jumpChange(true);
-    const views = s.comparedViews();
-    // The seventh page is the second document's, and its window has it;
-    // the first document's stays beside its last page rather than past it.
-    try testing.expectEqual(@as(u32, 6), views[1].?.currentPage());
-    try testing.expectEqual(@as(u32, 5), views[0].?.currentPage());
-    try testing.expectEqualStrings("change 2/2", s.status);
+        s.jumpChange(true);
+        const views = s.comparedViews();
+        // The seventh page is the second document's, and its window has it;
+        // the first document's stays beside its last page rather than past it.
+        try testing.expectEqual(@as(u32, 6), views[1].?.currentPage());
+        try testing.expectEqual(@as(u32, 5), views[0].?.currentPage());
+        try testing.expectEqualStrings("change 2/2", s.status);
 
-    s.jumpChange(true);
-    try testing.expectEqualStrings("change 1/2, from the top", s.status);
-    try testing.expectEqual(@as(u32, 2), views[0].?.currentPage());
+        s.jumpChange(true);
+        try testing.expectEqualStrings("change 1/2, from the top", s.status);
+        try testing.expectEqual(@as(u32, 2), views[0].?.currentPage());
 
-    // Backwards from the first is the last.
-    s.jumpChange(false);
-    try testing.expectEqualStrings("change 2/2, from the end", s.status);
-}
+        // Backwards from the first is the last.
+        s.jumpChange(false);
+        try testing.expectEqualStrings("change 2/2, from the end", s.status);
+    }
 
-test "gd goes round side by side, the overlay, and each document alone, at one place" {
-    const gpa = testing.allocator;
-    var buf: [13]fenrir.Page = undefined;
-    var results: [7]diff_mod.Result = undefined;
-    var cmp: diff_mod.Comparison = undefined;
-    var s = try comparedSession(gpa, &buf, &results, &cmp);
-    defer closeCompared(&s, &cmp);
-    s.arrangeComparison();
-    const scroll = s.view().scroll;
+    test "gd goes round side by side, the overlay, and each document alone, at one place" {
+        const gpa = testing.allocator;
+        var buf: [13]fenrir.Page = undefined;
+        var results: [7]diff_mod.Result = undefined;
+        var cmp: diff_mod.Comparison = undefined;
+        var s = try comparedSession(gpa, &buf, &results, &cmp);
+        defer closeCompared(&s, &cmp);
+        s.arrangeComparison();
+        const scroll = s.view().scroll;
 
-    // The overlay: one window, on the first document's pages, asking the
-    // worker for pictures of both rather than for the page.
-    _ = s.apply(.{ .diff_view = 1 });
-    try testing.expectEqual(Session.Showing.overlay, s.diff_showing);
-    try testing.expectEqual(@as(u32, 1), s.layout().count());
-    try testing.expectEqual(@as(u32, 0), s.view().buffer);
-    try testing.expectEqual(Job.Want.overlay, s.firstMissing().?.want);
-    try testing.expectEqual(scroll, s.view().scroll);
+        // The overlay: one window, on the first document's pages, asking the
+        // worker for pictures of both rather than for the page.
+        _ = s.apply(.{ .diff_view = 1 });
+        try testing.expectEqual(Session.Showing.overlay, s.diff_showing);
+        try testing.expectEqual(@as(u32, 1), s.layout().count());
+        try testing.expectEqual(@as(u32, 0), s.view().buffer);
+        try testing.expectEqual(Job.Want.overlay, s.firstMissing().?.want);
+        try testing.expectEqual(scroll, s.view().scroll);
 
-    // Each alone, and the blink between them keeps the place.
-    _ = s.apply(.{ .diff_view = 1 });
-    try testing.expectEqual(Job.Want.page, s.firstMissing().?.want);
-    _ = s.apply(.{ .diff_view = 1 });
-    try testing.expectEqual(Session.Showing.second, s.diff_showing);
-    try testing.expectEqual(@as(u32, 1), s.view().buffer);
-    try testing.expectEqual(scroll, s.view().scroll);
-    _ = s.apply(.{ .diff_view = -1 });
-    try testing.expectEqual(@as(u32, 0), s.view().buffer);
-    try testing.expectEqual(scroll, s.view().scroll);
+        // Each alone, and the blink between them keeps the place.
+        _ = s.apply(.{ .diff_view = 1 });
+        try testing.expectEqual(Job.Want.page, s.firstMissing().?.want);
+        _ = s.apply(.{ .diff_view = 1 });
+        try testing.expectEqual(Session.Showing.second, s.diff_showing);
+        try testing.expectEqual(@as(u32, 1), s.view().buffer);
+        try testing.expectEqual(scroll, s.view().scroll);
+        _ = s.apply(.{ .diff_view = -1 });
+        try testing.expectEqual(@as(u32, 0), s.view().buffer);
+        try testing.expectEqual(scroll, s.view().scroll);
 
-    // And back to two windows, first on the left, still together.
-    _ = s.apply(.{ .diff_view = -1 });
-    _ = s.apply(.{ .diff_view = -1 });
-    try testing.expectEqual(Session.Showing.side_by_side, s.diff_showing);
-    const views = s.comparedViews();
-    try testing.expect(views[0].?.rect.min_x < views[1].?.rect.min_x);
-    s.lockComparison();
-    try testing.expectEqual(views[0].?.scroll, views[1].?.scroll);
-}
+        // And back to two windows, first on the left, still together.
+        _ = s.apply(.{ .diff_view = -1 });
+        _ = s.apply(.{ .diff_view = -1 });
+        try testing.expectEqual(Session.Showing.side_by_side, s.diff_showing);
+        const views = s.comparedViews();
+        try testing.expect(views[0].?.rect.min_x < views[1].?.rect.min_x);
+        s.lockComparison();
+        try testing.expectEqual(views[0].?.scroll, views[1].?.scroll);
+    }
 
-test "the changes panel is a row a page that differs, numbered from the window's side" {
-    const gpa = testing.allocator;
-    var buf: [13]fenrir.Page = undefined;
-    var results: [7]diff_mod.Result = undefined;
-    var cmp: diff_mod.Comparison = undefined;
-    var s = try comparedSession(gpa, &buf, &results, &cmp);
-    defer closeCompared(&s, &cmp);
-    s.arrangeComparison();
-    results[2].detail = "\"fox\" → \"cat\"";
+    test "the changes panel is a row a page that differs, numbered from the window's side" {
+        const gpa = testing.allocator;
+        var buf: [13]fenrir.Page = undefined;
+        var results: [7]diff_mod.Result = undefined;
+        var cmp: diff_mod.Comparison = undefined;
+        var s = try comparedSession(gpa, &buf, &results, &cmp);
+        defer closeCompared(&s, &cmp);
+        s.arrangeComparison();
+        results[2].detail = "\"fox\" → \"cat\"";
 
-    const rows = s.panelRows(.changes);
-    try testing.expectEqual(@as(usize, 2), rows.len);
-    try testing.expectEqualStrings("\"fox\" → \"cat\"", rows[0].label);
-    try testing.expectEqual(@as(u32, 3), rows[0].page);
-    // The seventh page is the second document's alone. From the first
-    // document's window it stands beside that document's last page.
-    try testing.expectEqualStrings("only in the second document", rows[1].label);
-    try testing.expectEqual(@as(u32, 6), rows[1].page);
-    try testing.expectEqual(@as(u64, 7), rows[1].id);
-}
+        const rows = s.panelRows(.changes);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        try testing.expectEqualStrings("\"fox\" → \"cat\"", rows[0].label);
+        try testing.expectEqual(@as(u32, 3), rows[0].page);
+        // The seventh page is the second document's alone. From the first
+        // document's window it stands beside that document's last page.
+        try testing.expectEqualStrings("only in the second document", rows[1].label);
+        try testing.expectEqual(@as(u32, 6), rows[1].page);
+        try testing.expectEqual(@as(u64, 7), rows[1].id);
+    }
 
-test "a nudge moves the overlay at once, and a picture of the old offset is not wanted" {
-    const gpa = testing.allocator;
-    var buf: [13]fenrir.Page = undefined;
-    var results: [7]diff_mod.Result = undefined;
-    var cmp: diff_mod.Comparison = undefined;
-    var s = try comparedSession(gpa, &buf, &results, &cmp);
-    defer closeCompared(&s, &cmp);
-    s.arrangeComparison();
-    s.showComparison(.overlay);
+    test "a nudge moves the overlay at once, and a picture of the old offset is not wanted" {
+        const gpa = testing.allocator;
+        var buf: [13]fenrir.Page = undefined;
+        var results: [7]diff_mod.Result = undefined;
+        var cmp: diff_mod.Comparison = undefined;
+        var s = try comparedSession(gpa, &buf, &results, &cmp);
+        defer closeCompared(&s, &cmp);
+        s.arrangeComparison();
+        s.showComparison(.overlay);
 
-    const before = s.firstMissing().?;
-    _ = s.apply(.{ .nudge = .{ 1, 0 } });
-    _ = s.apply(.{ .nudge = .{ 1, 0 } });
-    _ = s.apply(.{ .nudge = .{ 0, -1 } });
-    try testing.expectEqual([2]f32{ 2, -1 }, s.diff_offset);
-    try testing.expectEqualStrings("comparing again, the second document 2pt right, 1pt up", s.status);
+        const before = s.firstMissing().?;
+        _ = s.apply(.{ .nudge = .{ 1, 0 } });
+        _ = s.apply(.{ .nudge = .{ 1, 0 } });
+        _ = s.apply(.{ .nudge = .{ 0, -1 } });
+        try testing.expectEqual([2]f32{ 2, -1 }, s.diff_offset);
+        try testing.expectEqualStrings("comparing again, the second document 2pt right, 1pt up", s.status);
 
-    const after = s.firstMissing().?;
-    try testing.expectEqual([2]f32{ 2, -1 }, after.shift);
-    try testing.expect(!before.eql(after));
-    try testing.expect(!s.wantedNow(before));
-    try testing.expect(s.wantedNow(after));
+        const after = s.firstMissing().?;
+        try testing.expectEqual([2]f32{ 2, -1 }, after.shift);
+        try testing.expect(!before.eql(after));
+        try testing.expect(!s.wantedNow(before));
+        try testing.expect(s.wantedNow(after));
 
-    // The regions stay the ones they were found at until the comparison
-    // made again comes back.
-    try testing.expectEqual([2]f32{ 0, 0 }, cmp.options.offset);
-    _ = s.exec("diff offset");
-    try testing.expectEqual([2]f32{ 0, 0 }, s.diff_offset);
-}
+        // The regions stay the ones they were found at until the comparison
+        // made again comes back.
+        try testing.expectEqual([2]f32{ 0, 0 }, cmp.options.offset);
+        _ = s.exec("diff offset");
+        try testing.expectEqual([2]f32{ 0, 0 }, s.diff_offset);
+    }
 
-test "a comparison made again on its own thread comes back with the offset's answer" {
-    var one: [512]u8 = undefined;
-    var two: [512]u8 = undefined;
-    const pairs = [_]diff_mod.Pair{.{ .a = 0, .b = 0 }};
-    var r: Rerun = .{
-        .gpa = testing.allocator,
-        .io = testing.io,
-        .bytes = .{ diff_mod.rectanglePdf(&one, 72), diff_mod.rectanglePdf(&two, 108) },
-        .pairs = &pairs,
-        .options = .{ .dpi = 36, .offset = .{ -36, 0 } },
-    };
-    r.thread = try std.Thread.spawn(.{}, Rerun.work, .{&r});
-    defer r.finish();
-    r.thread.?.join();
-    r.thread = null;
+    test "a comparison made again on its own thread comes back with the offset's answer" {
+        var one: [512]u8 = undefined;
+        var two: [512]u8 = undefined;
+        const pairs = [_]diff_mod.Pair{.{ .a = 0, .b = 0 }};
+        var r: Rerun = .{
+            .gpa = testing.allocator,
+            .io = testing.io,
+            .bytes = .{ diff_mod.rectanglePdf(&one, 72), diff_mod.rectanglePdf(&two, 108) },
+            .pairs = &pairs,
+            .options = .{ .dpi = 36, .offset = .{ -36, 0 } },
+        };
+        r.thread = try std.Thread.spawn(.{}, Rerun.work, .{&r});
+        defer r.finish();
+        r.thread.?.join();
+        r.thread = null;
 
-    try testing.expect(r.done.load(.acquire));
-    try testing.expectEqual(diff_mod.Result.Kind.same_pixels, r.results.?[0].kind);
-    diff_mod.freeResults(r.gpa, r.results.?);
-    r.results = null;
-}
+        try testing.expect(r.done.load(.acquire));
+        try testing.expectEqual(diff_mod.Result.Kind.same_pixels, r.results.?[0].kind);
+        diff_mod.freeResults(r.gpa, r.results.?);
+        r.results = null;
+    }
+};
 
 test "a tabpage keeps its own windows, and gt goes between them" {
     const gpa = testing.allocator;
@@ -7467,7 +7684,7 @@ test "the place written down is where the reader was, to the point" {
     var buf: [12]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
     defer closeSession(&s);
-    s.library = lib;
+    try giveLibrary(&s, lib);
 
     // 150 pixels below the top of page 5, which at zoom 1 is 150 points.
     s.view().scroll = s.view().pageTop(5) + 150;
@@ -7505,7 +7722,7 @@ test "highlights come back out of the library the next time it is opened" {
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
     defer closeSession(&s);
-    s.library = lib;
+    try giveLibrary(&s, lib);
     s.ctx = undefined;
 
     // Written through the session, so the row and the in-memory mark are
@@ -7572,7 +7789,7 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
     defer closeSession(&s);
 
     const rt = try galdr.Runtime.create(gpa, s.host(), .{});
-    s.plugins = rt;
+    try givePlugins(&s, rt);
     defer {
         rt.destroy();
         s.plugins = null;
@@ -7633,7 +7850,7 @@ test "a plugin's exec runs a command and not the console's lua" {
     defer closeSession(&s);
 
     const rt = try galdr.Runtime.create(gpa, s.host(), .{});
-    s.plugins = rt;
+    try givePlugins(&s, rt);
     defer {
         rt.destroy();
         s.plugins = null;
@@ -7664,7 +7881,7 @@ test "the plugin lifecycle is asked for by name, and only from the console" {
     defer closeSession(&s);
 
     const rt = try galdr.Runtime.create(gpa, s.host(), .{});
-    s.plugins = rt;
+    try givePlugins(&s, rt);
     defer {
         rt.destroy();
         s.plugins = null;
@@ -7720,7 +7937,7 @@ test "moving between two documents at the same place still says so" {
     try s.doc_handles.append(gpa, s.next_doc_handle);
 
     const rt = try galdr.Runtime.create(gpa, s.host(), .{});
-    s.plugins = rt;
+    try givePlugins(&s, rt);
     defer {
         rt.destroy();
         s.plugins = null;
@@ -7995,7 +8212,7 @@ test "a panel a plugin declared latches on the rail and lists what it says" {
     defer closeSession(&s);
 
     const rt = try galdr.Runtime.create(gpa, s.host(), .{});
-    s.plugins = rt;
+    try givePlugins(&s, rt);
     defer {
         rt.destroy();
         s.plugins = null;
@@ -8048,7 +8265,7 @@ test "a plugin's commands and settings arrive in the palette and the page" {
     defer closeSession(&s);
 
     const rt = try galdr.Runtime.create(gpa, s.host(), .{});
-    s.plugins = rt;
+    try givePlugins(&s, rt);
     defer {
         rt.destroy();
         s.plugins = null;
@@ -8379,7 +8596,7 @@ test "a note typed on a stroke is written to the library and comes back" {
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
     defer closeSession(&s);
-    s.library = lib;
+    try giveLibrary(&s, lib);
 
     // Drawn with the pen, so the mark and its row are made by the calls a
     // drag makes.
