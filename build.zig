@@ -2,7 +2,16 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+
+    // One resolved configuration, computed before any module or step exists.
+    // Everything below reads `caps` and never asks for an option again: which
+    // commands are registered, which modules are created, which dependencies
+    // are fetched, which shader stages are compiled. A flag read in two
+    // places is a flag two halves of the build can disagree about, and the
+    // symptom of that is a binary whose help text offers a command its
+    // comptime table does not contain.
+    const caps = resolve(b);
+    const optimize = caps.optimize;
 
     // Týr's glyph backends. These flags decide what is *linked*; which backend
     // opens a given font is still a runtime decision, so a build with both can
@@ -58,68 +67,37 @@ pub fn build(b: *std.Build) void {
         "Which GLSL compiler -Dshaders=glsl runs: auto, glslc or glslang (default: auto)",
     ) orelse .auto;
     const slangc_path = b.option([]const u8, "slangc", "Path to slangc, when it is not on PATH");
-    const shaders = compileShaders(b, shader_source, glsl_compiler, slangc_path);
+    const shaders = compileShaders(b, shader_source, glsl_compiler, slangc_path, caps.stages());
 
-    // Which path rasteriser the *window* uses, and which `--path` will
-    // accept.
-    //
-    // `both` is the point of it: the
-    // CPU rasteriser is the reference, the GPU one is the model of the
-    // shader, and a build with both can draw the same page each way and
-    // subtract. `fenrir raster --path both` is that comparison.
-    //
-    // A release build may pick one, and `-Dpath=gpu` builds a reader that
-    // never rasterises a page on the CPU while `-Dpath=cpu` builds one that
-    // never creates the analytic pipeline -- for a machine whose driver
-    // cannot be trusted with it.
-    //
-    // The default stays `both` in every mode, and deliberately: a build with
-    // both is a build that can check one against the other. The GPU path
-    // draws images and the blend modes documents use, and the CPU one is
-    // still the only one with all sixteen modes.
-    //
-    // What this does *not* do is remove the CPU rasteriser from the binary.
-    // `fenrir raster` and `fenrir read --shot` both render with no device in
-    // the process and would have nothing to render with; the flag decides
-    // what the window does, not what the program contains.
-    //
-    // This is one option and not two booleans because there is no fourth
-    // state: a build with neither draws nothing.
-    const path_backend = b.option(
-        PathBackend,
-        "path",
-        "Which path rasteriser the window uses: cpu, gpu, or both (default: both)",
-    ) orelse PathBackend.both;
+    // Mímir's store and Galdr's Lua, fetched only if this configuration has
+    // them. Both are `lazy` in `build.zig.zon`, so a profile that carries no
+    // database and no plugin host neither downloads nor compiles a line of C
+    // -- which costs nothing but asking in this order.
+    const sqlite_dep = if (caps.store) b.lazyDependency("sqlite", .{}) else null;
+    const lua_dep = if (caps.plugins) b.lazyDependency("lua", .{}) else null;
 
-    // Mímir's store. SQLite is the one library this project links on purpose:
-    // the recent files, the settings and the reading positions are small,
-    // structured, and have to survive a crash mid-write, which is a
-    // transactional database and not a file format worth inventing. It is
-    // compiled from the amalgamation by this build -- one C file, pinned by
-    // hash in `build.zig.zon` -- rather than linked from the system.
-    //
-    // A lazy dependency, so `-Dsqlite=false` neither downloads nor compiles
-    // it and the binary links no C at all. Everything else still works; the
-    // reader simply forgets where you were.
-    const want_sqlite = b.option(bool, "sqlite", "Store recent files, places, settings and highlights in SQLite (default: true)") orelse true;
-    // Resolved before the module is created, because `build_options` has to
-    // say whether Mímir has a database; linked after, which is below.
-    const sqlite_dep = if (want_sqlite) b.lazyDependency("sqlite", .{}) else null;
+    // A lazy dependency answers null on the run that fetches it, so what the
+    // binary *has* is not what the profile asked for until the archive is
+    // there. `build_options` says what is actually linked.
     const have_sqlite = sqlite_dep != null;
-
-    // Galdr, the plugin system, and the Lua it runs. The second library this
-    // project links on purpose, compiled from the pinned release by this
-    // build exactly as SQLite is. `-Dlua=false` builds a reader that runs no
-    // scripts, and links no Lua.
-    const want_lua = b.option(bool, "lua", "Run Lua plugins and init.lua with Galdr (default: true)") orelse true;
-    const lua_dep = if (want_lua) b.lazyDependency("lua", .{}) else null;
+    const have_lua = lua_dep != null;
 
     const opts = b.addOptions();
+    opts.addOption([]const u8, "profile", @tagName(caps.profile));
     opts.addOption(bool, "sqlite", have_sqlite);
-    opts.addOption(bool, "lua", lua_dep != null);
-    opts.addOption(bool, "path_cpu", path_backend != .gpu);
-    opts.addOption(bool, "path_gpu", path_backend != .cpu);
-    opts.addOption([]const u8, "path_backend", @tagName(path_backend));
+    opts.addOption(bool, "lua", have_lua);
+    opts.addOption(bool, "path_cpu", caps.path_cpu);
+    opts.addOption(bool, "path_gpu", caps.path_gpu);
+    opts.addOption(bool, "tools", caps.tools);
+    opts.addOption(bool, "splits", caps.splits);
+    opts.addOption(bool, "marks", caps.marks);
+    opts.addOption(bool, "compare", caps.compare);
+    opts.addOption(bool, "diagnostics", caps.diagnostics);
+    opts.addOption(bool, "bench", caps.bench);
+    opts.addOption(bool, "instruments", caps.instruments);
+    opts.addOption(bool, "stripped", caps.strip);
+    opts.addOption(bool, "shader_path", caps.shader_path);
+    opts.addOption(bool, "shader_slug", caps.path_gpu);
     opts.addOption(bool, "tyr_freetype", want_freetype);
     opts.addOption(bool, "tyr_stb_truetype", want_stb);
     opts.addOption(bool, "tyr_harfbuzz", want_harfbuzz);
@@ -133,6 +111,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        // Stripping and optimising are different decisions: `-Dstrip` is its
+        // own axis so a profile cannot end up with either unreadable stacks
+        // or a binary nobody wants to ship. Runtime error messages survive
+        // it; they are what a user reports.
+        .strip = caps.strip,
     });
     fenrir.addOptions("build_options", opts);
 
@@ -259,10 +242,20 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = caps.strip,
             .imports = &.{.{ .name = "fenrir", .module = fenrir }},
         }),
     });
-    b.installArtifact(exe);
+
+    // `zig-out/<profile>-<path>/bin/`, so building a second configuration
+    // does not destroy the first. Not tidiness: the benchmark method in
+    // OPTIMIZING.md needs both binaries to exist at once and to be run
+    // interleaved, and an install that overwrites the thing being compared
+    // against guarantees the comparison measures CPU frequency drift.
+    const install = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/bin", .{caps.dir(b)}) } },
+    });
+    b.getInstallStep().dependOn(&install.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -278,17 +271,236 @@ pub fn build(b: *std.Build) void {
     // `zig build spirv`: the modules this build compiled, written back into
     // the tree, so a checkout builds with `-Dshaders=spirv` and no compiler.
     const spirv_step = b.step("spirv", "Regenerate src/gleipnir/shader/spirv/ from -Dshaders=glsl|slang");
-    if (shaders.generated) {
+    if (!shaders.generated) {
+        spirv_step.dependOn(&b.addFail(
+            "nothing to write: this build compiled no shaders. Pass -Dshaders=glsl or -Dshaders=slang.",
+        ).step);
+    } else if (!caps.allStages()) {
+        // Every stage, or none of them. A profile that left a stage out holds
+        // an empty module in its place, and writing that back would delete a
+        // committed shader -- silently, and only noticed by the next person
+        // who builds with -Dshaders=spirv.
+        spirv_step.dependOn(&b.addFail(
+            "this profile compiles only the shader stages it uses, so it cannot rewrite " ++
+                "spirv/ without deleting the rest. Use -Dprofile=debug.",
+        ).step);
+    } else {
         const update = b.addUpdateSourceFiles();
         for (shader_stages, 0..) |stage, i| {
             update.addCopyFileToSource(shaders.spv[i], b.fmt("{s}/spirv/{s}.spv", .{ shader_dir, stage }));
         }
         spirv_step.dependOn(&update.step);
-    } else {
-        spirv_step.dependOn(&b.addFail(
-            "nothing to write: this build compiled no shaders. Pass -Dshaders=glsl or -Dshaders=slang.",
-        ).step);
     }
+}
+
+/// What this binary contains, resolved once from the options and read
+/// everywhere after.
+///
+/// Three jobs want three binaries, and they are not the same binary with
+/// flags on it:
+///
+///   **light** -- a viewer that opens now. A LaTeX edit-compile-look loop
+///   wants a window that is already there and redraws the page the compiler
+///   just wrote: no database, no plugin host, no editing surface, nothing to
+///   initialise. It renders exactly what the others render -- the same Gjöll,
+///   the same Gelgja, the same Gleipnir -- because a viewer that is fast
+///   because it is less correct is not a viewer worth having.
+///
+///   **debug** -- everything, for finding out what is wrong. Both rasterisers
+///   in one binary so a page can be drawn each way and subtracted, every
+///   diagnostic command, and symbols.
+///
+///   **release** -- the reader people use: reader, editor, persistence and
+///   plugins, and none of the benchmark drivers, tracing or diagnostic
+///   capture that exist to answer questions about fenrir rather than about a
+///   document.
+///
+/// `-Doptimize` is deliberately off this axis, so `debug` can be ReleaseFast
+/// when a bug only appears there and `release` can be Debug while something
+/// is chased.
+const Profile = enum { light, debug, release };
+
+const Caps = struct {
+    profile: Profile,
+    /// What `-Dpath` named, which is what the *window* reaches for first.
+    path: PathBackend,
+    optimize: std.builtin.Optimize,
+    strip: bool,
+
+    /// Which rasterisers are *in* the binary. In `light` and `release` these
+    /// follow `path` exactly; in `debug` both are always true, and
+    /// deliberately -- `fenrir raster` is the reference every GPU answer is
+    /// checked against, so a build that honestly excluded the CPU rasteriser
+    /// could not check itself, and `debug` exists to check things.
+    path_cpu: bool,
+    path_gpu: bool,
+
+    /// Mímir: recent files, places, settings, stored marks.
+    store: bool,
+    /// Galdr: Lua, init.lua, plugins.
+    plugins: bool,
+    /// The split tree's commands and the tab bar. The tree itself is the
+    /// reader's spine and is in every build; what goes is `:sp`, `:tabnew`
+    /// and the bar.
+    splits: bool,
+    /// Highlights, notes and ink.
+    marks: bool,
+    /// `fenrir diff` and the reader's comparison overlay.
+    compare: bool,
+    /// The commands that answer questions about fenrir rather than about a
+    /// document: `dump`, `xref`, `extract`, `trace`, `icons`, `rects`, `ui`,
+    /// `view`.
+    diagnostics: bool,
+    /// `--time`, `--bench`, and the fixed workloads they drive.
+    bench: bool,
+    /// Validation layers and GPU timestamps.
+    instruments: bool,
+    /// The commands that report on a document or on this build: `info`,
+    /// `pages`, `fonts`, `health`, `commands`. Off only in `light`, whose
+    /// surface is the document and nothing else.
+    tools: bool,
+
+    /// `path.vert`/`path.frag`. The stencil-then-cover pipeline has no Vulkan
+    /// consumer at all -- `gleipnir/pathpipe.zig` is a contract with no
+    /// implementor, and the two modules are reached only by
+    /// `lyngvi/shaders.zig`'s own layout tests. So they belong in `debug` and
+    /// nowhere else. That is not permission to delete them: the contract is
+    /// what the CPU rasteriser is written against.
+    shader_path: bool,
+
+    /// Which shader stages this configuration compiles. The rest are empty
+    /// modules, so the `@embedFile` still resolves.
+    fn stages(c: Caps) [shader_stages.len]bool {
+        var out: [shader_stages.len]bool = undefined;
+        for (shader_stages, 0..) |stage, i| {
+            out[i] = if (std.mem.startsWith(u8, stage, "rect."))
+                true // common presentation, in every build
+            else if (std.mem.startsWith(u8, stage, "slug."))
+                c.path_gpu
+            else
+                c.shader_path;
+        }
+        return out;
+    }
+
+    fn allStages(c: Caps) bool {
+        for (c.stages()) |on| {
+            if (!on) return false;
+        }
+        return true;
+    }
+
+    fn dir(c: Caps, b: *std.Build) []const u8 {
+        return b.fmt("{t}-{t}", .{ c.profile, c.path });
+    }
+};
+
+/// Resolves every option into one `Caps`, and refuses a configuration that
+/// contradicts itself with a sentence rather than a warning.
+fn resolve(b: *std.Build) Caps {
+    const profile = b.option(
+        Profile,
+        "profile",
+        "What the binary contains: light, debug or release (default: debug)",
+    ) orelse .debug;
+
+    // Read by hand rather than through `standardOptimizeOption`, which only
+    // offers a default by *replacing* `-Doptimize` with `-Drelease`. The
+    // profile is allowed to prefer a mode; it is not allowed to take the axis
+    // away.
+    const optimize: std.builtin.Optimize = b.option(
+        std.builtin.Optimize,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse switch (b.graph.release_mode) {
+        .off => switch (profile) {
+            // What this project already recommends for reading documents:
+            // fast, and it still stops on a bad index instead of drawing
+            // garbage. Whether ReleaseFast is worth the lost check is a
+            // question for the benchmark matrix, not for a preference.
+            .light, .release => .safe,
+            .debug => .debug,
+        },
+        // `--release` with no mode asks for the one this project declares,
+        // and it is the same answer whichever profile asked.
+        .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
+    };
+
+    // Which path rasteriser the window uses, and which `--path` will accept.
+    //
+    // `both` is the point of it in `debug`: the CPU rasteriser is the
+    // reference, the GPU one is the model of the shader, and a build with
+    // both can draw the same page each way and subtract. `fenrir raster
+    // --path both` is that comparison.
+    //
+    // In `light` and `release` the flag removes the other one, and a build
+    // with one refuses the other by name rather than falling back. The
+    // consequence is that `-Dprofile=release -Dpath=gpu` has no `raster`
+    // command at all. That is correct and it is the point: a binary for a
+    // machine whose driver is trusted carries nothing to fall back to.
+    //
+    // One option and not two booleans because there is no fourth state: a
+    // build with neither draws nothing.
+    const path: PathBackend = b.option(
+        PathBackend,
+        "path",
+        "Which path rasteriser the window uses: cpu, gpu, or both (default: cpu for light, both otherwise)",
+    ) orelse switch (profile) {
+        .light => .cpu,
+        .debug, .release => .both,
+    };
+
+    // `?bool`, so "not given" and "given true" are different facts. Only the
+    // second can contradict a profile, and only a contradiction is an error.
+    const want_sqlite = b.option(
+        bool,
+        "sqlite",
+        "Store recent files, places, settings and highlights in SQLite (default: on outside -Dprofile=light)",
+    );
+    const want_lua = b.option(
+        bool,
+        "lua",
+        "Run Lua plugins and init.lua with Galdr (default: on outside -Dprofile=light)",
+    );
+    const want_strip = b.option(bool, "strip", "Leave the symbols out (default: on outside -Dprofile=debug)");
+
+    const light = profile == .light;
+    if (light and want_sqlite == true) {
+        fatal(
+            \\-Dprofile=light builds no database, so -Dsqlite=true has nothing to
+            \\       turn on. Use -Dprofile=release for a reader that remembers.
+        , .{});
+    }
+    if (light and want_lua == true) {
+        fatal(
+            \\-Dprofile=light builds no plugin host, so -Dlua=true has nothing to
+            \\       turn on. Use -Dprofile=release for a reader with plugins.
+        , .{});
+    }
+
+    return .{
+        .profile = profile,
+        .path = path,
+        .optimize = optimize,
+        // Symbols follow the table in build.md: `debug` keeps them, the other
+        // two do not. `-Dstrip=false` is how a release build gets a readable
+        // stack out of a crash a user reported.
+        .strip = want_strip orelse (profile != .debug),
+        .path_cpu = profile == .debug or path != .gpu,
+        .path_gpu = profile == .debug or path != .cpu,
+        .store = !light and (want_sqlite orelse true),
+        .plugins = !light and (want_lua orelse true),
+        .splits = !light,
+        .marks = !light,
+        .compare = !light,
+        .diagnostics = profile == .debug,
+        .bench = profile == .debug,
+        .instruments = profile == .debug,
+        .tools = !light,
+        .shader_path = profile == .debug,
+    };
 }
 
 /// The two rasterisers, and the build that keeps both.
@@ -420,36 +632,49 @@ const Shaders = struct {
     generated: bool = false,
 };
 
+/// `wanted` selects the stages by their consumers: `rect.*` is common
+/// presentation and is in every build, `slug.*` is GPU PDF rendering, and
+/// `path.*` has no Vulkan consumer at all. A stage this configuration does
+/// not want gets an empty module rather than no module, so the
+/// `@embedFile` on the Zig side still resolves and the payload is what
+/// shrank.
 fn compileShaders(
     b: *std.Build,
     source: ShaderSource,
     glsl_compiler: GlslCompiler,
     slangc_path: ?[]const u8,
+    wanted: [shader_stages.len]bool,
 ) Shaders {
     switch (source) {
-        .glsl => return compileGlsl(b, glsl_compiler) orelse
+        .glsl => return compileGlsl(b, glsl_compiler, wanted) orelse
             fatal("-Dshaders=glsl needs glslc or glslang on PATH (or pick -Dshaders=spirv)", .{}),
         .slang => {
             const exe = slangc_path orelse (b.findProgram(.{ .names = &.{"slangc"} }) orelse
                 fatal("-Dshaders=slang needs slangc on PATH, or -Dslangc=<path>", .{}));
-            return compileSlang(b, exe);
+            return compileSlang(b, exe, wanted);
         },
-        .spirv => return prebuilt(b) orelse
+        .spirv => return prebuilt(b, wanted) orelse
             fatal("-Dshaders=spirv needs {s}/spirv/*.spv; run `zig build spirv` where a compiler is installed", .{shader_dir}),
         .auto => {
-            if (compileGlsl(b, glsl_compiler)) |s| return s;
-            if (prebuilt(b)) |s| return s;
+            if (compileGlsl(b, glsl_compiler, wanted)) |s| return s;
+            if (prebuilt(b, wanted)) |s| return s;
             // Empty rather than absent, so `@embedFile` still resolves and
             // the failure is one `if` at pipeline creation rather than a
             // conditional import.
-            const empty = b.addWriteFiles();
             var out: Shaders = .{ .spv = undefined, .compiled = false, .compiler = "" };
-            for (shader_stages, 0..) |stage, i| {
-                out.spv[i] = empty.add(b.fmt("{s}.spv", .{stage}), "");
-            }
+            for (shader_stages, 0..) |_, i| out.spv[i] = emptyStage(b, i);
             return out;
         },
     }
+}
+
+/// The placeholder for a stage nobody in this build asks for. One
+/// `WriteFile` step per stage rather than one for all of them, because the
+/// callers fill `spv` a stage at a time and only some of the entries are
+/// empty.
+fn emptyStage(b: *std.Build, i: usize) std.Build.LazyPath {
+    const empty = b.addWriteFiles();
+    return empty.add(b.fmt("{s}.spv", .{shader_stages[i]}), "");
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -461,23 +686,28 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 /// shaderc's. `glslang` is the current name of the Khronos reference
 /// compiler, and `glslangValidator` is what it was called before 14.0 and
 /// still is in a Linux distribution's `glslang-tools` package.
-fn compileGlsl(b: *std.Build, which: GlslCompiler) ?Shaders {
+fn compileGlsl(b: *std.Build, which: GlslCompiler, wanted: [shader_stages.len]bool) ?Shaders {
     if (which != .glslang) {
         if (b.findProgram(.{ .names = &.{"glslc"} })) |exe| {
-            return compileGlslWith(b, .glslc, exe);
+            return compileGlslWith(b, .glslc, exe, wanted);
         } else {
             if (which == .glslc) fatal("-Dglsl-compiler=glslc: glslc is not on PATH", .{});
         }
     }
     if (b.findProgram(.{ .names = &.{ "glslang", "glslangValidator" } })) |exe| {
-        return compileGlslWith(b, .glslang, exe);
+        return compileGlslWith(b, .glslang, exe, wanted);
     } else {
         if (which == .glslang) fatal("-Dglsl-compiler=glslang: glslang is not on PATH", .{});
     }
     return null;
 }
 
-fn compileGlslWith(b: *std.Build, which: GlslCompiler, exe: []const u8) Shaders {
+fn compileGlslWith(
+    b: *std.Build,
+    which: GlslCompiler,
+    exe: []const u8,
+    wanted: [shader_stages.len]bool,
+) Shaders {
     var out: Shaders = .{
         .spv = undefined,
         .compiled = true,
@@ -485,6 +715,10 @@ fn compileGlslWith(b: *std.Build, which: GlslCompiler, exe: []const u8) Shaders 
         .generated = true,
     };
     for (shader_stages, 0..) |stage, i| {
+        if (!wanted[i]) {
+            out.spv[i] = emptyStage(b, i);
+            continue;
+        }
         const run = switch (which) {
             // `-O` is shaderc's optimiser. glslang has no equivalent without
             // linking SPIRV-Tools, and the difference is a few hundred bytes
@@ -522,9 +756,13 @@ fn compileGlslWith(b: *std.Build, which: GlslCompiler, exe: []const u8) Shaders 
 /// `slangc <pipeline>.slang -entry vertexMain -stage vertex`, and the same
 /// for the fragment half. Slang names the SPIR-V entry point `main` unless
 /// told otherwise, which is what the pipelines ask for.
-fn compileSlang(b: *std.Build, exe: []const u8) Shaders {
+fn compileSlang(b: *std.Build, exe: []const u8, wanted: [shader_stages.len]bool) Shaders {
     var out: Shaders = .{ .spv = undefined, .compiled = true, .compiler = "slangc", .generated = true };
     for (shader_stages, 0..) |stage, i| {
+        if (!wanted[i]) {
+            out.spv[i] = emptyStage(b, i);
+            continue;
+        }
         const dot = std.mem.indexOfScalar(u8, stage, '.').?;
         const module = stage[0..dot];
         const kind = stage[dot + 1 ..];
@@ -542,10 +780,14 @@ fn compileSlang(b: *std.Build, exe: []const u8) Shaders {
     return out;
 }
 
-/// The committed modules, if every one of them is there.
-fn prebuilt(b: *std.Build) ?Shaders {
+/// The committed modules, if every stage this build wants is there.
+fn prebuilt(b: *std.Build, wanted: [shader_stages.len]bool) ?Shaders {
     var out: Shaders = .{ .spv = undefined, .compiled = true, .compiler = "spirv" };
     for (shader_stages, 0..) |stage, i| {
+        if (!wanted[i]) {
+            out.spv[i] = emptyStage(b, i);
+            continue;
+        }
         const sub = b.fmt("{s}/spirv/{s}.spv", .{ shader_dir, stage });
         if (!exists(b, sub)) return null;
         out.spv[i] = b.path(sub);

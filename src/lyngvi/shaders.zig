@@ -29,6 +29,15 @@ const spirv = @import("spirv.zig");
 /// True when this binary has real SPIR-V in it.
 pub const available = build_options.lyngvi_spirv;
 
+/// Which pipelines' modules this build carries, chosen by their consumers:
+/// `rect.*` is common presentation and is in every build, `slug.*` is GPU PDF
+/// rendering, and `path.*` -- the stencil-then-cover pipeline -- has no Vulkan
+/// consumer at all and is compiled only where the layout tests below run. A
+/// stage that was left out is an empty blob, so the import still resolves and
+/// what shrank is the payload.
+pub const has_path = build_options.shader_path;
+pub const has_slug = build_options.shader_slug;
+
 /// The command that produces the modules, quoted in the error message when
 /// there are none. Kept next to the thing it produces so it cannot drift.
 pub const compile_hint =
@@ -112,31 +121,42 @@ test "a build with no shader compiler says so rather than crashing" {
         try testing.expect(v.byteSize() > 0);
         try testing.expect(f.byteSize() > 0);
         // The path stages come from the same build step and either both
-        // stages of both pipelines are here or none of them are.
-        const pv = try pathVertexModule();
-        const pf = try pathFragmentModule();
-        try testing.expect(pv.byteSize() > 0);
-        try testing.expect(pf.byteSize() > 0);
-        try testing.expect(pv.isStage(.vertex));
-        try testing.expect(pf.isStage(.fragment));
-        // The path shaders index no descriptor array at all -- everything they
-        // need is a push constant -- so they must *not* need the feature the
-        // rect pipeline does. A path pipeline that asked for it would make the
-        // descriptor-indexing fallback pointless.
-        try testing.expect(!try pf.needsNonUniformIndexing());
+        // stages of both pipelines are here or none of them are -- in a build
+        // that asked for them at all.
+        if (has_path) {
+            const pv = try pathVertexModule();
+            const pf = try pathFragmentModule();
+            try testing.expect(pv.byteSize() > 0);
+            try testing.expect(pf.byteSize() > 0);
+            try testing.expect(pv.isStage(.vertex));
+            try testing.expect(pf.isStage(.fragment));
+            // The path shaders index no descriptor array at all -- everything
+            // they need is a push constant -- so they must *not* need the
+            // feature the rect pipeline does. A path pipeline that asked for
+            // it would make the descriptor-indexing fallback pointless.
+            try testing.expect(!try pf.needsNonUniformIndexing());
+        } else {
+            try testing.expectError(error.NoShaders, pathVertexModule());
+        }
 
         // The analytic pipeline reads eight storage buffers and indexes every
         // one of them with a value derived from the instance index, which is
         // uniform across the draw. So it must not ask for non-uniform
         // indexing either: a page's worth of paths goes through one draw call
         // on a device that has none of the descriptor-indexing features.
-        const sv = try slugVertexModule();
-        const sf = try slugFragmentModule();
-        try testing.expect(sv.byteSize() > 0);
-        try testing.expect(sf.byteSize() > 0);
-        try testing.expect(sv.isStage(.vertex));
-        try testing.expect(sf.isStage(.fragment));
-        try testing.expect(!try sf.needsNonUniformIndexing());
+        if (has_slug) {
+            const sv = try slugVertexModule();
+            const sf = try slugFragmentModule();
+            try testing.expect(sv.byteSize() > 0);
+            try testing.expect(sf.byteSize() > 0);
+            try testing.expect(sv.isStage(.vertex));
+            try testing.expect(sf.isStage(.fragment));
+            try testing.expect(!try sf.needsNonUniformIndexing());
+        } else {
+            // A build with no GPU path pipeline carries no module for it, and
+            // says so by name rather than creating a pipeline out of nothing.
+            try testing.expectError(error.NoShaders, slugVertexModule());
+        }
         // The check that catches a build wiring the modules to the wrong
         // stages, which creates a pipeline that draws nothing and reports
         // nothing.
@@ -163,7 +183,7 @@ test "the compiled shader lays out every buffer the way the Zig side writes it" 
     // after the first was read from the wrong place -- a page of text drawn
     // as its own glyphs, huge and scattered. Nothing but the compiled module
     // knows the layout the shader will actually use, so it is read from there.
-    if (!available) return error.SkipZigTest;
+    if (!available or !has_slug) return error.SkipZigTest;
     const slugpipe = @import("../gleipnir/slugpipe.zig");
     const slug = @import("../gleipnir/slug.zig");
     const b = slugpipe.binding;
