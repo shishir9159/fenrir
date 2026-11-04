@@ -6,6 +6,13 @@
 
 const std = @import("std");
 const Io = std.Io;
+const fenrir = @import("fenrir");
+
+/// What this build contains. `-Dprofile` resolved it once; the table below is
+/// generated from it, so a command this profile left out is not registered,
+/// not compiled and not callable -- registering one and then hiding it from
+/// the help text is not exclusion.
+const caps = fenrir.build_options;
 
 const Context = @import("vanagandr/Context.zig");
 const commands_cmd = @import("vanagandr/commands.zig");
@@ -35,28 +42,88 @@ const Command = struct {
     run: *const fn (ctx: *Context, args: []const []const u8) anyerror!void,
 };
 
-const commands = [_]Command{
-    .{ .name = "info", .summary = "summarise a document", .usage = info.usage, .run = info.run },
-    .{ .name = "dump", .summary = "print the object graph", .usage = dump.usage, .run = dump.run },
-    .{ .name = "pages", .summary = "list pages and their geometry", .usage = pages.usage, .run = pages.run },
-    .{ .name = "xref", .summary = "print the cross-reference table", .usage = xref.usage, .run = xref.run },
-    .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run },
-    .{ .name = "raster", .summary = "rasterise a page to a PNG on the CPU", .usage = raster.usage, .run = raster.run },
-    .{ .name = "read", .summary = "open the document in a window and scroll through it", .usage = read.usage, .run = read.run },
-    .{ .name = "diff", .summary = "which pages of two documents differ", .usage = diff.usage, .run = diff.run },
-    .{ .name = "recent", .summary = "the documents opened before, and where you were", .usage = library.recent_usage, .run = library.recentRun },
-    .{ .name = "config", .summary = "the settings the reader remembers", .usage = library.config_usage, .run = library.configRun },
-    .{ .name = "marks", .summary = "the highlights made in a document", .usage = library.marks_usage, .run = library.marksRun },
-    .{ .name = "plugins", .summary = "load init.lua and the plugins, and report", .usage = plugins.usage, .run = plugins.run },
-    .{ .name = "health", .summary = "what this build can do, and what it found", .usage = health.usage, .run = health.run },
-    .{ .name = "run", .summary = "run a Lua script over a document, with no window", .usage = run_cmd.usage, .run = run_cmd.run },
-    .{ .name = "commands", .summary = "list the reader's `:` commands", .usage = commands_cmd.usage, .run = commands_cmd.run },
-    .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run },
-    .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run },
-    .{ .name = "icons", .summary = "list the icon registry, and draw a sheet of it", .usage = icons.usage, .run = icons.run },
-    .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run },
-    .{ .name = "ui", .summary = "render a frame of interface, layout and text included", .usage = ui.usage, .run = ui.run },
-    .{ .name = "view", .summary = "open a window and draw on the GPU", .usage = view.usage, .run = view.run },
+/// The command table, built at comptime from the capability set.
+///
+/// A flat array that a `for` walks, as before -- but one whose entries this
+/// profile actually has. The branches are comptime-known, so a command left
+/// out is never referenced, its module is never analysed, and `fenrir dump`
+/// in a `light` binary is an unknown command rather than a hidden one.
+const commands = table: {
+    var buf: [21]Command = undefined;
+    var n: usize = 0;
+
+    // The reader, in every profile. `read` stays a name because that is what
+    // every script and every note already says; `fenrir <file>` is the form
+    // `light` is for.
+    buf[n] = .{ .name = "read", .summary = "open the document in a window and scroll through it", .usage = read.usage, .run = read.run };
+    n += 1;
+
+    if (caps.tools) {
+        buf[n] = .{ .name = "info", .summary = "summarise a document", .usage = info.usage, .run = info.run };
+        n += 1;
+        buf[n] = .{ .name = "pages", .summary = "list pages and their geometry", .usage = pages.usage, .run = pages.run };
+        n += 1;
+        buf[n] = .{ .name = "fonts", .summary = "list the compiled-in font backends", .usage = fonts.usage, .run = fonts.run };
+        n += 1;
+        buf[n] = .{ .name = "commands", .summary = "list the reader's `:` commands", .usage = commands_cmd.usage, .run = commands_cmd.run };
+        n += 1;
+        buf[n] = .{ .name = "health", .summary = "what this build can do, and what it found", .usage = health.usage, .run = health.run };
+        n += 1;
+    }
+
+    // `raster` rasterises with no device in the process, so it needs the CPU
+    // rasteriser to be in the binary -- which `-Dpath=gpu` outside `debug`
+    // means it is not.
+    if (caps.tools and caps.path_cpu) {
+        buf[n] = .{ .name = "raster", .summary = "rasterise a page to a PNG on the CPU", .usage = raster.usage, .run = raster.run };
+        n += 1;
+    }
+
+    if (caps.compare) {
+        buf[n] = .{ .name = "diff", .summary = "which pages of two documents differ", .usage = diff.usage, .run = diff.run };
+        n += 1;
+    }
+
+    // Three views of one database, so they stand or fall together.
+    if (caps.sqlite) {
+        buf[n] = .{ .name = "recent", .summary = "the documents opened before, and where you were", .usage = library.recent_usage, .run = library.recentRun };
+        n += 1;
+        buf[n] = .{ .name = "config", .summary = "the settings the reader remembers", .usage = library.config_usage, .run = library.configRun };
+        n += 1;
+        buf[n] = .{ .name = "marks", .summary = "the highlights made in a document", .usage = library.marks_usage, .run = library.marksRun };
+        n += 1;
+    }
+
+    if (caps.lua) {
+        buf[n] = .{ .name = "plugins", .summary = "load init.lua and the plugins, and report", .usage = plugins.usage, .run = plugins.run };
+        n += 1;
+        buf[n] = .{ .name = "run", .summary = "run a Lua script over a document, with no window", .usage = run_cmd.usage, .run = run_cmd.run };
+        n += 1;
+    }
+
+    // The commands that answer a question about fenrir rather than about a
+    // document.
+    if (caps.diagnostics) {
+        buf[n] = .{ .name = "dump", .summary = "print the object graph", .usage = dump.usage, .run = dump.run };
+        n += 1;
+        buf[n] = .{ .name = "xref", .summary = "print the cross-reference table", .usage = xref.usage, .run = xref.run };
+        n += 1;
+        buf[n] = .{ .name = "extract", .summary = "write a stream's decoded bytes", .usage = extract.usage, .run = extract.run };
+        n += 1;
+        buf[n] = .{ .name = "trace", .summary = "interpret a page into a display list", .usage = trace.usage, .run = trace.run };
+        n += 1;
+        buf[n] = .{ .name = "icons", .summary = "list the icon registry, and draw a sheet of it", .usage = icons.usage, .run = icons.run };
+        n += 1;
+        buf[n] = .{ .name = "rects", .summary = "render a demo frame through the rect pipeline", .usage = rects.usage, .run = rects.run };
+        n += 1;
+        buf[n] = .{ .name = "ui", .summary = "render a frame of interface, layout and text included", .usage = ui.usage, .run = ui.run };
+        n += 1;
+        buf[n] = .{ .name = "view", .summary = "open a window and draw on the GPU", .usage = view.usage, .run = view.run };
+        n += 1;
+    }
+
+    const out = buf[0..n].*;
+    break :table out;
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -118,21 +185,37 @@ fn dispatch(ctx: *Context, args: []const []const u8) !void {
         if (std.mem.eql(u8, name, cmd.name)) return cmd.run(ctx, args[1..]);
     }
 
+    // `fenrir paper.pdf --watch`: the document straight away, with no verb.
+    // Only when one of the arguments really is a file, so a mistyped command
+    // is still reported as one rather than handed to the reader, which would
+    // say it cannot open `dmup`.
+    if (namesAFile(ctx, args)) return read.run(ctx, args);
+
     ctx.note("fenrir: unknown command '{s}'", .{name});
     try writeUsage(ctx);
     return error.CommandFailed;
 }
 
+/// Whether any argument that is not an option is a file this process can see.
+fn namesAFile(ctx: *Context, args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "-")) continue;
+        if (Io.Dir.cwd().access(ctx.io, arg, .{})) |_| return true else |_| {}
+    }
+    return false;
+}
+
 fn writeUsage(ctx: *Context) !void {
     const w = ctx.out;
-    try w.writeAll(
-        \\fenrir -- a PDF reader written from scratch in Zig
+    try w.print(
+        \\fenrir -- a PDF reader written from scratch in Zig ({s} build)
         \\
-        \\usage: fenrir <command> [arguments]
+        \\usage: fenrir <file>... [options]
+        \\       fenrir <command> [arguments]
         \\
         \\commands:
         \\
-    );
+    , .{caps.profile});
     for (commands) |cmd| {
         try w.print("  {s: <9} {s}\n", .{ cmd.name, cmd.summary });
     }
@@ -146,4 +229,43 @@ fn writeUsage(ctx: *Context) !void {
 test {
     // Compile the command modules under `zig build test`.
     std.testing.refAllDecls(@This());
+}
+
+test "the table holds exactly the commands this configuration has" {
+    const has = struct {
+        fn f(name: []const u8) bool {
+            for (commands) |cmd| {
+                if (std.mem.eql(u8, cmd.name, name)) return true;
+            }
+            return false;
+        }
+    }.f;
+
+    // The reader is the one command no profile may drop; it is what fenrir
+    // is.
+    try std.testing.expect(has("read"));
+
+    // Each gated command is registered exactly when its capability is on.
+    // Written as an equality and not as "light has no dump", so the
+    // assertion is the same sentence in all nine configurations.
+    try std.testing.expectEqual(caps.diagnostics, has("dump"));
+    try std.testing.expectEqual(caps.diagnostics, has("trace"));
+    try std.testing.expectEqual(caps.compare, has("diff"));
+    try std.testing.expectEqual(caps.sqlite, has("recent"));
+    try std.testing.expectEqual(caps.sqlite, has("marks"));
+    try std.testing.expectEqual(caps.lua, has("plugins"));
+    try std.testing.expectEqual(caps.tools, has("info"));
+    try std.testing.expectEqual(caps.tools, has("health"));
+    // `raster` renders with no device in the process, so it needs the CPU
+    // rasteriser to be in the binary and not merely named by -Dpath.
+    try std.testing.expectEqual(caps.tools and caps.path_cpu, has("raster"));
+
+    // Two entries of the same name would make the second unreachable, which
+    // is the failure a comptime table built by hand can have and a literal
+    // one cannot.
+    for (commands, 0..) |a, i| {
+        for (commands[i + 1 ..]) |b| {
+            try std.testing.expect(!std.mem.eql(u8, a.name, b.name));
+        }
+    }
 }

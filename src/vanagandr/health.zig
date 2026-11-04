@@ -121,10 +121,19 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
 }
 
 fn build(r: *Report) void {
+    const caps = fenrir.build_options;
     r.section("build");
     r.line(.ok, "zig", "{s}", .{builtin.zig_version_string});
     r.line(.ok, "target", "{s}-{s}", .{ @tagName(builtin.cpu.arch), @tagName(builtin.os.tag) });
     r.line(.ok, "mode", "{s}", .{@tagName(builtin.mode)});
+    // What `-Dprofile` resolved to, which is what decides every line below
+    // it. A bug report that says "fenrir does not have :sp" is answered here
+    // rather than by guessing which binary the reporter is holding.
+    r.line(.ok, "profile", "{s}", .{caps.profile});
+    r.line(.ok, "page raster", "{s}", .{
+        if (caps.path_cpu and caps.path_gpu) "cpu and gpu" else if (caps.path_gpu) "gpu only" else "cpu only",
+    });
+    r.flag("symbols", !caps.stripped, "in the binary", "stripped: build with -Dstrip=false for a stack");
 
     // The two C dependencies, each of which the build can be told to leave
     // out -- and which everything above them is written to work without.

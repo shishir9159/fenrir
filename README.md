@@ -22,10 +22,18 @@ this project links on purpose.
 
 ```
 git clone <this repository> fenrir && cd fenrir
-zig build                 # zig-out/bin/fenrir
+zig build                 # zig-out/debug-both/bin/fenrir
 zig build test            # the whole suite
-zig-out/bin/fenrir read paper.pdf
+zig-out/debug-both/bin/fenrir paper.pdf
 ```
+
+`-Dprofile` picks what the binary contains, and what it leaves out is absent
+rather than hidden behind a flag: `light` is a viewer and nothing else -- no
+database, no plugin host, no diagnostic commands, under two megabytes --
+`release` is the reader people use, and `debug`, the default, has everything
+including both rasterisers so a page can be drawn each way and subtracted.
+Each configuration installs into `zig-out/<profile>-<path>/bin/`, so two of
+them can be benchmarked against each other.
 
 Every option, how SQLite and Lua are pinned by hash, where the SPIR-V comes
 from, how to cross-compile and what to do when the build fails are in
