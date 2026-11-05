@@ -7,13 +7,13 @@
 //!
 //! So this is `fallback.zig`'s trick with something worth drawing at the end
 //! of it: a hundred-odd lines of `Face` whose `outline` reads a table of
-//! `d` strings and hands them to `svgpath`. Everything downstream is then
-//! unchanged and gets the icons for nothing. `Atlas` keys on
-//! `(face, glyph, size, subpixel)` and already quantises the size, so an icon
-//! is rasterised once per size and cached beside the letters. `Fonts.layout`
-//! places it. `draw.zig` emits one tinted quad -- and that tint is the whole
-//! of `currentColor`: an icon follows `Style.fg`, so a light theme and a dark
-//! one need no second asset between them.
+//! outlines, Phosphor's path data put through `svgpath` by the compiler.
+//! Everything downstream is then unchanged and gets the icons for nothing.
+//! `Atlas` keys on `(face, glyph, size, subpixel)` and already quantises the
+//! size, so an icon is rasterised once per size and cached beside the
+//! letters. `Fonts.layout` places it. `draw.zig` emits one tinted quad -- and
+//! that tint is the whole of `currentColor`: an icon follows `Style.fg`, so a
+//! light theme and a dark one need no second asset between them.
 //!
 //! ## Why the glyphs are reached by code point
 //!
@@ -27,18 +27,29 @@
 //!
 //! ## The grid, and where the icon sits on the line
 //!
-//! The paths are drawn on the 24-unit grid every icon set publishes, which
-//! `svgpath.viewBox` maps onto the em square, flipping y. The face then
-//! reports an ascender of a full em and no descender, so an icon's box *is*
-//! the line box: drawn at fourteen pixels it is fourteen pixels tall and
-//! sits centred on the line, with no per-call-site nudging.
+//! The paths are drawn on Phosphor's 256-unit grid, which `svgpath.viewBox`
+//! maps onto the em square, flipping y. A theme's path data is on the same
+//! grid, so an icon copied from phosphoricons.com in another weight drops
+//! in. The face then reports an ascender of a full em and no descender, so
+//! an icon's box *is* the line box: drawn at fourteen pixels it is fourteen
+//! pixels tall and sits centred on the line, with no per-call-site nudging.
+//!
+//! ## Parsed by the compiler
+//!
+//! A built-in icon's outline is in the binary, so asking for one is two
+//! slice copies and a bad path in the table is a compile error. Parsing at
+//! run time cost 2.5us an icon, half of first drawing it at 20px. The
+//! compiler runs `svgpath` itself, so there is one parser and the test below
+//! holds the two answers together.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const geom = @import("../../gelgja/geom.zig");
 const Face = @import("../Face.zig");
 const Outline = @import("../Outline.zig");
 const svgpath = @import("../svgpath.zig");
+const ph = @import("phosphor.zig");
 
 const GlyphIndex = Face.GlyphIndex;
 
@@ -47,7 +58,9 @@ const GlyphIndex = Face.GlyphIndex;
 pub const units_per_em: u16 = 1000;
 
 /// The grid the path data is drawn on.
-pub const grid: f32 = 24;
+pub const grid: f32 = 256;
+
+const view = svgpath.viewBox(grid, @floatFromInt(units_per_em));
 
 /// Where the glyphs appear in Unicode. The private use area, which is what it
 /// is for; nothing outside this program should ever see these code points,
@@ -68,89 +81,94 @@ pub const Icon = struct {
 /// draws *nothing* is indistinguishable from a toolbar that is correctly
 /// empty, and the bug is then found by someone else, later, in a screenshot.
 ///
-/// They are drawn on a 24-unit grid with y downwards, as published. A hole is
-/// a contour wound against the one containing it -- the nonzero rule, which
-/// is what the rasteriser applies -- and the y flip reverses both, so it
-/// survives the transform.
+/// Fenrir's names, which the registry and every call site use, on
+/// Phosphor's drawings, which can change under them without one call site
+/// noticing.
 pub const builtin = [_]Icon{
-    .{ .name = "unknown", .d = "M3 3h18v18H3z M5 5v14h14V5z" },
+    .{ .name = "unknown", .d = ph.square },
 
     // The reader's own furniture.
-    .{ .name = "bookmark", .d = "M6 2h12v20l-6-5-6 5z" },
-    .{ .name = "highlight", .d = "M4 17h16v4H4z M7 14l8-11 4 3-8 11z" },
-    .{ .name = "note", .d = "M3 4h18v13H8l-5 4z" },
-    .{ .name = "outline", .d = "M3 4h18v2H3z M7 11h14v2H7z M11 18h10v2H11z" },
-    .{ .name = "page", .d = "M5 2h9l5 5v15H5z M7 4v16h10V8h-4V4z" },
-    .{ .name = "open", .d = "M3 5h7l2 2h9v12H3z" },
+    .{ .name = "bookmark", .d = ph.bookmark_simple },
+    .{ .name = "highlight", .d = ph.highlighter },
+    .{ .name = "note", .d = ph.chat_text },
+    .{ .name = "outline", .d = ph.tree_view },
+    .{ .name = "page", .d = ph.file },
+    .{ .name = "open", .d = ph.folder_open },
 
     // The keymap's modes, in the order the left rail shows them.
-    .{ .name = "normal", .d = "M5 2 5 20 10 15.5 13 21 15.6 19.7 12.8 14.6 18 14z" },
-    .{
-        .name = "visual",
-        .d = "M3 3h7v2H5v5H3z M21 3v7h-2V5h-5V3z M3 21v-7h2v5h5v2z M21 21h-7v-2h5v-5h2z",
-    },
-    .{ .name = "edit", .d = "M3 17.2 14.8 5.4l3.8 3.8L6.8 21H3z M16.2 4 18 2.2 21.8 6 20 7.8z" },
-    // A squiggle and not a pen. The pen it used to be sat one button below
+    .{ .name = "normal", .d = ph.cursor },
+    .{ .name = "visual", .d = ph.cursor_text },
+    .{ .name = "edit", .d = ph.pencil_simple },
+    // A scribble and not a pen. The pen it once was sat one button below
     // `edit`, which is a pencil, and at sixteen pixels the two were the same
     // diagonal shape with the same nib -- a picture of the left rail is what
     // said so. An icon has to be different from the one beside it, not merely
     // correct about what it names.
-    .{
-        .name = "draw",
-        .d = "M3 17 C6 9 9 9 12 14 C15 19 18 19 21 11 L21 14" ++
-            " C18 22 15 22 12 17 C9 12 6 12 3 20 Z",
-    },
+    .{ .name = "draw", .d = ph.scribble_loop },
 
-    // Chevrons, as one shape rotated four ways. Written out rather than
-    // rotated at run time: a matrix per icon would be a second way to say
-    // where a glyph is, and the table is the first.
-    .{ .name = "chevron_left", .d = "M15.5 4 6 12 15.5 20 17 18.2 9.5 12 17 5.8z" },
-    .{ .name = "chevron_right", .d = "M8.5 4 18 12 8.5 20 7 18.2 14.5 12 7 5.8z" },
-    .{ .name = "chevron_up", .d = "M4 15.5 12 6 20 15.5 18.2 17 12 9.5 5.8 17z" },
-    .{ .name = "chevron_down", .d = "M4 8.5 12 18 20 8.5 18.2 7 12 14.5 5.8 7z" },
+    .{ .name = "chevron_left", .d = ph.caret_left },
+    .{ .name = "chevron_right", .d = ph.caret_right },
+    .{ .name = "chevron_up", .d = ph.caret_up },
+    .{ .name = "chevron_down", .d = ph.caret_down },
 
     // Search and the zooms, which are the same ring with different ink in it.
-    .{
-        .name = "search",
-        .d = "M4 10a7 7 0 1 0 14 0 7 7 0 1 0-14 0z M6 10a5 5 0 1 1 10 0 5 5 0 1 1-10 0z" ++
-            " M14.8 16.2l1.4-1.4 5.5 5.5-1.4 1.4z",
-    },
-    .{
-        .name = "zoom_in",
-        .d = "M4 10a7 7 0 1 0 14 0 7 7 0 1 0-14 0z M6 10a5 5 0 1 1 10 0 5 5 0 1 1-10 0z" ++
-            " M10 6h2v3h3v2h-3v3h-2v-3H7V9h3z M14.8 16.2l1.4-1.4 5.5 5.5-1.4 1.4z",
-    },
-    .{
-        .name = "zoom_out",
-        .d = "M4 10a7 7 0 1 0 14 0 7 7 0 1 0-14 0z M6 10a5 5 0 1 1 10 0 5 5 0 1 1-10 0z" ++
-            " M7 9h8v2H7z M14.8 16.2l1.4-1.4 5.5 5.5-1.4 1.4z",
-    },
-    .{ .name = "fit_width", .d = "M2 12 7 7v10z M22 12l-5-5v10z M6 11h12v2H6z" },
-    .{
-        .name = "fit_page",
-        .d = "M4 3h16v18H4z M6 5v14h12V5z M12 6 15 10H9z M12 18 9 14h6z",
-    },
+    .{ .name = "search", .d = ph.magnifying_glass },
+    .{ .name = "zoom_in", .d = ph.magnifying_glass_plus },
+    .{ .name = "zoom_out", .d = ph.magnifying_glass_minus },
+    .{ .name = "fit_width", .d = ph.arrows_out_line_horizontal },
+    .{ .name = "fit_page", .d = ph.corners_out },
 
     // Chrome: the bars, the panels and the buttons on them.
-    .{ .name = "menu", .d = "M3 5h18v2H3z M3 11h18v2H3z M3 17h18v2H3z" },
-    .{ .name = "settings", .d = "M3 7h5v2H3z M12 7h9v2h-9z M8 4h4v8H8z" ++
-        " M3 15h9v2H3z M16 15h5v2h-5z M12 12h4v8h-4z" },
-    .{ .name = "panel", .d = "M3 4h18v16H3z M5 6v12h9V6z" },
-    .{ .name = "split", .d = "M3 4h18v16H3z M5 6v12h6V6z M13 6v12h6V6z" },
+    .{ .name = "menu", .d = ph.list },
+    .{ .name = "settings", .d = ph.sliders_horizontal },
+    .{ .name = "panel", .d = ph.sidebar_simple },
+    .{ .name = "split", .d = ph.square_split_horizontal },
     // A plus over a minus: what came and what went.
-    .{ .name = "changes", .d = "M11 2h2v4h4v2h-4v4h-2V8H7V6h4z M6 17h12v2.5H6z" },
-    .{ .name = "plus", .d = "M11 4h2v7h7v2h-7v7h-2v-7H4v-2h7z" },
-    .{ .name = "minus", .d = "M4 11h16v2H4z" },
-    .{
-        .name = "close",
-        .d = "M5.6 4.2 12 10.6 18.4 4.2 19.8 5.6 13.4 12 19.8 18.4 18.4 19.8" ++
-            " 12 13.4 5.6 19.8 4.2 18.4 10.6 12 4.2 5.6z",
-    },
-    .{ .name = "check", .d = "M9.5 18.8 3.6 12.9 5.7 10.8 9.5 14.6 18.3 5.8 20.4 7.9z" },
+    .{ .name = "changes", .d = ph.plus_minus },
+    .{ .name = "plus", .d = ph.plus },
+    .{ .name = "minus", .d = ph.minus },
+    .{ .name = "close", .d = ph.x },
+    .{ .name = "check", .d = ph.check },
 };
 
 /// The glyph every failure resolves to.
 pub const unknown: GlyphIndex = 0;
+
+/// `builtin`, already outlines.
+const baked = bake();
+
+const Baked = struct {
+    verbs: []const geom.Verb,
+    points: []const geom.Point,
+};
+
+fn bake() [builtin.len]Baked {
+    // Parsing took about twenty backward branches a byte of path data; three
+    // times that, so adding an icon never means finding this number.
+    var bytes: u32 = 0;
+    for (builtin) |b| bytes += b.d.len;
+    @setEvalBranchQuota(64 * bytes);
+
+    var out: [builtin.len]Baked = undefined;
+    for (builtin, &out) |b, *o| {
+        // No allocator runs at comptime, and none is asked for while the
+        // lists have room: `failing` is what says so if one ever has not.
+        var verbs: [256]geom.Verb = undefined;
+        var points: [768]geom.Point = undefined;
+        var ol: Outline = .{ .verbs = .initBuffer(&verbs), .points = .initBuffer(&points) };
+        svgpath.parse(.failing, &ol, b.d, .{ .transform = view }) catch |err|
+            @compileError("icon '" ++ b.name ++ "': " ++ @errorName(err));
+        const v = verbs[0..ol.verbs.items.len].*;
+        const p = points[0..ol.points.items.len].*;
+        o.* = .{ .verbs = &v, .points = &p };
+    }
+    return out;
+}
+
+fn copy(gpa: Allocator, out: *Outline, b: Baked) Error!void {
+    try out.verbs.appendSlice(gpa, b.verbs);
+    try out.points.appendSlice(gpa, b.points);
+}
 
 pub const Error = Face.Error;
 
@@ -285,12 +303,10 @@ fn advance(_: *anyopaque, _: GlyphIndex) ?f32 {
 
 fn outline(ptr: *anyopaque, gpa: Allocator, g: GlyphIndex, out: *Outline) Error!void {
     const set: *Set = @ptrCast(@alignCast(ptr));
-    const found = set.icon(g) orelse builtin[unknown];
-    const opts: svgpath.Options = .{
-        .transform = svgpath.viewBox(grid, @floatFromInt(units_per_em)),
-    };
+    if (g < builtin.len) return copy(gpa, out, baked[g]);
+    const found = set.icon(g) orelse return copy(gpa, out, baked[unknown]);
 
-    svgpath.parse(gpa, out, found.d, opts) catch |err| switch (err) {
+    svgpath.parse(gpa, out, found.d, .{ .transform = view }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Path data this face cannot read came from a theme, and the theme
         // is what should be reporting it -- `fenrir icons` asks for every
@@ -298,11 +314,7 @@ fn outline(ptr: *anyopaque, gpa: Allocator, g: GlyphIndex, out: *Outline) Error!
         // the same reason index zero is one.
         error.BadPathData => {
             out.reset(units_per_em);
-            svgpath.parse(gpa, out, builtin[unknown].d, opts) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // The box is written in this file and a test parses it.
-                error.BadPathData => unreachable,
-            };
+            return copy(gpa, out, baked[unknown]);
         },
     };
 }
@@ -321,27 +333,42 @@ fn deinit(ptr: *anyopaque, gpa: Allocator) void {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+const raster = @import("../raster.zig");
 
-test "every built-in icon parses, and draws inside the em" {
+test "the compiler's outlines are the parser's, and draw inside the em" {
     const gpa = testing.allocator;
     var o: Outline = .{};
     defer o.deinit(gpa);
 
+    var r: raster.Raster = .{};
+    defer r.deinit(gpa);
+
     const em: f32 = @floatFromInt(units_per_em);
-    for (builtin) |b| {
+    // A tenth of a pixel at 24px, the largest slot. Phosphor's ink runs to
+    // the edge of its grid, and `draw`'s 1.6 units past it.
+    const slack = em / 240;
+    for (builtin, baked) |b, k| {
         o.reset(units_per_em);
-        svgpath.parse(gpa, &o, b.d, .{ .transform = svgpath.viewBox(grid, em) }) catch |err| {
-            std.debug.print("icon '{s}': {t}\n", .{ b.name, err });
-            return err;
-        };
+        try svgpath.parse(gpa, &o, b.d, .{ .transform = view });
         try testing.expect(!o.isEmpty());
+
+        // Comptime float arithmetic is not promised to round as the
+        // target's does, so the points agree to a thousandth of a unit --
+        // a millionth of the em -- rather than to the bit.
+        try testing.expectEqualSlices(geom.Verb, o.verbs.items, k.verbs);
+        for (o.points.items, k.points) |p, q| {
+            try testing.expectApproxEqAbs(p.x, q.x, 1e-3);
+            try testing.expectApproxEqAbs(p.y, q.y, 1e-3);
+        }
 
         // Drawn on the grid it says it is drawn on. An icon that overflows
         // the em is one that will be clipped by a neighbour's cell in the
         // atlas, which reads as a stray line through the next glyph along.
-        const bounds = o.bounds();
-        try testing.expect(bounds.min_x >= -1 and bounds.max_x <= em + 1);
-        try testing.expect(bounds.min_y >= -1 and bounds.max_y <= em + 1);
+        // The ink is what is measured, as the atlas measures it: a curve's
+        // controls may stand further out.
+        const ink = try r.flatten(gpa, o, .{});
+        try testing.expect(ink.min_x >= -slack and ink.max_x <= em + slack);
+        try testing.expect(-ink.max_y >= -slack and -ink.min_y <= em + slack);
 
         // And it is a shape, not a stroke that happens to have ink: every
         // icon here is filled, so every contour has to be closed.
@@ -392,8 +419,6 @@ test "an unregistered glyph draws the visible box rather than nothing" {
     try testing.expectEqualSlices(geom.Point, box.points.items, o.points.items);
 }
 
-const geom = @import("../../gelgja/geom.zig");
-
 test "an icon added by a theme is drawn by the same face" {
     const gpa = testing.allocator;
     var face = try create(gpa);
@@ -401,7 +426,7 @@ test "an icon added by a theme is drawn by the same face" {
 
     const set = setOf(face).?;
     var name: [8]u8 = "sparkle\x00".*;
-    const g = try set.add(name[0..7], "M12 2 14 10 22 12 14 14 12 22 10 14 2 12 10 10z");
+    const g = try set.add(name[0..7], "M128 16 152 104 240 128 152 152 128 240 104 152 16 128 104 104z");
     // The strings are copied: the caller's buffer is not the face's.
     @memset(&name, '?');
 

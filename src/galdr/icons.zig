@@ -9,9 +9,9 @@
 //!     return {
 //!       font = "icons/nerd.ttf",
 //!       icons = {
-//!         ["fenrir.bookmark"] = "M6 2h12v20l-6-5-6 5z",
+//!         ["fenrir.bookmark"] = "M64 24h128v208l-64-56-64 56z",
 //!         ["fenrir.search"]   = { glyph = 0xf002 },
-//!         ["fenrir.note"]     = { path = "M3 4h18v13H8z", slot = "menu" },
+//!         ["fenrir.note"]     = { path = "M32 40h192v144H88z", slot = "menu" },
 //!       },
 //!     }
 //!
@@ -47,7 +47,7 @@ pub const Error = error{
 
 /// What draws one icon, as a theme says it.
 pub const Source = union(enum) {
-    /// SVG path data, on the icon grid.
+    /// SVG path data, on the icon face's 256-unit grid, which is Phosphor's.
     path: []const u8,
     /// A code point in the theme's own font.
     glyph: u21,
