@@ -71,6 +71,10 @@ pub const Highlight = struct {
     /// a flag because this crosses into Lua, where a table field reading
     /// `kind = "ink"` needs no documentation to understand.
     kind: []const u8 = "block",
+    /// How a block marks its words, by PDF's name: `"highlight"`,
+    /// `"underline"`, `"strikeout"` or `"squiggly"`. Empty on ink, which Lua
+    /// then sees as `nil`.
+    style: []const u8 = "",
 };
 
 pub const VTable = struct {

@@ -350,6 +350,7 @@ else
     \\
 ++ (if (caps.marks)
     \\    m, enter             highlight it in the default colour
+    \\    _ / - / ~            underline it, strike it through, squiggle it
     \\
 else "") ++
     \\    y                    put it away; there is no clipboard yet, and a
@@ -372,6 +373,8 @@ const mark_modes =
     \\    n / N, j / k, tab    the next and previous highlight
     \\    ]a [a, ]c [c         the same, or only the ones with a note
     \\    1 .. 8               recolour it
+    \\    m / _ / - / ~        make it a highlight, an underline, a
+    \\                         strike-through or a squiggle
     \\    d, x, delete         delete it, and take the next
     \\    a, enter             write a note on it; enter keeps the note,
     \\                         escape throws it away
@@ -1866,6 +1869,7 @@ const Session = struct {
                 .page = h.page,
                 .box = .fromRect(h.x0, h.y0, h.x1, h.y1),
                 .color = color,
+                .style = std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight,
                 .note = h.note,
             }, true) catch return;
         }
@@ -2554,6 +2558,12 @@ const Session = struct {
     /// stacking on it, so selecting highlighted words and pressing `3`
     /// recolours them instead of darkening them.
     fn highlightBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color) void {
+        s.markBoxes(buffer_index, boxes, color, .highlight);
+    }
+
+    /// Marks each box, replacing what mostly covered the same words: marking
+    /// a line again in another colour or style is changing its mark.
+    fn markBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color, style: Marks.Style) void {
         const b = s.buffer(buffer_index);
         b.marks.beginGroup();
         defer b.marks.beginGroup();
@@ -2569,7 +2579,7 @@ const Session = struct {
                 if (area(shared) < area(mark.box) * 0.5) continue;
                 _ = b.marks.removeAt(s.gpa, i) catch return;
             }
-            _ = b.marks.add(s.gpa, .{ .page = pb.page, .box = pb.box, .color = color }, false) catch return;
+            _ = b.marks.add(s.gpa, .{ .page = pb.page, .box = pb.box, .color = color, .style = style }, false) catch return;
         }
     }
 
@@ -2588,7 +2598,7 @@ const Session = struct {
         // words, not a line, and `m` means those words -- otherwise the only
         // way to highlight a mouse selection would be to make it again with
         // the keyboard.
-        if (s.drag != null) return s.highlightSelection(null);
+        if (s.drag != null) return s.highlightSelection(null, .highlight);
 
         if (!v.cursor.visible or v.cursor.caret.isEmpty()) return;
 
@@ -2722,7 +2732,7 @@ const Session = struct {
     /// Visual mode's `m`, enter or a digit -- and `m` over a selection the
     /// mouse made, which is the only way a drag becomes a highlight: letting
     /// go of one does not, and `y` does not.
-    fn highlightSelection(s: *Session, colour: ?u8) void {
+    fn highlightSelection(s: *Session, colour: ?u8, style: Marks.Style) void {
         const v = s.view();
         const sel = s.activeSelection(v) orelse return;
         defer s.clearSelection();
@@ -2730,7 +2740,7 @@ const Session = struct {
         var boxes: std.ArrayList(PageBox) = .empty;
         defer boxes.deinit(s.gpa);
         s.selectionBoxes(v.buffer, sel[0], sel[1], s.lineSelection(), &boxes) catch return;
-        s.highlightBoxes(v.buffer, boxes.items, s.paletteColor(colour));
+        s.markBoxes(v.buffer, boxes.items, s.paletteColor(colour), style);
     }
 
     /// Visual mode's `d`: every highlight the selection touches goes.
@@ -3364,6 +3374,17 @@ const Session = struct {
         b.marks.recolour(s.gpa, i, s.paletteColor(colour)) catch {};
     }
 
+    fn restyleMark(s: *Session, style: Marks.Style) void {
+        const i = s.focusedMarkIndex() orelse return;
+        const b = s.buffer(s.view().buffer);
+        if (b.marks.items()[i].kind == .ink) {
+            s.status = "ink is drawn as it went -- only marked words have a style";
+            return;
+        }
+        b.marks.beginGroup();
+        b.marks.restyle(s.gpa, i, style) catch {};
+    }
+
     /// `d` in edit mode: delete the highlight in hand and take hold of the
     /// next one, so that deleting several in a row is `ddd`.
     fn deleteMark(s: *Session) void {
@@ -3483,6 +3504,7 @@ const Session = struct {
                         .y1 = mark.box.max_y,
                         .color = @constCast(hexOf(mark.color, &hex)),
                         .note = @constCast(mark.note),
+                        .style = @constCast(@tagName(mark.style)),
                     }, s.now()) catch return,
                     .ink => lib.addStroke(b.path, .{
                         .page = mark.page,
@@ -3503,7 +3525,7 @@ const Session = struct {
                 if (!mark.saved()) return;
                 var hex: [7]u8 = undefined;
                 switch (mark.kind) {
-                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note) catch {},
+                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note, @tagName(mark.style)) catch {},
                     .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex), mark.note) catch {},
                 }
             },
@@ -3531,6 +3553,7 @@ const Session = struct {
             .color = hexOf(mark.color, &hex),
             .note = mark.note,
             .kind = kindName(mark.kind),
+            .style = styleName(mark),
         } } });
     }
 
@@ -3540,6 +3563,12 @@ const Session = struct {
             .block => "block",
             .ink => "ink",
         };
+    }
+
+    /// PDF's name for how a block is drawn, and nothing for ink, which has
+    /// no style to report.
+    fn styleName(m: Marks.Mark) []const u8 {
+        return if (m.kind == .ink) "" else @tagName(m.style);
     }
 
     fn hexOf(c: Color, buf: *[7]u8) []const u8 {
@@ -4277,6 +4306,7 @@ const Session = struct {
             .color = hexOf(m.color, &s.hex_buf),
             .note = m.note,
             .kind = kindName(m.kind),
+            .style = styleName(m),
         };
     }
 
@@ -4578,7 +4608,8 @@ const Session = struct {
                 if (s.buffer(v.buffer).textMap(other.page)) |map| v.cursorTo(other, map);
                 v.scrollToCursor();
             },
-            .highlight_selection => |colour| s.highlightSelection(colour),
+            .highlight_selection => |colour| s.highlightSelection(colour, .highlight),
+            .style_selection => |style| s.highlightSelection(null, style),
             .yank_selection => {
                 // The selection goes and nothing is written: a selection is
                 // the interface's, never a mark, whichever key ends it.
@@ -4595,6 +4626,7 @@ const Session = struct {
             .jump_mark => |j| s.jumpMark(j),
             .jump_change => |forwards| s.jumpChange(forwards),
             .recolour_mark => |colour| s.recolourMark(colour),
+            .restyle_mark => |style| s.restyleMark(style),
             .delete_mark => s.deleteMark(),
 
             .pen_colour => |colour| s.setPenColour(colour),
@@ -5063,12 +5095,13 @@ const Session = struct {
         try s.drawScrollbar(v, over);
     }
 
-    /// The highlights on the pages a window can see.
+    /// The marks over words on the pages a window can see.
     ///
     /// Drawn over the page rather than under it, with alpha, because a PDF's
     /// paper is opaque: a highlight beneath it would not be visible at all.
     /// That means dark text shows through a light wash, which is what a
-    /// highlighter does to paper.
+    /// highlighter does to paper. An underline, a strike-through and a
+    /// squiggle are solid, being lines and not washes.
     ///
     /// The one in hand in edit mode is stronger and outlined, and one with a
     /// note carries a small tab at its top-right corner -- the note's text is
@@ -5095,11 +5128,15 @@ const Session = struct {
             const box = v.windowBox(page, mark.box);
             const held = editing and in_focus and s.focus_mark == mark.key;
             const c = mark.color;
-            try over.rounded(
-                blockOf(box, v.zoom),
-                .all(markRadius(v.zoom)),
-                .{ .r = c.r, .g = c.g, .b = c.b, .a = if (held) 0.55 else 0.35 },
-            );
+            switch (mark.style) {
+                .highlight => try over.rounded(
+                    blockOf(box, v.zoom),
+                    .all(markRadius(v.zoom)),
+                    .{ .r = c.r, .g = c.g, .b = c.b, .a = if (held) 0.55 else 0.35 },
+                ),
+                .underline, .strikeout => try over.fill(ruleOf(box, mark.style), c),
+                .squiggly => try squiggle(over, box, c),
+            }
             if (held) {
                 const pad = 2.0;
                 try over.border(
@@ -5294,6 +5331,49 @@ const Session = struct {
 
     fn markRadius(zoom: f32) f32 {
         return @max(2.0, zoom * 1.5);
+    }
+
+    /// How heavy an underline, a strike-through or a squiggle is: a twelfth
+    /// of the line it marks, so it keeps its weight against the type at
+    /// every zoom, and never under a pixel.
+    fn ruleWeight(box: Bounds) f32 {
+        return @max(1.0, box.height() / 12);
+    }
+
+    /// An underline at the foot of the box, or a strike-through across its
+    /// middle. One rect, as a highlight is one.
+    fn ruleOf(box: Bounds, style: Marks.Style) Bounds {
+        const t = ruleWeight(box);
+        const top = if (style == .underline) box.max_y - t else (box.min_y + box.max_y - t) * 0.5;
+        return .fromRect(box.min_x, top, box.max_x, top + t);
+    }
+
+    /// A squiggle along the foot of the box: half rings, the top of one and
+    /// the bottom of the next, each clipped to its half. Two halves meet with
+    /// the same upright tangent, so the chain is a smooth wave.
+    ///
+    /// Not ink's stamping, which it began as: a disc every half pixel was
+    /// 562 instances a line at 120%, fifty thousand for a page of squiggles,
+    /// rebuilt every frame. This is one a half wave, a fifth of that.
+    fn squiggle(over: *DrawList, box: Bounds, color: Color) !void {
+        const t = ruleWeight(box);
+        // To the middle of the stroke, and to its outside edge.
+        const r = 1.25 * t;
+        const outer = r + t * 0.5;
+        const y = box.max_y - outer;
+        over.pushClip(box);
+        defer over.popClip();
+
+        var x = box.min_x + r;
+        var up = true;
+        while (x - r < box.max_x) : ({
+            x += 2 * r;
+            up = !up;
+        }) {
+            over.pushClip(.fromRect(x - outer, if (up) y - outer else y, x + outer, if (up) y else y + outer));
+            defer over.popClip();
+            try over.border(.fromRect(x - outer, y - outer, x + outer, y + outer), .all(outer), t, color);
+        }
     }
 
     /// What is selected, drawn the way the highlight `m` would make of it, so
@@ -5785,11 +5865,16 @@ const Session = struct {
                         // A row with nothing written on it still has to say
                         // something, and what it says is this panel's to
                         // decide -- `panels.Row` draws what it is given. A
-                        // stroke says what it is rather than "no note",
-                        // because nothing ever writes a note on one.
+                        // stroke or a mark that is not a highlight says what
+                        // it is, since its chip cannot.
                         .label = if (m.note.len != 0)
                             m.note
-                        else if (m.kind == .ink) "ink" else "no note",
+                        else if (m.kind == .ink)
+                            "ink"
+                        else if (m.style != .highlight)
+                            m.style.label()
+                        else
+                            "no note",
                         .page = m.page + 1,
                         .swatch = m.color,
                         .id = m.key,
@@ -7048,6 +7133,57 @@ test "visual d removes the highlights the selection touches" {
     _ = s.apply(.unhighlight_selection);
 
     try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());
+}
+
+test "a selection underlined, then squiggled in edit mode, keeps its style in the library" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    try putText(&s, 0, 3, 4);
+
+    s.keymap.mode = .visual;
+    _ = s.apply(.enter_visual);
+    _ = s.apply(.{ .move_cursor = .word_next });
+    s.keymap.mode = .normal;
+    _ = s.apply(.{ .style_selection = .underline });
+    s.applyEffects();
+    const marks = &s.buffer(0).marks;
+    try testing.expectEqual(Marks.Style.underline, marks.items()[0].style);
+
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    _ = s.apply(.{ .restyle_mark = .squiggly });
+    s.applyEffects();
+
+    // Read back as the next session would.
+    marks.deinit(gpa);
+    s.loadMarks(0);
+    try testing.expectEqual(Marks.Style.squiggly, marks.items()[0].style);
+}
+
+test "an underline is one rect at the foot of the line, and a squiggle stays inside it" {
+    const gpa = testing.allocator;
+    const box: Bounds = .fromRect(100, 200, 400, 224);
+    const under = Session.ruleOf(box, .underline);
+    try testing.expectEqual(box.max_y, under.max_y);
+    try testing.expectApproxEqAbs(@as(f32, 2), under.height(), 1e-4);
+    const through = Session.ruleOf(box, .strikeout);
+    try testing.expectApproxEqAbs((box.min_y + box.max_y) * 0.5, (through.min_y + through.max_y) * 0.5, 1e-4);
+
+    var d: DrawList = .init(gpa, .fromRect(0, 0, 1000, 1000));
+    defer d.deinit();
+    try Session.squiggle(&d, box, .{ .r = 1, .g = 0, .b = 0, .a = 1 });
+    var ink: Bounds = .empty;
+    for (d.instances.items) |i| ink = ink.add(.{ .x = i.dst[0], .y = i.dst[1] }).add(.{ .x = i.dst[2], .y = i.dst[3] });
+    try testing.expect(ink.max_y <= box.max_y + 1e-3 and ink.min_y >= box.min_y);
+    // A half ring every five pixels of a line 24 tall: what it costs a frame.
+    try testing.expectEqual(@as(usize, 60), d.instances.items.len);
 }
 
 test "edit mode walks highlights in reading order, recolours, notes and deletes, and the library follows" {

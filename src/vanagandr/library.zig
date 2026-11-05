@@ -13,6 +13,7 @@ const Io = std.Io;
 const Context = @import("Context.zig");
 const mimir = fenrir.mimir;
 
+const Marks = fenrir.hlidskjalf.Marks;
 pub const Library = mimir.Library;
 
 /// The process environment, in the shape Mímir asks for.
@@ -169,7 +170,8 @@ pub fn recentRun(ctx: *Context, argv: []const []const u8) !void {
 
 pub const marks_usage =
     \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
-    \\                    [--ink PAGE X Y X Y ... [COLOUR]] [--db FILE]
+    \\                    [--style STYLE] [--ink PAGE X Y X Y ... [COLOUR]]
+    \\                    [--db FILE]
     \\
     \\    The marks made on a document, which `fenrir read` draws and keeps
     \\    here rather than writing into the PDF: the highlights made with m
@@ -180,6 +182,8 @@ pub const marks_usage =
     \\    fenrir marks paper.pdf --clear      remove every one, ink included
     \\    fenrir marks paper.pdf --add 3 72 700 300 712 yellow
     \\                                        add a highlight, for scripting
+    \\    --style STYLE                       what --add makes: highlight,
+    \\                                        underline, strikeout or squiggly
     \\    fenrir marks paper.pdf --ink 3 72 700 120 690 160 705 red
     \\                                        draw a stroke, the same way
     \\
@@ -193,6 +197,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var db_path: ?[]const u8 = null;
     var clear = false;
     var add: ?Library.Highlight = null;
+    var style: Marks.Style = .highlight;
     var colour: []const u8 = "";
     var ink_page: ?u32 = null;
     var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
@@ -207,6 +212,11 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
             db_path = argv[i];
         } else if (std.mem.eql(u8, arg, "--clear")) {
             clear = true;
+        } else if (std.mem.eql(u8, arg, "--style")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--style needs a style", .{});
+            style = std.meta.stringToEnum(Marks.Style, argv[i]) orelse
+                return ctx.fail("{s} is not a style: highlight, underline, strikeout or squiggly", .{argv[i]});
         } else if (std.mem.eql(u8, arg, "--add")) {
             if (i + 5 >= argv.len) return ctx.fail("--add needs PAGE X0 Y0 X1 Y1", .{});
             const page = std.fmt.parseInt(u32, argv[i + 1], 10) catch
@@ -297,6 +307,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
 
     if (add) |h| {
         var row = h;
+        row.style = @constCast(@tagName(style));
         // Normalised before it is stored, so the file holds `#rrggbb` whatever
         // name was typed -- the form `read` writes, and the one a person
         // editing the file would expect.
@@ -309,7 +320,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         }
         const id = lib.addHighlight(key, row, now(ctx.io)) catch |err|
             return ctx.fail("cannot add: {t}", .{err});
-        ctx.out.print("added highlight {d} on page {d}\n", .{ id, h.page + 1 }) catch {};
+        ctx.out.print("added {s} {d} on page {d}\n", .{ style.label(), id, h.page + 1 }) catch {};
         return;
     }
 
@@ -347,6 +358,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         ctx.out.print("page {d: >4}  ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})", .{
             h.page + 1, h.x0, h.y0, h.x1, h.y1,
         }) catch {};
+        if (!std.mem.eql(u8, h.style, "highlight")) ctx.out.print("  {s}", .{h.style}) catch {};
         if (h.color.len != 0) ctx.out.print("  {s}", .{h.color}) catch {};
         if (h.note.len != 0) ctx.out.print("  \"{s}\"", .{h.note}) catch {};
         ctx.out.print("\n", .{}) catch {};

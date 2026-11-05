@@ -15,11 +15,12 @@
 //!   highlight of a line. Where the reader starts and where `escape` returns.
 //! * **visual** -- selecting. `v` drops an anchor at the cursor and every
 //!   motion extends the selection from it; `V` selects whole lines. `m` or
-//!   enter highlights the selection, `d` removes highlights under it, a digit
+//!   enter highlights the selection, `_` underlines it, `-` strikes it
+//!   through and `~` squiggles it; `d` removes marks under it, a digit
 //!   highlights it in that colour.
 //! * **edit** -- changing marks that exist. `i` walks to the mark at or after
-//!   the cursor; `n` and `N` go between them; a digit recolours, `d` deletes,
-//!   `a` starts a note.
+//!   the cursor; `n` and `N` go between them; a digit recolours, `m _ - ~`
+//!   restyle, `d` deletes, `a` starts a note.
 //! * **draw** -- freehand ink. `d` enters it and the pointer is a pen; a digit
 //!   picks the colour, `[` and `]` change its width. Nothing is bound to a
 //!   motion here because the hand is on the mouse, which is the argument for
@@ -64,6 +65,7 @@ const std = @import("std");
 
 const thviti = @import("../thviti.zig");
 const Layout = @import("Layout.zig");
+const Marks = @import("Marks.zig");
 const View = @import("View.zig");
 
 const Input = thviti.Input;
@@ -182,6 +184,8 @@ pub const Command = union(enum) {
     swap_selection_ends,
     /// Highlight the selection, in the accent colour or a palette colour.
     highlight_selection: ?u8,
+    /// Mark the selection another way, in the accent colour.
+    style_selection: Marks.Style,
     /// `y`, Vim's yank. There is no clipboard yet -- `lyngvi.Window` leaves
     /// it out on purpose -- so this copies nothing and says so. What it must
     /// never do is highlight: see `visualKey`.
@@ -205,6 +209,7 @@ pub const Command = union(enum) {
     /// forwards when true. Anywhere `]a` is.
     jump_change: bool,
     recolour_mark: u8,
+    restyle_mark: Marks.Style,
     delete_mark,
 
     // -- draw
@@ -524,6 +529,19 @@ fn motion(c: u21) ?View.Step {
     };
 }
 
+/// What a key marks words with, in visual and edit mode. `-` and `_` zoom
+/// out in normal mode and that stays: a key meaning one thing per mode is
+/// what modes are for.
+fn styleKey(c: u21) ?Marks.Style {
+    return switch (c) {
+        'm' => .highlight,
+        '_' => .underline,
+        '-' => .strikeout,
+        '~' => .squiggly,
+        else => null,
+    };
+}
+
 fn digit(c: u21) ?u8 {
     if (c < '1' or c > '0' + palette_size) return null;
     return @intCast(c - '1');
@@ -646,6 +664,10 @@ fn visualKey(state: *State, c: u21, out: *Result) void {
             state.mode = .normal;
             break :blk .{ .highlight_selection = null };
         },
+        '_', '-', '~' => blk: {
+            state.mode = .normal;
+            break :blk .{ .style_selection = styleKey(c).? };
+        },
         // Not a highlight, though it was one. Somebody who selects and presses
         // `y` wants the words copied, and turning a selection into a stored
         // highlight is what the author has had to have taken out twice -- once
@@ -690,6 +712,7 @@ fn editKey(state: *State, c: u21, out: *Result) void {
     const cmd: Command = switch (c) {
         'n', 'j' => .next_mark,
         'N', 'k' => .previous_mark,
+        'm', '_', '-', '~' => .{ .restyle_mark = styleKey(c).? },
         'd', 'x' => .delete_mark,
         'u' => .undo,
         'a', 'i', 'A' => blk: {
@@ -951,6 +974,23 @@ test "edit mode walks, recolours, deletes and starts a note" {
     // `q` in edit mode leaves the mode, not the reader.
     try testing.expectEqual(Command.leave_mode, command(&state, typing("q")).items()[0]);
     try testing.expectEqual(Mode.normal, state.mode);
+}
+
+test "_ - and ~ mark a selection and restyle a mark, and still zoom in normal mode" {
+    var state: State = .{ .mode = .visual };
+    try testing.expectEqual(Marks.Style.underline, command(&state, typing("_")).items()[0].style_selection);
+    try testing.expectEqual(Mode.normal, state.mode);
+    state.mode = .visual_line;
+    try testing.expectEqual(Marks.Style.squiggly, command(&state, typing("~")).items()[0].style_selection);
+
+    // In edit mode the mark stays in hand, and `m` makes it a highlight again.
+    state.mode = .edit;
+    try testing.expectEqual(Marks.Style.strikeout, command(&state, typing("-")).items()[0].restyle_mark);
+    try testing.expectEqual(Marks.Style.highlight, command(&state, typing("m")).items()[0].restyle_mark);
+    try testing.expectEqual(Mode.edit, state.mode);
+
+    state.mode = .normal;
+    try testing.expect(command(&state, typing("-")).items()[0].zoom_by < 1);
 }
 
 test "in a note every key is text, even the ones that are commands elsewhere" {

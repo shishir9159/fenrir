@@ -3508,7 +3508,7 @@ fn apiSelection(L: ?*lua.State) callconv(.c) c_int {
 }
 
 fn pushHighlight(L: ?*lua.State, h: Host.Highlight) void {
-    lua.lua_createtable(L, 0, 9);
+    lua.lua_createtable(L, 0, 10);
     fillHighlight(L, h);
 }
 
@@ -3530,6 +3530,10 @@ fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
     lua.lua_setfield(L, -2, "note");
     lua.pushString(L, h.kind);
     lua.lua_setfield(L, -2, "kind");
+    if (h.style.len != 0) {
+        lua.pushString(L, h.style);
+        lua.lua_setfield(L, -2, "style");
+    }
 }
 
 fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {
@@ -3858,6 +3862,8 @@ const FakeHost = struct {
                 // a real host copies them, and this one forgets them.
                 copy.color = "";
                 copy.note = "";
+                // A real host's block always has one.
+                copy.style = "underline";
                 d.highlights.append(testing.allocator, copy) catch return null;
                 d.next_key += 1;
                 return copy.id;
@@ -4308,6 +4314,7 @@ test "the reader's state reads out and writes back" {
         \\local id = fenrir.highlight{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712, color = "#ff0000" }
         \\assert(#fenrir.highlights() == 1)
         \\assert(fenrir.highlights()[1].page == 2)
+        \\assert(fenrir.highlights()[1].style == "underline")
         \\assert(fenrir.unhighlight(id))
         \\assert(#fenrir.highlights() == 0)
         \\assert(fenrir.store.get("k") == nil)

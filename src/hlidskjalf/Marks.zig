@@ -66,6 +66,25 @@ const Marks = @This();
 /// the same reason `note` usually is.
 pub const Kind = enum { block, ink };
 
+/// How a block marks its words: PDF's four text-markup subtypes, so that
+/// writing one into a file is a name and not a translation.
+pub const Style = enum {
+    highlight,
+    underline,
+    strikeout,
+    squiggly,
+
+    /// What a person calls it, where the tag is what PDF does.
+    pub fn label(s: Style) []const u8 {
+        return switch (s) {
+            .highlight => "highlight",
+            .underline => "underline",
+            .strikeout => "strike-through",
+            .squiggly => "squiggle",
+        };
+    }
+};
+
 /// One mark.
 pub const Mark = struct {
     /// This session's name for it. Stable across undo and redo; see the note
@@ -80,6 +99,8 @@ pub const Mark = struct {
     /// field whichever kind it is.
     box: Bounds = .empty,
     color: Color = .{ .r = 1, .g = 0.9, .b = 0.2, .a = 1 },
+    /// How a block is drawn. Ink is drawn as it went and ignores it.
+    style: Style = .highlight,
     /// A note on it. Owned by the `Marks` it belongs to; see `owned`.
     note: []const u8 = &.{},
     /// Where the pen went, in PDF user space, or empty for a block. Owned
@@ -210,7 +231,7 @@ pub const Effect = union(enum) {
     /// This mark is gone: delete its row, if it has one. The whole mark and
     /// not only the row, so that a plugin can be told what was removed.
     delete: Mark,
-    /// Rewrite the colour and note of the mark with this key.
+    /// Rewrite the colour, note and style of the mark with this key.
     update: u64,
 };
 
@@ -375,6 +396,16 @@ pub fn recolour(m: *Marks, gpa: Allocator, index: usize, color: Color) Allocator
     if (std.meta.eql(before.color, color)) return;
     var after = before;
     after.color = color;
+    try m.replace(gpa, index, before, after);
+}
+
+/// A block drawn another way. A stroke has no other way, and stays as it is.
+pub fn restyle(m: *Marks, gpa: Allocator, index: usize, style: Style) Allocator.Error!void {
+    if (index >= m.list.items.len) return;
+    const before = m.list.items[index];
+    if (before.kind == .ink or before.style == style) return;
+    var after = before;
+    after.style = style;
     try m.replace(gpa, index, before, after);
 }
 
@@ -800,6 +831,33 @@ test "recolouring and notes are undoable, and survive the undo of something else
     _ = try m.redo(gpa);
     try testing.expectEqual(red, m.items()[0].color);
     try testing.expectEqualStrings("check this proof", m.items()[0].note);
+}
+
+test "a style is undoable and written, and a stroke has none to change" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 10, 10) }, true);
+    const pen = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 9, .y = 9 } };
+    _ = try m.add(gpa, .{ .kind = .ink, .page = 0, .points = &pen, .width = 1 }, true);
+
+    m.beginGroup();
+    try m.restyle(gpa, 0, .squiggly);
+    try testing.expectEqual(Style.squiggly, m.items()[0].style);
+    try testing.expectEqual(@as(u64, m.items()[0].key), m.takeEffects()[0].update);
+
+    // The same style again is no change, and ink is drawn as it went.
+    const revision = m.revision;
+    try m.restyle(gpa, 0, .squiggly);
+    try m.restyle(gpa, 1, .underline);
+    try testing.expectEqual(revision, m.revision);
+    try testing.expectEqual(Style.highlight, m.items()[1].style);
+
+    _ = try m.undo(gpa);
+    try testing.expectEqual(Style.highlight, m.items()[0].style);
+    _ = try m.redo(gpa);
+    try testing.expectEqual(Style.squiggly, m.items()[0].style);
 }
 
 test "effects say exactly what the database must do, rows included" {

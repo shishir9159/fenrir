@@ -53,7 +53,7 @@ pub const Error = Db.Error;
 /// forward on open; one from a *newer* version is left alone and opened
 /// read-only in effect, because a later fenrir may have added a column this
 /// one would drop on write.
-pub const schema_version: i64 = 4;
+pub const schema_version: i64 = 5;
 
 gpa: Allocator,
 db: Db,
@@ -188,6 +188,18 @@ fn migrate(lib: *Library, from: i64) Error!void {
         try lib.db.exec(
             \\BEGIN;
             \\ALTER TABLE ink ADD COLUMN note TEXT NOT NULL DEFAULT '';
+            \\COMMIT;
+        );
+    }
+
+    if (from < 5) {
+        // How a highlight marks its words, by PDF's names for the four ways:
+        // `highlight`, `underline`, `strikeout`, `squiggly`. Names and not
+        // numbers, so the file still reads, and so writing one into a PDF
+        // has nothing to translate. Every row before this was a highlight.
+        try lib.db.exec(
+            \\BEGIN;
+            \\ALTER TABLE highlight ADD COLUMN style TEXT NOT NULL DEFAULT 'highlight';
             \\COMMIT;
         );
     }
@@ -478,15 +490,22 @@ pub const Highlight = struct {
     /// that the file stays something a person can read and edit.
     color: []u8 = &.{},
     note: []u8 = &.{},
+    /// `highlight`, `underline`, `strikeout` or `squiggly`. Empty is written
+    /// as `highlight`, which is what a caller that does not say means.
+    style: []u8 = &.{},
 };
+
+fn styleOf(style: []const u8) []const u8 {
+    return if (style.len == 0) "highlight" else style;
+}
 
 /// Writes a highlight and returns the row it was given, so the caller can
 /// delete exactly this one later.
 pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Error!i64 {
     if (lib.future) return 0;
     var s = try lib.db.prepare(
-        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, style, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -497,21 +516,23 @@ pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Erro
     s.bindFloat(6, h.y1);
     s.bindText(7, h.color);
     s.bindText(8, h.note);
-    s.bindInt(9, now);
+    s.bindText(9, styleOf(h.style));
+    s.bindInt(10, now);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
 
-/// Rewrites what can change about a highlight once it exists: its colour and
-/// its note. Its box and page never change -- a highlight moved to other
-/// words is a different highlight, and is removed and added as one.
-pub fn updateHighlight(lib: Library, id: i64, color: []const u8, note: []const u8) Error!void {
+/// Rewrites what can change about a highlight once it exists: its colour, its
+/// note and its style. Its box and page never change -- a highlight moved to
+/// other words is a different highlight, and is removed and added as one.
+pub fn updateHighlight(lib: Library, id: i64, color: []const u8, note: []const u8, style: []const u8) Error!void {
     if (lib.future) return;
-    var s = try lib.db.prepare("UPDATE highlight SET color = ?2, note = ?3 WHERE id = ?1");
+    var s = try lib.db.prepare("UPDATE highlight SET color = ?2, note = ?3, style = ?4 WHERE id = ?1");
     defer s.finalize();
     s.bindInt(1, id);
     s.bindText(2, color);
     s.bindText(3, note);
+    s.bindText(4, styleOf(style));
     try s.exec();
 }
 
@@ -539,7 +560,7 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
     errdefer lib.freeHighlights(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, x0, y0, x1, y1, color, note FROM highlight
+        \\SELECT id, page, x0, y0, x1, y1, color, note, style FROM highlight
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -548,6 +569,9 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
         const color = try lib.gpa.dupe(u8, s.columnText(6));
         errdefer lib.gpa.free(color);
         const note = try lib.gpa.dupe(u8, s.columnText(7));
+        errdefer lib.gpa.free(note);
+        const style = try lib.gpa.dupe(u8, s.columnText(8));
+        errdefer lib.gpa.free(style);
         try out.append(lib.gpa, .{
             .id = s.columnInt(0),
             .page = @intCast(@max(0, s.columnInt(1))),
@@ -557,6 +581,7 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
             .y1 = @floatCast(s.columnFloat(5)),
             .color = color,
             .note = note,
+            .style = style,
         });
     }
     return out.toOwnedSlice(lib.gpa);
@@ -565,6 +590,7 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
 pub fn freeHighlight(lib: Library, h: Highlight) void {
     lib.gpa.free(h.color);
     lib.gpa.free(h.note);
+    lib.gpa.free(h.style);
 }
 
 pub fn freeHighlights(lib: Library, list: []Highlight, n: usize) void {
@@ -1032,13 +1058,19 @@ test "forgetting a document does not throw away what was highlighted in it" {
     try testing.expectEqual(@as(usize, 1), list.len);
 }
 
-test "a highlight's colour and note can be changed in place" {
+test "a highlight's colour, note and style can be changed in place" {
     if (!Db.available) return error.SkipZigTest;
     var lib = try memory();
     defer lib.close();
 
     const id = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
-    try lib.updateHighlight(id, "#3fa34d", "see lemma 3");
+    {
+        // Not saying is saying `highlight`, in the file as well.
+        const list = try lib.highlights("a.pdf");
+        defer lib.freeHighlights(list, list.len);
+        try testing.expectEqualStrings("highlight", list[0].style);
+    }
+    try lib.updateHighlight(id, "#3fa34d", "see lemma 3", "squiggly");
 
     const list = try lib.highlights("a.pdf");
     defer lib.freeHighlights(list, list.len);
@@ -1046,6 +1078,23 @@ test "a highlight's colour and note can be changed in place" {
     try testing.expectEqual(id, list[0].id);
     try testing.expectEqualStrings("#3fa34d", list[0].color);
     try testing.expectEqualStrings("see lemma 3", list[0].note);
+    try testing.expectEqualStrings("squiggly", list[0].style);
+}
+
+test "a version-4 file's highlights stay highlights" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    _ = try lib.addHighlight("old.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    try lib.db.exec("ALTER TABLE highlight DROP COLUMN style");
+    try lib.db.exec("PRAGMA user_version = 4");
+    try lib.migrate(4);
+    try testing.expectEqual(schema_version, try lib.userVersion());
+
+    const list = try lib.highlights("old.pdf");
+    defer lib.freeHighlights(list, list.len);
+    try testing.expectEqualStrings("highlight", list[0].style);
 }
 
 test "a stroke round-trips through the file, points and all" {
@@ -1174,6 +1223,7 @@ test "a version-3 file gains the note column without losing its ink" {
         \\);
         \\INSERT INTO ink (path, page, color, width, points, created_at)
         \\VALUES ('old.pdf', 1, '#c04040', 2, '10.00 20.00 30.00 40.00', 1);
+        \\ALTER TABLE highlight DROP COLUMN style;
         \\COMMIT;
     );
     try lib.db.exec("PRAGMA user_version = 3");
@@ -1203,6 +1253,7 @@ test "a version-2 file gains the ink table without losing its highlights" {
 
     // Wound back to where the previous release left it, then opened again.
     try lib.db.exec("DROP TABLE ink");
+    try lib.db.exec("ALTER TABLE highlight DROP COLUMN style");
     try lib.db.exec("PRAGMA user_version = 2");
     try lib.migrate(2);
     try testing.expectEqual(schema_version, try lib.userVersion());

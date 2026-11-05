@@ -452,6 +452,7 @@ const Driver = struct {
                 break :blk d.hex[0..h.color.len];
             } else "",
             .note = h.note,
+            .style = h.style,
         };
     }
 
