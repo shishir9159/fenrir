@@ -272,6 +272,9 @@ else
 ++ (if (caps.marks)
     \\    :undo, :redo         the history of the marks
     \\    :marks, :marks clear how many marks, or remove them all
+    \\    :filter WORDS        only the marks that match, in the panel and to
+    \\                         ]a: a colour, a style, ink, commented, or words
+    \\                         in the note; with no words, every mark again
     \\
 else "") ++ (if (caps.lua)
     \\    :lua CODE            run Lua, with the fenrir table
@@ -371,7 +374,8 @@ const mark_modes =
     \\
     \\edit mode (changing highlights), from i:
     \\    n / N, j / k, tab    the next and previous highlight
-    \\    ]a [a, ]c [c         the same, or only the ones with a note
+    \\    ]a [a, ]c [c         the same, or only the ones with a note, among
+    \\                         what :filter lets through
     \\    1 .. 8               recolour it
     \\    m / _ / - / ~        make it a highlight, an underline, a
     \\                         strike-through or a squiggle
@@ -1319,6 +1323,7 @@ const Session = struct {
         revision: u64 = 0,
         contributions: u32 = 0,
         compared: usize = 0,
+        filtered: u32 = 0,
     } = .{},
 
     /// What is written on the tabs, and the bytes those names point into.
@@ -2504,6 +2509,16 @@ const Session = struct {
         return Library.parseColor(palette_names[i - 1]).?;
     }
 
+    /// The annotations panel's filter, read out of its field. Parsed where it
+    /// is asked for -- on a key, or when the rows are rebuilt -- and never
+    /// held, so it cannot outlive the text its words point into.
+    fn markFilter(s: *Session) Marks.Filter {
+        var swatches: [palette_names.len + 1]Marks.Swatch = undefined;
+        swatches[0] = .{ .name = "default", .color = s.highlight };
+        for (palette_names, swatches[1..]) |name, *sw| sw.* = .{ .name = name, .color = Library.parseColor(name).? };
+        return .parse(s.panel.filterText(), &swatches);
+    }
+
     fn paletteName(index: u8) []const u8 {
         if (index == 0 or index > palette_names.len) return "the usual colour";
         return palette_names[index - 1];
@@ -2864,8 +2879,15 @@ const Session = struct {
             break :from .{ .page = page, .box = .fromRect(0, top, 0, top) };
         };
 
-        const to = b.marks.jump(from, j.forwards, j.comments) orelse {
-            s.status = if (j.comments)
+        // What the panel shows, whether or not it is open: a filter is set to
+        // be walked, and the status line says when one is in force.
+        var filter = s.markFilter();
+        const filtered = !filter.isEmpty();
+        filter.commented = filter.commented or j.comments;
+        const to = b.marks.jump(from, j.forwards, &filter) orelse {
+            s.status = if (filtered)
+                "nothing matches the filter -- :filter with nothing after it clears it"
+            else if (j.comments)
                 "no comments in this document -- a in edit mode writes one"
             else
                 "no marks in this document";
@@ -2880,11 +2902,12 @@ const Session = struct {
         s.last_jump = .{ .buffer = v.buffer, .key = to.key, .caret = v.cursor.caret };
 
         const round: []const u8 = if (!to.wrapped) "" else if (j.forwards) ", from the top" else ", from the end";
+        const of: []const u8 = if (filtered) " that match" else "";
         if (j.comments) {
             const note = b.marks.byKey(to.key).?.note;
-            s.say("comment {d}/{d}{s}: {s}", .{ to.place, to.of, round, note });
+            s.say("comment {d}/{d}{s}{s}: {s}", .{ to.place, to.of, of, round, note });
         } else {
-            s.say("mark {d}/{d}{s}", .{ to.place, to.of, round });
+            s.say("mark {d}/{d}{s}{s}", .{ to.place, to.of, of, round });
         }
     }
 
@@ -3765,6 +3788,19 @@ const Session = struct {
             .mprevious => s.jumpMark(.{ .forwards = false }),
             .cnext => s.jumpMark(.{ .forwards = true, .comments = true }),
             .cprevious => s.jumpMark(.{ .forwards = false, .comments = true }),
+            .filter => {
+                s.panel.setFilter(args);
+                if (s.chrome) |c| c.rails.show(.annotations);
+                const filter = s.markFilter();
+                if (filter.isEmpty()) {
+                    s.status = "no filter: every mark is shown, and ]a walks them all";
+                } else {
+                    const marks = s.buffer(v.buffer).marks.items();
+                    var n: usize = 0;
+                    for (marks) |m| n += @intFromBool(filter.matches(m));
+                    s.say("{d} of {d} marks match", .{ n, marks.len });
+                }
+            },
             .dnext => s.jumpChange(true),
             .dprevious => s.jumpChange(false),
             .diff => {
@@ -4470,7 +4506,7 @@ const Session = struct {
         // stays on screen. So the question is whether the field has it, not
         // whether the bar is open -- and the answer is last frame's, for the
         // same reason the rest of this function's answers are.
-        if (s.find.typing) return true;
+        if (s.find.typing or s.panel.typing) return true;
         const c = s.chrome orelse return false;
         return c.grabbing();
     }
@@ -5793,6 +5829,7 @@ const Session = struct {
             // A comparison made again hands over new results, and the rows
             // of the old ones borrow strings from them.
             .compared = if (s.diff) |c| @intFromPtr(c.results.ptr) else 0,
+            .filtered = s.panel.filtered,
         };
         if (std.meta.eql(s.rows_for, stamp)) return s.rows.items;
         s.rows_for = stamp;
@@ -5860,7 +5897,9 @@ const Session = struct {
                 }
             },
             .annotations => {
+                const filter = s.markFilter();
                 for (b.marks.items()) |m| {
+                    if (!filter.matches(m)) continue;
                     s.rows.append(s.gpa, .{
                         // A row with nothing written on it still has to say
                         // something, and what it says is this panel's to
@@ -5931,6 +5970,8 @@ const Session = struct {
         const which = c.rails.panel;
         if (which == .none) {
             s.panel.rect = .empty;
+            // Or a panel shut while its filter had the keyboard keeps it.
+            s.panel.typing = false;
             return;
         }
         s.panel.chosen = s.focus_mark orelse 0;
@@ -5940,6 +5981,10 @@ const Session = struct {
         // sentence for when it is empty, and a list of rows -- which is all
         // the annotations panel ever was.
         const declared = s.declaredPanel(which);
+        const rows = s.panelRows(which);
+        // Every mark is a row unless the filter says not, so marks and no
+        // rows can only be the filter.
+        const marked = s.buffer(s.view().buffer).marks.count() != 0;
         const chosen = try panels.panel(
             &c.ui,
             c.face,
@@ -5947,12 +5992,13 @@ const Session = struct {
             &c.icons,
             if (declared) |p| p.title else which.label(),
             if (declared) |p| p.empty else switch (which) {
-                .none, .annotations => "no highlights yet",
+                .none, .annotations => if (marked) "nothing matches the filter" else "no highlights yet",
                 .bookmarks => "this document has no outline",
                 .changes => "no differences",
                 .plugin => "",
             },
-            s.panelRows(which),
+            if (which == .annotations) "colour, style, ink, commented, #tag" else null,
+            rows,
             &s.panel,
             c.top,
         ) orelse return;
@@ -7331,6 +7377,37 @@ test "]a and ]c walk the marks from where the reader is, and come round again" {
     try testing.expect(s.exec("mprevious"));
     try testing.expect(s.focus_mark.? != held);
     try testing.expectEqual(s.last_jump.?.key, s.focus_mark.?);
+}
+
+test "]a walks what :filter lets the panel show, and the rows are those" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 600, 200, 612) }}, Library.parseColor("green").?);
+    s.highlightBoxes(0, &.{.{ .page = 1, .box = .fromRect(100, 500, 200, 512) }}, s.accent);
+    const marks = &s.buffer(0).marks;
+    try marks.setNote(gpa, 0, "#question one");
+    try marks.setNote(gpa, 2, "a #question too");
+
+    try testing.expect(s.exec("filter #question"));
+    try testing.expectEqualStrings("2 of 3 marks match", s.status);
+    try testing.expectEqual(@as(usize, 2), s.panelRows(.annotations).len);
+
+    // Over the green one, which the panel does not show.
+    _ = s.apply(.{ .jump_mark = .{ .forwards = true } });
+    try testing.expectEqual(marks.items()[0].key, s.last_jump.?.key);
+    _ = s.apply(.{ .jump_mark = .{ .forwards = true } });
+    try testing.expectEqual(marks.items()[2].key, s.last_jump.?.key);
+    try testing.expect(std.mem.indexOf(u8, s.status, "that match") != null);
+
+    // A colour by its swatch's name; then nothing, which is everything.
+    try testing.expect(s.exec("filter green"));
+    try testing.expectEqual(@as(usize, 1), s.panelRows(.annotations).len);
+    try testing.expect(s.exec("filter"));
+    try testing.expectEqual(@as(usize, 3), s.panelRows(.annotations).len);
 }
 
 test "backspace in a note removes a character, not a byte" {

@@ -603,6 +603,98 @@ pub fn step(m: Marks, from: ?u64, forwards: bool) ?u64 {
     return (best orelse wrap.?).key;
 }
 
+/// A colour a filter can name, by the name its swatch goes by.
+pub const Swatch = struct { name: []const u8, color: Color };
+
+/// What the annotations panel shows, and so what `]a` and `]c` walk.
+///
+/// Typed as words. Words of one sort are alternatives, and every sort named
+/// must hold: `yellow green #question` is a yellow or green mark whose note
+/// says `#question`. The sorts are a swatch's name; a style, or `ink`;
+/// `commented`; and any other word, which the note must contain -- so a
+/// `#tag` is only a word, and needs no syntax of its own. Case is ignored.
+pub const Filter = struct {
+    pub const max_terms = 8;
+
+    terms: u8 = 0,
+    styles: std.EnumSet(Style) = .empty,
+    ink: bool = false,
+    commented: bool = false,
+    colours: [max_terms]Color = undefined,
+    colour_count: u8 = 0,
+    /// Borrowed from the text parsed, which must outlive the filter.
+    words: [max_terms][]const u8 = undefined,
+    word_count: u8 = 0,
+
+    pub fn parse(text: []const u8, swatches: []const Swatch) Filter {
+        var f: Filter = .{};
+        var it = std.mem.tokenizeAny(u8, text, " \t");
+        while (it.next()) |word| : (f.terms += 1) {
+            if (f.terms == max_terms) break;
+            if (styleNamed(word)) |s| {
+                f.styles.insert(s);
+            } else if (std.ascii.eqlIgnoreCase(word, "ink")) {
+                f.ink = true;
+            } else if (std.ascii.eqlIgnoreCase(word, "commented")) {
+                f.commented = true;
+            } else if (swatchNamed(swatches, word)) |c| {
+                f.colours[f.colour_count] = c;
+                f.colour_count += 1;
+            } else {
+                f.words[f.word_count] = word;
+                f.word_count += 1;
+            }
+        }
+        return f;
+    }
+
+    pub fn isEmpty(f: *const Filter) bool {
+        return f.terms == 0;
+    }
+
+    pub fn matches(f: *const Filter, m: Mark) bool {
+        if (f.ink or f.styles.count() != 0) {
+            if (!(if (m.kind == .ink) f.ink else f.styles.contains(m.style))) return false;
+        }
+        if (f.colour_count != 0) {
+            for (f.colours[0..f.colour_count]) |c| {
+                if (sameColour(c, m.color)) break;
+            } else return false;
+        }
+        if (f.commented and m.note.len == 0) return false;
+        for (f.words[0..f.word_count]) |w| {
+            if (std.ascii.findIgnoreCase(m.note, w) == null) return false;
+        }
+        return true;
+    }
+
+    fn styleNamed(word: []const u8) ?Style {
+        inline for (@typeInfo(Style).@"enum".field_names) |name| {
+            const s = @field(Style, name);
+            if (std.ascii.eqlIgnoreCase(word, name) or std.ascii.eqlIgnoreCase(word, s.label())) return s;
+        }
+        return null;
+    }
+
+    fn swatchNamed(swatches: []const Swatch, word: []const u8) ?Color {
+        for (swatches) |s| {
+            if (std.ascii.eqlIgnoreCase(word, s.name)) return s.color;
+        }
+        return null;
+    }
+
+    /// Equal as the library stores them, a byte a channel: a mark read back
+    /// from `#f7e733` is the yellow swatch, whatever float it was made from.
+    fn sameColour(a: Color, b: Color) bool {
+        const byte = struct {
+            fn of(v: f32) u8 {
+                return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
+            }
+        }.of;
+        return byte(a.r) == byte(b.r) and byte(a.g) == byte(b.g) and byte(a.b) == byte(b.b);
+    }
+};
+
 /// Where `jump` landed, and where that is among the marks it could have.
 pub const Jumped = struct {
     key: u64,
@@ -613,19 +705,19 @@ pub const Jumped = struct {
     of: usize,
 };
 
-/// The mark after (or before) `from` in reading order, wrapping; with
-/// `noted`, only a mark with a note on it. Null when none qualifies.
+/// The mark after (or before) `from` in reading order, wrapping, among those
+/// `filter` lets through. Null when none does.
 ///
 /// `from` is a place, not necessarily a mark: a point is a mark with a key of
 /// zero, which no mark has, and a box of no size -- the probe `atOrAfter`
 /// makes. A real mark is skipped as itself, so stepping from one never lands
 /// on it again unless it is the only one.
-pub fn jump(m: Marks, from: Mark, forwards: bool, noted: bool) ?Jumped {
+pub fn jump(m: Marks, from: Mark, forwards: bool, filter: *const Filter) ?Jumped {
     var best: ?Mark = null;
     var wrap: ?Mark = null;
     var of: usize = 0;
     for (m.list.items) |mark| {
-        if (noted and mark.note.len == 0) continue;
+        if (!filter.matches(mark)) continue;
         of += 1;
         if (wrap == null or (if (forwards) readsBefore(mark, wrap.?) else readsBefore(wrap.?, mark))) wrap = mark;
         if (mark.key == from.key) continue;
@@ -636,8 +728,7 @@ pub fn jump(m: Marks, from: Mark, forwards: bool, noted: bool) ?Jumped {
     const to = best orelse wrap orelse return null;
     var place: usize = 1;
     for (m.list.items) |mark| {
-        if (noted and mark.note.len == 0) continue;
-        if (readsBefore(mark, to)) place += 1;
+        if (filter.matches(mark) and readsBefore(mark, to)) place += 1;
     }
     return .{ .key = to.key, .wrapped = best == null, .place = place, .of = of };
 }
@@ -944,35 +1035,83 @@ test "a jump goes to the next mark from a point or a mark, and can ask for a not
     const top = m.items()[0];
     const noted = m.items()[1];
     const p2 = m.items()[2];
+    const any: Filter = .{};
+    const commented: Filter = .{ .commented = true };
 
     // From a point between the first two: forwards is the middle one,
     // backwards the top one, and neither wrapped.
     const between: Mark = .{ .page = 1, .box = box(5, 500, 5, 500) };
-    const fwd = m.jump(between, true, false).?;
+    const fwd = m.jump(between, true, &any).?;
     try testing.expectEqual(noted.key, fwd.key);
     try testing.expect(!fwd.wrapped);
     try testing.expectEqual(@as(usize, 2), fwd.place);
     try testing.expectEqual(@as(usize, 3), fwd.of);
-    try testing.expectEqual(top.key, m.jump(between, false, false).?.key);
+    try testing.expectEqual(top.key, m.jump(between, false, &any).?.key);
 
     // From a mark it never lands on itself, and past the end it wraps.
-    try testing.expectEqual(p2.key, m.jump(noted, true, false).?.key);
-    const round = m.jump(p2, true, false).?;
+    try testing.expectEqual(p2.key, m.jump(noted, true, &any).?.key);
+    const round = m.jump(p2, true, &any).?;
     try testing.expectEqual(top.key, round.key);
     try testing.expect(round.wrapped);
 
     // Only the noted one counts for a comment, whichever way and from where.
-    const c = m.jump(p2, true, true).?;
+    const c = m.jump(p2, true, &commented).?;
     try testing.expectEqual(noted.key, c.key);
     try testing.expect(c.wrapped);
     try testing.expectEqual(@as(usize, 1), c.of);
-    try testing.expectEqual(noted.key, m.jump(noted, false, true).?.key);
+    try testing.expectEqual(noted.key, m.jump(noted, false, &commented).?.key);
 
     // And with no note anywhere there is nothing to go to.
     var bare: Marks = .{};
     defer bare.deinit(gpa);
     _ = try bare.add(gpa, .{ .page = 0, .box = box(0, 0, 10, 10) }, true);
-    try testing.expect(bare.jump(between, true, true) == null);
+    try testing.expect(bare.jump(between, true, &commented) == null);
+}
+
+test "a filter's words of one sort are alternatives, and every sort must hold" {
+    const yellow: Color = .{ .r = 247.0 / 255.0, .g = 231.0 / 255.0, .b = 51.0 / 255.0, .a = 1 };
+    const green: Color = .{ .r = 63.0 / 255.0, .g = 163.0 / 255.0, .b = 77.0 / 255.0, .a = 1 };
+    const swatches = [_]Swatch{ .{ .name = "yellow", .color = yellow }, .{ .name = "green", .color = green } };
+
+    const question: Mark = .{ .color = yellow, .note = "Is this #Question settled?" };
+    const plain: Mark = .{ .color = green, .style = .underline };
+    const pen: Mark = .{ .kind = .ink, .color = green };
+
+    const f = Filter.parse("YELLOW green #question", &swatches);
+    try testing.expectEqual(@as(u8, 3), f.terms);
+    try testing.expect(f.matches(question));
+    try testing.expect(!f.matches(plain)); // green, but says nothing
+
+    // A style and ink are one sort: either will do.
+    const shapes = Filter.parse("strike-through ink", &swatches);
+    try testing.expect(shapes.matches(pen));
+    try testing.expect(!shapes.matches(plain));
+    try testing.expect(Filter.parse("underline", &swatches).matches(plain));
+
+    try testing.expect(!Filter.parse("commented", &swatches).matches(plain));
+    try testing.expect(Filter.parse("  ", &swatches).isEmpty());
+
+    // A colour read back from the library is a byte a channel off the float
+    // it was made from, and is still that swatch.
+    var faded = question;
+    faded.color.g += 0.001;
+    try testing.expect(Filter.parse("yellow", &swatches).matches(faded));
+}
+
+test "a jump walks only what the filter lets through" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 700, 10, 710), .note = "#q one" }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 600, 10, 610) }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 500, 10, 510), .note = "#q two" }, true);
+
+    const f = Filter.parse("#q", &.{});
+    const to = m.jump(m.items()[0], true, &f).?;
+    try testing.expectEqual(m.items()[2].key, to.key);
+    try testing.expectEqual(@as(usize, 2), to.place);
+    try testing.expectEqual(@as(usize, 2), to.of);
 }
 
 test "an empty group is not an undo step" {

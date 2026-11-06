@@ -109,15 +109,44 @@ pub const State = struct {
     /// is the only thing that knows where its rows are.
     reveal: bool = false,
 
+    /// The field at the top of a panel that filters. `bytes` is re-aimed on
+    /// every use, for the reason `find.State.field` gives.
+    filter: w.Field = .{ .bytes = &.{} },
+    filter_buf: [filter_max]u8 = undefined,
+    /// Bumped by every change to the filter: the stamp the reader keeps its
+    /// rows against, as it keeps them against `Marks.revision`.
+    filtered: u32 = 0,
+    /// The field had the keyboard when it was last drawn. Last frame's, as
+    /// `find.State.typing` is and for the same reason.
+    typing: bool = false,
+
     pub fn holds(st: *const State, p: fenrir.gelgja.Point) bool {
         return st.rect.contains(p);
     }
+
+    pub fn filterText(st: *State) []const u8 {
+        st.filter.bytes = &st.filter_buf;
+        return st.filter.slice();
+    }
+
+    /// What `:filter` does, which is what typing into the field does.
+    pub fn setFilter(st: *State, text: []const u8) void {
+        st.filter.bytes = &st.filter_buf;
+        st.filter.set(text);
+        st.filtered +%= 1;
+    }
 };
+
+/// The longest filter a panel holds: eight words and room to spare.
+pub const filter_max = 128;
 
 /// The panel, and the row that was activated in it.
 ///
 /// Built after the bar and the rails and before the popups, which is where it
 /// belongs in the stack: over the page, under anything modal.
+///
+/// `filter` is the hint a filter field shows while empty, or null for a panel
+/// with no field. What the words mean is the caller's: this file holds them.
 pub fn panel(
     ui: *UI,
     face: Fonts.FontId,
@@ -125,6 +154,7 @@ pub fn panel(
     icons: *const Icons,
     title: []const u8,
     empty: []const u8,
+    filter: ?[]const u8,
     rows: []const Row,
     st: *State,
     top: f32,
@@ -169,6 +199,32 @@ pub fn panel(
             .size = 18,
         })).clicked;
         try w.spacer(ui, .px(pad * 0.5));
+    }
+
+    // Above the rows and before the early return, so a filter that matches
+    // nothing can still be changed.
+    st.typing = false;
+    if (filter) |hint| {
+        st.filter.bytes = &st.filter_buf;
+        ui.next(.{ .w = .fill, .h = .px(head_height), .axis = .x, .child_align = .center });
+        const row = try ui.open("filter");
+        defer ui.close(row);
+
+        try w.spacer(ui, .px(pad));
+        const funnel = icons.byName("fenrir.filter", .toolbar_small);
+        ui.next(.{ .fg = t.text_dim, .font = funnel.font, .font_size = funnel.px });
+        _ = try w.label(ui, funnel.text);
+        try w.spacer(ui, .px(pad * 0.5));
+
+        const r = try w.field.textField(ui, "query", &st.filter, .{ .w = .fill, .h = .px(22), .placeholder = hint });
+        if (r.edited) st.filtered +%= 1;
+        // Enter and escape give the keyboard back and keep the words: the
+        // filter is what the panel shows until it is changed, not a question
+        // asked once.
+        const done = r.submitted or r.cancelled;
+        if (done) ui.setFocus(.nil);
+        st.typing = !done and ui.focus == thviti.key.make(row.key, "query");
+        try w.spacer(ui, .px(pad));
     }
 
     if (rows.len == 0) {
@@ -325,6 +381,7 @@ const Rig = struct {
     fonts: Fonts,
     icons: Icons,
     ui: UI,
+    filter: ?[]const u8 = null,
 
     fn init(rig: *Rig) !void {
         rig.* = .{
@@ -350,6 +407,7 @@ const Rig = struct {
             &rig.icons,
             "Annotations",
             "no highlights yet",
+            rig.filter,
             rows,
             st,
             0,
@@ -495,4 +553,23 @@ test "only the rows the panel can see are built" {
     // The two spacers standing in for what is above and below, and a couple
     // of rows of overscan either side of what fits.
     try testing.expect(built < 30);
+}
+
+test "a panel that filters has its field with nothing to show, and typing is a change" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    rig.filter = "colour, style, #tag";
+
+    var st: State = .{};
+    _ = try rig.frame(&.{}, &st, .{});
+    const field = rig.find(&.{ "filter", "query" }).?;
+    _ = try rig.click(&.{}, &st, middleOf(field));
+    try testing.expect(st.typing);
+
+    _ = try rig.frame(&.{}, &st, .{ .events = &.{.{ .text = "#q" }} });
+    try testing.expectEqualStrings("#q", st.filterText());
+    try testing.expectEqual(@as(u32, 1), st.filtered);
+    // And it is still saying why the list is empty, under the field.
+    try testing.expect(rig.find(&.{ "empty", "said" }) != null);
 }

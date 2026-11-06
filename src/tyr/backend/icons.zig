@@ -122,6 +122,7 @@ pub const builtin = [_]Icon{
     .{ .name = "menu", .d = ph.list },
     .{ .name = "settings", .d = ph.sliders_horizontal },
     .{ .name = "panel", .d = ph.sidebar_simple },
+    .{ .name = "filter", .d = ph.funnel },
     .{ .name = "split", .d = ph.square_split_horizontal },
     // A plus over a minus: what came and what went.
     .{ .name = "changes", .d = ph.plus_minus },
