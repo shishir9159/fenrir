@@ -25,6 +25,7 @@ const builtin = @import("builtin");
 const fenrir = @import("fenrir");
 
 const Context = @import("Context.zig");
+const config = @import("config.zig");
 const library = @import("library.zig");
 
 const galdr = fenrir.galdr;
@@ -191,11 +192,38 @@ fn storage(r: *Report, db_path: ?[]const u8) void {
     r.line(.ok, "schema", "version {d}", .{found});
 }
 
+/// Which fenrir.toml the reader would read, and whether it would start with
+/// it. Checked as the reader checks it, so a line refused here is the line
+/// the reader would refuse -- except that whether `[read]`'s flags are ones
+/// `read` takes is the reader's own loop to say.
+fn written(r: *Report) void {
+    const ctx = r.ctx;
+    const path = config.find(ctx) orelse {
+        r.line(.off, "fenrir.toml", "none here or beside the library, which is fine", .{});
+        return;
+    };
+    var diag: mimir.toml.Diagnostic = .{};
+    const w = config.read(ctx.gpa, ctx.io, path, &diag) catch |err| {
+        if (err == error.Invalid) {
+            r.line(.bad, "fenrir.toml", "{s}:{d}: {s}", .{ path, diag.line, diag.message() });
+        } else {
+            r.line(.bad, "fenrir.toml", "{s}: {t}", .{ path, err });
+        }
+        return;
+    };
+    r.line(.ok, "fenrir.toml", "{s}", .{path});
+    if (w.flags.len == 0) return;
+    // The words `read` will see before the typed ones.
+    r.line(.ok, "[read]", "{s}", .{std.mem.join(ctx.gpa, " ", w.flags) catch "?"});
+}
+
 /// Where plugins are read from, and whether it is there. Returns the
 /// directory so the plugin section can use it; the caller frees it.
 fn configuration(r: *Report, dir_arg: ?[]const u8) !?[]u8 {
     r.section("configuration");
     const ctx = r.ctx;
+    // Before Lua, because the file is read whether or not there is any.
+    if (fenrir.build_options.config) written(r);
     if (!galdr.available) {
         r.line(.off, "directory", "this build has no Lua, so nothing is read", .{});
         return null;

@@ -65,6 +65,7 @@ const fenrir = @import("fenrir");
 
 const Context = @import("Context.zig");
 const chrome_mod = @import("chrome.zig");
+const config_mod = @import("config.zig");
 const diff_mod = @import("diff.zig");
 const glyphmod = @import("glyphs.zig");
 const Images = @import("images.zig").Images;
@@ -130,6 +131,7 @@ const ComparisonIfCompared = if (caps.compare) *diff_mod.Comparison else noretur
 const RuntimeIfScripted = if (caps.lua) *galdr.Runtime else noreturn;
 const BenchKind = if (caps.bench) Bench.Kind else noreturn;
 const BenchDriver = if (caps.bench) Bench else noreturn;
+const WrittenIfRead = if (caps.config) config_mod.Written else noreturn;
 
 const Backend = enum { cpu, gpu };
 
@@ -149,6 +151,7 @@ pub const usage = synopsis ++ view_flags ++
     (if (caps.instruments) validate_flag else "") ++
     (if (caps.sqlite) db_flag else "") ++
     (if (caps.lua) plugin_flags else "") ++
+    (if (caps.config) config_note else "") ++
     colon_commands ++
     (if (caps.splits) window_keys else "") ++
     normal_mode ++
@@ -244,6 +247,16 @@ const plugin_flags =
     \\    --config DIR Read init.lua and plugins/ from DIR instead of the
     \\                 configuration directory. $FENRIR_CONFIG does the same.
     \\    --clean      Run no plugins and no init.lua.
+    \\
+;
+
+const config_note =
+    \\
+    \\    fenrir.toml, in the directory fenrir starts in or else beside the
+    \\    library, holds what would otherwise be typed every time: theme and
+    \\    accent at the top, and under [read] the flags above by name, as in
+    \\    zoom = 1.25 or vsync = "off", with a switch written as NAME = true.
+    \\    A flag typed wins over one written there; nothing writes the file.
     \\
 ;
 
@@ -458,7 +471,11 @@ pub fn run(ctx: *Context, args: []const []const u8) !void {
 
 /// The reader, and with `comparison` the two documents of a `fenrir diff`
 /// side by side: see `arrangeComparison`.
-pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?ComparisonIfCompared) !void {
+pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?ComparisonIfCompared) !void {
+    // fenrir.toml, before anything is parsed, because its `[read]` is parsed
+    // with the typed flags. See `config.zig`.
+    const written: ?WrittenIfRead = if (caps.config) try config_mod.load(ctx) else null;
+
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(ctx.gpa);
 
@@ -486,116 +503,135 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?ComparisonI
     // guards are comptime-known: a `light` build does not merely refuse
     // `--bench`, it has no `--bench` to refuse and nothing of the benchmark
     // driver in it. `unknown option` is then the truth rather than a policy.
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (caps.instruments and std.mem.eql(u8, arg, "--validate")) {
-            validate = true;
-        } else if (std.mem.eql(u8, arg, "--page")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--page needs a number", .{});
-            start_page = std.fmt.parseInt(u32, args[i], 10) catch
-                return ctx.fail("--page wants a number, not '{s}'", .{args[i]});
-            if (start_page == 0) return ctx.fail("pages are numbered from 1", .{});
-            page_given = true;
-        } else if (std.mem.eql(u8, arg, "--zoom")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--zoom needs a number", .{});
-            zoom = std.fmt.parseFloat(f32, args[i]) catch
-                return ctx.fail("--zoom wants a number, not '{s}'", .{args[i]});
-        } else if (std.mem.eql(u8, arg, "--dpi")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--dpi needs a number", .{});
-            const dpi = std.fmt.parseFloat(f32, args[i]) catch
-                return ctx.fail("--dpi wants a number, not '{s}'", .{args[i]});
-            zoom = dpi / 72.0;
-        } else if (std.mem.eql(u8, arg, "--samples")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--samples needs 1, 2, 4 or 8", .{});
-            samples = switch (std.fmt.parseInt(u8, args[i], 10) catch 0) {
-                1 => .one,
-                2 => .two,
-                4 => .four,
-                8 => .eight,
-                else => return ctx.fail("--samples wants 1, 2, 4 or 8", .{}),
-            };
-        } else if (caps.bench and std.mem.eql(u8, arg, "--frames")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--frames needs a count", .{});
-            frames = std.fmt.parseInt(u32, args[i], 10) catch
-                return ctx.fail("--frames wants a number, not '{s}'", .{args[i]});
-        } else if (caps.bench and std.mem.eql(u8, arg, "--time")) {
-            timing = true;
-        } else if (caps.bench and std.mem.eql(u8, arg, "--bench")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--bench needs scroll, zoom or flip", .{});
-            bench = std.meta.stringToEnum(Bench.Kind, args[i]) orelse
-                return ctx.fail("--bench wants scroll, zoom or flip, not '{s}'", .{args[i]});
-            timing = true;
-        } else if (caps.sqlite and std.mem.eql(u8, arg, "--db")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--db needs a file", .{});
-            db_path = args[i];
-        } else if (caps.splits and std.mem.eql(u8, arg, "--split")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--split needs v, h, or a run of them", .{});
-            for (args[i]) |c| {
-                if (c != 'v' and c != 'h') return ctx.fail("--split wants v and h, not '{c}'", .{c});
-            }
-            splits = args[i];
-        } else if (caps.lua and std.mem.eql(u8, arg, "--clean")) {
-            clean = true;
-        } else if (caps.lua and std.mem.eql(u8, arg, "--config")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--config needs a directory", .{});
-            config_dir = args[i];
-        } else if (caps.diagnostics and std.mem.eql(u8, arg, "--device")) {
-            on_device = true;
-        } else if (caps.diagnostics and std.mem.eql(u8, arg, "--shot")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--shot needs a file", .{});
-            shot = args[i];
-        } else if (have_both and std.mem.eql(u8, arg, "--path")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--path needs cpu or gpu", .{});
-            if (std.mem.eql(u8, args[i], "cpu")) {
-                backend = .cpu;
-            } else if (std.mem.eql(u8, args[i], "gpu")) {
-                backend = .gpu;
+    //
+    // Twice: the flags fenrir.toml wrote down, then the typed ones, so a flag
+    // typed now wins. Each pass is a list of its own, so a flag in the file
+    // left without its value cannot take the first typed argument -- the
+    // document -- as one. A refusal in the first pass says which file it
+    // came from.
+    var from_file: ?[]const u8 = null;
+    errdefer if (from_file) |path| ctx.note("    (in {s})", .{path});
+    const passes = [_][]const []const u8{ if (written) |w| w.flags else &.{}, typed };
+    for (passes, 0..) |args, pass| {
+        from_file = if (written) |w| (if (pass == 0) w.path else null) else null;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (caps.instruments and std.mem.eql(u8, arg, "--validate")) {
+                validate = true;
+            } else if (std.mem.eql(u8, arg, "--page")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--page needs a number", .{});
+                start_page = std.fmt.parseInt(u32, args[i], 10) catch
+                    return ctx.fail("--page wants a number, not '{s}'", .{args[i]});
+                if (start_page == 0) return ctx.fail("pages are numbered from 1", .{});
+                page_given = true;
+            } else if (std.mem.eql(u8, arg, "--zoom")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--zoom needs a number", .{});
+                zoom = std.fmt.parseFloat(f32, args[i]) catch
+                    return ctx.fail("--zoom wants a number, not '{s}'", .{args[i]});
+            } else if (std.mem.eql(u8, arg, "--dpi")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--dpi needs a number", .{});
+                const dpi = std.fmt.parseFloat(f32, args[i]) catch
+                    return ctx.fail("--dpi wants a number, not '{s}'", .{args[i]});
+                zoom = dpi / 72.0;
+            } else if (std.mem.eql(u8, arg, "--samples")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--samples needs 1, 2, 4 or 8", .{});
+                samples = switch (std.fmt.parseInt(u8, args[i], 10) catch 0) {
+                    1 => .one,
+                    2 => .two,
+                    4 => .four,
+                    8 => .eight,
+                    else => return ctx.fail("--samples wants 1, 2, 4 or 8", .{}),
+                };
+            } else if (caps.bench and std.mem.eql(u8, arg, "--frames")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--frames needs a count", .{});
+                frames = std.fmt.parseInt(u32, args[i], 10) catch
+                    return ctx.fail("--frames wants a number, not '{s}'", .{args[i]});
+            } else if (caps.bench and std.mem.eql(u8, arg, "--time")) {
+                timing = true;
+            } else if (caps.bench and std.mem.eql(u8, arg, "--bench")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--bench needs scroll, zoom or flip", .{});
+                bench = std.meta.stringToEnum(Bench.Kind, args[i]) orelse
+                    return ctx.fail("--bench wants scroll, zoom or flip, not '{s}'", .{args[i]});
+                timing = true;
+            } else if (caps.sqlite and std.mem.eql(u8, arg, "--db")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--db needs a file", .{});
+                db_path = args[i];
+            } else if (caps.splits and std.mem.eql(u8, arg, "--split")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--split needs v, h, or a run of them", .{});
+                for (args[i]) |c| {
+                    if (c != 'v' and c != 'h') return ctx.fail("--split wants v and h, not '{c}'", .{c});
+                }
+                splits = args[i];
+            } else if (caps.lua and std.mem.eql(u8, arg, "--clean")) {
+                clean = true;
+            } else if (caps.lua and std.mem.eql(u8, arg, "--config")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--config needs a directory", .{});
+                config_dir = args[i];
+            } else if (caps.diagnostics and std.mem.eql(u8, arg, "--device")) {
+                on_device = true;
+            } else if (caps.diagnostics and std.mem.eql(u8, arg, "--shot")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--shot needs a file", .{});
+                shot = args[i];
+            } else if (have_both and std.mem.eql(u8, arg, "--path")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--path needs cpu or gpu", .{});
+                if (std.mem.eql(u8, args[i], "cpu")) {
+                    backend = .cpu;
+                } else if (std.mem.eql(u8, args[i], "gpu")) {
+                    backend = .gpu;
+                } else {
+                    return ctx.fail("--path wants cpu or gpu, not '{s}'", .{args[i]});
+                }
+            } else if (std.mem.eql(u8, arg, "--gpu")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--gpu needs a name", .{});
+                prefer = args[i];
+            } else if (std.mem.eql(u8, arg, "--vsync")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--vsync needs on, off or adaptive", .{});
+                vsync = if (std.mem.eql(u8, args[i], "on"))
+                    .on
+                else if (std.mem.eql(u8, args[i], "off"))
+                    .off
+                else if (std.mem.eql(u8, args[i], "adaptive"))
+                    .adaptive
+                else
+                    return ctx.fail("--vsync wants on, off or adaptive", .{});
+            } else if (std.mem.eql(u8, arg, "--size")) {
+                i += 1;
+                if (i >= args.len) return ctx.fail("--size needs WxH", .{});
+                const x = std.mem.indexOfScalar(u8, args[i], 'x') orelse
+                    return ctx.fail("--size wants WxH", .{});
+                width = std.fmt.parseInt(u32, args[i][0..x], 10) catch
+                    return ctx.fail("--size wants WxH", .{});
+                height = std.fmt.parseInt(u32, args[i][x + 1 ..], 10) catch
+                    return ctx.fail("--size wants WxH", .{});
+                if (width == 0 or height == 0) return ctx.fail("--size must be positive", .{});
+            } else if (std.mem.startsWith(u8, arg, "-")) {
+                return ctx.fail("unknown option {s}", .{arg});
+            } else if (caps.config and pass == 0) {
+                // The file names no documents. A word on its own in its list
+                // is the value a switch was written with: `clean = "yes"` is
+                // `--clean yes`, and so is `clean = false`.
+                const name = std.mem.trimStart(u8, args[i - 1], "-");
+                return ctx.fail("{s} is a switch: write {s} = true, or leave it out", .{ name, name });
             } else {
-                return ctx.fail("--path wants cpu or gpu, not '{s}'", .{args[i]});
+                try files.append(ctx.gpa, arg);
             }
-        } else if (std.mem.eql(u8, arg, "--gpu")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--gpu needs a name", .{});
-            prefer = args[i];
-        } else if (std.mem.eql(u8, arg, "--vsync")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--vsync needs on, off or adaptive", .{});
-            vsync = if (std.mem.eql(u8, args[i], "on"))
-                .on
-            else if (std.mem.eql(u8, args[i], "off"))
-                .off
-            else if (std.mem.eql(u8, args[i], "adaptive"))
-                .adaptive
-            else
-                return ctx.fail("--vsync wants on, off or adaptive", .{});
-        } else if (std.mem.eql(u8, arg, "--size")) {
-            i += 1;
-            if (i >= args.len) return ctx.fail("--size needs WxH", .{});
-            const x = std.mem.indexOfScalar(u8, args[i], 'x') orelse
-                return ctx.fail("--size wants WxH", .{});
-            width = std.fmt.parseInt(u32, args[i][0..x], 10) catch
-                return ctx.fail("--size wants WxH", .{});
-            height = std.fmt.parseInt(u32, args[i][x + 1 ..], 10) catch
-                return ctx.fail("--size wants WxH", .{});
-            if (width == 0 or height == 0) return ctx.fail("--size must be positive", .{});
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return ctx.fail("unknown option {s}", .{arg});
-        } else {
-            try files.append(ctx.gpa, arg);
         }
     }
+    from_file = null;
 
     if (files.items.len == 0) return ctx.fail("read needs a file", .{});
     if (comparison != null and files.items.len != 2) return ctx.fail("a comparison is of two documents", .{});
@@ -659,9 +695,19 @@ pub fn runWith(ctx: *Context, args: []const []const u8, comparison: ?ComparisonI
     // ends at the last page and must not leave the reader there.
     session.remembers_place = shot == null and comparison == null and bench == null;
     if (caps.compare) session.diff = comparison;
+    // fenrir.toml's settings over the library's, for this session and never
+    // written into it: the library is what was last clicked, the file is
+    // what somebody wrote down to have every time.
+    if (written) |w| {
+        if (w.accent) |c| {
+            session.chosen_accent = c;
+            session.highlight = c;
+        }
+    }
+    const written_theme: ?Theme = if (written) |w| w.theme else null;
     // After the accent, because the theme carries it: `useTheme` puts the
     // chosen colour back on top of whichever theme was named.
-    session.useTheme(session.rememberedTheme());
+    session.useTheme(written_theme orelse session.rememberedTheme());
 
     for (files.items) |file| {
         _ = session.openBuffer(file) catch |err| {

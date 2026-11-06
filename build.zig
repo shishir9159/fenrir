@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "path_cpu", caps.path_cpu);
     opts.addOption(bool, "path_gpu", caps.path_gpu);
     opts.addOption(bool, "tools", caps.tools);
+    opts.addOption(bool, "config", caps.config);
     opts.addOption(bool, "splits", caps.splits);
     opts.addOption(bool, "marks", caps.marks);
     opts.addOption(bool, "compare", caps.compare);
@@ -339,6 +340,10 @@ const Caps = struct {
     store: bool,
     /// Galdr: Lua, init.lua, plugins.
     plugins: bool,
+    /// `fenrir.toml`: the reader's options and settings, read from a file at
+    /// start. Not in `light`, which reads nothing it was not handed on its
+    /// command line: a viewer that opens now has no file to look for first.
+    config: bool,
     /// The split tree's commands and the tab bar. The tree itself is the
     /// reader's spine and is in every build; what goes is `:sp`, `:tabnew`
     /// and the bar.
@@ -492,6 +497,7 @@ fn resolve(b: *std.Build) Caps {
         .path_gpu = profile == .debug or path != .cpu,
         .store = !light and (want_sqlite orelse true),
         .plugins = !light and (want_lua orelse true),
+        .config = !light,
         .splits = !light,
         .marks = !light,
         .compare = !light,
