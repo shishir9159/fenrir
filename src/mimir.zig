@@ -9,6 +9,8 @@
 //! * `Db` is SQLite with its entry points declared by hand.
 //! * `Library` is the schema: recent files with where you were in each, and
 //!   settings, including the author name and the accent colour.
+//! * `toml` reads `fenrir.toml`, the one thing here a person writes rather
+//!   than the reader, and `configPath` is where it is found.
 //!
 //! Nothing above this layer may assume it exists. `-Dsqlite=false` compiles
 //! it away to functions that report `error.NoDatabase`, and every caller is
@@ -20,6 +22,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Db = @import("mimir/Db.zig");
 pub const Library = @import("mimir/Library.zig");
+pub const toml = @import("mimir/toml.zig");
 
 /// True when this build can remember anything.
 pub const available = Db.available;
@@ -93,6 +96,38 @@ fn set(value: ?[]const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
+/// What the file a person writes their options in is called.
+pub const config_name = "fenrir.toml";
+
+/// Where `fenrir.toml` is, if anywhere: the one in `here`, the directory the
+/// program started in, or else the one beside the library. Caller owns it.
+///
+/// One or the other and never the two merged, as the author asked. A
+/// project's own file is the whole answer to how its documents open, so the
+/// question "why is this dark" has one file to look in rather than two and
+/// an order between them. Do not "improve" this into a cascade.
+///
+/// Beside the library and not in Galdr's directory, because the library's
+/// is where this program already keeps what is yours on every platform --
+/// and so `FENRIR_DB`, which moves the library, moves this with it, and a
+/// portable install stays one directory.
+pub fn configPath(gpa: Allocator, io: std.Io, here: std.Io.Dir, env: Environment) ?[]u8 {
+    if (here.realPathFileAlloc(io, config_name, gpa)) |real| {
+        defer gpa.free(real);
+        return gpa.dupe(u8, real) catch null;
+    } else |_| {}
+
+    const db = defaultPath(gpa, env) catch return null;
+    defer gpa.free(db);
+    const dir = std.fs.path.dirname(db) orelse return null;
+    const beside = std.fs.path.join(gpa, &.{ dir, config_name }) catch return null;
+    std.Io.Dir.cwd().access(io, beside, .{}) catch {
+        gpa.free(beside);
+        return null;
+    };
+    return beside;
+}
+
 /// Opens the library at `path`, or at `defaultPath` when none is given,
 /// creating the directory it lives in.
 ///
@@ -118,6 +153,7 @@ pub fn open(gpa: Allocator, io: std.Io, env: Environment, path: ?[]const u8) ?Li
 test {
     _ = Db;
     _ = Library;
+    _ = toml;
 }
 
 /// An environment made of pairs, for the tests.
@@ -161,4 +197,36 @@ test "the database path follows the platform, and FENRIR_DB overrides it" {
     // which would put a database wherever the program happened to start.
     const nothing: FakeEnv = .{ .pairs = &.{} };
     try std.testing.expectError(error.NoHome, defaultPath(gpa, nothing.environment()));
+}
+
+test "fenrir.toml is the working directory's, or else the one beside the library" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const sep = std.fs.path.sep_str;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "work");
+    try tmp.dir.createDirPath(io, "lib");
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+
+    const db = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "lib", "fenrir.db" });
+    defer gpa.free(db);
+    const env: FakeEnv = .{ .pairs = &.{.{ "FENRIR_DB", db }} };
+
+    // Neither, which is every reader on its first day and not an error.
+    try std.testing.expect(configPath(gpa, io, work, env.environment()) == null);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/fenrir.toml", .data = "" });
+    const beside = configPath(gpa, io, work, env.environment()).?;
+    defer gpa.free(beside);
+    try std.testing.expect(std.mem.endsWith(u8, beside, "lib" ++ sep ++ config_name));
+
+    // With its own, the directory's is the only file read. The author asked
+    // for one or the other, not the two merged.
+    try work.writeFile(io, .{ .sub_path = config_name, .data = "" });
+    const local = configPath(gpa, io, work, env.environment()).?;
+    defer gpa.free(local);
+    try std.testing.expect(std.mem.endsWith(u8, local, "work" ++ sep ++ config_name));
 }
