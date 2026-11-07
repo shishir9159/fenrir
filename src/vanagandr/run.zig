@@ -493,6 +493,8 @@ const Driver = struct {
             .y1 = @max(h.y0, h.y1),
             .color = @constCast(h.color),
             .note = @constCast(h.note),
+            // Empty is written as a highlight, and Galdr has refused the rest.
+            .style = @constCast(h.style),
         }, library.now(d.ctx.io)) catch return null;
         d.forget();
         return @intCast(id);

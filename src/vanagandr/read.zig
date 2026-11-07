@@ -2565,6 +2565,9 @@ const Session = struct {
         return .parse(s.panel.filterText(), &swatches);
     }
 
+    /// Said wherever a filter has left nothing to walk.
+    const unmatched = "nothing matches the filter -- :filter with nothing after it clears it";
+
     fn paletteName(index: u8) []const u8 {
         if (index == 0 or index > palette_names.len) return "the usual colour";
         return palette_names[index - 1];
@@ -2838,7 +2841,8 @@ const Session = struct {
 
     // -- edit mode -----------------------------------------------------------
 
-    /// `i`: take hold of the highlight at or after the cursor.
+    /// `i`: take hold of the highlight at or after the cursor, among those
+    /// the filter lets through -- the first of what `n` will walk.
     fn enterEdit(s: *Session) void {
         const v = s.view();
         const b = s.buffer(v.buffer);
@@ -2848,15 +2852,21 @@ const Session = struct {
             return;
         }
 
+        const filter = s.markFilter();
         const key = if (v.cursor.visible and !v.cursor.caret.isEmpty())
             b.marks.atOrAfter(v.cursor.page, .{
                 .x = v.cursor.caret.min_x,
                 .y = (v.cursor.caret.min_y + v.cursor.caret.max_y) * 0.5,
-            })
+            }, &filter)
         else blk: {
             const page = v.currentPage();
-            break :blk b.marks.atOrAfter(page, .{ .x = 0, .y = v.pageBox(page).max_y });
+            break :blk b.marks.atOrAfter(page, .{ .x = 0, .y = v.pageBox(page).max_y }, &filter);
         };
+        if (key == null) {
+            s.keymap.mode = .normal;
+            s.status = unmatched;
+            return;
+        }
         s.focusMark(key);
     }
 
@@ -2886,11 +2896,6 @@ const Session = struct {
     fn focusedMarkIndex(s: *Session) ?usize {
         const key = s.focus_mark orelse return null;
         return s.buffer(s.view().buffer).marks.indexOf(key);
-    }
-
-    fn stepMark(s: *Session, forwards: bool) void {
-        const b = s.buffer(s.view().buffer);
-        s.focusMark(b.marks.step(s.focus_mark, forwards));
     }
 
     const Jumped = struct { buffer: u32, key: u64, caret: Bounds };
@@ -2932,7 +2937,7 @@ const Session = struct {
         filter.commented = filter.commented or j.comments;
         const to = b.marks.jump(from, j.forwards, &filter) orelse {
             s.status = if (filtered)
-                "nothing matches the filter -- :filter with nothing after it clears it"
+                unmatched
             else if (j.comments)
                 "no comments in this document -- a in edit mode writes one"
             else
@@ -3456,21 +3461,29 @@ const Session = struct {
 
     /// `d` in edit mode: delete the highlight in hand and take hold of the
     /// next one, so that deleting several in a row is `ddd`.
+    ///
+    /// The next of what `n` walks, so `ddd` under a filter deletes only what
+    /// the panel shows, and stops when the filter has nothing left rather
+    /// than going on into marks the panel hides.
     fn deleteMark(s: *Session) void {
         const i = s.focusedMarkIndex() orelse return;
         const b = s.buffer(s.view().buffer);
-        const next = b.marks.step(s.focus_mark, true);
+        const filter = s.markFilter();
+        const next = if (b.marks.jump(b.marks.items()[i], true, &filter)) |to| to.key else null;
 
         b.marks.beginGroup();
         _ = b.marks.removeAt(s.gpa, i) catch return;
 
-        if (b.marks.count() == 0) {
+        if (next == null or next == s.focus_mark) {
             s.focus_mark = null;
             s.keymap.mode = .normal;
-            s.status = "that was the last highlight";
+            s.status = if (b.marks.count() == 0)
+                "that was the last highlight"
+            else
+                "that was the last that matches -- :filter with nothing after it clears it";
             return;
         }
-        s.focusMark(if (next != s.focus_mark) next else b.marks.step(null, true));
+        s.focusMark(next);
     }
 
     fn beginNote(s: *Session) void {
@@ -4405,6 +4418,8 @@ const Session = struct {
             .page = h.page - 1,
             .box = .fromRect(@min(h.x0, h.x1), @min(h.y0, h.y1), @max(h.x0, h.x1), @max(h.y0, h.y1)),
             .color = color,
+            // Galdr has refused any name that is not one of these.
+            .style = std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight,
             .note = h.note,
         }, false) catch return null;
         return b.marks.items()[index].key;
@@ -4703,8 +4718,12 @@ const Session = struct {
             .toggle_highlight => s.toggleMark(),
             .clear_highlights => s.clearMarks(),
 
-            .next_mark => s.stepMark(true),
-            .previous_mark => s.stepMark(false),
+            // Edit mode's `n` and `N` are `]a` and `[a`: they walk what the
+            // filter lets through. The author asked for this -- don't give
+            // them a walk of their own over every mark again, or the panel
+            // shows one set and `n` steps through another.
+            .next_mark => s.jumpMark(.{ .forwards = true }),
+            .previous_mark => s.jumpMark(.{ .forwards = false }),
             .jump_mark => |j| s.jumpMark(j),
             .jump_change => |forwards| s.jumpChange(forwards),
             .recolour_mark => |colour| s.recolourMark(colour),
@@ -5657,12 +5676,14 @@ const Session = struct {
         // does not, because what is being typed is about to replace it.
         if ((mode == .edit or mode == .note) and s.focusedMarkIndex() != null) {
             const held = b.marks.items()[s.focusedMarkIndex().?];
-            var place: usize = 1;
-            for (b.marks.items()) |m| {
-                if (Marks.readsBefore(m, held)) place += 1;
-            }
+            // Among what the filter lets through, which is what `n` walks;
+            // among them all when the one in hand is not one of those -- a
+            // click takes hold of any mark, and a recolour can take one out.
+            var filter = s.markFilter();
+            if (!filter.matches(held)) filter = .{};
+            const at = b.marks.placeOf(held, &filter);
             var wr: std.Io.Writer = .fixed(&s.mode_buf);
-            wr.print("{s} {d}/{d}", .{ mode.label(), place, b.marks.count() }) catch {};
+            wr.print("{s} {d}/{d}", .{ mode.label(), at.place, at.of }) catch {};
             st.mode = s.mode_buf[0..wr.end];
             if (mode == .edit) st.note = held.note;
         }
@@ -7456,6 +7477,61 @@ test "]a walks what :filter lets the panel show, and the rows are those" {
     try testing.expectEqual(@as(usize, 3), s.panelRows(.annotations).len);
 }
 
+// The author asked for edit mode to walk the filter as `]a` does. `n` and `N`
+// stepping every mark while the panel shows a few is what this pins.
+test "edit mode's i, n, N and d walk what the filter lets through" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    // A question, a plain one, and another question, down the page.
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 600, 200, 612) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 500, 200, 512) }}, s.accent);
+    const marks = &s.buffer(0).marks;
+    try marks.setNote(gpa, 0, "#question one");
+    try marks.setNote(gpa, 2, "#question two");
+    const one = marks.items()[0].key;
+    const plain = marks.items()[1].key;
+    const two = marks.items()[2].key;
+    try testing.expect(s.exec("filter #question"));
+
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    try testing.expectEqual(one, s.focus_mark.?);
+    try testing.expectEqualStrings("-- EDIT -- 1/2", s.statusLine().mode);
+
+    // Over the plain one, both ways.
+    _ = s.apply(.next_mark);
+    try testing.expectEqual(two, s.focus_mark.?);
+    try testing.expectEqualStrings("-- EDIT -- 2/2", s.statusLine().mode);
+    _ = s.apply(.previous_mark);
+    try testing.expectEqual(one, s.focus_mark.?);
+
+    // A click can still take hold of the plain one, which is then counted
+    // among them all.
+    s.focus_mark = plain;
+    try testing.expectEqualStrings("-- EDIT -- 2/3", s.statusLine().mode);
+
+    // `d` goes on to the next question, and after the last stops, leaving
+    // the plain one where it was.
+    s.focus_mark = one;
+    _ = s.apply(.delete_mark);
+    try testing.expectEqual(two, s.focus_mark.?);
+    _ = s.apply(.delete_mark);
+    try testing.expect(s.focus_mark == null);
+    try testing.expectEqual(keys.Mode.normal, s.keymap.mode);
+    try testing.expectEqual(@as(usize, 1), marks.count());
+    try testing.expectEqual(plain, marks.items()[0].key);
+
+    // And `i` with nothing to match does not take hold of what is left.
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    try testing.expectEqual(keys.Mode.normal, s.keymap.mode);
+    try testing.expect(std.mem.startsWith(u8, s.status, "nothing matches"));
+}
+
 test "backspace in a note removes a character, not a byte" {
     const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
@@ -8063,7 +8139,7 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
         \\fenrir.on("DocEnter", function(e) entered = (entered or 0) + 1 end)
         \\fenrir.keymap("n", "g", function() fenrir.go(fenrir.document().pages) end)
         \\fenrir.command("Mark", function(args)
-        \\  fenrir.highlight{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", note = "from lua" }
+        \\  fenrir.highlight{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", style = "squiggly", note = "from lua" }
         \\end)
     ));
 
@@ -8086,6 +8162,7 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
     try testing.expectEqual(@as(u32, 2), marks[0].page);
     try testing.expectEqualStrings("from lua", marks[0].note);
     try testing.expectEqual(Library.parseColor("blue").?, marks[0].color);
+    try testing.expectEqual(Marks.Style.squiggly, marks[0].style);
 
     // Undo is the reader's, and the plugin hears about both.
     _ = s.apply(.undo);

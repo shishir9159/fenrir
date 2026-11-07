@@ -578,35 +578,11 @@ pub fn readsBefore(a: Mark, b: Mark) bool {
     return a.box.min_x < b.box.min_x;
 }
 
-/// The key of the mark after (or before) `from` in reading order, wrapping.
-/// With `from` null, the first (or last) one.
-pub fn step(m: Marks, from: ?u64, forwards: bool) ?u64 {
-    if (m.list.items.len == 0) return null;
-    const current = if (from) |k| blk: {
-        const i = m.indexOf(k) orelse break :blk null;
-        break :blk m.list.items[i];
-    } else null;
-
-    var best: ?Mark = null;
-    var wrap: ?Mark = null;
-    for (m.list.items) |mark| {
-        // The wrap candidate: the first mark of all, or the last.
-        if (wrap == null or (if (forwards) readsBefore(mark, wrap.?) else readsBefore(wrap.?, mark))) wrap = mark;
-
-        const c = current orelse continue;
-        if (mark.key == c.key) continue;
-        const ahead = if (forwards) readsBefore(c, mark) else readsBefore(mark, c);
-        if (!ahead) continue;
-        if (best == null or (if (forwards) readsBefore(mark, best.?) else readsBefore(best.?, mark))) best = mark;
-    }
-    if (current == null) return wrap.?.key;
-    return (best orelse wrap.?).key;
-}
-
 /// A colour a filter can name, by the name its swatch goes by.
 pub const Swatch = struct { name: []const u8, color: Color };
 
-/// What the annotations panel shows, and so what `]a` and `]c` walk.
+/// What the annotations panel shows, and so what `]a` and `]c` walk, and
+/// edit mode's `i`, `n`, `N` and `d`.
 ///
 /// Typed as words. Words of one sort are alternatives, and every sort named
 /// must hold: `yellow green #question` is a yellow or green mark whose note
@@ -715,10 +691,8 @@ pub const Jumped = struct {
 pub fn jump(m: Marks, from: Mark, forwards: bool, filter: *const Filter) ?Jumped {
     var best: ?Mark = null;
     var wrap: ?Mark = null;
-    var of: usize = 0;
     for (m.list.items) |mark| {
         if (!filter.matches(mark)) continue;
-        of += 1;
         if (wrap == null or (if (forwards) readsBefore(mark, wrap.?) else readsBefore(wrap.?, mark))) wrap = mark;
         if (mark.key == from.key) continue;
         const ahead = if (forwards) readsBefore(from, mark) else readsBefore(mark, from);
@@ -726,25 +700,41 @@ pub fn jump(m: Marks, from: Mark, forwards: bool, filter: *const Filter) ?Jumped
         if (best == null or (if (forwards) readsBefore(mark, best.?) else readsBefore(best.?, mark))) best = mark;
     }
     const to = best orelse wrap orelse return null;
-    var place: usize = 1;
-    for (m.list.items) |mark| {
-        if (filter.matches(mark) and readsBefore(mark, to)) place += 1;
-    }
-    return .{ .key = to.key, .wrapped = best == null, .place = place, .of = of };
+    const where = m.placeOf(to, filter);
+    return .{ .key = to.key, .wrapped = best == null, .place = where.place, .of = where.of };
 }
 
-/// The first mark at or after a point in reading order: where edit mode
-/// starts when it is entered from the cursor.
-pub fn atOrAfter(m: Marks, page: u32, p: Point) ?u64 {
+pub const Place = struct { place: usize, of: usize };
+
+/// Where `mark` falls in reading order among the marks `filter` lets
+/// through: from 1, of how many. One count for the jump and the status
+/// line, so that the line's `edit 2/5` is the count `n` steps through.
+pub fn placeOf(m: Marks, mark: Mark, filter: *const Filter) Place {
+    var where: Place = .{ .place = 1, .of = 0 };
+    for (m.list.items) |other| {
+        if (!filter.matches(other)) continue;
+        where.of += 1;
+        if (readsBefore(other, mark)) where.place += 1;
+    }
+    return where;
+}
+
+/// The first mark `filter` lets through at or after a point in reading
+/// order, wrapping: where edit mode starts when it is entered from the
+/// cursor. Null when none does.
+pub fn atOrAfter(m: Marks, page: u32, p: Point, filter: *const Filter) ?u64 {
     const probe: Mark = .{ .page = page, .box = .fromRect(p.x, p.y, p.x, p.y) };
     var best: ?Mark = null;
+    var first: ?Mark = null;
     for (m.list.items) |mark| {
+        if (!filter.matches(mark)) continue;
         if (mark.page == page and mark.box.contains(p)) return mark.key;
+        if (first == null or readsBefore(mark, first.?)) first = mark;
         if (readsBefore(mark, probe)) continue;
         if (best == null or readsBefore(mark, best.?)) best = mark;
     }
-    if (best) |b| return b.key;
-    return m.step(null, true);
+    const to = best orelse first orelse return null;
+    return to.key;
 }
 
 // -- tests --------------------------------------------------------------------
@@ -1008,20 +998,20 @@ test "marks are walked in reading order, and wrap" {
     _ = try m.add(gpa, .{ .page = 2, .box = box(0, 700, 10, 710) }, true);
     _ = try m.add(gpa, .{ .page = 1, .box = box(0, 100, 10, 110) }, true);
     _ = try m.add(gpa, .{ .page = 1, .box = box(0, 700, 10, 710) }, true);
-    const p2 = m.items()[0].key;
-    const bottom = m.items()[1].key;
-    const top = m.items()[2].key;
+    const p2 = m.items()[0];
+    const bottom = m.items()[1];
+    const top = m.items()[2];
+    const any: Filter = .{};
 
-    try testing.expectEqual(top, m.step(null, true).?);
-    try testing.expectEqual(bottom, m.step(top, true).?);
-    try testing.expectEqual(p2, m.step(bottom, true).?);
-    try testing.expectEqual(top, m.step(p2, true).?);
-    try testing.expectEqual(p2, m.step(top, false).?);
+    try testing.expectEqual(bottom.key, m.jump(top, true, &any).?.key);
+    try testing.expectEqual(p2.key, m.jump(bottom, true, &any).?.key);
+    try testing.expectEqual(top.key, m.jump(p2, true, &any).?.key);
+    try testing.expectEqual(p2.key, m.jump(top, false, &any).?.key);
 
     // From a point in the middle of page 1, the next is the bottom one.
-    try testing.expectEqual(bottom, m.atOrAfter(1, .{ .x = 5, .y = 400 }).?);
+    try testing.expectEqual(bottom.key, m.atOrAfter(1, .{ .x = 5, .y = 400 }, &any).?);
     // And from past the end, it wraps to the start.
-    try testing.expectEqual(top, m.atOrAfter(9, .{ .x = 5, .y = 400 }).?);
+    try testing.expectEqual(top.key, m.atOrAfter(9, .{ .x = 5, .y = 400 }, &any).?);
 }
 
 test "a jump goes to the next mark from a point or a mark, and can ask for a note" {
@@ -1112,6 +1102,17 @@ test "a jump walks only what the filter lets through" {
     try testing.expectEqual(m.items()[2].key, to.key);
     try testing.expectEqual(@as(usize, 2), to.place);
     try testing.expectEqual(@as(usize, 2), to.of);
+
+    // Edit mode taken up inside the unmatched mark starts at the next that
+    // matches, and one past the last that matches wraps to the first.
+    try testing.expectEqual(m.items()[2].key, m.atOrAfter(0, .{ .x = 5, .y = 605 }, &f).?);
+    try testing.expectEqual(m.items()[0].key, m.atOrAfter(0, .{ .x = 5, .y = 100 }, &f).?);
+    try testing.expect(m.atOrAfter(0, .{ .x = 5, .y = 605 }, &Filter.parse("#nothing", &.{})) == null);
+
+    // The unmatched one is still counted among them all.
+    const all: Filter = .{};
+    try testing.expectEqual(Place{ .place = 2, .of = 3 }, m.placeOf(m.items()[1], &all));
+    try testing.expectEqual(Place{ .place = 2, .of = 2 }, m.placeOf(m.items()[2], &f));
 }
 
 test "an empty group is not an undo step" {

@@ -80,6 +80,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Host = @import("Host.zig");
+const Marks = @import("../hlidskjalf/Marks.zig");
 const keys = @import("../hlidskjalf/keys.zig");
 const keyspec = @import("keyspec.zig");
 const lua = @import("lua.zig");
@@ -1370,7 +1371,7 @@ pub const api = [_]Entry{
         .name = "highlight",
         .func = apiHighlight,
         .cap = .document_write,
-        .args = "{ doc =, page =, x0 =, y0 =, x1 =, y1 =, color =, note = }",
+        .args = "{ doc =, page =, x0 =, y0 =, x1 =, y1 =, color =, style =, note = }",
         .returns = "id",
         .about = "makes one, in PDF points, so it survives zoom and reopening",
     },
@@ -3553,8 +3554,8 @@ fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {
     return 1;
 }
 
-/// `fenrir.highlight{page=, x0=, y0=, x1=, y1=, color=, note=}`, returning
-/// the new highlight's id.
+/// `fenrir.highlight{page=, x0=, y0=, x1=, y1=, color=, style=, note=}`,
+/// returning the new highlight's id.
 fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
@@ -3586,6 +3587,19 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
     h.color = lua.toString(L, -1) orelse "";
     _ = lua.lua_getfield(L, 1, "note");
     h.note = lua.toString(L, -1) orelse "";
+
+    // PDF's four names, exactly as `highlights()` reads them back: the
+    // author asked for `squiggly`, not `squiggle`. Don't take the names
+    // `Marks.Filter` also accepts for a person typing -- a plugin's style
+    // is what the file holds. Anything else is refused rather than made a
+    // highlight, so a misspelling is an error its author sees and not a
+    // mark that quietly looks wrong.
+    _ = lua.lua_getfield(L, 1, "style");
+    if (lua.typeOf(L, -1) != .nil) {
+        h.style = lua.toString(L, -1) orelse "";
+        if (std.meta.stringToEnum(Marks.Style, h.style) == null)
+            lua.raise(L, "galdr: a highlight's style is \"highlight\", \"underline\", \"strikeout\" or \"squiggly\"");
+    }
 
     if (of(L).host.addHighlight(doc, h)) |id| lua.lua_pushinteger(L, @intCast(id)) else lua.lua_pushnil(L);
     return 1;
@@ -3862,8 +3876,9 @@ const FakeHost = struct {
                 // a real host copies them, and this one forgets them.
                 copy.color = "";
                 copy.note = "";
-                // A real host's block always has one.
-                copy.style = "underline";
+                // A real host's block always has one, and `highlight` when
+                // none was asked for. The enum's name, since Lua's is not kept.
+                copy.style = @tagName(std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight);
                 d.highlights.append(testing.allocator, copy) catch return null;
                 d.next_key += 1;
                 return copy.id;
@@ -4314,9 +4329,11 @@ test "the reader's state reads out and writes back" {
         \\local id = fenrir.highlight{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712, color = "#ff0000" }
         \\assert(#fenrir.highlights() == 1)
         \\assert(fenrir.highlights()[1].page == 2)
-        \\assert(fenrir.highlights()[1].style == "underline")
+        \\assert(fenrir.highlights()[1].style == "highlight")
+        \\fenrir.highlight{ page = 2, x0 = 10, y0 = 600, x1 = 90, y1 = 612, style = "squiggly" }
+        \\assert(fenrir.highlights()[2].style == "squiggly")
         \\assert(fenrir.unhighlight(id))
-        \\assert(#fenrir.highlights() == 0)
+        \\assert(#fenrir.highlights() == 1)
         \\assert(fenrir.store.get("k") == nil)
         \\fenrir.store.set("k", "v")
         \\assert(fenrir.store.get("k") == "v")
@@ -4325,6 +4342,10 @@ test "the reader's state reads out and writes back" {
     try testing.expectEqualStrings("vsplit", fake.execs.items[0]);
     try testing.expect(!rt.runString("bad", "fenrir.go(0)"));
     try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1 }"));
+    // PDF's name and no other: the person's word for it is refused.
+    try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = 'squiggle' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = {} }"));
+    try testing.expect(rt.runString("check", "assert(#fenrir.highlights() == 1)"));
 }
 
 test "init.lua, then plugins by name, and require reads lua/" {
