@@ -171,25 +171,34 @@ pub fn recentRun(ctx: *Context, argv: []const []const u8) !void {
 pub const marks_usage =
     \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
     \\                    [--style STYLE] [--ink PAGE X Y X Y ... [COLOUR]]
+    \\                    [--comment ANCHOR TEXT]
     \\                    [--db FILE]
     \\
     \\    The marks made on a document, which `fenrir read` draws and keeps
     \\    here rather than writing into the PDF: the highlights made with m
-    \\    or a palette colour, and the ink drawn in draw mode. A selection is
-    \\    not a mark and is never stored.
+    \\    or a palette colour, the ink drawn in draw mode, and the comments on
+    \\    them. A selection is not a mark and is never stored.
     \\
     \\    fenrir marks paper.pdf              list them
-    \\    fenrir marks paper.pdf --clear      remove every one, ink included
+    \\    fenrir marks paper.pdf --clear      remove every one, ink and
+    \\                                        comments included
     \\    fenrir marks paper.pdf --add 3 72 700 300 712 yellow
     \\                                        add a highlight, for scripting
     \\    --style STYLE                       what --add makes: highlight,
     \\                                        underline, strikeout or squiggly
     \\    fenrir marks paper.pdf --ink 3 72 700 120 690 160 705 red
     \\                                        draw a stroke, the same way
+    \\    fenrir marks paper.pdf --comment f3 "is this right?"
+    \\                                        comment on the mark named f3
     \\
     \\    Pages are numbered from 1. Boxes and strokes alike are in PDF points
     \\    on the page as it is displayed, measured from its bottom-left corner
     \\    -- the same numbers `read` stores when it makes a highlight.
+    \\
+    \\    Each mark is listed with the name of its anchor: the lines one
+    \\    selection marked share one, and a comment is made on it. Names are
+    \\    the ones a PDF will hold as /NM, so they mean the same thing here,
+    \\    in the reader and in the file.
 ;
 
 pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
@@ -202,6 +211,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var ink_page: ?u32 = null;
     var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
     defer ink.deinit(ctx.gpa);
+    var comment: ?struct { anchor: []const u8, text: []const u8 } = null;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -271,6 +281,10 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
                     return ctx.fail("{s} is not a colour: try a name or #rrggbb", .{colour});
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--comment")) {
+            if (i + 2 >= argv.len) return ctx.fail("--comment needs ANCHOR TEXT", .{});
+            comment = .{ .anchor = argv[i + 1], .text = argv[i + 2] };
+            i += 2;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ctx.fail("unknown option {s}", .{arg});
         } else if (file == null) {
@@ -298,12 +312,17 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         // found ink on page four would rightly call that a bug.
         const n = lib.clearHighlights(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         const k = lib.clearStrokes(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
-        ctx.out.print("removed {d} highlight{s} and {d} stroke{s}\n", .{
+        // And what was written on them, which has nothing left to be about.
+        const c = lib.clearComments(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
+        ctx.out.print("removed {d} highlight{s}, {d} stroke{s} and {d} comment{s}\n", .{
             n, if (n == 1) "" else "s",
             k, if (k == 1) "" else "s",
+            c, if (c == 1) "" else "s",
         }) catch {};
         return;
     }
+
+    if (comment) |c| return addComment(ctx, &lib, key, c.anchor, c.text);
 
     if (add) |h| {
         var row = h;
@@ -318,9 +337,11 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
                 toByte(c.r), toByte(c.g), toByte(c.b),
             }) catch unreachable);
         }
-        const id = lib.addHighlight(key, row, now(ctx.io)) catch |err|
+        var anchor: [Library.name_len]u8 = undefined;
+        row.anchor = @constCast(try nextName(ctx, &lib, key, &anchor));
+        _ = lib.addHighlight(key, row, now(ctx.io)) catch |err|
             return ctx.fail("cannot add: {t}", .{err});
-        ctx.out.print("added {s} {d} on page {d}\n", .{ style.label(), id, h.page + 1 }) catch {};
+        ctx.out.print("added {s} {s} on page {d}\n", .{ style.label(), row.anchor, h.page + 1 }) catch {};
         return;
     }
 
@@ -333,13 +354,16 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
                 toByte(c.r), toByte(c.g), toByte(c.b),
             }) catch unreachable;
         }
-        const id = lib.addStroke(key, .{
+        var anchor: [Library.name_len]u8 = undefined;
+        const named = try nextName(ctx, &lib, key, &anchor);
+        _ = lib.addStroke(key, .{
             .page = page,
             .color = @constCast(text),
             .points = ink.items,
+            .anchor = @constCast(named),
         }, now(ctx.io)) catch |err| return ctx.fail("cannot add: {t}", .{err});
-        ctx.out.print("added stroke {d} of {d} points on page {d}\n", .{
-            id, ink.items.len, page + 1,
+        ctx.out.print("added stroke {s} of {d} points on page {d}\n", .{
+            named, ink.items.len, page + 1,
         }) catch {};
         return;
     }
@@ -350,13 +374,16 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     const strokes = lib.strokes(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeStrokes(strokes, strokes.len);
 
-    if (list.len == 0 and strokes.len == 0) {
+    const said = lib.comments(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeComments(said, said.len);
+
+    if (list.len == 0 and strokes.len == 0 and said.len == 0) {
         ctx.out.print("no marks in {s}\n", .{name}) catch {};
         return;
     }
     for (list) |h| {
-        ctx.out.print("page {d: >4}  ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})", .{
-            h.page + 1, h.x0, h.y0, h.x1, h.y1,
+        ctx.out.print("page {d: >4}  ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})  {s}", .{
+            h.page + 1, h.x0, h.y0, h.x1, h.y1, h.anchor,
         }) catch {};
         if (!std.mem.eql(u8, h.style, "highlight")) ctx.out.print("  {s}", .{h.style}) catch {};
         if (h.color.len != 0) ctx.out.print("  {s}", .{h.color}) catch {};
@@ -370,14 +397,57 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     for (strokes) |k| {
         var box: fenrir.gelgja.Bounds = .empty;
         for (k.points) |p| box = box.add(p);
-        ctx.out.print("page {d: >4}  ink {d} points  ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})", .{
-            k.page + 1, k.points.len, box.min_x, box.min_y, box.max_x, box.max_y,
+        ctx.out.print("page {d: >4}  ink {d} points  ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})  {s}", .{
+            k.page + 1, k.points.len, box.min_x, box.min_y, box.max_x, box.max_y, k.anchor,
         }) catch {};
         if (k.color.len != 0) ctx.out.print("  {s}", .{k.color}) catch {};
         if (k.width != 0) ctx.out.print("  w{d:.2}", .{k.width}) catch {};
         if (k.note.len != 0) ctx.out.print("  \"{s}\"", .{k.note}) catch {};
         ctx.out.print("\n", .{}) catch {};
     }
+    // A comment by its own name and the anchor it hangs from, in the order
+    // written, which is the order a thread reads in. The first on an anchor
+    // has the anchor's name, as it will in the PDF.
+    for (said) |c| {
+        ctx.out.print("comment {s} on {s}  \"{s}\"\n", .{ c.nm, c.anchor, c.text }) catch {};
+    }
+}
+
+/// The name the next thing written into a document gets.
+fn nextName(ctx: *Context, lib: *Library, key: []const u8, buf: *[Library.name_len]u8) ![]const u8 {
+    const high = lib.highestName(key) catch |err| return ctx.fail("cannot read the names: {t}", .{err});
+    return Library.makeName(buf, high + 1);
+}
+
+/// `--comment`: a comment on an anchor that exists. The first on it takes
+/// the anchor's name, because in a PDF it is the anchor's `/Contents`; a
+/// later one is a reply and takes a name of its own.
+fn addComment(ctx: *Context, lib: *Library, key: []const u8, anchor: []const u8, text: []const u8) !void {
+    const blocks = lib.highlights(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeHighlights(blocks, blocks.len);
+    const strokes = lib.strokes(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeStrokes(strokes, strokes.len);
+    const said = lib.comments(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeComments(said, said.len);
+
+    const marked = for (blocks) |h| {
+        if (std.mem.eql(u8, h.anchor, anchor)) break true;
+    } else for (strokes) |k| {
+        if (std.mem.eql(u8, k.anchor, anchor)) break true;
+    } else false;
+    if (!marked) return ctx.fail("no mark in this document is named {s}: `fenrir marks` lists them", .{anchor});
+
+    const taken = for (said) |c| {
+        if (std.mem.eql(u8, c.nm, anchor)) break true;
+    } else false;
+    var buf: [Library.name_len]u8 = undefined;
+    const nm = if (taken) try nextName(ctx, lib, key, &buf) else anchor;
+    _ = lib.addComment(key, .{
+        .anchor = @constCast(anchor),
+        .nm = @constCast(nm),
+        .text = @constCast(text),
+    }, now(ctx.io)) catch |err| return ctx.fail("cannot add: {t}", .{err});
+    ctx.out.print("added comment {s} on {s}\n", .{ nm, anchor }) catch {};
 }
 
 fn toByte(v: f32) u8 {

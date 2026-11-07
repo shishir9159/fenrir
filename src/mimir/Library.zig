@@ -31,6 +31,26 @@
 //! a list of them -- and a table whose meaning depends on which of its
 //! columns are null is a table nobody can read.
 //!
+//! ## Anchors, comments and links
+//!
+//! A comment is made on an *anchor*: the marks one selection made, which is
+//! six rows for six lines and one annotation when the PDF takes it. Every
+//! mark row names its anchor, and every comment names the anchor it is on,
+//! so many comments can hang from one anchor. A link joins two comments.
+//!
+//! The names are the ones the PDF will hold, from the start: an anchor is
+//! named by the `/NM` its annotation will carry, a comment by its own, and a
+//! link by the two comments' -- `f` and a base-36 number, unique within one
+//! document (see `makeName`). The first comment on an anchor is the anchor's own
+//! `/Contents` in a PDF, so it takes the anchor's name; later ones are
+//! replies with names of their own. Nothing is ever translated between a
+//! row id and a name, because a program that rewrites a PDF renumbers every
+//! object and keeps `/NM`.
+//!
+//! `document` holds the trailer's `/ID` beside the path. A path changes when
+//! a file is moved or sent and the `/ID` does not, so a link to a comment in
+//! another document names that document by its `/ID`.
+//!
 //! Settings are key and value, both text, because every one of them is
 //! either a name, a colour or a number that a person may want to read in the
 //! file. `author` is who annotations will be signed by; `accent` is the
@@ -53,7 +73,7 @@ pub const Error = Db.Error;
 /// forward on open; one from a *newer* version is left alone and opened
 /// read-only in effect, because a later fenrir may have added a column this
 /// one would drop on write.
-pub const schema_version: i64 = 5;
+pub const schema_version: i64 = 6;
 
 gpa: Allocator,
 db: Db,
@@ -204,9 +224,252 @@ fn migrate(lib: *Library, from: i64) Error!void {
         );
     }
 
+    if (from < 6) {
+        // Comments as records of their own, many to an anchor, and links
+        // between them. See "Anchors, comments and links" at the top.
+        //
+        // `path` on each new table rather than a key into `document`, for
+        // the reason `highlight` has one: forgetting a document's place must
+        // not take what was written on it. `other` on a link is the other
+        // document's `/ID`, and empty when both comments are in this one.
+        //
+        // The marks already here are given anchors and their notes become
+        // comments, in one transaction with the tables, so a file is never
+        // left with the tables and without the names.
+        try lib.db.exec("BEGIN");
+        lib.addComments() catch |err| {
+            lib.db.exec("ROLLBACK") catch {};
+            return err;
+        };
+        try lib.db.exec("COMMIT");
+    }
+
     var buf: [64]u8 = undefined;
     const sql = std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{schema_version}, 0) catch return error.Failed;
     try lib.db.exec(sql);
+}
+
+/// Version 6's tables, and names for the marks made before them.
+fn addComments(lib: *Library) Error!void {
+    try lib.db.exec(
+        \\CREATE TABLE IF NOT EXISTS document (
+        \\    id      INTEGER PRIMARY KEY,
+        \\    path    TEXT NOT NULL UNIQUE,
+        \\    file_id TEXT NOT NULL DEFAULT ''
+        \\);
+        \\CREATE INDEX IF NOT EXISTS document_by_file ON document (file_id);
+        \\ALTER TABLE highlight ADD COLUMN anchor TEXT NOT NULL DEFAULT '';
+        \\ALTER TABLE ink ADD COLUMN anchor TEXT NOT NULL DEFAULT '';
+        \\CREATE TABLE IF NOT EXISTS comment (
+        \\    id          INTEGER PRIMARY KEY,
+        \\    path        TEXT NOT NULL,
+        \\    anchor      TEXT NOT NULL,
+        \\    nm          TEXT NOT NULL,
+        \\    text        TEXT NOT NULL DEFAULT '',
+        \\    created_at  INTEGER NOT NULL DEFAULT 0,
+        \\    modified_at INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE INDEX IF NOT EXISTS comment_by_doc ON comment (path, anchor);
+        \\CREATE TABLE IF NOT EXISTS link (
+        \\    id         INTEGER PRIMARY KEY,
+        \\    path       TEXT NOT NULL,
+        \\    from_nm    TEXT NOT NULL,
+        \\    to_nm      TEXT NOT NULL,
+        \\    other      TEXT NOT NULL DEFAULT '',
+        \\    label      TEXT NOT NULL DEFAULT '',
+        \\    created_at INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE INDEX IF NOT EXISTS link_by_doc ON link (path);
+    );
+    try lib.nameAnchors();
+}
+
+/// Gives every mark made before version 6 an anchor, and makes each note
+/// the first comment on its anchor.
+///
+/// The rows do not say which selection made them. A selection's lines were
+/// written in one pass, though, with one clock reading, one colour and one
+/// style, down a page or onto the next -- so consecutive rows that agree on
+/// all of that are taken for one anchor. The mistake this can make is two
+/// highlights made within one second in one colour becoming one anchor,
+/// which is one annotation of two lines in a PDF and invisible on the page.
+/// The mistake it avoids is a six-line highlight written as six
+/// annotations, which is six comments in another reader's pane. A stroke is
+/// an anchor of its own.
+fn nameAnchors(lib: *Library) Error!void {
+    var arena_state: std.heap.ArenaAllocator = .init(lib.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    {
+        var s = try lib.db.prepare("SELECT path FROM highlight UNION SELECT path FROM ink");
+        defer s.finalize();
+        while (try s.step()) try paths.append(arena, try arena.dupe(u8, s.columnText(0)));
+    }
+
+    var name_block = try lib.db.prepare("UPDATE highlight SET anchor = ?2 WHERE id = ?1");
+    defer name_block.finalize();
+    var name_stroke = try lib.db.prepare("UPDATE ink SET anchor = ?2 WHERE id = ?1");
+    defer name_stroke.finalize();
+    var add_comment = try lib.db.prepare(
+        \\INSERT INTO comment (path, anchor, nm, text, created_at, modified_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+    );
+    defer add_comment.finalize();
+
+    const Row = struct { id: i64, anchor: u64, note: []const u8, at: i64 };
+    var rows: std.ArrayList(Row) = .empty;
+    for (paths.items) |path| {
+        rows.clearRetainingCapacity();
+        var last: u64 = 0;
+
+        // Read out whole before anything is written, so no update lands
+        // under a statement still walking the table.
+        {
+            var s = try lib.db.prepare(
+                \\SELECT id, page, color, style, created_at, note FROM highlight
+                \\WHERE path = ?1 ORDER BY id
+            );
+            defer s.finalize();
+            s.bindText(1, path);
+            var page: i64 = -2;
+            var at: i64 = 0;
+            var color: []const u8 = "";
+            var style: []const u8 = "";
+            while (try s.step()) {
+                const row_page = s.columnInt(1);
+                const row_at = s.columnInt(4);
+                const same = row_at != 0 and row_at == at and
+                    (row_page == page or row_page == page + 1) and
+                    std.mem.eql(u8, s.columnText(2), color) and
+                    std.mem.eql(u8, s.columnText(3), style);
+                if (!same) last += 1;
+                page = row_page;
+                at = row_at;
+                color = try arena.dupe(u8, s.columnText(2));
+                style = try arena.dupe(u8, s.columnText(3));
+                try rows.append(arena, .{
+                    .id = s.columnInt(0),
+                    .anchor = last,
+                    .note = try arena.dupe(u8, s.columnText(5)),
+                    .at = row_at,
+                });
+            }
+        }
+        const blocks = rows.items.len;
+        {
+            var s = try lib.db.prepare("SELECT id, created_at, note FROM ink WHERE path = ?1 ORDER BY id");
+            defer s.finalize();
+            s.bindText(1, path);
+            while (try s.step()) {
+                last += 1;
+                try rows.append(arena, .{
+                    .id = s.columnInt(0),
+                    .anchor = last,
+                    .note = try arena.dupe(u8, s.columnText(2)),
+                    .at = s.columnInt(1),
+                });
+            }
+        }
+
+        // A second note on one anchor is a reply, named after every anchor.
+        var next = last + 1;
+        var commented: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (rows.items, 0..) |r, i| {
+            var anchor_buf: [name_len]u8 = undefined;
+            const anchor = makeName(&anchor_buf, r.anchor);
+            const named = if (i < blocks) name_block else name_stroke;
+            named.reset();
+            named.bindInt(1, r.id);
+            named.bindText(2, anchor);
+            try named.exec();
+
+            if (r.note.len == 0) continue;
+            var own_buf: [name_len]u8 = undefined;
+            const first = !(try commented.getOrPut(arena, r.anchor)).found_existing;
+            const nm = if (first) anchor else makeName(&own_buf, next);
+            if (!first) next += 1;
+            add_comment.reset();
+            add_comment.bindText(1, path);
+            add_comment.bindText(2, anchor);
+            add_comment.bindText(3, nm);
+            add_comment.bindText(4, r.note);
+            add_comment.bindInt(5, r.at);
+            try add_comment.exec();
+        }
+    }
+}
+
+// -- names --------------------------------------------------------------------
+
+/// The longest name `makeName` writes: `f` and a `u64` in base 36.
+pub const name_len = 14;
+
+/// Fenrir's name for the `n`th thing it has named in a document, as a PDF's
+/// `/NM` will hold it: `f`, then `n` in base 36, lower case, from 1.
+///
+/// Base 36 because a name is written once per annotation and once per link
+/// end, and `f2bj` is shorter than `f99991`. Lower case and with no leading
+/// zero, so that of two names of one length the larger number is also the
+/// later string.
+pub fn makeName(buf: *[name_len]u8, n: u64) []const u8 {
+    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    var tail: [name_len - 1]u8 = undefined;
+    var i: usize = tail.len;
+    var v = n;
+    while (true) {
+        i -= 1;
+        tail[i] = digits[@intCast(v % 36)];
+        v /= 36;
+        if (v == 0) break;
+    }
+    buf[0] = 'f';
+    const len = tail.len - i;
+    @memcpy(buf[1..][0..len], tail[i..]);
+    return buf[0 .. 1 + len];
+}
+
+/// The number in a name `makeName` wrote, or null for any other: another
+/// program's `/NM` is kept as it is and never counted, so it can never make
+/// fenrir's next name collide with it.
+pub fn nameNumber(nm: []const u8) ?u64 {
+    if (nm.len < 2 or nm.len > name_len or nm[0] != 'f' or nm[1] == '0') return null;
+    var n: u64 = 0;
+    for (nm[1..]) |c| {
+        const d: u64 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'z' => c - 'a' + 10,
+            else => return null,
+        };
+        n = std.math.mul(u64, n, 36) catch return null;
+        n = std.math.add(u64, n, d) catch return null;
+    }
+    return n;
+}
+
+/// The highest name fenrir has given in a document, or 0 for none. The next
+/// is one more.
+///
+/// Asked of every row because it is asked rarely -- once when a document is
+/// opened, and on each mark a command writes -- and a counter kept beside
+/// the rows is a second thing to be wrong.
+pub fn highestName(lib: Library, path: []const u8) Error!u64 {
+    var s = try lib.db.prepare(
+        \\SELECT anchor FROM highlight WHERE path = ?1
+        \\UNION SELECT anchor FROM ink WHERE path = ?1
+        \\UNION SELECT nm FROM comment WHERE path = ?1
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    var high: u64 = 0;
+    while (try s.step()) high = @max(high, nameNumber(s.columnText(0)) orelse 0);
+    return high;
+}
+
+/// The name a new mark is given when its writer did not choose one.
+fn nextName(lib: Library, path: []const u8, buf: *[name_len]u8) Error![]const u8 {
+    return makeName(buf, try lib.highestName(path) + 1);
 }
 
 // -- settings ----------------------------------------------------------------
@@ -493,6 +756,9 @@ pub const Highlight = struct {
     /// `highlight`, `underline`, `strikeout` or `squiggly`. Empty is written
     /// as `highlight`, which is what a caller that does not say means.
     style: []u8 = &.{},
+    /// The name of the anchor this line is part of; see `makeName`. Empty is
+    /// written as the document's next name, an anchor of one line.
+    anchor: []u8 = &.{},
 };
 
 fn styleOf(style: []const u8) []const u8 {
@@ -503,9 +769,11 @@ fn styleOf(style: []const u8) []const u8 {
 /// delete exactly this one later.
 pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Error!i64 {
     if (lib.future) return 0;
+    var buf: [name_len]u8 = undefined;
+    const anchor = if (h.anchor.len != 0) h.anchor else try lib.nextName(path, &buf);
     var s = try lib.db.prepare(
-        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, style, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, style, anchor, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -517,7 +785,8 @@ pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Erro
     s.bindText(7, h.color);
     s.bindText(8, h.note);
     s.bindText(9, styleOf(h.style));
-    s.bindInt(10, now);
+    s.bindText(10, anchor);
+    s.bindInt(11, now);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
@@ -560,7 +829,7 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
     errdefer lib.freeHighlights(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, x0, y0, x1, y1, color, note, style FROM highlight
+        \\SELECT id, page, x0, y0, x1, y1, color, note, style, anchor FROM highlight
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -572,6 +841,8 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
         errdefer lib.gpa.free(note);
         const style = try lib.gpa.dupe(u8, s.columnText(8));
         errdefer lib.gpa.free(style);
+        const anchor = try lib.gpa.dupe(u8, s.columnText(9));
+        errdefer lib.gpa.free(anchor);
         try out.append(lib.gpa, .{
             .id = s.columnInt(0),
             .page = @intCast(@max(0, s.columnInt(1))),
@@ -582,6 +853,7 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
             .color = color,
             .note = note,
             .style = style,
+            .anchor = anchor,
         });
     }
     return out.toOwnedSlice(lib.gpa);
@@ -591,6 +863,7 @@ pub fn freeHighlight(lib: Library, h: Highlight) void {
     lib.gpa.free(h.color);
     lib.gpa.free(h.note);
     lib.gpa.free(h.style);
+    lib.gpa.free(h.anchor);
 }
 
 pub fn freeHighlights(lib: Library, list: []Highlight, n: usize) void {
@@ -620,6 +893,9 @@ pub const Stroke = struct {
     /// A line of text on the stroke, the way a highlight has one. Empty for
     /// most of them.
     note: []u8 = &.{},
+    /// The anchor it is, as for a highlight. A stroke is always an anchor of
+    /// its own.
+    anchor: []u8 = &.{},
 };
 
 /// How many characters a point takes at the precision `writePoints` uses,
@@ -643,10 +919,12 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     const text = try lib.gpa.alloc(u8, k.points.len * point_chars);
     defer lib.gpa.free(text);
     const encoded = writePoints(text, k.points);
+    var buf: [name_len]u8 = undefined;
+    const anchor = if (k.anchor.len != 0) k.anchor else try lib.nextName(path, &buf);
 
     var s = try lib.db.prepare(
-        \\INSERT INTO ink (path, page, color, width, points, note, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\INSERT INTO ink (path, page, color, width, points, note, anchor, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -655,7 +933,8 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     s.bindFloat(4, k.width);
     s.bindText(5, encoded);
     s.bindText(6, k.note);
-    s.bindInt(7, now);
+    s.bindText(7, anchor);
+    s.bindInt(8, now);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
@@ -697,7 +976,7 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
     errdefer lib.freeStrokes(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, color, width, points, note FROM ink
+        \\SELECT id, page, color, width, points, note, anchor FROM ink
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -719,6 +998,9 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
         }
         errdefer lib.gpa.free(points);
         const note = try lib.gpa.dupe(u8, s.columnText(5));
+        errdefer lib.gpa.free(note);
+        const anchor = try lib.gpa.dupe(u8, s.columnText(6));
+        errdefer lib.gpa.free(anchor);
         try out.append(lib.gpa, .{
             .id = s.columnInt(0),
             .page = @intCast(@max(0, s.columnInt(1))),
@@ -726,6 +1008,7 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
             .width = @floatCast(s.columnFloat(3)),
             .points = points,
             .note = note,
+            .anchor = anchor,
         });
     }
     return out.toOwnedSlice(lib.gpa);
@@ -735,6 +1018,7 @@ pub fn freeStroke(lib: Library, k: Stroke) void {
     lib.gpa.free(k.color);
     lib.gpa.free(k.points);
     lib.gpa.free(k.note);
+    lib.gpa.free(k.anchor);
 }
 
 pub fn freeStrokes(lib: Library, list: []Stroke, n: usize) void {
@@ -799,12 +1083,135 @@ pub fn forgetAll(lib: Library) Error!void {
     try lib.db.exec("DELETE FROM recent");
 }
 
+// -- comments -----------------------------------------------------------------
+
+/// One comment, as the file holds it.
+pub const Comment = struct {
+    id: i64 = 0,
+    /// The name of the anchor it is on: the `anchor` of the marks it is about.
+    anchor: []u8 = &.{},
+    /// Its own name. The first comment on an anchor has the anchor's, since
+    /// in a PDF it is the anchor's `/Contents` and has no annotation of its
+    /// own to carry another.
+    nm: []u8 = &.{},
+    text: []u8 = &.{},
+    /// Seconds since the epoch. `modified_at` is what a PDF's `/M` will say.
+    created_at: i64 = 0,
+    modified_at: i64 = 0,
+};
+
+/// Writes a comment and returns its row. The caller names it, because the
+/// name has to be known before the row exists: a link made in the same
+/// breath refers to it.
+pub fn addComment(lib: Library, path: []const u8, c: Comment, now: i64) Error!i64 {
+    if (lib.future) return 0;
+    var s = try lib.db.prepare(
+        \\INSERT INTO comment (path, anchor, nm, text, created_at, modified_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindText(2, c.anchor);
+    s.bindText(3, c.nm);
+    s.bindText(4, c.text);
+    s.bindInt(5, now);
+    try s.exec();
+    return lib.db.lastInsertRowId();
+}
+
+/// A comment's text is the one thing about it that changes. Moved to another
+/// anchor it would be another comment, and is removed and added as one.
+pub fn updateComment(lib: Library, id: i64, text: []const u8, now: i64) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("UPDATE comment SET text = ?2, modified_at = ?3 WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    s.bindText(2, text);
+    s.bindInt(3, now);
+    try s.exec();
+}
+
+pub fn removeComment(lib: Library, id: i64) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("DELETE FROM comment WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    try s.exec();
+}
+
+pub fn clearComments(lib: Library, path: []const u8) Error!u32 {
+    if (lib.future) return 0;
+    var s = try lib.db.prepare("DELETE FROM comment WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    try s.exec();
+    return lib.db.changes();
+}
+
+/// Every comment on a document, oldest first: the order a thread reads in.
+pub fn comments(lib: Library, path: []const u8) Error![]Comment {
+    var out: std.ArrayList(Comment) = .empty;
+    errdefer lib.freeComments(out.items, out.items.len);
+
+    var s = try lib.db.prepare(
+        \\SELECT id, anchor, nm, text, created_at, modified_at FROM comment
+        \\WHERE path = ?1 ORDER BY id
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const anchor = try lib.gpa.dupe(u8, s.columnText(1));
+        errdefer lib.gpa.free(anchor);
+        const nm = try lib.gpa.dupe(u8, s.columnText(2));
+        errdefer lib.gpa.free(nm);
+        const text = try lib.gpa.dupe(u8, s.columnText(3));
+        errdefer lib.gpa.free(text);
+        try out.append(lib.gpa, .{
+            .id = s.columnInt(0),
+            .anchor = anchor,
+            .nm = nm,
+            .text = text,
+            .created_at = s.columnInt(4),
+            .modified_at = s.columnInt(5),
+        });
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freeComment(lib: Library, c: Comment) void {
+    lib.gpa.free(c.anchor);
+    lib.gpa.free(c.nm);
+    lib.gpa.free(c.text);
+}
+
+pub fn freeComments(lib: Library, list: []Comment, n: usize) void {
+    for (list[0..n]) |c| lib.freeComment(c);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
 // -- tests --------------------------------------------------------------------
 
 const testing = std.testing;
 
 fn memory() !Library {
     return Library.open(testing.allocator, ":memory:");
+}
+
+/// Undoes every migration above `to`, rows and all, so a test can write the
+/// rows an older release would have and open them again.
+fn rewind(lib: *Library, to: i64) !void {
+    if (to < 6) try lib.db.exec(
+        \\DROP TABLE comment;
+        \\DROP TABLE link;
+        \\DROP TABLE document;
+        \\ALTER TABLE highlight DROP COLUMN anchor;
+        \\ALTER TABLE ink DROP COLUMN anchor;
+    );
+    if (to < 5) try lib.db.exec("ALTER TABLE highlight DROP COLUMN style");
+    if (to < 4) try lib.db.exec("ALTER TABLE ink DROP COLUMN note");
+    if (to < 3) try lib.db.exec("DROP TABLE ink");
+    var buf: [64]u8 = undefined;
+    try lib.db.exec(try std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{to}, 0));
 }
 
 test "a fresh database is migrated to the schema this build knows" {
@@ -1087,8 +1494,7 @@ test "a version-4 file's highlights stay highlights" {
     defer lib.close();
 
     _ = try lib.addHighlight("old.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
-    try lib.db.exec("ALTER TABLE highlight DROP COLUMN style");
-    try lib.db.exec("PRAGMA user_version = 4");
+    try rewind(&lib, 4);
     try lib.migrate(4);
     try testing.expectEqual(schema_version, try lib.userVersion());
 
@@ -1209,24 +1615,11 @@ test "a version-3 file gains the note column without losing its ink" {
     defer lib.close();
 
     // The ink table as the previous release left it, with a stroke in it.
+    try rewind(&lib, 3);
     try lib.db.exec(
-        \\BEGIN;
-        \\DROP TABLE ink;
-        \\CREATE TABLE ink (
-        \\    id         INTEGER PRIMARY KEY,
-        \\    path       TEXT NOT NULL,
-        \\    page       INTEGER NOT NULL,
-        \\    color      TEXT NOT NULL DEFAULT '',
-        \\    width      REAL NOT NULL DEFAULT 0,
-        \\    points     TEXT NOT NULL DEFAULT '',
-        \\    created_at INTEGER NOT NULL DEFAULT 0
-        \\);
         \\INSERT INTO ink (path, page, color, width, points, created_at)
         \\VALUES ('old.pdf', 1, '#c04040', 2, '10.00 20.00 30.00 40.00', 1);
-        \\ALTER TABLE highlight DROP COLUMN style;
-        \\COMMIT;
     );
-    try lib.db.exec("PRAGMA user_version = 3");
     try lib.migrate(3);
     try testing.expectEqual(schema_version, try lib.userVersion());
 
@@ -1252,9 +1645,7 @@ test "a version-2 file gains the ink table without losing its highlights" {
     _ = try lib.addHighlight("old.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
 
     // Wound back to where the previous release left it, then opened again.
-    try lib.db.exec("DROP TABLE ink");
-    try lib.db.exec("ALTER TABLE highlight DROP COLUMN style");
-    try lib.db.exec("PRAGMA user_version = 2");
+    try rewind(&lib, 2);
     try lib.migrate(2);
     try testing.expectEqual(schema_version, try lib.userVersion());
 
@@ -1268,4 +1659,137 @@ test "a version-2 file gains the ink table without losing its highlights" {
     defer lib.freeStrokes(ink, ink.len);
     try testing.expectEqual(@as(usize, 1), ink.len);
     _ = gpa;
+}
+
+test "a name is f and base 36, and only fenrir's are counted" {
+    var buf: [name_len]u8 = undefined;
+    try testing.expectEqualStrings("f1", makeName(&buf, 1));
+    try testing.expectEqualStrings("fz", makeName(&buf, 35));
+    try testing.expectEqualStrings("f10", makeName(&buf, 36));
+    try testing.expectEqual(@as(?u64, 36), nameNumber("f10"));
+    const most = std.math.maxInt(u64);
+    try testing.expectEqual(@as(?u64, most), nameNumber(makeName(&buf, most)));
+
+    // Another program's `/NM`, and the forms fenrir never writes.
+    for ([_][]const u8{ "f", "F1", "f01", "f1A", "f-1", "8a7d-41c2", "fzzzzzzzzzzzzz" }) |other| {
+        try testing.expectEqual(@as(?u64, null), nameNumber(other));
+    }
+}
+
+test "a mark written without an anchor is the next name, and comments count" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    _ = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    var points = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 9, .y = 9 } };
+    _ = try lib.addStroke("a.pdf", .{ .points = &points }, 1);
+    // A reply's name is past every anchor's, and another program's is not
+    // a number at all.
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f9"), .text = @constCast("why") }, 1);
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f2"), .nm = @constCast("{8a7d-41c2}") }, 1);
+    _ = try lib.addHighlight("a.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    // Each document counts its own.
+    _ = try lib.addHighlight("b.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+
+    const marks = try lib.highlights("a.pdf");
+    defer lib.freeHighlights(marks, marks.len);
+    try testing.expectEqualStrings("f1", marks[0].anchor);
+    try testing.expectEqualStrings("fa", marks[1].anchor);
+    const ink = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(ink, ink.len);
+    try testing.expectEqualStrings("f2", ink[0].anchor);
+    try testing.expectEqual(@as(u64, 10), try lib.highestName("a.pdf"));
+    try testing.expectEqual(@as(u64, 1), try lib.highestName("b.pdf"));
+
+    // A writer that names its own anchor keeps it, which is how six lines
+    // of one selection are one anchor.
+    _ = try lib.addHighlight("a.pdf", .{ .page = 2, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("fa") }, 1);
+    try testing.expectEqual(@as(u64, 10), try lib.highestName("a.pdf"));
+}
+
+test "a version-5 file's marks become anchors, and their notes the first comments" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    // What version 5 wrote: a three-line selection highlighted in one go,
+    // with notes on its first and last lines; a highlight made in the same
+    // second in another colour; one written by a script with no clock; a
+    // stroke with a note; and another document's highlight.
+    try rewind(&lib, 5);
+    try lib.db.exec(
+        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, style, created_at) VALUES
+        \\  ('a.pdf', 2, 0, 700, 9, 710, '#f7e733', 'first', 'highlight', 100),
+        \\  ('a.pdf', 2, 0, 690, 9, 700, '#f7e733', '', 'highlight', 100),
+        \\  ('a.pdf', 3, 0, 790, 9, 800, '#f7e733', 'second', 'highlight', 100),
+        \\  ('a.pdf', 3, 0, 500, 9, 510, '#3fa34d', '', 'highlight', 100),
+        \\  ('a.pdf', 4, 0, 500, 9, 510, '#3fa34d', '', 'highlight', 0),
+        \\  ('b.pdf', 0, 0, 500, 9, 510, '', '', 'highlight', 100);
+        \\INSERT INTO ink (path, page, color, width, points, note, created_at) VALUES
+        \\  ('a.pdf', 1, '', 1, '0 0 9 9', 'pen', 120);
+    );
+    try lib.migrate(5);
+    try testing.expectEqual(schema_version, try lib.userVersion());
+
+    const marks = try lib.highlights("a.pdf");
+    defer lib.freeHighlights(marks, marks.len);
+    const want = [_][]const u8{ "f1", "f1", "f1", "f2", "f3" };
+    for (want, marks) |w, m| try testing.expectEqualStrings(w, m.anchor);
+    const ink = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(ink, ink.len);
+    try testing.expectEqualStrings("f4", ink[0].anchor);
+
+    // The first note on the selection is its anchor's comment; the second is
+    // a reply, named past every anchor; the stroke's is its own.
+    const list = try lib.comments("a.pdf");
+    defer lib.freeComments(list, list.len);
+    try testing.expectEqual(@as(usize, 3), list.len);
+    try testing.expectEqualStrings("f1", list[0].anchor);
+    try testing.expectEqualStrings("f1", list[0].nm);
+    try testing.expectEqualStrings("first", list[0].text);
+    try testing.expectEqual(@as(i64, 100), list[0].created_at);
+    try testing.expectEqualStrings("f1", list[1].anchor);
+    try testing.expectEqualStrings("f5", list[1].nm);
+    try testing.expectEqualStrings("second", list[1].text);
+    try testing.expectEqualStrings("f4", list[2].anchor);
+    try testing.expectEqualStrings("f4", list[2].nm);
+
+    // Another document's names start again.
+    const other = try lib.highlights("b.pdf");
+    defer lib.freeHighlights(other, other.len);
+    try testing.expectEqualStrings("f1", other[0].anchor);
+}
+
+test "comments are many to an anchor, and change and go by row" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    const first = try lib.addComment("a.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f1"), .text = @constCast("is this right?") }, 10);
+    const reply = try lib.addComment("a.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f2"), .text = @constCast("no") }, 11);
+    _ = try lib.addComment("b.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f1") }, 12);
+
+    try lib.updateComment(reply, "yes, see lemma 3", 20);
+    {
+        const list = try lib.comments("a.pdf");
+        defer lib.freeComments(list, list.len);
+        try testing.expectEqual(@as(usize, 2), list.len);
+        try testing.expectEqualStrings("is this right?", list[0].text);
+        try testing.expectEqualStrings("yes, see lemma 3", list[1].text);
+        try testing.expectEqual(@as(i64, 11), list[1].created_at);
+        try testing.expectEqual(@as(i64, 20), list[1].modified_at);
+    }
+
+    try lib.removeComment(first);
+    {
+        const list = try lib.comments("a.pdf");
+        defer lib.freeComments(list, list.len);
+        try testing.expectEqual(@as(usize, 1), list.len);
+        try testing.expectEqualStrings("f2", list[0].nm);
+    }
+    try testing.expectEqual(@as(u32, 1), try lib.clearComments("a.pdf"));
+    const left = try lib.comments("b.pdf");
+    defer lib.freeComments(left, left.len);
+    try testing.expectEqual(@as(usize, 1), left.len);
 }
