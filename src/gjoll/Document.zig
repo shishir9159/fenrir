@@ -184,6 +184,21 @@ pub fn trailer(doc: *const Document) Dict {
     return doc.table.trailer;
 }
 
+/// The first of the trailer's two `/ID` strings: the file's permanent
+/// identifier, which a program saving a revision keeps and a program writing
+/// a new file replaces (§14.4). Null for a file with none.
+///
+/// Read off the trailer as it was parsed on open, resolving nothing, so it
+/// may be asked from a thread that does not own the document. An `/ID` held
+/// by reference, which the standard does not allow, is taken as no `/ID`.
+pub fn fileId(doc: *const Document) ?[]const u8 {
+    const id = doc.table.trailer.get("ID") orelse return null;
+    const pair = id.asArray() orelse return null;
+    if (pair.len == 0) return null;
+    const first = pair[0].asString() orelse return null;
+    return if (first.len == 0) null else first;
+}
+
 /// Encrypted documents parse structurally, but their strings and stream data
 /// are ciphertext. Decryption is not implemented yet, so callers should say so
 /// rather than presenting garbage.
@@ -508,6 +523,23 @@ test "opens a file whose xref offset is wrong by falling back to scanning" {
 
     const cat = try doc.catalog();
     try testing.expect(cat.get("Type").?.isName("Catalog"));
+}
+
+test "a file's /ID is the first of the trailer's two strings, and may be absent" {
+    var plain = try openStatic(minimal_pdf);
+    defer plain.deinit();
+    try testing.expect(plain.fileId() == null);
+
+    var doc = try openStatic(
+        "%PDF-1.4\n" ++
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" ++
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n" ++
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n" ++
+            "trailer\n<< /Size 4 /Root 1 0 R /ID [<0A1B2C3D> (later)] >>\n" ++
+            "startxref\n0\n%%EOF\n",
+    );
+    defer doc.deinit();
+    try testing.expectEqualSlices(u8, "\x0a\x1b\x2c\x3d", doc.fileId().?);
 }
 
 test "resolves references through the catalog" {

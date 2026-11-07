@@ -1669,7 +1669,20 @@ const Session = struct {
 
         const id: u32 = @intCast(s.buffers.items.len - 1);
         s.loadMarks(id);
+        s.rememberFileId(path, doc);
         return id;
+    }
+
+    /// Writes the document's `/ID` down beside its path, which is how a link
+    /// into it finds it again after it has been moved or sent.
+    ///
+    /// Here, before any job for this buffer exists to race with: the
+    /// rasterising thread owns the `Document`, and `fileId` reads only the
+    /// trailer parsed on open.
+    fn rememberFileId(s: *Session, path: []const u8, doc: *const fenrir.Document) void {
+        const lib = s.library orelse return;
+        var hex: [Library.id_hex_len]u8 = undefined;
+        lib.setFileId(path, Library.hexId(&hex, doc.fileId() orelse "")) catch {};
     }
 
     fn buffer(s: *Session, index: u32) *Buffer {

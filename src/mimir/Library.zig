@@ -1189,6 +1189,159 @@ pub fn freeComments(lib: Library, list: []Comment, n: usize) void {
     if (list.len != 0) lib.gpa.free(list);
 }
 
+// -- links --------------------------------------------------------------------
+
+/// Two comments joined, as the file holds it.
+///
+/// Both ends are names and never rows, so a link survives the PDF being
+/// rewritten by a program that renumbers its objects. `from` is always in
+/// the document the row is filed under; `to` is too unless `other` names
+/// the document it is in, by `/ID`.
+pub const Link = struct {
+    id: i64 = 0,
+    from: []u8 = &.{},
+    to: []u8 = &.{},
+    /// The other document's `/ID` as hex, or empty for this one.
+    other: []u8 = &.{},
+    /// `supports`, `contradicts`, or whatever the reader called it. Empty
+    /// for a link with no label, which is most of them.
+    label: []u8 = &.{},
+};
+
+pub fn addLink(lib: Library, path: []const u8, l: Link, now: i64) Error!i64 {
+    if (lib.future) return 0;
+    var s = try lib.db.prepare(
+        \\INSERT INTO link (path, from_nm, to_nm, other, label, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindText(2, l.from);
+    s.bindText(3, l.to);
+    s.bindText(4, l.other);
+    s.bindText(5, l.label);
+    s.bindInt(6, now);
+    try s.exec();
+    return lib.db.lastInsertRowId();
+}
+
+pub fn removeLink(lib: Library, id: i64) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("DELETE FROM link WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    try s.exec();
+}
+
+pub fn clearLinks(lib: Library, path: []const u8) Error!u32 {
+    if (lib.future) return 0;
+    var s = try lib.db.prepare("DELETE FROM link WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    try s.exec();
+    return lib.db.changes();
+}
+
+/// Every link filed under a document, oldest first.
+pub fn links(lib: Library, path: []const u8) Error![]Link {
+    var out: std.ArrayList(Link) = .empty;
+    errdefer lib.freeLinks(out.items, out.items.len);
+
+    var s = try lib.db.prepare(
+        \\SELECT id, from_nm, to_nm, other, label FROM link
+        \\WHERE path = ?1 ORDER BY id
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const from = try lib.gpa.dupe(u8, s.columnText(1));
+        errdefer lib.gpa.free(from);
+        const to = try lib.gpa.dupe(u8, s.columnText(2));
+        errdefer lib.gpa.free(to);
+        const other = try lib.gpa.dupe(u8, s.columnText(3));
+        errdefer lib.gpa.free(other);
+        const label = try lib.gpa.dupe(u8, s.columnText(4));
+        errdefer lib.gpa.free(label);
+        try out.append(lib.gpa, .{
+            .id = s.columnInt(0),
+            .from = from,
+            .to = to,
+            .other = other,
+            .label = label,
+        });
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freeLink(lib: Library, l: Link) void {
+    lib.gpa.free(l.from);
+    lib.gpa.free(l.to);
+    lib.gpa.free(l.other);
+    lib.gpa.free(l.label);
+}
+
+pub fn freeLinks(lib: Library, list: []Link, n: usize) void {
+    for (list[0..n]) |l| lib.freeLink(l);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
+// -- documents ----------------------------------------------------------------
+
+/// The most of an `/ID` kept, as hex. The standard's are sixteen bytes; a
+/// longer one keeps its first sixty-four, which no two files share by chance.
+pub const id_hex_len = 128;
+
+/// An `/ID` as the library holds it: lower-case hex, so that it reads in the
+/// file and compares as text.
+pub fn hexId(buf: *[id_hex_len]u8, raw: []const u8) []const u8 {
+    const digits = "0123456789abcdef";
+    const n = @min(raw.len, id_hex_len / 2);
+    for (raw[0..n], 0..) |b, i| {
+        buf[i * 2] = digits[b >> 4];
+        buf[i * 2 + 1] = digits[b & 15];
+    }
+    return buf[0 .. n * 2];
+}
+
+/// Writes down a document's `/ID` -- the first of the trailer's two strings,
+/// as hex -- beside its path. Empty for a file that has none, which a later
+/// save will give one.
+pub fn setFileId(lib: Library, path: []const u8, file_id: []const u8) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare(
+        \\INSERT INTO document (path, file_id) VALUES (?1, ?2)
+        \\ON CONFLICT (path) DO UPDATE SET file_id = excluded.file_id
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindText(2, file_id);
+    try s.exec();
+}
+
+/// The `/ID` a document was last seen with, or null when it has not been
+/// seen or had none. The caller owns it.
+pub fn fileId(lib: Library, path: []const u8) Error!?[]u8 {
+    var s = try lib.db.prepare("SELECT file_id FROM document WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    if (!try s.step()) return null;
+    const text = s.columnText(0);
+    if (text.len == 0) return null;
+    return try lib.gpa.dupe(u8, text);
+}
+
+/// Where the document with this `/ID` was seen, which is the first place a
+/// link into it looks. When copies were opened from two places, the one
+/// recorded later. The caller owns it.
+pub fn pathOf(lib: Library, file_id: []const u8) Error!?[]u8 {
+    if (file_id.len == 0) return null;
+    var s = try lib.db.prepare("SELECT path FROM document WHERE file_id = ?1 ORDER BY id DESC LIMIT 1");
+    defer s.finalize();
+    s.bindText(1, file_id);
+    if (!try s.step()) return null;
+    return try lib.gpa.dupe(u8, s.columnText(0));
+}
+
 // -- tests --------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1792,4 +1945,66 @@ test "comments are many to an anchor, and change and go by row" {
     const left = try lib.comments("b.pdf");
     defer lib.freeComments(left, left.len);
     try testing.expectEqual(@as(usize, 1), left.len);
+}
+
+test "a link names its comments, and another document by its /ID" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    const here = try lib.addLink("a.pdf", .{ .from = @constCast("f1"), .to = @constCast("f4"), .label = @constCast("supports") }, 1);
+    _ = try lib.addLink("a.pdf", .{ .from = @constCast("f4"), .to = @constCast("f2"), .other = @constCast("0a1b2c3d4e5f60718293a4b5c6d7e8f9") }, 2);
+
+    {
+        const list = try lib.links("a.pdf");
+        defer lib.freeLinks(list, list.len);
+        try testing.expectEqual(@as(usize, 2), list.len);
+        try testing.expectEqualStrings("f1", list[0].from);
+        try testing.expectEqualStrings("f4", list[0].to);
+        try testing.expectEqualStrings("supports", list[0].label);
+        try testing.expectEqualStrings("", list[0].other);
+        try testing.expectEqualStrings("0a1b2c3d4e5f60718293a4b5c6d7e8f9", list[1].other);
+        try testing.expectEqualStrings("", list[1].label);
+    }
+
+    try lib.removeLink(here);
+    {
+        const list = try lib.links("a.pdf");
+        defer lib.freeLinks(list, list.len);
+        try testing.expectEqual(@as(usize, 1), list.len);
+    }
+    try testing.expectEqual(@as(u32, 1), try lib.clearLinks("a.pdf"));
+}
+
+test "a document's /ID is kept beside its path, and finds the path again" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    var hex: [id_hex_len]u8 = undefined;
+    try testing.expectEqualStrings("00ff", hexId(&hex, "\x00\xff"));
+
+    try testing.expect((try lib.fileId("a.pdf")) == null);
+    try lib.setFileId("a.pdf", "00ff");
+    try lib.setFileId("b.pdf", "");
+    {
+        const id = (try lib.fileId("a.pdf")).?;
+        defer testing.allocator.free(id);
+        try testing.expectEqualStrings("00ff", id);
+    }
+    // A file with no `/ID` has none to find it by.
+    try testing.expect((try lib.fileId("b.pdf")) == null);
+    try testing.expect((try lib.pathOf("")) == null);
+
+    // Moved: the same `/ID` at another path is found at the later one.
+    try lib.setFileId("moved/a.pdf", "00ff");
+    const where = (try lib.pathOf("00ff")).?;
+    defer testing.allocator.free(where);
+    try testing.expectEqualStrings("moved/a.pdf", where);
+
+    // A rebuilt file is a new `/ID` at the old path.
+    try lib.setFileId("a.pdf", "1234");
+    const now_id = (try lib.fileId("a.pdf")).?;
+    defer testing.allocator.free(now_id);
+    try testing.expectEqualStrings("1234", now_id);
 }

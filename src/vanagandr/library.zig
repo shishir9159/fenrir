@@ -171,17 +171,18 @@ pub fn recentRun(ctx: *Context, argv: []const []const u8) !void {
 pub const marks_usage =
     \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
     \\                    [--style STYLE] [--ink PAGE X Y X Y ... [COLOUR]]
-    \\                    [--comment ANCHOR TEXT]
+    \\                    [--comment ANCHOR TEXT] [--link FROM TO [LABEL]]
     \\                    [--db FILE]
     \\
     \\    The marks made on a document, which `fenrir read` draws and keeps
     \\    here rather than writing into the PDF: the highlights made with m
-    \\    or a palette colour, the ink drawn in draw mode, and the comments on
-    \\    them. A selection is not a mark and is never stored.
+    \\    or a palette colour, the ink drawn in draw mode, the comments on
+    \\    them and the links between those. A selection is not a mark and is
+    \\    never stored.
     \\
     \\    fenrir marks paper.pdf              list them
-    \\    fenrir marks paper.pdf --clear      remove every one, ink and
-    \\                                        comments included
+    \\    fenrir marks paper.pdf --clear      remove every one, ink, comments
+    \\                                        and links included
     \\    fenrir marks paper.pdf --add 3 72 700 300 712 yellow
     \\                                        add a highlight, for scripting
     \\    --style STYLE                       what --add makes: highlight,
@@ -190,6 +191,8 @@ pub const marks_usage =
     \\                                        draw a stroke, the same way
     \\    fenrir marks paper.pdf --comment f3 "is this right?"
     \\                                        comment on the mark named f3
+    \\    fenrir marks paper.pdf --link f3 f7 supports
+    \\                                        link two comments, by name
     \\
     \\    Pages are numbered from 1. Boxes and strokes alike are in PDF points
     \\    on the page as it is displayed, measured from its bottom-left corner
@@ -212,6 +215,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
     defer ink.deinit(ctx.gpa);
     var comment: ?struct { anchor: []const u8, text: []const u8 } = null;
+    var link: ?struct { from: []const u8, to: []const u8, label: []const u8 = "" } = null;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -285,6 +289,14 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
             if (i + 2 >= argv.len) return ctx.fail("--comment needs ANCHOR TEXT", .{});
             comment = .{ .anchor = argv[i + 1], .text = argv[i + 2] };
             i += 2;
+        } else if (std.mem.eql(u8, arg, "--link")) {
+            if (i + 2 >= argv.len) return ctx.fail("--link needs FROM TO", .{});
+            link = .{ .from = argv[i + 1], .to = argv[i + 2] };
+            i += 2;
+            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+                i += 1;
+                link.?.label = argv[i];
+            }
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ctx.fail("unknown option {s}", .{arg});
         } else if (file == null) {
@@ -314,15 +326,18 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         const k = lib.clearStrokes(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         // And what was written on them, which has nothing left to be about.
         const c = lib.clearComments(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
-        ctx.out.print("removed {d} highlight{s}, {d} stroke{s} and {d} comment{s}\n", .{
+        const l = lib.clearLinks(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
+        ctx.out.print("removed {d} highlight{s}, {d} stroke{s}, {d} comment{s} and {d} link{s}\n", .{
             n, if (n == 1) "" else "s",
             k, if (k == 1) "" else "s",
             c, if (c == 1) "" else "s",
+            l, if (l == 1) "" else "s",
         }) catch {};
         return;
     }
 
     if (comment) |c| return addComment(ctx, &lib, key, c.anchor, c.text);
+    if (link) |l| return addLink(ctx, &lib, key, l.from, l.to, l.label);
 
     if (add) |h| {
         var row = h;
@@ -377,6 +392,15 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     const said = lib.comments(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeComments(said, said.len);
 
+    const joined = lib.links(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeLinks(joined, joined.len);
+
+    // The `/ID` the reader saw the file with last, which is what a link from
+    // another document names it by.
+    if (lib.fileId(key) catch null) |id| {
+        defer ctx.gpa.free(id);
+        ctx.out.print("id {s}\n", .{id}) catch {};
+    }
     if (list.len == 0 and strokes.len == 0 and said.len == 0) {
         ctx.out.print("no marks in {s}\n", .{name}) catch {};
         return;
@@ -410,6 +434,12 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     // has the anchor's name, as it will in the PDF.
     for (said) |c| {
         ctx.out.print("comment {s} on {s}  \"{s}\"\n", .{ c.nm, c.anchor, c.text }) catch {};
+    }
+    for (joined) |l| {
+        ctx.out.print("link {s} -> {s}", .{ l.from, l.to }) catch {};
+        if (l.other.len != 0) ctx.out.print(" in {s}", .{l.other}) catch {};
+        if (l.label.len != 0) ctx.out.print("  {s}", .{l.label}) catch {};
+        ctx.out.print("\n", .{}) catch {};
     }
 }
 
@@ -448,6 +478,25 @@ fn addComment(ctx: *Context, lib: *Library, key: []const u8, anchor: []const u8,
         .text = @constCast(text),
     }, now(ctx.io)) catch |err| return ctx.fail("cannot add: {t}", .{err});
     ctx.out.print("added comment {s} on {s}\n", .{ nm, anchor }) catch {};
+}
+
+/// `--link`: two comments of this document joined. A link into another
+/// document is the reader's to make, since it has to know that document's
+/// `/ID`.
+fn addLink(ctx: *Context, lib: *Library, key: []const u8, from: []const u8, to: []const u8, label: []const u8) !void {
+    const said = lib.comments(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeComments(said, said.len);
+    for ([_][]const u8{ from, to }) |end| {
+        for (said) |c| {
+            if (std.mem.eql(u8, c.nm, end)) break;
+        } else return ctx.fail("no comment in this document is named {s}: a link joins two comments", .{end});
+    }
+    _ = lib.addLink(key, .{
+        .from = @constCast(from),
+        .to = @constCast(to),
+        .label = @constCast(label),
+    }, now(ctx.io)) catch |err| return ctx.fail("cannot add: {t}", .{err});
+    ctx.out.print("linked {s} to {s}\n", .{ from, to }) catch {};
 }
 
 fn toByte(v: f32) u8 {
