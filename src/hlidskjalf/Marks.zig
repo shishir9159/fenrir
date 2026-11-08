@@ -22,7 +22,7 @@
 //!
 //! ## Editing, undo, and the database
 //!
-//! Every change -- add, remove, recolour, a note -- goes through a method
+//! Every change -- add, remove, recolour, a comment -- goes through a method
 //! here, and each one does three things: changes the list, records how to
 //! reverse it, and queues an `Effect` describing what the library must write.
 //! The reader drains the effects once a frame and turns them into SQL. That
@@ -37,6 +37,22 @@
 //!
 //! Changes are **grouped**. Highlighting a selection that spans six lines
 //! makes six marks, and `u` should take all six back, not the last line.
+//!
+//! ## Anchors and comments
+//!
+//! Those six marks are also one **anchor**: they share a number, and that
+//! is what a comment is made on. Comments are a second list in the same
+//! history, so `u` after a comment takes the comment back and `u` after a
+//! deletion brings the marks and what was written on them back together.
+//! Many comments may hang from one anchor, and they read in the order they
+//! were made.
+//!
+//! The numbers are the ones a PDF's `/NM` will carry -- Mímir writes them
+//! as `f` and base 36 -- and they are handed out here, one past the highest
+//! seen, because a comment has to name its anchor before either has a row.
+//! The first comment on an anchor takes the anchor's own number, since in a
+//! PDF it is the anchor's `/Contents`; later ones take numbers of their own.
+//! An anchor whose last mark goes takes its comments with it.
 //!
 //! ## Coordinates
 //!
@@ -62,8 +78,8 @@ const Marks = @This();
 /// A tag on the struct rather than a union, because every field but two is
 /// shared and the parts that walk this list -- undo, the effects queue,
 /// reading order, the panel -- want a `Mark` and not a switch. The two that
-/// are not shared are `points` and `width`, and both are empty on a block for
-/// the same reason `note` usually is.
+/// are not shared are `points` and `width`, and both are empty on a block, as
+/// a mark nobody has commented on has no comments.
 pub const Kind = enum { block, ink };
 
 /// How a block marks its words: PDF's four text-markup subtypes, so that
@@ -101,10 +117,11 @@ pub const Mark = struct {
     color: Color = .{ .r = 1, .g = 0.9, .b = 0.2, .a = 1 },
     /// How a block is drawn. Ink is drawn as it went and ignores it.
     style: Style = .highlight,
-    /// A note on it. Owned by the `Marks` it belongs to; see `owned`.
-    note: []const u8 = &.{},
-    /// Where the pen went, in PDF user space, or empty for a block. Owned
-    /// the same way `note` is.
+    /// The anchor this mark is a line of; see "Anchors and comments" at the
+    /// top. Zero until `add` gives it one, which makes it an anchor alone.
+    anchor: u64 = 0,
+    /// Where the pen went, in PDF user space, or empty for a block. Owned by
+    /// the `Marks` it belongs to; see `owned`.
     points: []const Point = &.{},
     /// The pen's width in those same points, so a stroke keeps its weight
     /// against the type it was drawn over at every zoom. Zero on a block.
@@ -224,6 +241,25 @@ pub fn simplify(points: []Point, tolerance: f32) []Point {
     return points[0 .. kept + 1];
 }
 
+/// A comment, on an anchor.
+pub const Comment = struct {
+    /// This session's name for it, as a mark's `key` is.
+    key: u64 = 0,
+    /// The row it is stored as in Mímir, or `Mark.unsaved`.
+    id: i64 = Mark.unsaved,
+    /// The anchor it is on: the `anchor` of the marks it is about.
+    anchor: u64 = 0,
+    /// Its own number, which a link names it by. The first comment on an
+    /// anchor has the anchor's; see the top of the file.
+    name: u64 = 0,
+    /// Owned by the `Marks` it belongs to; see `owned`.
+    text: []const u8 = &.{},
+
+    pub fn saved(c: Comment) bool {
+        return c.id != Mark.unsaved;
+    }
+};
+
 /// What the library has to do to catch up with the list.
 pub const Effect = union(enum) {
     /// Write the mark with this key as a new row, and give it the row's id.
@@ -231,29 +267,44 @@ pub const Effect = union(enum) {
     /// This mark is gone: delete its row, if it has one. The whole mark and
     /// not only the row, so that a plugin can be told what was removed.
     delete: Mark,
-    /// Rewrite the colour, note and style of the mark with this key.
+    /// Rewrite the colour and style of the mark with this key.
     update: u64,
+    /// The same three for a comment, whose update is its text.
+    comment_insert: u64,
+    comment_delete: Comment,
+    comment_update: u64,
 };
 
-/// One reversible change. Both halves are whole marks rather than a diff,
+/// One reversible change. Both halves are whole records rather than a diff,
 /// because a mark is five numbers and a slice, and a diff would be a second
 /// thing to get wrong.
 const Change = struct {
     group: u32,
     kind: Action,
-    /// The mark as it was. Unused for an add.
-    before: Mark = .{},
-    /// The mark as it became. Unused for a remove.
-    after: Mark = .{},
+    /// As it was. Unused for an add.
+    before: Item = .{ .mark = .{} },
+    /// As it became. Unused for a remove.
+    after: Item = .{ .mark = .{} },
     /// Where in the list it was, so an undone removal goes back to the same
-    /// place in the drawing order rather than on top of everything.
+    /// place in the drawing order rather than on top of everything. Unused
+    /// for a comment, whose place is worked out from its anchor.
     index: usize = 0,
 
     /// Named for the edit and not `Kind`, which is now what a mark is.
     const Action = enum { added, removed, changed };
+    const Item = union(enum) { mark: Mark, comment: Comment };
 };
 
 list: std.ArrayList(Mark) = .empty,
+
+/// Every comment, ordered by anchor and then by when it was made, so that
+/// the comments on one anchor are one run found by a binary search. That is
+/// asked once per mark per frame, by the tab drawn on a commented mark.
+comments: std.ArrayList(Comment) = .empty,
+
+/// The next anchor or comment number to hand out.
+next_name: u64 = 1,
+
 
 /// Bumped by every change. A view redraws when this is not the number it last
 /// drew.
@@ -268,11 +319,11 @@ effects: std.ArrayList(Effect) = .empty,
 undo_stack: std.ArrayList(Change) = .empty,
 redo_stack: std.ArrayList(Change) = .empty,
 
-/// Note text, and the points of every stroke. An arena, because a mark that
-/// is edited leaves its old bytes behind in the undo history, and freeing
-/// them would leave history pointing at nothing. A document collects
-/// kilobytes of these in a long session, not megabytes, and all of it goes
-/// when the document is closed.
+/// Comment text, and the points of every stroke. An arena, because a
+/// comment that is edited leaves its old bytes behind in the undo history,
+/// and freeing them would leave history pointing at nothing. A document
+/// collects kilobytes of these in a long session, not megabytes, and all of
+/// it goes when the document is closed.
 ///
 /// It was `strings` when notes were the only thing in it. A stroke's points
 /// are here for the same argument and under the same lifetime, so the field
@@ -291,6 +342,7 @@ pub const history_limit = 1000;
 
 pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.list.deinit(gpa);
+    m.comments.deinit(gpa);
     m.effects.deinit(gpa);
     m.undo_stack.deinit(gpa);
     m.redo_stack.deinit(gpa);
@@ -351,7 +403,7 @@ pub fn add(m: *Marks, gpa: Allocator, mark: Mark, loading: bool) Allocator.Error
     var fresh = mark;
     fresh.key = m.next_key;
     m.next_key += 1;
-    fresh.note = try m.own(mark.note);
+    if (mark.anchor == 0) fresh.anchor = m.newName() else m.claim(mark.anchor);
     if (mark.kind == .ink) {
         fresh.points = try m.ownPoints(mark.points);
         fresh.box = inkBounds(fresh.points, fresh.width);
@@ -364,11 +416,29 @@ pub fn add(m: *Marks, gpa: Allocator, mark: Mark, loading: bool) Allocator.Error
 
     m.dirty = true;
     try m.effects.append(gpa, .{ .insert = fresh.key });
-    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .added, .after = fresh, .index = index });
+    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .added, .after = .{ .mark = fresh }, .index = index });
     return index;
 }
 
+/// A number no anchor or comment has. The lines of one selection are given
+/// one before the first of them is added, which is what makes them one
+/// anchor.
+pub fn newName(m: *Marks) u64 {
+    defer m.next_name += 1;
+    return m.next_name;
+}
+
+/// Keeps the next number past one already in use: each mark and comment
+/// read back from the library passes through here.
+fn claim(m: *Marks, n: u64) void {
+    m.next_name = @max(m.next_name, n +| 1);
+}
+
 /// Removes the mark at `index`, returning it.
+///
+/// When it was the last line of its anchor, the comments on the anchor go
+/// too, in the same undo step: there is nothing left for them to be about,
+/// and one `u` brings the words and what was said about them back together.
 pub fn removeAt(m: *Marks, gpa: Allocator, index: usize) Allocator.Error!?Mark {
     if (index >= m.list.items.len) return null;
     // Ordered, not swap-removed: the list is drawn in the order it is held,
@@ -378,7 +448,10 @@ pub fn removeAt(m: *Marks, gpa: Allocator, index: usize) Allocator.Error!?Mark {
     m.revision +%= 1;
     m.dirty = true;
     try m.effects.append(gpa, .{ .delete = gone });
-    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .removed, .before = gone, .index = index });
+    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .removed, .before = .{ .mark = gone }, .index = index });
+    if (m.lineCount(gone.anchor) == 0) {
+        while (m.said(gone.anchor).len != 0) _ = try m.removeComment(gpa, m.saidRange(gone.anchor)[0]);
+    }
     return gone;
 }
 
@@ -409,27 +482,131 @@ pub fn restyle(m: *Marks, gpa: Allocator, index: usize, style: Style) Allocator.
     try m.replace(gpa, index, before, after);
 }
 
-pub fn setNote(m: *Marks, gpa: Allocator, index: usize, note: []const u8) Allocator.Error!void {
-    if (index >= m.list.items.len) return;
-    const before = m.list.items[index];
-    if (std.mem.eql(u8, before.note, note)) return;
-    var after = before;
-    after.note = try m.own(note);
-    try m.replace(gpa, index, before, after);
-}
-
 fn replace(m: *Marks, gpa: Allocator, index: usize, before: Mark, after: Mark) Allocator.Error!void {
     m.list.items[index] = after;
     m.revision +%= 1;
     m.dirty = true;
     try m.effects.append(gpa, .{ .update = after.key });
-    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .changed, .before = before, .after = after, .index = index });
+    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .changed, .before = .{ .mark = before }, .after = .{ .mark = after }, .index = index });
 }
 
 /// Records the row a mark was given, once the library has written it.
 pub fn setId(m: *Marks, key: u64, id: i64) void {
     const mark = m.byKey(key) orelse return;
     mark.id = id;
+}
+
+// -- comments -----------------------------------------------------------------
+
+/// Adds a comment on `comment.anchor` and returns its index. `loading` is
+/// as for `add`.
+///
+/// A comment handed in without a number is given one: the anchor's own when
+/// no comment on the anchor has it yet, and a new one otherwise.
+pub fn addComment(m: *Marks, gpa: Allocator, comment: Comment, loading: bool) Allocator.Error!usize {
+    std.debug.assert(comment.anchor != 0);
+    var fresh = comment;
+    fresh.key = m.next_key;
+    m.next_key += 1;
+    fresh.text = try m.own(comment.text);
+    if (comment.name == 0) {
+        fresh.name = if (m.named(comment.anchor)) m.newName() else comment.anchor;
+    } else m.claim(comment.name);
+
+    const index = m.commentSlot(fresh);
+    try m.comments.insert(gpa, index, fresh);
+    m.revision +%= 1;
+    if (loading) return index;
+
+    m.dirty = true;
+    try m.effects.append(gpa, .{ .comment_insert = fresh.key });
+    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .added, .after = .{ .comment = fresh } });
+    return index;
+}
+
+pub fn removeComment(m: *Marks, gpa: Allocator, index: usize) Allocator.Error!?Comment {
+    if (index >= m.comments.items.len) return null;
+    const gone = m.comments.orderedRemove(index);
+    m.revision +%= 1;
+    m.dirty = true;
+    try m.effects.append(gpa, .{ .comment_delete = gone });
+    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .removed, .before = .{ .comment = gone } });
+    return gone;
+}
+
+pub fn setText(m: *Marks, gpa: Allocator, index: usize, text: []const u8) Allocator.Error!void {
+    if (index >= m.comments.items.len) return;
+    const before = m.comments.items[index];
+    if (std.mem.eql(u8, before.text, text)) return;
+    var after = before;
+    after.text = try m.own(text);
+    m.comments.items[index] = after;
+    m.revision +%= 1;
+    m.dirty = true;
+    try m.effects.append(gpa, .{ .comment_update = after.key });
+    try m.record(gpa, .{ .group = m.currentGroup(), .kind = .changed, .before = .{ .comment = before }, .after = .{ .comment = after } });
+}
+
+/// Records the row a comment was given, once the library has written it.
+pub fn setCommentId(m: *Marks, key: u64, id: i64) void {
+    const i = m.commentIndex(key) orelse return;
+    m.comments.items[i].id = id;
+}
+
+pub fn commentIndex(m: Marks, key: u64) ?usize {
+    for (m.comments.items, 0..) |c, i| {
+        if (c.key == key) return i;
+    }
+    return null;
+}
+
+/// The comments on an anchor, oldest first.
+pub fn said(m: Marks, anchor: u64) []const Comment {
+    const r = m.saidRange(anchor);
+    return m.comments.items[r[0]..r[1]];
+}
+
+/// Where the comments on an anchor are in `comments`.
+pub fn saidRange(m: Marks, anchor: u64) [2]usize {
+    const list = m.comments.items;
+    const below = struct {
+        fn f(a: u64, c: Comment) bool {
+            return c.anchor < a;
+        }
+    }.f;
+    const upto = struct {
+        fn f(a: u64, c: Comment) bool {
+            return c.anchor <= a;
+        }
+    }.f;
+    const lo = std.sort.partitionPoint(Comment, list, anchor, below);
+    return .{ lo, lo + std.sort.partitionPoint(Comment, list[lo..], anchor, upto) };
+}
+
+/// How many marks are lines of `anchor`.
+pub fn lineCount(m: Marks, anchor: u64) usize {
+    var n: usize = 0;
+    for (m.list.items) |mark| n += @intFromBool(mark.anchor == anchor);
+    return n;
+}
+
+/// Whether a comment on `anchor` already has the anchor's own number.
+fn named(m: Marks, anchor: u64) bool {
+    for (m.said(anchor)) |c| {
+        if (c.name == anchor) return true;
+    }
+    return false;
+}
+
+/// Where a comment goes so that `comments` stays ordered by anchor, then by
+/// key -- and keys are handed out in the order things are made.
+fn commentSlot(m: Marks, c: Comment) usize {
+    const before = struct {
+        fn f(new: Comment, x: Comment) bool {
+            return x.anchor < new.anchor or (x.anchor == new.anchor and x.key < new.key);
+        }
+    }.f;
+    return std.sort.partitionPoint(Comment, m.comments.items, c, before);
 }
 
 // -- undo ---------------------------------------------------------------------
@@ -479,31 +656,51 @@ fn travel(m: *Marks, gpa: Allocator, from: *std.ArrayList(Change), to: *std.Arra
         const take_out = (change.kind == .added) == backwards;
         switch (change.kind) {
             .added, .removed => {
-                if (take_out) {
+                const item = if (change.kind == .added) change.after else change.before;
+                if (take_out) switch (item) {
                     // Take it out, wherever it is now.
-                    const key = if (change.kind == .added) change.after.key else change.before.key;
-                    const i = m.indexOf(key) orelse continue;
-                    const gone = m.list.orderedRemove(i);
-                    try m.effects.append(gpa, .{ .delete = gone });
-                } else {
+                    .mark => |mark| {
+                        const i = m.indexOf(mark.key) orelse continue;
+                        try m.effects.append(gpa, .{ .delete = m.list.orderedRemove(i) });
+                    },
+                    .comment => |c| {
+                        const i = m.commentIndex(c.key) orelse continue;
+                        try m.effects.append(gpa, .{ .comment_delete = m.comments.orderedRemove(i) });
+                    },
+                } else switch (item) {
                     // Put it back, as a new row -- the old one is gone.
-                    var mark = if (change.kind == .added) change.after else change.before;
-                    mark.id = Mark.unsaved;
-                    const slot = @min(change.index, m.list.items.len);
-                    try m.list.insert(gpa, slot, mark);
-                    try m.effects.append(gpa, .{ .insert = mark.key });
+                    .mark => |mark| {
+                        var back = mark;
+                        back.id = Mark.unsaved;
+                        try m.list.insert(gpa, @min(change.index, m.list.items.len), back);
+                        try m.effects.append(gpa, .{ .insert = back.key });
+                    },
+                    .comment => |c| {
+                        var back = c;
+                        back.id = Mark.unsaved;
+                        try m.comments.insert(gpa, m.commentSlot(back), back);
+                        try m.effects.append(gpa, .{ .comment_insert = back.key });
+                    },
                 }
             },
-            .changed => {
-                const key = change.after.key;
-                const i = m.indexOf(key) orelse continue;
-                var target = if (backwards) change.before else change.after;
-                // The row id is whatever the mark has now, not whatever it
-                // had when this was recorded -- an undo in between may have
-                // rewritten it.
-                target.id = m.list.items[i].id;
-                m.list.items[i] = target;
-                try m.effects.append(gpa, .{ .update = key });
+            // The row id is whatever the record has now, not whatever it had
+            // when this was recorded -- an undo in between may have
+            // rewritten it.
+            .changed => switch (if (backwards) change.before else change.after) {
+                .mark => |mark| {
+                    const i = m.indexOf(mark.key) orelse continue;
+                    var target = mark;
+                    target.id = m.list.items[i].id;
+                    m.list.items[i] = target;
+                    try m.effects.append(gpa, .{ .update = mark.key });
+                },
+                .comment => |c| {
+                    const i = m.commentIndex(c.key) orelse continue;
+                    var target = c;
+                    target.id = m.comments.items[i].id;
+                    m.comments.items[i] = target;
+                    try m.effects.append(gpa, .{ .comment_update = c.key });
+                },
             },
         }
         try to.append(gpa, change);
@@ -585,10 +782,11 @@ pub const Swatch = struct { name: []const u8, color: Color };
 /// edit mode's `i`, `n`, `N` and `d`.
 ///
 /// Typed as words. Words of one sort are alternatives, and every sort named
-/// must hold: `yellow green #question` is a yellow or green mark whose note
-/// says `#question`. The sorts are a swatch's name; a style, or `ink`;
-/// `commented`; and any other word, which the note must contain -- so a
-/// `#tag` is only a word, and needs no syntax of its own. Case is ignored.
+/// must hold: `yellow green #question` is a yellow or green mark with a
+/// comment that says `#question`. The sorts are a swatch's name; a style, or
+/// `ink`; `commented`; and any other word, which a comment on the mark's
+/// anchor must contain -- so a `#tag` is only a word, and needs no syntax of
+/// its own. Case is ignored.
 pub const Filter = struct {
     pub const max_terms = 8;
 
@@ -628,7 +826,8 @@ pub const Filter = struct {
         return f.terms == 0;
     }
 
-    pub fn matches(f: *const Filter, m: Mark) bool {
+    /// `written` is what was written on the mark's anchor: `Marks.said`.
+    pub fn matches(f: *const Filter, m: Mark, written: []const Comment) bool {
         if (f.ink or f.styles.count() != 0) {
             if (!(if (m.kind == .ink) f.ink else f.styles.contains(m.style))) return false;
         }
@@ -637,9 +836,11 @@ pub const Filter = struct {
                 if (sameColour(c, m.color)) break;
             } else return false;
         }
-        if (f.commented and m.note.len == 0) return false;
+        if (f.commented and written.len == 0) return false;
         for (f.words[0..f.word_count]) |w| {
-            if (std.ascii.findIgnoreCase(m.note, w) == null) return false;
+            for (written) |c| {
+                if (std.ascii.findIgnoreCase(c.text, w) != null) break;
+            } else return false;
         }
         return true;
     }
@@ -692,7 +893,7 @@ pub fn jump(m: Marks, from: Mark, forwards: bool, filter: *const Filter) ?Jumped
     var best: ?Mark = null;
     var wrap: ?Mark = null;
     for (m.list.items) |mark| {
-        if (!filter.matches(mark)) continue;
+        if (!filter.matches(mark, m.said(mark.anchor))) continue;
         if (wrap == null or (if (forwards) readsBefore(mark, wrap.?) else readsBefore(wrap.?, mark))) wrap = mark;
         if (mark.key == from.key) continue;
         const ahead = if (forwards) readsBefore(from, mark) else readsBefore(mark, from);
@@ -712,7 +913,7 @@ pub const Place = struct { place: usize, of: usize };
 pub fn placeOf(m: Marks, mark: Mark, filter: *const Filter) Place {
     var where: Place = .{ .place = 1, .of = 0 };
     for (m.list.items) |other| {
-        if (!filter.matches(other)) continue;
+        if (!filter.matches(other, m.said(other.anchor))) continue;
         where.of += 1;
         if (readsBefore(other, mark)) where.place += 1;
     }
@@ -727,7 +928,7 @@ pub fn atOrAfter(m: Marks, page: u32, p: Point, filter: *const Filter) ?u64 {
     var best: ?Mark = null;
     var first: ?Mark = null;
     for (m.list.items) |mark| {
-        if (!filter.matches(mark)) continue;
+        if (!filter.matches(mark, m.said(mark.anchor))) continue;
         if (mark.page == page and mark.box.contains(p)) return mark.key;
         if (first == null or readsBefore(mark, first.?)) first = mark;
         if (readsBefore(mark, probe)) continue;
@@ -852,7 +1053,7 @@ test "a group is undone as one step, and redone in the order it was made" {
     }
 }
 
-test "a note changed twice in one group redoes to the last of them" {
+test "a comment changed twice in one group redoes to the last of them" {
     // The other half of the reversal: a `.changed` run replayed backwards
     // restores the first value instead of the last.
     const gpa = testing.allocator;
@@ -860,15 +1061,17 @@ test "a note changed twice in one group redoes to the last of them" {
     defer m.deinit(gpa);
 
     _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 1, 1) }, false);
+    const anchor = m.items()[0].anchor;
+    _ = try m.addComment(gpa, .{ .anchor = anchor }, false);
     m.beginGroup();
-    try m.setNote(gpa, 0, "first");
-    try m.setNote(gpa, 0, "second");
-    try testing.expectEqualStrings("second", m.items()[0].note);
+    try m.setText(gpa, 0, "first");
+    try m.setText(gpa, 0, "second");
+    try testing.expectEqualStrings("second", m.said(anchor)[0].text);
 
     try testing.expect(try m.undo(gpa));
-    try testing.expectEqualStrings("", m.items()[0].note);
+    try testing.expectEqualStrings("", m.said(anchor)[0].text);
     try testing.expect(try m.redo(gpa));
-    try testing.expectEqualStrings("second", m.items()[0].note);
+    try testing.expectEqualStrings("second", m.said(anchor)[0].text);
 }
 
 test "a new change after an undo forgets what could have been redone" {
@@ -886,23 +1089,24 @@ test "a new change after an undo forgets what could have been redone" {
     try testing.expect(!m.canRedo());
 }
 
-test "recolouring and notes are undoable, and survive the undo of something else" {
+test "recolouring and comments are undoable, and survive the undo of something else" {
     const gpa = testing.allocator;
     var m: Marks = .{};
     defer m.deinit(gpa);
 
     m.beginGroup();
     _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 1, 1) }, false);
+    const anchor = m.items()[0].anchor;
     const red: Color = .{ .r = 1, .g = 0, .b = 0, .a = 1 };
 
     m.beginGroup();
     try m.recolour(gpa, 0, red);
     m.beginGroup();
-    try m.setNote(gpa, 0, "check this proof");
-    try testing.expectEqualStrings("check this proof", m.items()[0].note);
+    _ = try m.addComment(gpa, .{ .anchor = anchor, .text = "check this proof" }, false);
+    try testing.expectEqualStrings("check this proof", m.said(anchor)[0].text);
 
     _ = try m.undo(gpa);
-    try testing.expectEqualStrings("", m.items()[0].note);
+    try testing.expectEqual(@as(usize, 0), m.said(anchor).len);
     try testing.expectEqual(red, m.items()[0].color);
 
     _ = try m.undo(gpa);
@@ -911,7 +1115,7 @@ test "recolouring and notes are undoable, and survive the undo of something else
     _ = try m.redo(gpa);
     _ = try m.redo(gpa);
     try testing.expectEqual(red, m.items()[0].color);
-    try testing.expectEqualStrings("check this proof", m.items()[0].note);
+    try testing.expectEqualStrings("check this proof", m.said(anchor)[0].text);
 }
 
 test "a style is undoable and written, and a stroke has none to change" {
@@ -1014,14 +1218,15 @@ test "marks are walked in reading order, and wrap" {
     try testing.expectEqual(top.key, m.atOrAfter(9, .{ .x = 5, .y = 400 }, &any).?);
 }
 
-test "a jump goes to the next mark from a point or a mark, and can ask for a note" {
+test "a jump goes to the next mark from a point or a mark, and can ask for a comment" {
     const gpa = testing.allocator;
     var m: Marks = .{};
     defer m.deinit(gpa);
 
     _ = try m.add(gpa, .{ .page = 1, .box = box(0, 700, 10, 710) }, true);
-    _ = try m.add(gpa, .{ .page = 1, .box = box(0, 400, 10, 410), .note = "why?" }, true);
+    _ = try m.add(gpa, .{ .page = 1, .box = box(0, 400, 10, 410) }, true);
     _ = try m.add(gpa, .{ .page = 2, .box = box(0, 700, 10, 710) }, true);
+    _ = try m.addComment(gpa, .{ .anchor = m.items()[1].anchor, .text = "why?" }, true);
     const top = m.items()[0];
     const noted = m.items()[1];
     const p2 = m.items()[2];
@@ -1044,14 +1249,15 @@ test "a jump goes to the next mark from a point or a mark, and can ask for a not
     try testing.expectEqual(top.key, round.key);
     try testing.expect(round.wrapped);
 
-    // Only the noted one counts for a comment, whichever way and from where.
+    // Only the commented one counts for a comment, whichever way and from
+    // where.
     const c = m.jump(p2, true, &commented).?;
     try testing.expectEqual(noted.key, c.key);
     try testing.expect(c.wrapped);
     try testing.expectEqual(@as(usize, 1), c.of);
     try testing.expectEqual(noted.key, m.jump(noted, false, &commented).?.key);
 
-    // And with no note anywhere there is nothing to go to.
+    // And with no comment anywhere there is nothing to go to.
     var bare: Marks = .{};
     defer bare.deinit(gpa);
     _ = try bare.add(gpa, .{ .page = 0, .box = box(0, 0, 10, 10) }, true);
@@ -1063,29 +1269,33 @@ test "a filter's words of one sort are alternatives, and every sort must hold" {
     const green: Color = .{ .r = 63.0 / 255.0, .g = 163.0 / 255.0, .b = 77.0 / 255.0, .a = 1 };
     const swatches = [_]Swatch{ .{ .name = "yellow", .color = yellow }, .{ .name = "green", .color = green } };
 
-    const question: Mark = .{ .color = yellow, .note = "Is this #Question settled?" };
+    const question: Mark = .{ .color = yellow };
+    const thread = [_]Comment{ .{ .text = "Is this settled?" }, .{ .text = "a #Question for Tuesday" } };
     const plain: Mark = .{ .color = green, .style = .underline };
     const pen: Mark = .{ .kind = .ink, .color = green };
 
     const f = Filter.parse("YELLOW green #question", &swatches);
     try testing.expectEqual(@as(u8, 3), f.terms);
-    try testing.expect(f.matches(question));
-    try testing.expect(!f.matches(plain)); // green, but says nothing
+    // A word may be in any comment on the anchor, not only the first.
+    try testing.expect(f.matches(question, &thread));
+    try testing.expect(!f.matches(question, thread[0..1]));
+    try testing.expect(!f.matches(plain, &.{})); // green, but says nothing
 
     // A style and ink are one sort: either will do.
     const shapes = Filter.parse("strike-through ink", &swatches);
-    try testing.expect(shapes.matches(pen));
-    try testing.expect(!shapes.matches(plain));
-    try testing.expect(Filter.parse("underline", &swatches).matches(plain));
+    try testing.expect(shapes.matches(pen, &.{}));
+    try testing.expect(!shapes.matches(plain, &.{}));
+    try testing.expect(Filter.parse("underline", &swatches).matches(plain, &.{}));
 
-    try testing.expect(!Filter.parse("commented", &swatches).matches(plain));
+    try testing.expect(!Filter.parse("commented", &swatches).matches(plain, &.{}));
+    try testing.expect(Filter.parse("commented", &swatches).matches(plain, thread[0..1]));
     try testing.expect(Filter.parse("  ", &swatches).isEmpty());
 
     // A colour read back from the library is a byte a channel off the float
     // it was made from, and is still that swatch.
     var faded = question;
     faded.color.g += 0.001;
-    try testing.expect(Filter.parse("yellow", &swatches).matches(faded));
+    try testing.expect(Filter.parse("yellow", &swatches).matches(faded, &.{}));
 }
 
 test "a jump walks only what the filter lets through" {
@@ -1093,9 +1303,11 @@ test "a jump walks only what the filter lets through" {
     var m: Marks = .{};
     defer m.deinit(gpa);
 
-    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 700, 10, 710), .note = "#q one" }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 700, 10, 710) }, true);
     _ = try m.add(gpa, .{ .page = 0, .box = box(0, 600, 10, 610) }, true);
-    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 500, 10, 510), .note = "#q two" }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 500, 10, 510) }, true);
+    _ = try m.addComment(gpa, .{ .anchor = m.items()[0].anchor, .text = "#q one" }, true);
+    _ = try m.addComment(gpa, .{ .anchor = m.items()[2].anchor, .text = "#q two" }, true);
 
     const f = Filter.parse("#q", &.{});
     const to = m.jump(m.items()[0], true, &f).?;
@@ -1225,4 +1437,80 @@ test "ink and highlights undo through one history, in the order they were made" 
     try testing.expect(try m.redo(gpa));
     try testing.expectEqual(Kind.ink, m.items()[1].kind);
     try testing.expectEqual(@as(usize, 2), m.items()[1].points.len);
+}
+
+test "a selection's lines are one anchor, and its comments hang from it in order" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    // What came back from the library: a name past which new ones go.
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 1, 1), .anchor = 7 }, true);
+
+    m.beginGroup();
+    const anchor = m.newName();
+    try testing.expectEqual(@as(u64, 8), anchor);
+    for (0..3) |i| {
+        const y: f32 = @floatFromInt(i * 10);
+        _ = try m.add(gpa, .{ .page = 1, .box = box(0, y, 9, y + 9), .anchor = anchor }, false);
+    }
+    try testing.expectEqual(@as(usize, 3), m.lineCount(anchor));
+    // A mark made alone is an anchor alone.
+    _ = try m.add(gpa, .{ .page = 2, .box = box(0, 0, 1, 1) }, false);
+    try testing.expectEqual(@as(u64, 9), m.items()[4].anchor);
+
+    // The first comment takes the anchor's number, as the PDF's `/Contents`
+    // of the anchor; the next is a reply with a number of its own. One on
+    // another anchor made in between does not get between them.
+    _ = try m.addComment(gpa, .{ .anchor = anchor, .text = "is this right?" }, false);
+    _ = try m.addComment(gpa, .{ .anchor = 7, .text = "elsewhere" }, false);
+    _ = try m.addComment(gpa, .{ .anchor = anchor, .text = "no" }, false);
+    const thread = m.said(anchor);
+    try testing.expectEqual(@as(usize, 2), thread.len);
+    try testing.expectEqual(anchor, thread[0].name);
+    try testing.expectEqualStrings("is this right?", thread[0].text);
+    try testing.expectEqual(@as(u64, 10), thread[1].name);
+    try testing.expectEqualStrings("no", thread[1].text);
+    try testing.expectEqual(@as(u64, 7), m.said(7)[0].name);
+    try testing.expectEqual(@as(usize, 0), m.said(9).len);
+}
+
+test "the last line of an anchor takes its comments, and one u brings both back" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    const anchor = m.newName();
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 10, 9, 19), .anchor = anchor }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 9, 9), .anchor = anchor }, true);
+    _ = try m.addComment(gpa, .{ .anchor = anchor, .text = "one", .id = 4 }, true);
+    _ = try m.addComment(gpa, .{ .anchor = anchor, .text = "two", .id = 5 }, true);
+
+    // One line of two: the comments stay with the line that is left.
+    m.beginGroup();
+    _ = try m.removeAt(gpa, 0);
+    try testing.expectEqual(@as(usize, 2), m.said(anchor).len);
+    m.clearEffects();
+
+    // The last: they go too, and the library is told to delete their rows.
+    m.beginGroup();
+    _ = try m.removeAt(gpa, 0);
+    try testing.expectEqual(@as(usize, 0), m.said(anchor).len);
+    var deleted: usize = 0;
+    for (m.takeEffects()) |e| deleted += @intFromBool(e == .comment_delete and e.comment_delete.saved());
+    try testing.expectEqual(@as(usize, 2), deleted);
+    m.clearEffects();
+
+    // One undo puts the line and both comments back, as new rows, in the
+    // order they were written.
+    _ = try m.undo(gpa);
+    try testing.expectEqual(@as(usize, 1), m.count());
+    const back = m.said(anchor);
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqualStrings("one", back[0].text);
+    try testing.expectEqualStrings("two", back[1].text);
+    try testing.expect(!back[0].saved());
+    var inserted: usize = 0;
+    for (m.takeEffects()) |e| inserted += @intFromBool(e == .comment_insert);
+    try testing.expectEqual(@as(usize, 2), inserted);
 }

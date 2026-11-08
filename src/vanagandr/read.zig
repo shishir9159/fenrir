@@ -287,7 +287,7 @@ else
     \\    :marks, :marks clear how many marks, or remove them all
     \\    :filter WORDS        only the marks that match, in the panel and to
     \\                         ]a: a colour, a style, ink, commented, or words
-    \\                         in the note; with no words, every mark again
+    \\                         in a comment; with no words, every mark again
     \\
 else "") ++ (if (caps.lua)
     \\    :lua CODE            run Lua, with the fenrir table
@@ -342,7 +342,7 @@ const normal_mode =
     \\    click on a mark      remove it: a highlight, or a line of ink
     \\    M                    remove every mark in this document
     \\    ]a / [a              the next / previous mark, in reading order
-    \\    ]c / [c              the next / previous comment: a mark with a note
+    \\    ]c / [c              the next / previous mark with a comment
     \\    u / ctrl+r           undo / redo a change to the marks
     \\
 else "") ++
@@ -387,14 +387,14 @@ const mark_modes =
     \\
     \\edit mode (changing highlights), from i:
     \\    n / N, j / k, tab    the next and previous highlight
-    \\    ]a [a, ]c [c         the same, or only the ones with a note, among
+    \\    ]a [a, ]c [c         the same, or only the ones with a comment, among
     \\                         what :filter lets through
     \\    1 .. 8               recolour it
     \\    m / _ / - / ~        make it a highlight, an underline, a
     \\                         strike-through or a squiggle
     \\    d, x, delete         delete it, and take the next
-    \\    a, enter             write a note on it; enter keeps the note,
-    \\                         escape throws it away
+    \\    a, enter             write its comment; enter keeps it, and keeps
+    \\                         none when it is empty; escape throws it away
     \\    u / ctrl+r           undo / redo
     \\    escape, q            back to normal mode
     \\
@@ -411,8 +411,9 @@ const mark_modes =
 
 const closing = (if (caps.marks)
     \\
-    \\    The title bar shows the mode, the highlight in hand, its note, the
-    \\    note or command as it is being typed, and messages from plugins.
+    \\    The title bar shows the mode, the highlight in hand, its comment,
+    \\    the comment or command as it is being typed, and messages from
+    \\    plugins.
     \\
 else
     \\
@@ -1918,7 +1919,9 @@ const Session = struct {
         return place;
     }
 
-    /// Reads this document's highlights into its buffer.
+    /// Reads this document's marks, and the comments on them, into its
+    /// buffer. A name that is not one fenrir wrote is read as no name, and
+    /// the mark becomes an anchor of its own.
     fn loadMarks(s: *Session, index: u32) void {
         const lib = s.library orelse return;
         const b = s.buffer(index);
@@ -1934,7 +1937,7 @@ const Session = struct {
                 .box = .fromRect(h.x0, h.y0, h.x1, h.y1),
                 .color = color,
                 .style = std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight,
-                .note = h.note,
+                .anchor = Library.nameNumber(h.anchor) orelse 0,
             }, true) catch return;
         }
 
@@ -1952,7 +1955,21 @@ const Session = struct {
                 .points = k.points,
                 .width = if (k.width > 0) k.width else default_pen_width,
                 .color = Library.parseColor(k.color) orelse ink_colour,
-                .note = k.note,
+                .anchor = Library.nameNumber(k.anchor) orelse 0,
+            }, true) catch return;
+        }
+
+        const said = lib.comments(b.path) catch return;
+        defer lib.freeComments(said, said.len);
+
+        for (said) |c| {
+            const anchor = Library.nameNumber(c.anchor) orelse continue;
+            if (anchor == 0) continue;
+            _ = b.marks.addComment(s.gpa, .{
+                .id = c.id,
+                .anchor = anchor,
+                .name = Library.nameNumber(c.nm) orelse 0,
+                .text = c.text,
             }, true) catch return;
         }
     }
@@ -2635,15 +2652,18 @@ const Session = struct {
     /// stacking on it, so selecting highlighted words and pressing `3`
     /// recolours them instead of darkening them.
     fn highlightBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color) void {
-        s.markBoxes(buffer_index, boxes, color, .highlight);
+        _ = s.markBoxes(buffer_index, boxes, color, .highlight);
     }
 
     /// Marks each box, replacing what mostly covered the same words: marking
     /// a line again in another colour or style is changing its mark.
-    fn markBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color, style: Marks.Style) void {
+    ///
+    /// Every box is a line of one new anchor, returned.
+    fn markBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color, style: Marks.Style) u64 {
         const b = s.buffer(buffer_index);
         b.marks.beginGroup();
         defer b.marks.beginGroup();
+        const anchor = b.marks.newName();
 
         for (boxes) |pb| {
             var i = b.marks.count();
@@ -2654,10 +2674,17 @@ const Session = struct {
                 const shared = mark.box.intersect(pb.box);
                 if (shared.isEmpty()) continue;
                 if (area(shared) < area(mark.box) * 0.5) continue;
-                _ = b.marks.removeAt(s.gpa, i) catch return;
+                _ = b.marks.removeAt(s.gpa, i) catch return anchor;
             }
-            _ = b.marks.add(s.gpa, .{ .page = pb.page, .box = pb.box, .color = color, .style = style }, false) catch return;
+            _ = b.marks.add(s.gpa, .{
+                .page = pb.page,
+                .box = pb.box,
+                .color = color,
+                .style = style,
+                .anchor = anchor,
+            }, false) catch return anchor;
         }
+        return anchor;
     }
 
     fn area(box: Bounds) f32 {
@@ -2817,7 +2844,7 @@ const Session = struct {
         var boxes: std.ArrayList(PageBox) = .empty;
         defer boxes.deinit(s.gpa);
         s.selectionBoxes(v.buffer, sel[0], sel[1], s.lineSelection(), &boxes) catch return;
-        s.markBoxes(v.buffer, boxes.items, s.paletteColor(colour), style);
+        _ = s.markBoxes(v.buffer, boxes.items, s.paletteColor(colour), style);
     }
 
     /// Visual mode's `d`: every highlight the selection touches goes.
@@ -2968,11 +2995,18 @@ const Session = struct {
         const round: []const u8 = if (!to.wrapped) "" else if (j.forwards) ", from the top" else ", from the end";
         const of: []const u8 = if (filtered) " that match" else "";
         if (j.comments) {
-            const note = b.marks.byKey(to.key).?.note;
-            s.say("comment {d}/{d}{s}{s}: {s}", .{ to.place, to.of, of, round, note });
+            const said = firstComment(b, b.marks.byKey(to.key).?.*);
+            s.say("comment {d}/{d}{s}{s}: {s}", .{ to.place, to.of, of, round, said });
         } else {
             s.say("mark {d}/{d}{s}{s}", .{ to.place, to.of, of, round });
         }
+    }
+
+    /// The first thing written on a mark's anchor, or nothing: what a line
+    /// of the status bar or of the panel has room for.
+    fn firstComment(b: *Buffer, mark: Marks.Mark) []const u8 {
+        const said = b.marks.said(mark.anchor);
+        return if (said.len == 0) "" else said[0].text;
     }
 
     // -- a comparison ----------------------------------------------------------
@@ -3499,13 +3533,16 @@ const Session = struct {
         s.focusMark(next);
     }
 
+    /// Note mode opens on the first comment on the anchor in hand, to change
+    /// it, or on nothing, to write one.
     fn beginNote(s: *Session) void {
+        const b = s.buffer(s.view().buffer);
         const i = s.focusedMarkIndex() orelse {
-            s.keymap.mode = if (s.buffer(s.view().buffer).marks.count() == 0) .normal else .edit;
+            s.keymap.mode = if (b.marks.count() == 0) .normal else .edit;
             return;
         };
         s.note.clearRetainingCapacity();
-        s.note.appendSlice(s.gpa, s.buffer(s.view().buffer).marks.items()[i].note) catch {};
+        s.note.appendSlice(s.gpa, firstComment(b, b.marks.items()[i])) catch {};
     }
 
     fn noteChar(s: *Session, c: u21) void {
@@ -3526,17 +3563,29 @@ const Session = struct {
         s.note.shrinkRetainingCapacity(n);
     }
 
+    /// Keeps what was typed as the first comment on the anchor in hand: a new
+    /// comment when it had none, the same one changed, or none at all when
+    /// everything was rubbed out.
     fn commitNote(s: *Session) void {
         defer s.note.clearRetainingCapacity();
         const i = s.focusedMarkIndex() orelse return;
         const b = s.buffer(s.view().buffer);
+        const anchor = b.marks.items()[i].anchor;
+        const first = b.marks.saidRange(anchor);
         b.marks.beginGroup();
-        b.marks.setNote(s.gpa, i, s.note.items) catch {};
+        if (first[0] == first[1]) {
+            if (s.note.items.len == 0) return;
+            _ = b.marks.addComment(s.gpa, .{ .anchor = anchor, .text = s.note.items }, false) catch {};
+        } else if (s.note.items.len == 0) {
+            _ = b.marks.removeComment(s.gpa, first[0]) catch {};
+        } else {
+            b.marks.setText(s.gpa, first[0], s.note.items) catch {};
+        }
     }
 
-    /// A note is a line of text on a highlight, not an essay. Bounded so that
-    /// a key held down does not fill the title bar, and the database, with a
-    /// megabyte of one letter.
+    /// A comment is a line of text on a highlight, not an essay. Bounded so
+    /// that a key held down does not fill the title bar, and the database,
+    /// with a megabyte of one letter.
     const max_note = 1024;
 
     fn undoMarks(s: *Session, forwards: bool) void {
@@ -3590,6 +3639,8 @@ const Session = struct {
             .insert => |key| {
                 const mark = b.marks.byKey(key) orelse return;
                 var hex: [7]u8 = undefined;
+                var name: [Library.name_len]u8 = undefined;
+                const anchor = Library.makeName(&name, mark.anchor);
                 const id = switch (mark.kind) {
                     .block => lib.addHighlight(b.path, .{
                         .page = mark.page,
@@ -3598,15 +3649,15 @@ const Session = struct {
                         .x1 = mark.box.max_x,
                         .y1 = mark.box.max_y,
                         .color = @constCast(hexOf(mark.color, &hex)),
-                        .note = @constCast(mark.note),
                         .style = @constCast(@tagName(mark.style)),
+                        .anchor = @constCast(anchor),
                     }, s.now()) catch return,
                     .ink => lib.addStroke(b.path, .{
                         .page = mark.page,
                         .color = @constCast(hexOf(mark.color, &hex)),
                         .width = mark.width,
                         .points = @constCast(mark.points),
-                        .note = @constCast(mark.note),
+                        .anchor = @constCast(anchor),
                     }, s.now()) catch return,
                 };
                 b.marks.setId(key, id);
@@ -3620,9 +3671,25 @@ const Session = struct {
                 if (!mark.saved()) return;
                 var hex: [7]u8 = undefined;
                 switch (mark.kind) {
-                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), mark.note, @tagName(mark.style)) catch {},
-                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex), mark.note) catch {},
+                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), "", @tagName(mark.style)) catch {},
+                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex), "") catch {},
                 }
+            },
+            .comment_insert => |key| {
+                const c = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
+                var anchor: [Library.name_len]u8 = undefined;
+                var own: [Library.name_len]u8 = undefined;
+                const id = lib.addComment(b.path, .{
+                    .anchor = @constCast(Library.makeName(&anchor, c.anchor)),
+                    .nm = @constCast(Library.makeName(&own, c.name)),
+                    .text = @constCast(c.text),
+                }, s.now()) catch return;
+                b.marks.setCommentId(key, id);
+            },
+            .comment_delete => |c| if (c.saved()) lib.removeComment(c.id) catch {},
+            .comment_update => |key| {
+                const c = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
+                if (c.saved()) lib.updateComment(c.id, c.text, s.now()) catch {};
             },
         }
     }
@@ -3636,6 +3703,7 @@ const Session = struct {
             .insert => .{ .AnnotationAdd, (b.marks.byKey(e.insert) orelse return).* },
             .update => .{ .AnnotationChange, (b.marks.byKey(e.update) orelse return).* },
             .delete => |m| .{ .AnnotationRemove, m },
+            .comment_insert, .comment_delete, .comment_update => return,
         };
         var hex: [7]u8 = undefined;
         rt.emit(.{ .event = event, .doc = s.handleOf(at), .path = b.path, .data = .{ .highlight = .{
@@ -3646,7 +3714,7 @@ const Session = struct {
             .x1 = mark.box.max_x,
             .y1 = mark.box.max_y,
             .color = hexOf(mark.color, &hex),
-            .note = mark.note,
+            .note = firstComment(b, mark),
             .kind = kindName(mark.kind),
             .style = styleName(mark),
         } } });
@@ -3867,10 +3935,10 @@ const Session = struct {
                 if (filter.isEmpty()) {
                     s.status = "no filter: every mark is shown, and ]a walks them all";
                 } else {
-                    const marks = s.buffer(v.buffer).marks.items();
+                    const b = s.buffer(v.buffer);
                     var n: usize = 0;
-                    for (marks) |m| n += @intFromBool(filter.matches(m));
-                    s.say("{d} of {d} marks match", .{ n, marks.len });
+                    for (b.marks.items()) |m| n += @intFromBool(filter.matches(m, b.marks.said(m.anchor)));
+                    s.say("{d} of {d} marks match", .{ n, b.marks.count() });
                 }
             },
             .dnext => s.jumpChange(true),
@@ -4399,7 +4467,8 @@ const Session = struct {
     fn hostHighlightAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host.Highlight {
         const s = hostSession(ptr);
         const at = s.bufferFor(doc) orelse return null;
-        const marks = s.buffer(at).marks.items();
+        const b = s.buffer(at);
+        const marks = b.marks.items();
         if (index >= marks.len) return null;
         const m = marks[index];
         return .{
@@ -4412,7 +4481,7 @@ const Session = struct {
             // Valid until the next call, which Galdr does not make until it
             // has copied this one into Lua.
             .color = hexOf(m.color, &s.hex_buf),
-            .note = m.note,
+            .note = firstComment(b, m),
             .kind = kindName(m.kind),
             .style = styleName(m),
         };
@@ -4433,9 +4502,11 @@ const Session = struct {
             .color = color,
             // Galdr has refused any name that is not one of these.
             .style = std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight,
-            .note = h.note,
         }, false) catch return null;
-        return b.marks.items()[index].key;
+        const made = b.marks.items()[index];
+        // A note given with it is the first comment on it, in the same step.
+        if (h.note.len != 0) _ = b.marks.addComment(s.gpa, .{ .anchor = made.anchor, .text = h.note }, false) catch {};
+        return made.key;
     }
 
     /// Against the document the caller named, which is the half of this
@@ -5217,10 +5288,10 @@ const Session = struct {
     /// highlighter does to paper. An underline, a strike-through and a
     /// squiggle are solid, being lines and not washes.
     ///
-    /// The one in hand in edit mode is stronger and outlined, and one with a
-    /// note carries a small tab at its top-right corner -- the note's text is
-    /// in the title bar while the highlight is in hand, since the title bar
-    /// is the only text this window draws.
+    /// The one in hand in edit mode is stronger and outlined, and one whose
+    /// anchor has a comment carries a small tab at its top-right corner --
+    /// the comment's text is in the title bar while the highlight is in
+    /// hand, since the title bar is the only text this window draws.
     ///
     /// The whole range at once, rather than a call per page: a buffer's marks
     /// are one list in no particular page order, so a call per page would
@@ -5260,7 +5331,7 @@ const Session = struct {
                     .{ .r = c.r * 0.6, .g = c.g * 0.6, .b = c.b * 0.6, .a = 1 },
                 );
             }
-            if (mark.note.len != 0) {
+            if (b.marks.said(mark.anchor).len != 0) {
                 const tab = @max(4.0, 3.0 * v.zoom);
                 try over.fill(
                     .fromRect(box.max_x - tab, box.min_y - tab * 0.5, box.max_x + tab * 0.5, box.min_y + tab),
@@ -5693,12 +5764,12 @@ const Session = struct {
             // among them all when the one in hand is not one of those -- a
             // click takes hold of any mark, and a recolour can take one out.
             var filter = s.markFilter();
-            if (!filter.matches(held)) filter = .{};
+            if (!filter.matches(held, b.marks.said(held.anchor))) filter = .{};
             const at = b.marks.placeOf(held, &filter);
             var wr: std.Io.Writer = .fixed(&s.mode_buf);
             wr.print("{s} {d}/{d}", .{ mode.label(), at.place, at.of }) catch {};
             st.mode = s.mode_buf[0..wr.end];
-            if (mode == .edit) st.note = held.note;
+            if (mode == .edit) st.note = firstComment(b, held);
         }
 
         return st;
@@ -5979,21 +6050,22 @@ const Session = struct {
             .annotations => {
                 const filter = s.markFilter();
                 for (b.marks.items()) |m| {
-                    if (!filter.matches(m)) continue;
+                    const said = b.marks.said(m.anchor);
+                    if (!filter.matches(m, said)) continue;
                     s.rows.append(s.gpa, .{
                         // A row with nothing written on it still has to say
                         // something, and what it says is this panel's to
                         // decide -- `panels.Row` draws what it is given. A
                         // stroke or a mark that is not a highlight says what
                         // it is, since its chip cannot.
-                        .label = if (m.note.len != 0)
-                            m.note
+                        .label = if (said.len != 0)
+                            said[0].text
                         else if (m.kind == .ink)
                             "ink"
                         else if (m.style != .highlight)
                             m.style.label()
                         else
-                            "no note",
+                            "no comment",
                         .page = m.page + 1,
                         .swatch = m.color,
                         .id = m.key,
@@ -7312,7 +7384,7 @@ test "an underline is one rect at the foot of the line, and a squiggle stays ins
     try testing.expectEqual(@as(usize, 60), d.instances.items.len);
 }
 
-test "edit mode walks highlights in reading order, recolours, notes and deletes, and the library follows" {
+test "edit mode walks highlights in reading order, recolours, comments and deletes, and the library follows" {
     if (!fenrir.mimir.available) return error.SkipZigTest;
     const gpa = testing.allocator;
     var lib = try Library.open(gpa, ":memory:");
@@ -7359,12 +7431,19 @@ test "edit mode walks highlights in reading order, recolours, notes and deletes,
             if (r.y0 != 600) continue;
             found = true;
             try testing.expectEqualStrings("#ef476f", r.color);
-            try testing.expectEqualStrings("chec", r.note);
+            // Written on its anchor, named as the anchor is.
+            const said = try lib.comments("/docs/a.pdf");
+            defer lib.freeComments(said, said.len);
+            try testing.expectEqual(@as(usize, 1), said.len);
+            try testing.expectEqualStrings("chec", said[0].text);
+            try testing.expectEqualStrings(r.anchor, said[0].anchor);
+            try testing.expectEqualStrings(r.anchor, said[0].nm);
         }
         try testing.expect(found);
     }
 
-    // Delete it: focus moves on to the other one, and the row goes.
+    // Delete it: focus moves on to the other one, and the row goes, and
+    // the comment with it, since it was the anchor's only line.
     _ = s.apply(.delete_mark);
     s.applyEffects();
     try testing.expectEqual(@as(usize, 1), marks.count());
@@ -7373,21 +7452,42 @@ test "edit mode walks highlights in reading order, recolours, notes and deletes,
         const rows = try lib.highlights("/docs/a.pdf");
         defer lib.freeHighlights(rows, rows.len);
         try testing.expectEqual(@as(usize, 1), rows.len);
+        const said = try lib.comments("/docs/a.pdf");
+        defer lib.freeComments(said, said.len);
+        try testing.expectEqual(@as(usize, 0), said.len);
     }
 
-    // Undo the deletion: a row again, with its colour and note.
+    // Undo the deletion: a row again, with its colour and its comment.
     _ = s.apply(.undo);
     s.applyEffects();
     {
         const rows = try lib.highlights("/docs/a.pdf");
         defer lib.freeHighlights(rows, rows.len);
         try testing.expectEqual(@as(usize, 2), rows.len);
-        var note_back = false;
-        for (rows) |r| {
-            if (std.mem.eql(u8, r.note, "chec")) note_back = true;
-        }
-        try testing.expect(note_back);
+        const said = try lib.comments("/docs/a.pdf");
+        defer lib.freeComments(said, said.len);
+        try testing.expectEqual(@as(usize, 1), said.len);
+        try testing.expectEqualStrings("chec", said[0].text);
     }
+
+    // Rubbing the comment out keeps none, rather than an empty one.
+    _ = s.apply(.next_mark);
+    try testing.expectApproxEqAbs(@as(f32, 600), marks.items()[s.focusedMarkIndex().?].box.min_y, 0.01);
+    s.keymap.mode = .note;
+    _ = s.apply(.enter_note);
+    for ("chec") |_| _ = s.apply(.note_backspace);
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    s.applyEffects();
+    const said = try lib.comments("/docs/a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqual(@as(usize, 0), said.len);
+}
+
+/// A comment on the anchor of the mark at `index`, as `a` in edit mode
+/// would write it.
+fn commentOn(marks: *Marks, gpa: Allocator, index: usize, text_: []const u8) !void {
+    _ = try marks.addComment(gpa, .{ .anchor = marks.items()[index].anchor, .text = text_ }, false);
 }
 
 test "edit mode on a document with no highlights says so and stays in normal" {
@@ -7425,7 +7525,7 @@ test "]a and ]c walk the marks from where the reader is, and come round again" {
     for (marks.items()) |m| {
         if (m.page == 1) p1 = m.key else if (m.box.min_y > 600) top = m.key else mid = m.key;
     }
-    try marks.setNote(gpa, marks.indexOf(mid).?, "why?");
+    try commentOn(marks, gpa, marks.indexOf(mid).?, "why?");
 
     // From the top of the page in front of the window, in reading order.
     const next: keys.Command = .{ .jump_mark = .{ .forwards = true } };
@@ -7442,7 +7542,7 @@ test "]a and ]c walk the marks from where the reader is, and come round again" {
     // Normal mode lands on a mark without taking hold of it.
     try testing.expect(s.focus_mark == null);
 
-    // A comment passes over the marks with no note, and reads the note out.
+    // A comment passes over the marks with none, and reads the comment out.
     _ = s.apply(.{ .jump_mark = .{ .forwards = true, .comments = true } });
     try testing.expectEqual(mid, s.last_jump.?.key);
     try testing.expect(std.mem.endsWith(u8, s.status, "why?"));
@@ -7469,8 +7569,8 @@ test "]a walks what :filter lets the panel show, and the rows are those" {
     s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 600, 200, 612) }}, Library.parseColor("green").?);
     s.highlightBoxes(0, &.{.{ .page = 1, .box = .fromRect(100, 500, 200, 512) }}, s.accent);
     const marks = &s.buffer(0).marks;
-    try marks.setNote(gpa, 0, "#question one");
-    try marks.setNote(gpa, 2, "a #question too");
+    try commentOn(marks, gpa, 0, "#question one");
+    try commentOn(marks, gpa, 2, "a #question too");
 
     try testing.expect(s.exec("filter #question"));
     try testing.expectEqualStrings("2 of 3 marks match", s.status);
@@ -7503,8 +7603,8 @@ test "edit mode's i, n, N and d walk what the filter lets through" {
     s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 600, 200, 612) }}, s.accent);
     s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 500, 200, 512) }}, s.accent);
     const marks = &s.buffer(0).marks;
-    try marks.setNote(gpa, 0, "#question one");
-    try marks.setNote(gpa, 2, "#question two");
+    try commentOn(marks, gpa, 0, "#question one");
+    try commentOn(marks, gpa, 2, "#question two");
     const one = marks.items()[0].key;
     const plain = marks.items()[1].key;
     const two = marks.items()[2].key;
@@ -8173,7 +8273,7 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
     const marks = s.buffer(0).marks.items();
     try testing.expectEqual(@as(usize, 1), marks.len);
     try testing.expectEqual(@as(u32, 2), marks[0].page);
-    try testing.expectEqualStrings("from lua", marks[0].note);
+    try testing.expectEqualStrings("from lua", Session.firstComment(s.buffer(0), marks[0]));
     try testing.expectEqual(Library.parseColor("blue").?, marks[0].color);
     try testing.expectEqual(Marks.Style.squiggly, marks[0].style);
 
@@ -8931,11 +9031,12 @@ test "a drag in draw mode is a stroke, and it is a mark like any other" {
     try testing.expectEqual(@as(usize, 0), b.marks.count());
 }
 
-test "a note typed on a stroke is written to the library and comes back" {
-    // A stroke is focusable, so `note` mode accepts a note on one -- and the
-    // ink arm of the writer was `updateStroke(id, colour)`, with no column
-    // behind it. The note lived for the session and was gone at the next
-    // open. It is persisted now; do not drop it from either arm again.
+test "a comment typed on a stroke is written to the library and comes back" {
+    // A stroke is focusable, so `note` mode accepts a comment on one -- and
+    // the ink arm of the writer was once `updateStroke(id, colour)`, with no
+    // column behind it, so what was typed lived for the session and was gone
+    // at the next open. A stroke is an anchor like any mark, and its comment
+    // is a row like any other; do not let ink fall out of that again.
     if (!fenrir.mimir.available) return error.SkipZigTest;
     const gpa = testing.allocator;
 
@@ -8974,7 +9075,11 @@ test "a note typed on a stroke is written to the library and comes back" {
         const rows = try lib.strokes(s.buffer(0).path);
         defer lib.freeStrokes(rows, rows.len);
         try testing.expectEqual(@as(usize, 1), rows.len);
-        try testing.expectEqualStrings("the margin", rows[0].note);
+        const said = try lib.comments(s.buffer(0).path);
+        defer lib.freeComments(said, said.len);
+        try testing.expectEqual(@as(usize, 1), said.len);
+        try testing.expectEqualStrings(rows[0].anchor, said[0].anchor);
+        try testing.expectEqualStrings("the margin", said[0].text);
     }
 
     // And the next open has it.
@@ -8986,7 +9091,7 @@ test "a note typed on a stroke is written to the library and comes back" {
     const marks = reopened.buffer(0).marks.items();
     try testing.expectEqual(@as(usize, 1), marks.len);
     try testing.expectEqual(Marks.Kind.ink, marks[0].kind);
-    try testing.expectEqualStrings("the margin", marks[0].note);
+    try testing.expectEqualStrings("the margin", Session.firstComment(reopened.buffer(0), marks[0]));
 }
 
 test "a press in draw mode that goes nowhere leaves nothing behind" {
