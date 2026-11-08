@@ -2658,7 +2658,10 @@ const Session = struct {
     /// Marks each box, replacing what mostly covered the same words: marking
     /// a line again in another colour or style is changing its mark.
     ///
-    /// Every box is a line of one new anchor, returned.
+    /// Every box is a line of one new anchor, returned. A replaced mark that
+    /// was the last line of its anchor hands its comments to the new one
+    /// first, so marking commented words again keeps what was said about
+    /// them.
     fn markBoxes(s: *Session, buffer_index: u32, boxes: []const PageBox, color: Color, style: Marks.Style) u64 {
         const b = s.buffer(buffer_index);
         b.marks.beginGroup();
@@ -2674,6 +2677,7 @@ const Session = struct {
                 const shared = mark.box.intersect(pb.box);
                 if (shared.isEmpty()) continue;
                 if (area(shared) < area(mark.box) * 0.5) continue;
+                if (b.marks.lineCount(mark.anchor) == 1) b.marks.moveComments(s.gpa, mark.anchor, anchor) catch return anchor;
                 _ = b.marks.removeAt(s.gpa, i) catch return anchor;
             }
             _ = b.marks.add(s.gpa, .{
@@ -3671,8 +3675,8 @@ const Session = struct {
                 if (!mark.saved()) return;
                 var hex: [7]u8 = undefined;
                 switch (mark.kind) {
-                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), "", @tagName(mark.style)) catch {},
-                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex), "") catch {},
+                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)) catch {},
+                    .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex)) catch {},
                 }
             },
             .comment_insert => |key| {
@@ -5288,10 +5292,10 @@ const Session = struct {
     /// highlighter does to paper. An underline, a strike-through and a
     /// squiggle are solid, being lines and not washes.
     ///
-    /// The one in hand in edit mode is stronger and outlined, and one whose
-    /// anchor has a comment carries a small tab at its top-right corner --
-    /// the comment's text is in the title bar while the highlight is in
-    /// hand, since the title bar is the only text this window draws.
+    /// The one in hand in edit mode is stronger and outlined, and the first
+    /// line of an anchor with a comment carries a small tab at its top-right
+    /// corner -- the comment's text is in the title bar while the highlight
+    /// is in hand, since the title bar is the only text this window draws.
     ///
     /// The whole range at once, rather than a call per page: a buffer's marks
     /// are one list in no particular page order, so a call per page would
@@ -5306,7 +5310,7 @@ const Session = struct {
     ) !void {
         const editing = s.keymap.mode == .edit or s.keymap.mode == .note;
         const in_focus = v == s.layout().current();
-        for (b.marks.items()) |mark| {
+        for (b.marks.items(), 0..) |mark, i| {
             if (mark.kind != .block) continue;
             if (mark.page < range.first or mark.page >= range.end) continue;
             const page = mark.page;
@@ -5331,7 +5335,9 @@ const Session = struct {
                     .{ .r = c.r * 0.6, .g = c.g * 0.6, .b = c.b * 0.6, .a = 1 },
                 );
             }
-            if (b.marks.said(mark.anchor).len != 0) {
+            // On the anchor's first line only: six lines of one comment
+            // carry one tab.
+            if (b.marks.leads(s.gpa, i)) {
                 const tab = @max(4.0, 3.0 * v.zoom);
                 try over.fill(
                     .fromRect(box.max_x - tab, box.min_y - tab * 0.5, box.max_x + tab * 0.5, box.min_y + tab),
@@ -6049,23 +6055,27 @@ const Session = struct {
             },
             .annotations => {
                 const filter = s.markFilter();
-                for (b.marks.items()) |m| {
+                for (b.marks.items(), 0..) |m, i| {
                     const said = b.marks.said(m.anchor);
                     if (!filter.matches(m, said)) continue;
+                    // The comment on its anchor's first line, and the lines
+                    // after it a step in, under it, saying only what they
+                    // are: six rows of one comment would read as six.
+                    const lead = said.len != 0 and b.marks.leads(s.gpa, i);
+                    const what = if (m.kind == .ink) "ink" else m.style.label();
                     s.rows.append(s.gpa, .{
                         // A row with nothing written on it still has to say
                         // something, and what it says is this panel's to
                         // decide -- `panels.Row` draws what it is given. A
                         // stroke or a mark that is not a highlight says what
                         // it is, since its chip cannot.
-                        .label = if (said.len != 0)
+                        .label = if (lead)
                             said[0].text
-                        else if (m.kind == .ink)
-                            "ink"
-                        else if (m.style != .highlight)
-                            m.style.label()
+                        else if (said.len != 0 or m.kind == .ink or m.style != .highlight)
+                            what
                         else
                             "no comment",
+                        .depth = @intFromBool(said.len != 0 and !lead),
                         .page = m.page + 1,
                         .swatch = m.color,
                         .id = m.key,
@@ -7295,6 +7305,43 @@ test "visual mode: select with motions, highlight in a colour, undo it" {
     try testing.expectEqual(@as(usize, 0), marks.count());
     _ = s.apply(.redo);
     try testing.expectEqual(@as(usize, 2), marks.count());
+}
+
+test "a selection's lines are one anchor, and marking them again keeps its comment" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const lines = [_]Session.PageBox{
+        .{ .page = 0, .box = .fromRect(100, 700, 300, 712) },
+        .{ .page = 0, .box = .fromRect(100, 686, 300, 698) },
+        .{ .page = 0, .box = .fromRect(100, 672, 200, 684) },
+    };
+    const anchor = s.markBoxes(0, &lines, s.accent, .highlight);
+    const marks = &s.buffer(0).marks;
+    for (marks.items()) |m| try testing.expectEqual(anchor, m.anchor);
+    try commentOn(marks, gpa, 0, "one claim");
+
+    // The comment on the first line, and the other two under it.
+    const rows = s.panelRows(.annotations);
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqualStrings("one claim", rows[0].label);
+    try testing.expectEqual(@as(u8, 0), rows[0].depth);
+    try testing.expectEqual(@as(u8, 1), rows[2].depth);
+
+    // Underlined over the same words: new marks, a new anchor, and the
+    // comment moved onto it rather than lost with the old marks.
+    const again = s.markBoxes(0, &lines, s.accent, .underline);
+    try testing.expect(again != anchor);
+    try testing.expectEqual(@as(usize, 3), marks.count());
+    try testing.expectEqual(@as(usize, 0), marks.said(anchor).len);
+    try testing.expectEqualStrings("one claim", marks.said(again)[0].text);
+
+    // One `u` is one step back to the old marks with their comment.
+    _ = s.apply(.undo);
+    try testing.expectEqualStrings("one claim", marks.said(anchor)[0].text);
+    for (marks.items()) |m| try testing.expectEqual(anchor, m.anchor);
 }
 
 test "highlighting over a highlight replaces it rather than stacking" {

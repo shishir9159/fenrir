@@ -305,6 +305,11 @@ comments: std.ArrayList(Comment) = .empty,
 /// The next anchor or comment number to hand out.
 next_name: u64 = 1,
 
+/// For each anchor with a comment, the index of its first line in reading
+/// order: the mark the comment is shown on. Worked out again when
+/// `revision` has moved past `led_revision`, never per frame; see `leads`.
+led: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+led_revision: u64 = 0,
 
 /// Bumped by every change. A view redraws when this is not the number it last
 /// drew.
@@ -343,6 +348,7 @@ pub const history_limit = 1000;
 pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.list.deinit(gpa);
     m.comments.deinit(gpa);
+    m.led.deinit(gpa);
     m.effects.deinit(gpa);
     m.undo_stack.deinit(gpa);
     m.redo_stack.deinit(gpa);
@@ -547,6 +553,20 @@ pub fn setText(m: *Marks, gpa: Allocator, index: usize, text: []const u8) Alloca
     try m.record(gpa, .{ .group = m.currentGroup(), .kind = .changed, .before = .{ .comment = before }, .after = .{ .comment = after } });
 }
 
+/// Files the comments on one anchor under another, each as a removal and an
+/// addition, since a comment moved is a different comment to the library.
+///
+/// What marking words again does: a highlight made over a commented one
+/// replaces its marks, and the comments follow the words rather than going
+/// with the marks they were first made on.
+pub fn moveComments(m: *Marks, gpa: Allocator, from: u64, to: u64) Allocator.Error!void {
+    if (from == to) return;
+    while (m.said(from).len != 0) {
+        const gone = (try m.removeComment(gpa, m.saidRange(from)[0])).?;
+        _ = try m.addComment(gpa, .{ .anchor = to, .text = gone.text }, false);
+    }
+}
+
 /// Records the row a comment was given, once the library has written it.
 pub fn setCommentId(m: *Marks, key: u64, id: i64) void {
     const i = m.commentIndex(key) orelse return;
@@ -607,6 +627,29 @@ fn commentSlot(m: Marks, c: Comment) usize {
         }
     }.f;
     return std.sort.partitionPoint(Comment, m.comments.items, c, before);
+}
+
+/// Whether the mark at `index` is where its anchor's comments are shown:
+/// the first of the anchor's lines in reading order, on an anchor that has
+/// any.
+///
+/// Asked of every mark every frame, so the answer is a table rebuilt when
+/// the marks change rather than a walk of the anchor's lines per mark.
+pub fn leads(m: *Marks, gpa: Allocator, index: usize) bool {
+    if (m.led_revision != m.revision) m.relead(gpa) catch return false;
+    const lead = m.led.get(m.list.items[index].anchor) orelse return false;
+    return lead == index;
+}
+
+fn relead(m: *Marks, gpa: Allocator) Allocator.Error!void {
+    const none = std.math.maxInt(usize);
+    m.led.clearRetainingCapacity();
+    for (m.comments.items) |c| try m.led.put(gpa, c.anchor, none);
+    for (m.list.items, 0..) |mark, i| {
+        const lead = m.led.getPtr(mark.anchor) orelse continue;
+        if (lead.* == none or readsBefore(mark, m.list.items[lead.*])) lead.* = i;
+    }
+    m.led_revision = m.revision;
 }
 
 // -- undo ---------------------------------------------------------------------
@@ -1513,4 +1556,46 @@ test "the last line of an anchor takes its comments, and one u brings both back"
     var inserted: usize = 0;
     for (m.takeEffects()) |e| inserted += @intFromBool(e == .comment_insert);
     try testing.expectEqual(@as(usize, 2), inserted);
+}
+
+test "marking words again moves their comments onto the new anchor" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 9, 9) }, true);
+    const old = m.items()[0].anchor;
+    _ = try m.addComment(gpa, .{ .anchor = old, .text = "keep me" }, true);
+
+    m.beginGroup();
+    const fresh = m.newName();
+    try m.moveComments(gpa, old, fresh);
+    _ = try m.removeAt(gpa, 0);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 9, 9), .anchor = fresh }, false);
+    try testing.expectEqual(@as(usize, 0), m.said(old).len);
+    try testing.expectEqualStrings("keep me", m.said(fresh)[0].text);
+    // On its new anchor it is the first comment, so it takes that name.
+    try testing.expectEqual(fresh, m.said(fresh)[0].name);
+
+    _ = try m.undo(gpa);
+    try testing.expectEqualStrings("keep me", m.said(old)[0].text);
+    try testing.expectEqual(@as(usize, 0), m.said(fresh).len);
+}
+
+test "an anchor's comment is shown on its first line in reading order" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    const anchor = m.newName();
+    // Made bottom line first, as a selection dragged upwards would be.
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 600, 9, 610), .anchor = anchor }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 700, 9, 710), .anchor = anchor }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 500, 9, 510) }, true);
+    try testing.expect(!m.leads(gpa, 1));
+
+    _ = try m.addComment(gpa, .{ .anchor = anchor, .text = "here" }, true);
+    try testing.expect(m.leads(gpa, 1));
+    try testing.expect(!m.leads(gpa, 0));
+    try testing.expect(!m.leads(gpa, 2));
 }

@@ -202,6 +202,8 @@ const Driver = struct {
     /// another in a script.
     marks: []Library.Highlight = &.{},
     ink: []Library.Stroke = &.{},
+    /// What was written on them, which a highlight hands over as its `note`.
+    comments: []Library.Comment = &.{},
     marks_for: []const u8 = "",
     /// A highlight's colour as text, for the one call being answered.
     hex: [7]u8 = undefined,
@@ -214,6 +216,7 @@ const Driver = struct {
         if (d.library) |lib| {
             lib.freeHighlights(d.marks, d.marks.len);
             lib.freeStrokes(d.ink, d.ink.len);
+            lib.freeComments(d.comments, d.comments.len);
             var l = lib;
             l.close();
         }
@@ -409,8 +412,10 @@ const Driver = struct {
         if (std.mem.eql(u8, d.marks_for, o.path) and d.marks_for.len != 0) return;
         lib.freeHighlights(d.marks, d.marks.len);
         lib.freeStrokes(d.ink, d.ink.len);
+        lib.freeComments(d.comments, d.comments.len);
         d.marks = lib.highlights(o.path) catch &.{};
         d.ink = lib.strokes(o.path) catch &.{};
+        d.comments = lib.comments(o.path) catch &.{};
         d.marks_for = o.path;
     }
 
@@ -418,8 +423,10 @@ const Driver = struct {
         const lib = d.library orelse return;
         lib.freeHighlights(d.marks, d.marks.len);
         lib.freeStrokes(d.ink, d.ink.len);
+        lib.freeComments(d.comments, d.comments.len);
         d.marks = &.{};
         d.ink = &.{};
+        d.comments = &.{};
         d.marks_for = "";
     }
 
@@ -451,7 +458,7 @@ const Driver = struct {
                 @memcpy(d.hex[0..h.color.len], h.color);
                 break :blk d.hex[0..h.color.len];
             } else "",
-            .note = h.note,
+            .note = d.firstComment(h.anchor),
             .style = h.style,
         };
     }
@@ -475,9 +482,17 @@ const Driver = struct {
                 @memcpy(d.hex[0..k.color.len], k.color);
                 break :blk d.hex[0..k.color.len];
             } else "",
-            .note = k.note,
+            .note = d.firstComment(k.anchor),
             .kind = "ink",
         };
+    }
+
+    /// The first thing written on an anchor, as the reader's `firstComment`.
+    fn firstComment(d: *Driver, anchor: []const u8) []const u8 {
+        for (d.comments) |c| {
+            if (std.mem.eql(u8, c.anchor, anchor)) return c.text;
+        }
+        return "";
     }
 
     fn addHighlight(ptr: *anyopaque, doc: Host.Handle, h: Host.Highlight) ?u64 {
@@ -485,6 +500,10 @@ const Driver = struct {
         const lib = d.library orelse return null;
         const o = d.find(doc) orelse return null;
         if (h.page == 0 or h.page > o.pages.len) return null;
+        // Named here rather than by the library, because a note given with it
+        // is the first comment on it and has to name the same anchor.
+        var name: [Library.name_len]u8 = undefined;
+        const anchor = Library.makeName(&name, (lib.highestName(o.path) catch return null) + 1);
         const id = lib.addHighlight(o.path, .{
             .page = h.page - 1,
             .x0 = @min(h.x0, h.x1),
@@ -492,10 +511,15 @@ const Driver = struct {
             .x1 = @max(h.x0, h.x1),
             .y1 = @max(h.y0, h.y1),
             .color = @constCast(h.color),
-            .note = @constCast(h.note),
             // Empty is written as a highlight, and Galdr has refused the rest.
             .style = @constCast(h.style),
+            .anchor = @constCast(anchor),
         }, library.now(d.ctx.io)) catch return null;
+        if (h.note.len != 0) _ = lib.addComment(o.path, .{
+            .anchor = @constCast(anchor),
+            .nm = @constCast(anchor),
+            .text = @constCast(h.note),
+        }, library.now(d.ctx.io)) catch {};
         d.forget();
         return @intCast(id);
     }

@@ -411,7 +411,6 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         }) catch {};
         if (!std.mem.eql(u8, h.style, "highlight")) ctx.out.print("  {s}", .{h.style}) catch {};
         if (h.color.len != 0) ctx.out.print("  {s}", .{h.color}) catch {};
-        if (h.note.len != 0) ctx.out.print("  \"{s}\"", .{h.note}) catch {};
         ctx.out.print("\n", .{}) catch {};
     }
     // The box a stroke covers rather than the points it is made of: a line
@@ -426,7 +425,6 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         }) catch {};
         if (k.color.len != 0) ctx.out.print("  {s}", .{k.color}) catch {};
         if (k.width != 0) ctx.out.print("  w{d:.2}", .{k.width}) catch {};
-        if (k.note.len != 0) ctx.out.print("  \"{s}\"", .{k.note}) catch {};
         ctx.out.print("\n", .{}) catch {};
     }
     // A comment by its own name and the anchor it hangs from, in the order

@@ -236,6 +236,11 @@ fn migrate(lib: *Library, from: i64) Error!void {
         // The marks already here are given anchors and their notes become
         // comments, in one transaction with the tables, so a file is never
         // left with the tables and without the names.
+        //
+        // The `note` columns stay, with what they held, and nothing writes
+        // them again. A build from before version 6 opens this file read-only
+        // and still selects them, and finds the notes as they were; dropping
+        // them would leave it reading no marks at all.
         try lib.db.exec("BEGIN");
         lib.addComments() catch |err| {
             lib.db.exec("ROLLBACK") catch {};
@@ -752,7 +757,6 @@ pub const Highlight = struct {
     /// `#rrggbb`, or empty for the reader's accent colour. Stored as text so
     /// that the file stays something a person can read and edit.
     color: []u8 = &.{},
-    note: []u8 = &.{},
     /// `highlight`, `underline`, `strikeout` or `squiggly`. Empty is written
     /// as `highlight`, which is what a caller that does not say means.
     style: []u8 = &.{},
@@ -772,8 +776,8 @@ pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Erro
     var buf: [name_len]u8 = undefined;
     const anchor = if (h.anchor.len != 0) h.anchor else try lib.nextName(path, &buf);
     var s = try lib.db.prepare(
-        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, style, anchor, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, style, anchor, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -783,25 +787,24 @@ pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Erro
     s.bindFloat(5, h.x1);
     s.bindFloat(6, h.y1);
     s.bindText(7, h.color);
-    s.bindText(8, h.note);
-    s.bindText(9, styleOf(h.style));
-    s.bindText(10, anchor);
-    s.bindInt(11, now);
+    s.bindText(8, styleOf(h.style));
+    s.bindText(9, anchor);
+    s.bindInt(10, now);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
 
-/// Rewrites what can change about a highlight once it exists: its colour, its
-/// note and its style. Its box and page never change -- a highlight moved to
-/// other words is a different highlight, and is removed and added as one.
-pub fn updateHighlight(lib: Library, id: i64, color: []const u8, note: []const u8, style: []const u8) Error!void {
+/// Rewrites what can change about a highlight once it exists: its colour and
+/// its style. Its box and page never change -- a highlight moved to other
+/// words is a different highlight, and is removed and added as one. What is
+/// written about it is a comment on its anchor.
+pub fn updateHighlight(lib: Library, id: i64, color: []const u8, style: []const u8) Error!void {
     if (lib.future) return;
-    var s = try lib.db.prepare("UPDATE highlight SET color = ?2, note = ?3, style = ?4 WHERE id = ?1");
+    var s = try lib.db.prepare("UPDATE highlight SET color = ?2, style = ?3 WHERE id = ?1");
     defer s.finalize();
     s.bindInt(1, id);
     s.bindText(2, color);
-    s.bindText(3, note);
-    s.bindText(4, styleOf(style));
+    s.bindText(3, styleOf(style));
     try s.exec();
 }
 
@@ -829,7 +832,7 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
     errdefer lib.freeHighlights(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, x0, y0, x1, y1, color, note, style, anchor FROM highlight
+        \\SELECT id, page, x0, y0, x1, y1, color, style, anchor FROM highlight
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -837,11 +840,9 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
     while (try s.step()) {
         const color = try lib.gpa.dupe(u8, s.columnText(6));
         errdefer lib.gpa.free(color);
-        const note = try lib.gpa.dupe(u8, s.columnText(7));
-        errdefer lib.gpa.free(note);
-        const style = try lib.gpa.dupe(u8, s.columnText(8));
+        const style = try lib.gpa.dupe(u8, s.columnText(7));
         errdefer lib.gpa.free(style);
-        const anchor = try lib.gpa.dupe(u8, s.columnText(9));
+        const anchor = try lib.gpa.dupe(u8, s.columnText(8));
         errdefer lib.gpa.free(anchor);
         try out.append(lib.gpa, .{
             .id = s.columnInt(0),
@@ -851,7 +852,6 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
             .x1 = @floatCast(s.columnFloat(4)),
             .y1 = @floatCast(s.columnFloat(5)),
             .color = color,
-            .note = note,
             .style = style,
             .anchor = anchor,
         });
@@ -861,7 +861,6 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
 
 pub fn freeHighlight(lib: Library, h: Highlight) void {
     lib.gpa.free(h.color);
-    lib.gpa.free(h.note);
     lib.gpa.free(h.style);
     lib.gpa.free(h.anchor);
 }
@@ -890,9 +889,6 @@ pub const Stroke = struct {
     color: []u8 = &.{},
     width: f32 = 0,
     points: []Point = &.{},
-    /// A line of text on the stroke, the way a highlight has one. Empty for
-    /// most of them.
-    note: []u8 = &.{},
     /// The anchor it is, as for a highlight. A stroke is always an anchor of
     /// its own.
     anchor: []u8 = &.{},
@@ -923,8 +919,8 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     const anchor = if (k.anchor.len != 0) k.anchor else try lib.nextName(path, &buf);
 
     var s = try lib.db.prepare(
-        \\INSERT INTO ink (path, page, color, width, points, note, anchor, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        \\INSERT INTO ink (path, page, color, width, points, anchor, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -932,23 +928,21 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     s.bindText(3, k.color);
     s.bindFloat(4, k.width);
     s.bindText(5, encoded);
-    s.bindText(6, k.note);
-    s.bindText(7, anchor);
-    s.bindInt(8, now);
+    s.bindText(6, anchor);
+    s.bindInt(7, now);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
 
-/// Rewrites what can change about a stroke once it exists: its colour and its
-/// note. Where the pen went is not editable -- a line drawn somewhere else is
-/// a different line, and is removed and drawn again as one.
-pub fn updateStroke(lib: Library, id: i64, color: []const u8, note: []const u8) Error!void {
+/// Rewrites what can change about a stroke once it exists: its colour. Where
+/// the pen went is not editable -- a line drawn somewhere else is a different
+/// line, and is removed and drawn again as one.
+pub fn updateStroke(lib: Library, id: i64, color: []const u8) Error!void {
     if (lib.future) return;
-    var s = try lib.db.prepare("UPDATE ink SET color = ?2, note = ?3 WHERE id = ?1");
+    var s = try lib.db.prepare("UPDATE ink SET color = ?2 WHERE id = ?1");
     defer s.finalize();
     s.bindInt(1, id);
     s.bindText(2, color);
-    s.bindText(3, note);
     try s.exec();
 }
 
@@ -976,7 +970,7 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
     errdefer lib.freeStrokes(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, color, width, points, note, anchor FROM ink
+        \\SELECT id, page, color, width, points, anchor FROM ink
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -997,9 +991,7 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
             continue;
         }
         errdefer lib.gpa.free(points);
-        const note = try lib.gpa.dupe(u8, s.columnText(5));
-        errdefer lib.gpa.free(note);
-        const anchor = try lib.gpa.dupe(u8, s.columnText(6));
+        const anchor = try lib.gpa.dupe(u8, s.columnText(5));
         errdefer lib.gpa.free(anchor);
         try out.append(lib.gpa, .{
             .id = s.columnInt(0),
@@ -1007,7 +999,6 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
             .color = color,
             .width = @floatCast(s.columnFloat(3)),
             .points = points,
-            .note = note,
             .anchor = anchor,
         });
     }
@@ -1017,7 +1008,6 @@ pub fn strokes(lib: Library, path: []const u8) Error![]Stroke {
 pub fn freeStroke(lib: Library, k: Stroke) void {
     lib.gpa.free(k.color);
     lib.gpa.free(k.points);
-    lib.gpa.free(k.note);
     lib.gpa.free(k.anchor);
 }
 
@@ -1618,7 +1608,7 @@ test "forgetting a document does not throw away what was highlighted in it" {
     try testing.expectEqual(@as(usize, 1), list.len);
 }
 
-test "a highlight's colour, note and style can be changed in place" {
+test "a highlight's colour and style can be changed in place" {
     if (!Db.available) return error.SkipZigTest;
     var lib = try memory();
     defer lib.close();
@@ -1630,14 +1620,13 @@ test "a highlight's colour, note and style can be changed in place" {
         defer lib.freeHighlights(list, list.len);
         try testing.expectEqualStrings("highlight", list[0].style);
     }
-    try lib.updateHighlight(id, "#3fa34d", "see lemma 3", "squiggly");
+    try lib.updateHighlight(id, "#3fa34d", "squiggly");
 
     const list = try lib.highlights("a.pdf");
     defer lib.freeHighlights(list, list.len);
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqual(id, list[0].id);
     try testing.expectEqualStrings("#3fa34d", list[0].color);
-    try testing.expectEqualStrings("see lemma 3", list[0].note);
     try testing.expectEqualStrings("squiggly", list[0].style);
 }
 
@@ -1729,39 +1718,24 @@ test "a stroke of one point, or one whose points will not parse, is not a stroke
     try testing.expectEqual(@as(usize, 0), list.len);
 }
 
-test "a stroke's note survives the file, and can be changed in place" {
-    // The reader lets a note be typed on a focused mark and a stroke can be
-    // the focused mark, so this is the other half of that: before the `note`
-    // column the ink arm of the writer was `updateStroke(id, colour)`, and
-    // what was typed was gone at the next open.
+test "a stroke's colour changes in place, and it keeps its anchor" {
+    // What is written about a stroke is a comment on its anchor, so the
+    // anchor is the one thing about it that must not move with an edit.
     if (!Db.available) return error.SkipZigTest;
     var lib = try memory();
     defer lib.close();
 
     var points = [_]Point{ .{ .x = 10, .y = 20 }, .{ .x = 30, .y = 40 } };
-    const id = try lib.addStroke("a.pdf", .{
-        .page = 1,
-        .points = &points,
-        .note = @constCast("the derivation is wrong here"),
-    }, 7);
+    const id = try lib.addStroke("a.pdf", .{ .page = 1, .points = &points }, 7);
+    try lib.updateStroke(id, "#c04040");
 
-    {
-        const list = try lib.strokes("a.pdf");
-        defer lib.freeStrokes(list, list.len);
-        try testing.expectEqual(@as(usize, 1), list.len);
-        try testing.expectEqualStrings("the derivation is wrong here", list[0].note);
-    }
-
-    try lib.updateStroke(id, "#c04040", "no, it is fine");
-    {
-        const list = try lib.strokes("a.pdf");
-        defer lib.freeStrokes(list, list.len);
-        try testing.expectEqualStrings("#c04040", list[0].color);
-        try testing.expectEqualStrings("no, it is fine", list[0].note);
-    }
+    const list = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(list, list.len);
+    try testing.expectEqualStrings("#c04040", list[0].color);
+    try testing.expectEqualStrings("f1", list[0].anchor);
 }
 
-test "a version-3 file gains the note column without losing its ink" {
+test "a version-3 file's ink comes through every version, and is named" {
     if (!Db.available) return error.SkipZigTest;
 
     var lib = try memory();
@@ -1780,13 +1754,12 @@ test "a version-3 file gains the note column without losing its ink" {
     defer lib.freeStrokes(list, list.len);
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqual(@as(usize, 2), list[0].points.len);
-    // Nothing was written where there was nothing to write.
-    try testing.expectEqualStrings("", list[0].note);
+    try testing.expectEqualStrings("f1", list[0].anchor);
 
-    try lib.updateStroke(list[0].id, "#c04040", "a note on an old stroke");
-    const after = try lib.strokes("old.pdf");
-    defer lib.freeStrokes(after, after.len);
-    try testing.expectEqualStrings("a note on an old stroke", after[0].note);
+    // With nothing written on it, there is nothing to have become a comment.
+    const said = try lib.comments("old.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqual(@as(usize, 0), said.len);
 }
 
 test "a version-2 file gains the ink table without losing its highlights" {
