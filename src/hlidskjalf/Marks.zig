@@ -963,6 +963,89 @@ pub fn placeOf(m: Marks, mark: Mark, filter: *const Filter) Place {
     return where;
 }
 
+/// Where `jumpComment` landed.
+pub const JumpedComment = struct {
+    /// The comment, and the line it is shown on.
+    key: u64,
+    mark: u64,
+    wrapped: bool,
+    /// From 1, in the order `jumpComment` reads, among those that qualified.
+    place: usize,
+    of: usize,
+};
+
+/// The comment after (or before) a place, wrapping, among those on marks
+/// `filter` lets through. Null when there is none.
+///
+/// Comments are read in the order of the lines they are shown on, and those
+/// on one anchor in the order they were made, so `]c` reads a thread through
+/// before it moves on. `after` is the comment the walk stands on, if it
+/// stands on one. From a mark that is not one, it starts with that mark's
+/// own comments: the walk stands before them.
+pub fn jumpComment(m: *Marks, gpa: Allocator, from: Mark, after: ?u64, forwards: bool, filter: *const Filter) ?JumpedComment {
+    if (m.led_revision != m.revision) m.relead(gpa) catch return null;
+
+    var stand: Spot = .{ .mark = from, .key = 0 };
+    if (from.key != 0) {
+        if (m.leadLine(from.anchor)) |i| stand.mark = m.list.items[i];
+    }
+    if (after) |k| {
+        if (m.commentIndex(k)) |i| {
+            const c = m.comments.items[i];
+            if (m.leadLine(c.anchor)) |l| stand = .{ .mark = m.list.items[l], .key = c.key };
+        }
+    }
+
+    var best: ?Spot = null;
+    var wrap: ?Spot = null;
+    for (m.comments.items) |c| {
+        const spot = m.spotOf(c, filter) orelse continue;
+        if (wrap == null or (if (forwards) spot.before(wrap.?) else wrap.?.before(spot))) wrap = spot;
+        if (c.key == stand.key) continue;
+        const ahead = if (forwards) stand.before(spot) else spot.before(stand);
+        if (!ahead) continue;
+        if (best == null or (if (forwards) spot.before(best.?) else best.?.before(spot))) best = spot;
+    }
+    const to = best orelse wrap orelse return null;
+
+    var place: usize = 1;
+    var of: usize = 0;
+    for (m.comments.items) |c| {
+        const spot = m.spotOf(c, filter) orelse continue;
+        of += 1;
+        if (spot.before(to)) place += 1;
+    }
+    return .{ .key = to.key, .mark = to.mark.key, .wrapped = best == null, .place = place, .of = of };
+}
+
+/// A comment's place in `jumpComment`'s order: the line it is shown on, then
+/// when it was made.
+const Spot = struct {
+    mark: Mark,
+    key: u64,
+
+    fn before(a: Spot, b: Spot) bool {
+        if (a.mark.key == b.mark.key) return a.key < b.key;
+        return readsBefore(a.mark, b.mark);
+    }
+};
+
+/// Where a comment is read, or null when it is not to be: on an anchor
+/// with no line left, or on a mark the filter hides. Needs `led` current.
+fn spotOf(m: *const Marks, c: Comment, filter: *const Filter) ?Spot {
+    const i = m.leadLine(c.anchor) orelse return null;
+    const mark = m.list.items[i];
+    if (!filter.matches(mark, m.said(c.anchor))) return null;
+    return .{ .mark = mark, .key = c.key };
+}
+
+/// The index of an anchor's first line in reading order, if it has a
+/// comment and a line. Needs `led` current.
+fn leadLine(m: *const Marks, anchor: u64) ?usize {
+    const i = m.led.get(anchor) orelse return null;
+    return if (i == std.math.maxInt(usize)) null else i;
+}
+
 /// The first mark `filter` lets through at or after a point in reading
 /// order, wrapping: where edit mode starts when it is entered from the
 /// cursor. Null when none does.
@@ -1598,4 +1681,61 @@ test "an anchor's comment is shown on its first line in reading order" {
     try testing.expect(m.leads(gpa, 1));
     try testing.expect(!m.leads(gpa, 0));
     try testing.expect(!m.leads(gpa, 2));
+}
+
+test "]c reads each comment, a thread through before the next anchor" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    // Two lines of one anchor high on the page, a plain mark, and one low
+    // down -- commented first, so it is the page that orders them and not
+    // the order they were written in.
+    const two = m.newName();
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 700, 9, 710), .anchor = two }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 690, 9, 700), .anchor = two }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 500, 9, 510) }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 300, 9, 310) }, true);
+    _ = try m.addComment(gpa, .{ .anchor = m.items()[3].anchor, .text = "low" }, true);
+    _ = try m.addComment(gpa, .{ .anchor = two, .text = "first" }, true);
+    _ = try m.addComment(gpa, .{ .anchor = two, .text = "reply" }, true);
+    const keyOf = struct {
+        fn f(marks: *Marks, text: []const u8) u64 {
+            for (marks.comments.items) |c| {
+                if (std.mem.eql(u8, c.text, text)) return c.key;
+            }
+            unreachable;
+        }
+    }.f;
+    const any: Filter = .{};
+
+    // From the top of the page: the thread in order, the low one, and round.
+    const top: Mark = .{ .page = 0, .box = box(0, 800, 0, 800) };
+    const first = m.jumpComment(gpa, top, null, true, &any).?;
+    try testing.expectEqual(keyOf(&m, "first"), first.key);
+    try testing.expectEqual(m.items()[0].key, first.mark);
+    try testing.expectEqual(@as(usize, 1), first.place);
+    try testing.expectEqual(@as(usize, 3), first.of);
+    const reply = m.jumpComment(gpa, m.items()[0], first.key, true, &any).?;
+    try testing.expectEqual(keyOf(&m, "reply"), reply.key);
+    const low = m.jumpComment(gpa, m.items()[0], reply.key, true, &any).?;
+    try testing.expectEqual(keyOf(&m, "low"), low.key);
+    try testing.expectEqual(@as(usize, 3), low.place);
+    const round = m.jumpComment(gpa, m.items()[3], low.key, true, &any).?;
+    try testing.expectEqual(keyOf(&m, "first"), round.key);
+    try testing.expect(round.wrapped);
+
+    // Backwards from the low one is the end of the thread, not its start.
+    try testing.expectEqual(keyOf(&m, "reply"), m.jumpComment(gpa, m.items()[3], low.key, false, &any).?.key);
+
+    // From a mark with no comment in hand its own come first, from any line
+    // of its anchor; from a mark with none, onward.
+    try testing.expectEqual(keyOf(&m, "first"), m.jumpComment(gpa, m.items()[1], null, true, &any).?.key);
+    try testing.expectEqual(keyOf(&m, "low"), m.jumpComment(gpa, m.items()[2], null, true, &any).?.key);
+
+    // What the filter hides, the walk does not read.
+    const f = Filter.parse("low", &.{});
+    const only = m.jumpComment(gpa, top, null, true, &f).?;
+    try testing.expectEqual(keyOf(&m, "low"), only.key);
+    try testing.expectEqual(@as(usize, 1), only.of);
 }

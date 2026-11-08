@@ -175,7 +175,7 @@ pub const table = [_]Entry{
     .{ .id = .marks, .name = "marks", .args = "[clear]", .icon = "fenrir.highlight", .about = "how many highlights and lines of ink there are, or clear them" },
     .{ .id = .mnext, .name = "mnext", .aliases = &.{"mn"}, .icon = "fenrir.chevron_right", .binding = "]a", .about = "the next mark in reading order, highlight or ink" },
     .{ .id = .mprevious, .name = "mprevious", .aliases = &.{"mp"}, .icon = "fenrir.chevron_left", .binding = "[a", .about = "the previous mark in reading order" },
-    .{ .id = .cnext, .name = "cnext", .aliases = &.{"cn"}, .icon = "fenrir.chevron_right", .binding = "]c", .about = "the next comment: a mark with a note on it" },
+    .{ .id = .cnext, .name = "cnext", .aliases = &.{"cn"}, .icon = "fenrir.chevron_right", .binding = "]c", .about = "the next comment, a thread read through before the next" },
     .{ .id = .cprevious, .name = "cprevious", .aliases = &.{"cp"}, .icon = "fenrir.chevron_left", .binding = "[c", .about = "the previous comment" },
     .{ .id = .filter, .name = "filter", .args = "[WORDS]", .icon = "fenrir.filter", .about = "show only the marks that match, in the panel and to ]a and ]c" },
     .{ .id = .dnext, .name = "dnext", .aliases = &.{"dn"}, .icon = "fenrir.chevron_right", .binding = "]d", .about = "the next change between two documents, in fenrir diff" },

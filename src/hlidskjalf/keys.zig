@@ -17,18 +17,20 @@
 //!   motion extends the selection from it; `V` selects whole lines. `m` or
 //!   enter highlights the selection, `_` underlines it, `-` strikes it
 //!   through and `~` squiggles it; `d` removes marks under it, a digit
-//!   highlights it in that colour.
+//!   highlights it in that colour. `c` highlights it and starts a comment
+//!   on it.
 //! * **edit** -- changing marks that exist. `i` walks to the mark at or after
 //!   the cursor; `n` and `N` go between them; a digit recolours, `m _ - ~`
-//!   restyle, `d` deletes, `a` starts a note.
+//!   restyle, `d` deletes, `a` edits the comment in hand and `c` starts
+//!   another on the same anchor.
 //! * **draw** -- freehand ink. `d` enters it and the pointer is a pen; a digit
 //!   picks the colour, `[` and `]` change its width. Nothing is bound to a
 //!   motion here because the hand is on the mouse, which is the argument for
 //!   it being a mode at all: a drag over the page means a stroke here and a
 //!   selection everywhere else, and there is no way to say which but to say
 //!   which.
-//! * **note** -- typing. Every printable key is text, enter keeps it, escape
-//!   throws it away.
+//! * **note** -- typing a comment. Every printable key is text, enter keeps
+//!   it, escape throws it away.
 //!
 //! `u` and `<C-r>` undo and redo in every mode that is not typing: an undo is
 //! not a thing that should need a mode change first, and a stroke drawn wrong
@@ -192,6 +194,9 @@ pub const Command = union(enum) {
     yank_selection,
     /// Remove every highlight the selection touches.
     unhighlight_selection,
+    /// `c`: highlight the selection, as one anchor, and start a comment on
+    /// it. Sent with the mode already `note`, as `enter_note` is.
+    comment_selection,
 
     // -- normal
     /// Highlight the cursor's line, or remove the highlight under the cursor.
@@ -211,6 +216,9 @@ pub const Command = union(enum) {
     recolour_mark: u8,
     restyle_mark: Marks.Style,
     delete_mark,
+    /// `c` in edit mode: start another comment on the anchor in hand, where
+    /// `a` changes the comment in hand.
+    add_comment,
 
     // -- draw
     /// The pen's colour, by its place in the palette. The same index a digit
@@ -680,6 +688,10 @@ fn visualKey(state: *State, c: u21, out: *Result) void {
             state.mode = .normal;
             break :blk .unhighlight_selection;
         },
+        'c' => blk: {
+            state.mode = .note;
+            break :blk .comment_selection;
+        },
         'u' => .undo,
         // The same key again leaves; the other visual key switches kind, as
         // `v` and `V` do in Vim.
@@ -718,6 +730,10 @@ fn editKey(state: *State, c: u21, out: *Result) void {
         'a', 'i', 'A' => blk: {
             state.mode = .note;
             break :blk .enter_note;
+        },
+        'c' => blk: {
+            state.mode = .note;
+            break :blk .add_comment;
         },
         'q' => blk: {
             state.mode = .normal;
@@ -1016,6 +1032,31 @@ test "in a note every key is text, even the ones that are commands elsewhere" {
     const gone = command(&state, frame(&.{keyDown(.escape)}));
     try testing.expectEqual(Command.leave_mode, gone.items()[0]);
     try testing.expectEqual(Mode.edit, state.mode);
+}
+
+test "c comments: on the selection in visual mode, on the anchor in hand in edit" {
+    // In visual mode the selection becomes the anchor and the comment is
+    // typed straight away; what follows `c` in the same frame is its text.
+    var state: State = .{ .mode = .visual };
+    const out = command(&state, typing("cwhy"));
+    try testing.expectEqual(Command.comment_selection, out.items()[0]);
+    try testing.expectEqual(Mode.note, state.mode);
+    try testing.expectEqual(@as(u21, 'w'), out.items()[1].note_char);
+
+    // Escape leaves the anchor in hand, in edit mode, as for any comment.
+    const gone = command(&state, frame(&.{keyDown(.escape)}));
+    try testing.expectEqual(Command.leave_mode, gone.items()[0]);
+    try testing.expectEqual(Mode.edit, state.mode);
+
+    // In edit mode `c` is another comment and `a` the one in hand.
+    try testing.expectEqual(Command.add_comment, command(&state, typing("c")).items()[0]);
+    try testing.expectEqual(Mode.note, state.mode);
+    state.mode = .edit;
+    try testing.expectEqual(Command.enter_note, command(&state, typing("a")).items()[0]);
+
+    // Normal mode has no selection to comment on, and `c` is not bound.
+    state.mode = .normal;
+    try testing.expectEqual(@as(usize, 0), command(&state, typing("c")).items().len);
 }
 
 test "window commands are not available while selecting" {

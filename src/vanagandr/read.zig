@@ -342,7 +342,7 @@ const normal_mode =
     \\    click on a mark      remove it: a highlight, or a line of ink
     \\    M                    remove every mark in this document
     \\    ]a / [a              the next / previous mark, in reading order
-    \\    ]c / [c              the next / previous mark with a comment
+    \\    ]c / [c              the next / previous comment, a thread at a time
     \\    u / ctrl+r           undo / redo a change to the marks
     \\
 else "") ++
@@ -367,6 +367,7 @@ else
 ++ (if (caps.marks)
     \\    m, enter             highlight it in the default colour
     \\    _ / - / ~            underline it, strike it through, squiggle it
+    \\    c                    highlight it and write a comment on it
     \\
 else "") ++
     \\    y                    put it away; there is no clipboard yet, and a
@@ -387,14 +388,17 @@ const mark_modes =
     \\
     \\edit mode (changing highlights), from i:
     \\    n / N, j / k, tab    the next and previous highlight
-    \\    ]a [a, ]c [c         the same, or only the ones with a comment, among
-    \\                         what :filter lets through
+    \\    ]a [a                the same, among what :filter lets through
+    \\    ]c [c                the next and previous comment, and take it in
+    \\                         hand
     \\    1 .. 8               recolour it
     \\    m / _ / - / ~        make it a highlight, an underline, a
     \\                         strike-through or a squiggle
     \\    d, x, delete         delete it, and take the next
-    \\    a, enter             write its comment; enter keeps it, and keeps
-    \\                         none when it is empty; escape throws it away
+    \\    a, enter             change the comment in hand, or write one;
+    \\                         enter keeps it, and keeps none when it is
+    \\                         empty; escape throws it away
+    \\    c                    write another comment on the same words
     \\    u / ctrl+r           undo / redo
     \\    escape, q            back to normal mode
     \\
@@ -1446,6 +1450,14 @@ const Session = struct {
 
     /// The highlight in hand in edit mode, by its session key.
     focus_mark: ?u64 = null,
+    /// The comment in hand with it: the first on its anchor when the mark is
+    /// taken up, the one `]c` landed on after that. Asked through
+    /// `focusedComment`, which mends it when an undo has taken it away.
+    focus_comment: ?u64 = null,
+    /// What note mode will write on enter. Set as it begins, because the
+    /// keys that begin it mean different things: `a` the comment in hand,
+    /// `c` a new one.
+    typing: ?Typing = null,
     /// The mark `]a` or `]c` last landed on, and the caret that left.
     last_jump: ?Jumped = null,
 
@@ -2918,10 +2930,13 @@ const Session = struct {
     /// that leaving edit mode leaves you where you were working.
     fn focusMark(s: *Session, key: ?u64) void {
         s.focus_mark = key;
+        s.focus_comment = null;
         const k = key orelse return;
         const v = s.view();
         const b = s.buffer(v.buffer);
         const mark = b.marks.byKey(k) orelse return;
+        const said = b.marks.said(mark.anchor);
+        if (said.len != 0) s.focus_comment = said[0].key;
         if (mark.page >= v.pages.len) return;
 
         v.scrollToBox(mark.page, mark.box);
@@ -2942,7 +2957,37 @@ const Session = struct {
         return s.buffer(s.view().buffer).marks.indexOf(key);
     }
 
-    const Jumped = struct { buffer: u32, key: u64, caret: Bounds };
+    /// The comment in hand, by its index in `comments`: the one `]c` took,
+    /// while it is still on the anchor in hand, and otherwise the first on
+    /// that anchor. Null when the anchor has none.
+    fn focusedComment(s: *Session) ?usize {
+        const i = s.focusedMarkIndex() orelse return null;
+        const b = s.buffer(s.view().buffer);
+        const anchor = b.marks.items()[i].anchor;
+        if (s.focus_comment) |k| {
+            if (b.marks.commentIndex(k)) |c| {
+                if (b.marks.comments.items[c].anchor == anchor) return c;
+            }
+        }
+        const range = b.marks.saidRange(anchor);
+        return if (range[0] == range[1]) null else range[0];
+    }
+
+    const Jumped = struct {
+        buffer: u32,
+        key: u64,
+        caret: Bounds,
+        /// The comment `]c` landed on, so the next `]c` reads on from it
+        /// rather than from the start of its thread.
+        comment: ?u64 = null,
+    };
+
+    const Typing = union(enum) {
+        /// The comment with this key, changed.
+        comment: u64,
+        /// A new comment on the anchor with this number.
+        new: u64,
+    };
 
     /// `]a`, `[a`, `]c`, `[c`. In edit mode from the highlight in hand, which
     /// the jump then replaces. Otherwise from where the reader is: the mark
@@ -2978,7 +3023,7 @@ const Session = struct {
         // be walked, and the status line says when one is in force.
         var filter = s.markFilter();
         const filtered = !filter.isEmpty();
-        filter.commented = filter.commented or j.comments;
+        if (j.comments) return s.jumpComment(from, j.forwards, &filter, filtered);
         const to = b.marks.jump(from, j.forwards, &filter) orelse {
             s.status = if (filtered)
                 unmatched
@@ -2998,12 +3043,44 @@ const Session = struct {
 
         const round: []const u8 = if (!to.wrapped) "" else if (j.forwards) ", from the top" else ", from the end";
         const of: []const u8 = if (filtered) " that match" else "";
-        if (j.comments) {
-            const said = firstComment(b, b.marks.byKey(to.key).?.*);
-            s.say("comment {d}/{d}{s}{s}: {s}", .{ to.place, to.of, of, round, said });
+        s.say("mark {d}/{d}{s}{s}", .{ to.place, to.of, of, round });
+    }
+
+    /// `]c` and `[c`: each comment in turn, a thread read through before the
+    /// next anchor's, from the comment the reader stands on. In edit mode
+    /// the comment is taken in hand, so `a` changes the one that was read.
+    fn jumpComment(s: *Session, from: Marks.Mark, forwards: bool, filter: *const Marks.Filter, filtered: bool) void {
+        const v = s.view();
+        const b = s.buffer(v.buffer);
+        const after: ?u64 = if (s.keymap.mode == .edit)
+            s.focus_comment
+        else if (s.last_jump) |last|
+            (if (last.buffer == v.buffer and last.key == from.key) last.comment else null)
+        else
+            null;
+        const to = b.marks.jumpComment(s.gpa, from, after, forwards, filter) orelse {
+            s.status = if (filtered)
+                unmatched
+            else
+                "no comments in this document -- c on a selection writes one";
+            return;
+        };
+
+        const held = s.focus_mark;
+        const held_comment = s.focus_comment;
+        s.focusMark(to.mark);
+        if (s.keymap.mode == .edit) {
+            s.focus_comment = to.key;
         } else {
-            s.say("mark {d}/{d}{s}{s}", .{ to.place, to.of, of, round });
+            s.focus_mark = held;
+            s.focus_comment = held_comment;
         }
+        s.last_jump = .{ .buffer = v.buffer, .key = to.mark, .caret = v.cursor.caret, .comment = to.key };
+
+        const round: []const u8 = if (!to.wrapped) "" else if (forwards) ", from the top" else ", from the end";
+        const of: []const u8 = if (filtered) " that match" else "";
+        const c = b.marks.comments.items[b.marks.commentIndex(to.key).?];
+        s.say("comment {d}/{d}{s}{s}: {s}", .{ to.place, to.of, of, round, c.text });
     }
 
     /// The first thing written on a mark's anchor, or nothing: what a line
@@ -3537,8 +3614,8 @@ const Session = struct {
         s.focusMark(next);
     }
 
-    /// Note mode opens on the first comment on the anchor in hand, to change
-    /// it, or on nothing, to write one.
+    /// `a`: note mode opens on the comment in hand, to change it, or on
+    /// nothing when the anchor has none, to write its first.
     fn beginNote(s: *Session) void {
         const b = s.buffer(s.view().buffer);
         const i = s.focusedMarkIndex() orelse {
@@ -3546,7 +3623,56 @@ const Session = struct {
             return;
         };
         s.note.clearRetainingCapacity();
-        s.note.appendSlice(s.gpa, firstComment(b, b.marks.items()[i])) catch {};
+        if (s.focusedComment()) |c| {
+            const comment = b.marks.comments.items[c];
+            s.typing = .{ .comment = comment.key };
+            s.note.appendSlice(s.gpa, comment.text) catch {};
+        } else {
+            s.typing = .{ .new = b.marks.items()[i].anchor };
+        }
+    }
+
+    /// `c` in edit mode: note mode opens empty, for another comment on the
+    /// anchor in hand.
+    fn beginComment(s: *Session) void {
+        const b = s.buffer(s.view().buffer);
+        const i = s.focusedMarkIndex() orelse {
+            s.keymap.mode = if (b.marks.count() == 0) .normal else .edit;
+            return;
+        };
+        s.note.clearRetainingCapacity();
+        s.typing = .{ .new = b.marks.items()[i].anchor };
+    }
+
+    /// `c` in visual mode: the selection is highlighted as one anchor, taken
+    /// in hand, and note mode opens for the first comment on it. Escape
+    /// keeps the highlight, which `u` takes back like any other.
+    fn commentSelection(s: *Session) void {
+        const v = s.view();
+        const sel = s.activeSelection(v) orelse return s.noAnchor();
+        defer s.clearSelection();
+        var boxes: std.ArrayList(PageBox) = .empty;
+        defer boxes.deinit(s.gpa);
+        s.selectionBoxes(v.buffer, sel[0], sel[1], s.lineSelection(), &boxes) catch return s.noAnchor();
+        if (boxes.items.len == 0) return s.noAnchor();
+
+        const b = s.buffer(v.buffer);
+        const anchor = s.markBoxes(v.buffer, boxes.items, s.highlight, .highlight);
+        var first: ?Marks.Mark = null;
+        for (b.marks.items()) |m| {
+            if (m.anchor != anchor) continue;
+            if (first == null or Marks.readsBefore(m, first.?)) first = m;
+        }
+        s.focusMark(first.?.key);
+        s.note.clearRetainingCapacity();
+        s.typing = .{ .new = anchor };
+    }
+
+    /// A comment begun where no words are selected, or none are known yet.
+    fn noAnchor(s: *Session) void {
+        s.keymap.mode = .normal;
+        s.typing = null;
+        s.status = "nothing to comment on -- select some words first";
     }
 
     fn noteChar(s: *Session, c: u21) void {
@@ -3567,23 +3693,32 @@ const Session = struct {
         s.note.shrinkRetainingCapacity(n);
     }
 
-    /// Keeps what was typed as the first comment on the anchor in hand: a new
-    /// comment when it had none, the same one changed, or none at all when
-    /// everything was rubbed out.
+    /// Keeps what was typed: the comment it was begun on changed, or none at
+    /// all when everything was rubbed out; or a new comment, taken in hand,
+    /// unless nothing was typed.
     fn commitNote(s: *Session) void {
         defer s.note.clearRetainingCapacity();
-        const i = s.focusedMarkIndex() orelse return;
+        const typing = s.typing orelse return;
+        s.typing = null;
         const b = s.buffer(s.view().buffer);
-        const anchor = b.marks.items()[i].anchor;
-        const first = b.marks.saidRange(anchor);
         b.marks.beginGroup();
-        if (first[0] == first[1]) {
-            if (s.note.items.len == 0) return;
-            _ = b.marks.addComment(s.gpa, .{ .anchor = anchor, .text = s.note.items }, false) catch {};
-        } else if (s.note.items.len == 0) {
-            _ = b.marks.removeComment(s.gpa, first[0]) catch {};
-        } else {
-            b.marks.setText(s.gpa, first[0], s.note.items) catch {};
+        switch (typing) {
+            .comment => |key| {
+                const at = b.marks.commentIndex(key) orelse return;
+                if (s.note.items.len == 0) {
+                    _ = b.marks.removeComment(s.gpa, at) catch {};
+                } else {
+                    b.marks.setText(s.gpa, at, s.note.items) catch {};
+                }
+            },
+            .new => |anchor| {
+                if (s.note.items.len == 0) return;
+                // The anchor may have gone while this was typed, to an undo
+                // from a plugin's key; a comment on nothing would be lost.
+                if (b.marks.lineCount(anchor) == 0) return;
+                const at = b.marks.addComment(s.gpa, .{ .anchor = anchor, .text = s.note.items }, false) catch return;
+                s.focus_comment = b.marks.comments.items[at].key;
+            },
         }
     }
 
@@ -4780,12 +4915,17 @@ const Session = struct {
                 s.say("pen {d:.1}pt -- drag to draw, d or escape to stop", .{s.pen.width});
             },
             .enter_note => s.beginNote(),
+            .add_comment => s.beginComment(),
             .leave_mode => {
                 s.clearSelection();
                 s.penCancel();
                 s.note.clearRetainingCapacity();
                 s.cmdline.clearRetainingCapacity();
-                if (s.keymap.mode == .normal) s.focus_mark = null;
+                s.typing = null;
+                if (s.keymap.mode == .normal) {
+                    s.focus_mark = null;
+                    s.focus_comment = null;
+                }
             },
 
             .swap_selection_ends => {
@@ -4802,6 +4942,7 @@ const Session = struct {
                 s.status = "nothing copied -- there is no clipboard yet; m highlights";
             },
             .unhighlight_selection => s.unhighlightSelection(),
+            .comment_selection => s.commentSelection(),
 
             .toggle_highlight => s.toggleMark(),
             .clear_highlights => s.clearMarks(),
@@ -5775,7 +5916,9 @@ const Session = struct {
             var wr: std.Io.Writer = .fixed(&s.mode_buf);
             wr.print("{s} {d}/{d}", .{ mode.label(), at.place, at.of }) catch {};
             st.mode = s.mode_buf[0..wr.end];
-            if (mode == .edit) st.note = firstComment(b, held);
+            if (mode == .edit) {
+                if (s.focusedComment()) |c| st.note = b.marks.comments.items[c].text;
+            }
         }
 
         return st;
@@ -7305,6 +7448,110 @@ test "visual mode: select with motions, highlight in a colour, undo it" {
     try testing.expectEqual(@as(usize, 0), marks.count());
     _ = s.apply(.redo);
     try testing.expectEqual(@as(usize, 2), marks.count());
+}
+
+test "c on a selection makes one anchor and its first comment, and c in edit mode another" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    try putText(&s, 0, 3, 4);
+
+    // `v`, `j`, `c`, then the comment, as the keymap sends them.
+    s.keymap.mode = .visual;
+    _ = s.apply(.enter_visual);
+    _ = s.apply(.{ .move_cursor = .down });
+    s.keymap.mode = .note;
+    _ = s.apply(.comment_selection);
+    for ("why") |c| _ = s.apply(.{ .note_char = c });
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    s.applyEffects();
+
+    // Two lines, one anchor, and the comment on it named as the anchor is.
+    const marks = &s.buffer(0).marks;
+    try testing.expectEqual(@as(usize, 2), marks.count());
+    const anchor = marks.items()[0].anchor;
+    try testing.expectEqual(anchor, marks.items()[1].anchor);
+    try testing.expectEqual(anchor, marks.said(anchor)[0].name);
+    try testing.expect(s.view().anchor == null);
+    try testing.expectEqualStrings("why", s.statusLine().note);
+
+    // `c` in edit mode is a reply on the same anchor, taken in hand.
+    _ = s.apply(.add_comment);
+    try testing.expectEqualStrings("", s.note.items);
+    s.keymap.mode = .note;
+    for ("because") |c| _ = s.apply(.{ .note_char = c });
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    try testing.expectEqual(@as(usize, 2), marks.said(anchor).len);
+    try testing.expectEqualStrings("because", s.statusLine().note);
+
+    // `a` changes the one in hand, which is the reply, not the first.
+    s.keymap.mode = .note;
+    _ = s.apply(.enter_note);
+    try testing.expectEqualStrings("because", s.note.items);
+    _ = s.apply(.{ .note_char = '!' });
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    s.applyEffects();
+    try testing.expectEqualStrings("why", marks.said(anchor)[0].text);
+    try testing.expectEqualStrings("because!", marks.said(anchor)[1].text);
+
+    const said = try lib.comments("/docs/a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqual(@as(usize, 2), said.len);
+    try testing.expectEqualStrings(said[0].anchor, said[1].anchor);
+    try testing.expect(!std.mem.eql(u8, said[0].nm, said[1].nm));
+    try testing.expectEqualStrings("because!", said[1].text);
+
+    // With nothing selected there is nothing to comment on, and no mark.
+    s.keymap.mode = .note;
+    _ = s.apply(.comment_selection);
+    try testing.expectEqual(keys.Mode.normal, s.keymap.mode);
+    try testing.expectEqual(@as(usize, 2), marks.count());
+}
+
+test "]c reads each comment of a thread, and in edit mode takes it in hand" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+    s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 500, 200, 512) }}, s.accent);
+    const marks = &s.buffer(0).marks;
+    try commentOn(marks, gpa, 0, "is this right?");
+    try commentOn(marks, gpa, 0, "no");
+    try commentOn(marks, gpa, 1, "see here");
+
+    // Normal mode reads them in order without taking any in hand.
+    const next: keys.Command = .{ .jump_mark = .{ .forwards = true, .comments = true } };
+    _ = s.apply(next);
+    try testing.expect(std.mem.endsWith(u8, s.status, "is this right?"));
+    _ = s.apply(next);
+    try testing.expect(std.mem.startsWith(u8, s.status, "comment 2/3"));
+    try testing.expect(std.mem.endsWith(u8, s.status, "no"));
+    _ = s.apply(next);
+    try testing.expect(std.mem.endsWith(u8, s.status, "see here"));
+    try testing.expect(s.focus_mark == null);
+
+    // Edit mode takes up the first mark with its first comment in hand;
+    // `]c` moves on to the reply and takes that, so `a` opens it.
+    s.keymap.mode = .edit;
+    _ = s.apply(.enter_edit);
+    try testing.expectEqualStrings("is this right?", s.statusLine().note);
+    _ = s.apply(next);
+    try testing.expectEqual(marks.items()[0].key, s.focus_mark.?);
+    try testing.expectEqualStrings("no", s.statusLine().note);
+    s.keymap.mode = .note;
+    _ = s.apply(.enter_note);
+    try testing.expectEqualStrings("no", s.note.items);
 }
 
 test "a selection's lines are one anchor, and marking them again keeps its comment" {
