@@ -113,10 +113,17 @@ pub const Event = enum {
     ModeChanged,
     /// The selection moved or was cleared. `{from, to}`, or neither.
     SelectionChanged,
-    /// A highlight was made, taken away, or recoloured or annotated.
+    /// A highlight was made, taken away, or recoloured or restyled.
     AnnotationAdd,
     AnnotationRemove,
     AnnotationChange,
+    /// A comment was written, taken away, or changed. `{id, anchor, name,
+    /// text, page}`. Three events and not one, for the reason the
+    /// annotation events are three; and none of the annotation events for
+    /// a comment, since what was written about words is not the words.
+    CommentAdd,
+    CommentRemove,
+    CommentChange,
     /// One page finished rasterising. `{page}`. Once per page, on the frame
     /// thread -- never per frame, and never on the rasterising thread, which
     /// owns the `Document` and cannot also own a Lua state.
@@ -159,6 +166,7 @@ pub const Data = union(enum) {
     /// other and is the reason this is an optional rather than no event.
     selection: ?[2]Host.Position,
     highlight: Host.Highlight,
+    comment: Host.Comment,
 };
 
 /// One event, as the reader hands it over.
@@ -189,9 +197,10 @@ pub const Payload = struct {
 /// manifest should see that they are.
 pub const Capability = enum {
     /// Where the reader is and what is under it: the document, the page, the
-    /// cursor, the selection, the highlights that exist.
+    /// cursor, the selection, the highlights and comments that exist.
     document_read,
-    /// Changing what is on the page: making and removing highlights.
+    /// Changing what is on the page: making and removing highlights, and
+    /// writing comments on them.
     document_write,
     /// Saying things, binding keys, adding commands, moving the view, and
     /// putting controls in the interface. The broadest of them, because
@@ -1376,6 +1385,17 @@ pub const api = [_]Entry{
         .about = "makes one, in PDF points, so it survives zoom and reopening",
     },
     .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write, .args = "(id, doc)", .returns = "ok", .about = "removes one, by the id fenrir.highlight gave back" },
+
+    .{ .name = "comments", .func = apiComments, .cap = .document_read, .args = "(doc)", .returns = "list", .about = "every comment, in the order ]c reads them; anchor is the highlights' own" },
+    .{
+        .name = "comment",
+        .func = apiComment,
+        .cap = .document_write,
+        .args = "{ doc =, anchor =, text = }",
+        .returns = "id",
+        .about = "writes one on an anchor: its name, or a highlight's id",
+    },
+    .{ .name = "uncomment", .func = apiUncomment, .cap = .document_write, .args = "(id, doc)", .returns = "ok", .about = "takes one away, by the id fenrir.comment gave back" },
 };
 
 /// `fenrir.store`, which every plugin has: its own key space in the library,
@@ -1390,7 +1410,7 @@ pub const store = [_]Entry{
 ///
 /// A number and not `fenrir.version`'s string, because a plugin comparing
 /// versions wants `>=` and `"0.10.0" < "0.9.0"` as a string.
-pub const api_version: lua.Integer = 1;
+pub const api_version: lua.Integer = 2;
 
 /// `fenrir.api`: the table asked about itself.
 ///
@@ -2354,6 +2374,7 @@ fn pushPayload(L: ?*lua.State, payload: Payload) void {
         // the same function: an event's table and `fenrir.highlights`' rows
         // that disagreed about a field would be a bug nobody could read.
         .highlight => |h| fillHighlight(L, h),
+        .comment => |c| fillComment(L, c),
     }
 }
 
@@ -3529,6 +3550,10 @@ fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
     lua.lua_setfield(L, -2, "color");
     lua.pushString(L, h.note);
     lua.lua_setfield(L, -2, "note");
+    if (h.anchor.len != 0) {
+        lua.pushString(L, h.anchor);
+        lua.lua_setfield(L, -2, "anchor");
+    }
     lua.pushString(L, h.kind);
     lua.lua_setfield(L, -2, "kind");
     if (h.style.len != 0) {
@@ -3616,6 +3641,85 @@ fn apiUnhighlight(L: ?*lua.State) callconv(.c) c_int {
     const id = lua.luaL_checkinteger(L, 1);
     const doc = checkDoc(L, 2);
     const removed = id > 0 and of(L).host.removeHighlight(doc, @intCast(id));
+    lua.lua_pushboolean(L, @intFromBool(removed));
+    return 1;
+}
+
+/// A comment's fields, into the table on top of the stack: a row of
+/// `fenrir.comments` and an event's table alike, as for a highlight.
+fn fillComment(L: ?*lua.State, c: Host.Comment) void {
+    lua.lua_pushinteger(L, @intCast(c.id));
+    lua.lua_setfield(L, -2, "id");
+    inline for (.{ "anchor", "name", "text" }) |field| {
+        lua.pushString(L, @field(c, field));
+        lua.lua_setfield(L, -2, field);
+    }
+    if (c.page != 0) {
+        lua.lua_pushinteger(L, c.page);
+        lua.lua_setfield(L, -2, "page");
+    }
+}
+
+fn apiComments(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
+    const doc = checkDoc(L, 1);
+    const rt = of(L);
+    const n = rt.host.commentCount(doc);
+    lua.lua_createtable(L, @intCast(@min(n, 1 << 20)), 0);
+    var i: usize = 0;
+    var out: lua.Integer = 1;
+    while (i < n) : (i += 1) {
+        const c = rt.host.commentAt(doc, i) orelse continue;
+        lua.lua_createtable(L, 0, 5);
+        fillComment(L, c);
+        lua.lua_rawseti(L, -2, out);
+        out += 1;
+    }
+    return 1;
+}
+
+/// `fenrir.comment{anchor=, text=, doc=}`, returning the new comment's id.
+///
+/// `anchor` is an anchor's name, as `highlights` and `comments` give it, or
+/// the id of a highlight, as `fenrir.highlight` gives it back -- so a plugin
+/// can comment on what it has just marked without looking the name up.
+/// Anything else, and an anchor that is not there, is an error: a comment
+/// on nothing would be lost on the next save.
+fn apiComment(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
+    lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
+    var c: Host.Comment = .{};
+
+    _ = rawField(L, 1, "doc");
+    const doc = checkDoc(L, -1);
+    lua.pop(L, 1);
+
+    // The strings stay on the stack until the host has copied them.
+    _ = lua.lua_getfield(L, 1, "anchor");
+    switch (lua.typeOf(L, -1)) {
+        .number => {
+            const id = lua.lua_tointegerx(L, -1, null);
+            if (id < 1) lua.raise(L, "galdr: a comment's anchor is a highlight's id, from 1, or an anchor's name");
+            c.on = @intCast(id);
+        },
+        .string => c.anchor = lua.toString(L, -1) orelse "",
+        else => lua.raise(L, "galdr: a comment needs anchor: a highlight's id, or an anchor's name"),
+    }
+    _ = lua.lua_getfield(L, 1, "text");
+    c.text = lua.toString(L, -1) orelse "";
+    if (c.text.len == 0) lua.raise(L, "galdr: a comment needs text");
+
+    const id = of(L).host.addComment(doc, c) orelse lua.raise(L, "galdr: there is no such anchor in that document");
+    lua.lua_pushinteger(L, @intCast(id));
+    return 1;
+}
+
+/// `fenrir.uncomment(id, doc)`, by the same rule as `unhighlight`.
+fn apiUncomment(L: ?*lua.State) callconv(.c) c_int {
+    _ = authority(L);
+    const id = lua.luaL_checkinteger(L, 1);
+    const doc = checkDoc(L, 2);
+    const removed = id > 0 and of(L).host.removeComment(doc, @intCast(id));
     lua.lua_pushboolean(L, @intFromBool(removed));
     return 1;
 }
@@ -3719,7 +3823,16 @@ const FakeHost = struct {
         title: []const u8,
         pages: u32 = 12,
         highlights: std.ArrayList(Host.Highlight) = .empty,
+        /// Each comment's text is copied, unlike a highlight's strings, so
+        /// a test can read back what a script wrote.
+        comments: std.ArrayList(Host.Comment) = .empty,
         next_key: u64 = 1,
+
+        fn deinit(d: *Doc) void {
+            d.highlights.deinit(testing.allocator);
+            for (d.comments.items) |c| testing.allocator.free(c.text);
+            d.comments.deinit(testing.allocator);
+        }
     };
 
     const Kept = struct {
@@ -3734,7 +3847,7 @@ const FakeHost = struct {
         f.notes.deinit(gpa);
         for (f.execs.items) |n| gpa.free(n);
         f.execs.deinit(gpa);
-        for (f.docs.items) |*d| d.highlights.deinit(gpa);
+        for (f.docs.items) |*d| d.deinit();
         f.docs.deinit(gpa);
         for (f.stored.items) |k| {
             gpa.free(k.space);
@@ -3759,7 +3872,7 @@ const FakeHost = struct {
     fn close(f: *FakeHost, doc: Host.Handle) void {
         for (f.docs.items, 0..) |*d, i| {
             if (d.handle != doc) continue;
-            d.highlights.deinit(testing.allocator);
+            d.deinit();
             _ = f.docs.orderedRemove(i);
             if (f.at >= f.docs.items.len) f.at = 0;
             return;
@@ -3890,6 +4003,48 @@ const FakeHost = struct {
                 for (d.highlights.items, 0..) |h, i| {
                     if (h.id != id) continue;
                     _ = d.highlights.orderedRemove(i);
+                    return true;
+                }
+                return false;
+            }
+        }.f,
+        .commentCount = struct {
+            fn f(ptr: *anyopaque, doc: Host.Handle) usize {
+                const d = self(ptr).find(doc) orelse return 0;
+                return d.comments.items.len;
+            }
+        }.f,
+        .commentAt = struct {
+            fn f(ptr: *anyopaque, doc: Host.Handle, i: usize) ?Host.Comment {
+                const d = self(ptr).find(doc) orelse return null;
+                return if (i < d.comments.items.len) d.comments.items[i] else null;
+            }
+        }.f,
+        .addComment = struct {
+            // Anchors are not modelled: a highlight's id is one, and so is
+            // any name. What a real host refuses is its own test's to show.
+            fn f(ptr: *anyopaque, doc: Host.Handle, c: Host.Comment) ?u64 {
+                const d = self(ptr).find(doc) orelse return null;
+                if (c.on != 0) {
+                    for (d.highlights.items) |h| {
+                        if (h.id == c.on) break;
+                    } else return null;
+                }
+                const text = testing.allocator.dupe(u8, c.text) catch return null;
+                d.comments.append(testing.allocator, .{ .id = d.next_key, .text = text, .page = 1 }) catch {
+                    testing.allocator.free(text);
+                    return null;
+                };
+                d.next_key += 1;
+                return d.next_key - 1;
+            }
+        }.f,
+        .removeComment = struct {
+            fn f(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
+                const d = self(ptr).find(doc) orelse return false;
+                for (d.comments.items, 0..) |c, i| {
+                    if (c.id != id) continue;
+                    testing.allocator.free(d.comments.orderedRemove(i).text);
                     return true;
                 }
                 return false;
@@ -4346,6 +4501,34 @@ test "the reader's state reads out and writes back" {
     try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = 'squiggle' }"));
     try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = {} }"));
     try testing.expect(rt.runString("check", "assert(#fenrir.highlights() == 1)"));
+}
+
+test "a plugin writes comments on what it marked, reads them, and takes them away" {
+    if (!lua.available) return error.SkipZigTest;
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    const rt = try start(&fake);
+    defer rt.destroy();
+
+    try testing.expect(rt.runString("check",
+        \\local id = fenrir.highlight{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712 }
+        \\local c = fenrir.comment{ anchor = id, text = "why?" }
+        \\fenrir.comment{ anchor = "f7", text = "because" }
+        \\local all = fenrir.comments()
+        \\assert(#all == 2)
+        \\assert(all[1].id == c and all[1].text == "why?" and all[1].page == 1)
+        \\assert(fenrir.uncomment(c))
+        \\assert(not fenrir.uncomment(c))
+        \\assert(#fenrir.comments() == 1)
+    ));
+    try testing.expectEqualStrings("because", fake.docs.items[0].comments.items[0].text);
+
+    // A comment on nothing, or saying nothing, is the author's mistake to see.
+    try testing.expect(!rt.runString("bad", "fenrir.comment{ anchor = 99, text = 'lost' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.comment{ anchor = 'f1' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.comment{ text = 'where?' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.comment{ anchor = {}, text = 'what?' }"));
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].comments.items.len);
 }
 
 test "init.lua, then plugins by name, and require reads lua/" {
@@ -5223,7 +5406,7 @@ test "the table answers for itself, before a plugin has said what it wants" {
         \\-- the door on declaring.
         \\local want = { "ui" }
         \\if fenrir.api.has("highlight") then want[#want + 1] = "document.write" end
-        \\assert(not fenrir.api.has("comment"), "comment is not there yet")
+        \\assert(not fenrir.api.has("link"), "link is not there yet")
         \\assert(fenrir.api.version >= 1, "a number, so >= works")
         \\fenrir.manifest{ about = "asks for what is there", capabilities = want }
         \\asked = #want

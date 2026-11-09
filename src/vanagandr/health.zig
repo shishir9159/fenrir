@@ -457,6 +457,26 @@ const Headless = struct {
                 return false;
             }
         }.f,
+        .commentCount = struct {
+            fn f(_: *anyopaque, _: galdr.Host.Handle) usize {
+                return 0;
+            }
+        }.f,
+        .commentAt = struct {
+            fn f(_: *anyopaque, _: galdr.Host.Handle, _: usize) ?galdr.Host.Comment {
+                return null;
+            }
+        }.f,
+        .addComment = struct {
+            fn f(_: *anyopaque, _: galdr.Host.Handle, _: galdr.Host.Comment) ?u64 {
+                return null;
+            }
+        }.f,
+        .removeComment = struct {
+            fn f(_: *anyopaque, _: galdr.Host.Handle, _: u64) bool {
+                return false;
+            }
+        }.f,
         .storeGet = struct {
             fn f(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) ?[]u8 {
                 return null;

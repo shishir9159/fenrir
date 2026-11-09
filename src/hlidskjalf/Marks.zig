@@ -1018,6 +1018,34 @@ pub fn jumpComment(m: *Marks, gpa: Allocator, from: Mark, after: ?u64, forwards:
     return .{ .key = to.key, .mark = to.mark.key, .wrapped = best == null, .place = place, .of = of };
 }
 
+/// Every comment that is on a line, by its index in `comments`, in the order
+/// `jumpComment` reads them: what a plugin's `fenrir.comments()` lists.
+pub fn readOrder(m: *Marks, gpa: Allocator, out: *std.ArrayList(usize)) Allocator.Error!void {
+    if (m.led_revision != m.revision) try m.relead(gpa);
+    out.clearRetainingCapacity();
+    const any: Filter = .{};
+    for (m.comments.items, 0..) |c, i| {
+        if (m.spotOf(c, &any) != null) try out.append(gpa, i);
+    }
+    const by = struct {
+        fn less(marks: *Marks, a: usize, b: usize) bool {
+            const none: Filter = .{};
+            const x = marks.spotOf(marks.comments.items[a], &none).?;
+            const y = marks.spotOf(marks.comments.items[b], &none).?;
+            return x.before(y);
+        }
+    }.less;
+    std.mem.sort(usize, out.items, m, by);
+}
+
+/// The index of an anchor's first line in reading order, when it has a
+/// comment and a line: where the comment is shown, and the page a plugin is
+/// told it is on.
+pub fn firstLine(m: *Marks, gpa: Allocator, anchor: u64) ?usize {
+    if (m.led_revision != m.revision) m.relead(gpa) catch return null;
+    return m.leadLine(anchor);
+}
+
 /// A comment's place in `jumpComment`'s order: the line it is shown on, then
 /// when it was made.
 const Spot = struct {

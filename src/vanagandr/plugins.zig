@@ -367,6 +367,26 @@ const Headless = struct {
                 return false;
             }
         }.f,
+        .commentCount = struct {
+            fn f(_: *anyopaque, _: Host.Handle) usize {
+                return 0;
+            }
+        }.f,
+        .commentAt = struct {
+            fn f(_: *anyopaque, _: Host.Handle, _: usize) ?Host.Comment {
+                return null;
+            }
+        }.f,
+        .addComment = struct {
+            fn f(_: *anyopaque, _: Host.Handle, _: Host.Comment) ?u64 {
+                return null;
+            }
+        }.f,
+        .removeComment = struct {
+            fn f(_: *anyopaque, _: Host.Handle, _: u64) bool {
+                return false;
+            }
+        }.f,
         .storeGet = storeGet,
         .storeSet = storeSet,
         .readFile = readFile,
@@ -499,7 +519,7 @@ test "every function in the fenrir table is documented, and only once" {
     }
     // And for nothing else, including the names plugins.md holds open for
     // later and the globals, which are not in the table.
-    for ([_][]const u8{ "", ".", "comment", "link", "comments", "links", "require", "print", "store.", "store.keys", "api.whatever" }) |name| {
+    for ([_][]const u8{ "", ".", "link", "links", "card", "require", "print", "store.", "store.keys", "api.whatever" }) |name| {
         try testing.expect(!Runtime.provides(name));
     }
 }

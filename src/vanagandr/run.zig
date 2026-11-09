@@ -355,6 +355,10 @@ const Driver = struct {
         .highlightAt = highlightAt,
         .addHighlight = addHighlight,
         .removeHighlight = removeHighlight,
+        .commentCount = commentCount,
+        .commentAt = commentAt,
+        .addComment = addComment,
+        .removeComment = removeComment,
         .storeGet = storeGet,
         .storeSet = storeSet,
         .readFile = readFile,
@@ -417,6 +421,35 @@ const Driver = struct {
         d.ink = lib.strokes(o.path) catch &.{};
         d.comments = lib.comments(o.path) catch &.{};
         d.marks_for = o.path;
+        // In the order the reader's `]c` reads them, or a script and a
+        // window would list one document's comments two ways.
+        std.mem.sort(Library.Comment, d.comments, d, readsBefore);
+    }
+
+    /// Where a comment is read: by its anchor's first line, then as written.
+    fn readsBefore(d: *Driver, a: Library.Comment, b: Library.Comment) bool {
+        const x = d.firstLine(a.anchor);
+        const y = d.firstLine(b.anchor);
+        if (x != null and y != null and !std.mem.eql(u8, a.anchor, b.anchor)) return Marks.readsBefore(x.?, y.?);
+        if ((x == null) != (y == null)) return x != null;
+        return a.id < b.id;
+    }
+
+    /// An anchor's first line in reading order, as a mark, or null when no
+    /// mark has that anchor.
+    fn firstLine(d: *Driver, anchor: []const u8) ?Marks.Mark {
+        var first: ?Marks.Mark = null;
+        for (d.marks) |h| {
+            if (!std.mem.eql(u8, h.anchor, anchor)) continue;
+            const m: Marks.Mark = .{ .page = h.page, .box = .fromRect(h.x0, h.y0, h.x1, h.y1) };
+            if (first == null or Marks.readsBefore(m, first.?)) first = m;
+        }
+        for (d.ink) |k| {
+            if (!std.mem.eql(u8, k.anchor, anchor)) continue;
+            const m: Marks.Mark = .{ .page = k.page, .box = Marks.inkBounds(k.points, k.width) };
+            if (first == null or Marks.readsBefore(m, first.?)) first = m;
+        }
+        return first;
     }
 
     fn forget(d: *Driver) void {
@@ -459,6 +492,7 @@ const Driver = struct {
                 break :blk d.hex[0..h.color.len];
             } else "",
             .note = d.firstComment(h.anchor),
+            .anchor = h.anchor,
             .style = h.style,
         };
     }
@@ -483,6 +517,7 @@ const Driver = struct {
                 break :blk d.hex[0..k.color.len];
             } else "",
             .note = d.firstComment(k.anchor),
+            .anchor = k.anchor,
             .kind = "ink",
         };
     }
@@ -522,6 +557,70 @@ const Driver = struct {
         }, library.now(d.ctx.io)) catch {};
         d.forget();
         return @intCast(id);
+    }
+
+    fn commentCount(ptr: *anyopaque, doc: Host.Handle) usize {
+        const d = of(ptr);
+        if (d.find(doc) == null) return 0;
+        d.loadMarks(doc);
+        return d.comments.len;
+    }
+
+    fn commentAt(ptr: *anyopaque, doc: Host.Handle, index: usize) ?Host.Comment {
+        const d = of(ptr);
+        if (d.find(doc) == null) return null;
+        d.loadMarks(doc);
+        if (index >= d.comments.len) return null;
+        const c = d.comments[index];
+        return .{
+            .id = @intCast(c.id),
+            .anchor = c.anchor,
+            .name = c.nm,
+            .text = c.text,
+            .page = if (d.firstLine(c.anchor)) |m| m.page + 1 else 0,
+        };
+    }
+
+    /// A comment on an anchor some mark of this document has: by name, or
+    /// by a highlight's id. Named as the reader would name it -- the
+    /// anchor's own name for the first, a new one after.
+    fn addComment(ptr: *anyopaque, doc: Host.Handle, c: Host.Comment) ?u64 {
+        const d = of(ptr);
+        const lib = d.library orelse return null;
+        const o = d.find(doc) orelse return null;
+        d.loadMarks(doc);
+
+        var anchor: ?[]const u8 = null;
+        for (d.marks) |h| {
+            if (if (c.on != 0) h.id == c.on else std.mem.eql(u8, h.anchor, c.anchor)) anchor = h.anchor;
+        }
+        if (anchor == null) for (d.ink) |k| {
+            if (if (c.on != 0) k.id == c.on else std.mem.eql(u8, k.anchor, c.anchor)) anchor = k.anchor;
+        };
+        const on = anchor orelse return null;
+        const taken = for (d.comments) |said| {
+            if (std.mem.eql(u8, said.nm, on)) break true;
+        } else false;
+        var buf: [Library.name_len]u8 = undefined;
+        const nm = if (!taken) on else Library.makeName(&buf, (lib.highestName(o.path) catch return null) + 1);
+
+        const id = lib.addComment(o.path, .{
+            .anchor = @constCast(on),
+            .nm = @constCast(nm),
+            .text = @constCast(c.text),
+        }, library.now(d.ctx.io)) catch return null;
+        d.forget();
+        return @intCast(id);
+    }
+
+    fn removeComment(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
+        const d = of(ptr);
+        const lib = d.library orelse return false;
+        if (d.find(doc) == null) return false;
+        if (id == 0 or id > std.math.maxInt(i64)) return false;
+        lib.removeComment(@intCast(id)) catch return false;
+        d.forget();
+        return true;
     }
 
     fn removeHighlight(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {

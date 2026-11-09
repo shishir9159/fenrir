@@ -61,7 +61,13 @@ pub const Highlight = struct {
     y1: f32,
     /// `#rrggbb`, or empty for the accent colour.
     color: []const u8 = "",
+    /// The first comment on its anchor, or empty. Given when one is made, it
+    /// is that comment.
     note: []const u8 = "",
+    /// The name of the anchor it is a line of, as a PDF's `/NM` will hold
+    /// it. The lines one selection marked share one, and comments are made
+    /// on it.
+    anchor: []const u8 = "",
     /// `"block"` for a highlight over words, `"ink"` for a freehand stroke.
     ///
     /// The box of a stroke is the box it covers, which is a true answer to
@@ -75,6 +81,25 @@ pub const Highlight = struct {
     /// `"underline"`, `"strikeout"` or `"squiggly"`. Empty on ink, which Lua
     /// then sees as `nil`.
     style: []const u8 = "",
+};
+
+/// A comment on an anchor, as a script sees it.
+pub const Comment = struct {
+    /// The session's key for it, as a highlight's `id` is: what
+    /// `fenrir.uncomment` takes.
+    id: u64 = 0,
+    /// The anchor it is on, by name: the `anchor` of the highlights it is
+    /// about.
+    anchor: []const u8 = "",
+    /// Its own name, which a link will name it by. The first comment on an
+    /// anchor has the anchor's.
+    name: []const u8 = "",
+    text: []const u8 = "",
+    /// Where its anchor begins, from 1. Zero for one whose words are gone.
+    page: u32 = 0,
+    /// When one is made: the id of a highlight, on whose anchor it goes,
+    /// given instead of `anchor`.
+    on: u64 = 0,
 };
 
 pub const VTable = struct {
@@ -108,6 +133,15 @@ pub const VTable = struct {
     highlightAt: *const fn (ptr: *anyopaque, doc: Handle, index: usize) ?Highlight,
     addHighlight: *const fn (ptr: *anyopaque, doc: Handle, h: Highlight) ?u64,
     removeHighlight: *const fn (ptr: *anyopaque, doc: Handle, id: u64) bool,
+
+    /// The comments, in the order `]c` reads them: by where their anchors
+    /// begin, a thread at a time.
+    commentCount: *const fn (ptr: *anyopaque, doc: Handle) usize,
+    commentAt: *const fn (ptr: *anyopaque, doc: Handle, index: usize) ?Comment,
+    /// A comment on an anchor that exists, named by `anchor` or `on`. Null
+    /// when there is no such anchor.
+    addComment: *const fn (ptr: *anyopaque, doc: Handle, c: Comment) ?u64,
+    removeComment: *const fn (ptr: *anyopaque, doc: Handle, id: u64) bool,
 
     /// A plugin's persistent value, or null. The caller owns the result and
     /// frees it with `gpa`.
@@ -187,6 +221,22 @@ pub fn addHighlight(h: Host, doc: Handle, hl: Highlight) ?u64 {
 
 pub fn removeHighlight(h: Host, doc: Handle, id: u64) bool {
     return h.vtable.removeHighlight(h.ptr, doc, id);
+}
+
+pub fn commentCount(h: Host, doc: Handle) usize {
+    return h.vtable.commentCount(h.ptr, doc);
+}
+
+pub fn commentAt(h: Host, doc: Handle, index: usize) ?Comment {
+    return h.vtable.commentAt(h.ptr, doc, index);
+}
+
+pub fn addComment(h: Host, doc: Handle, c: Comment) ?u64 {
+    return h.vtable.addComment(h.ptr, doc, c);
+}
+
+pub fn removeComment(h: Host, doc: Handle, id: u64) bool {
+    return h.vtable.removeComment(h.ptr, doc, id);
 }
 
 pub fn storeGet(h: Host, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {

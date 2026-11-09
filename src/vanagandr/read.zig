@@ -1513,6 +1513,14 @@ const Session = struct {
     mode_buf: [96]u8 = undefined,
     /// A highlight's colour as text, for the one `highlightAt` being answered.
     hex_buf: [7]u8 = undefined,
+    /// Names as text, for the one highlight or comment being answered: an
+    /// anchor's, and a comment's own.
+    name_bufs: [2][Library.name_len]u8 = undefined,
+    /// The comments of one buffer in the order `]c` reads them, by index,
+    /// for `fenrir.comments()`; kept until the marks change, so a plugin
+    /// listing them asks for one sort and not one a row.
+    comment_order: std.ArrayList(usize) = .empty,
+    comment_order_for: struct { buffer: u32 = 0, revision: u64 = 0 } = .{},
     /// What events were last reported with, so that the ones that are a
     /// difference fire on a change and not on every frame.
     ///
@@ -1610,6 +1618,7 @@ const Session = struct {
         s.cmdline.deinit(s.gpa);
         s.search.deinit(s.gpa);
         s.note.deinit(s.gpa);
+        s.comment_order.deinit(s.gpa);
         s.recorded.deinit(s.gpa);
         s.tabs.deinit(s.gpa);
         for (s.faces.items) |*c| c.deinit();
@@ -3835,6 +3844,10 @@ const Session = struct {
 
     fn announceEffect(s: *Session, at: u32, b: *Buffer, e: Marks.Effect) void {
         const rt = s.plugins orelse return;
+        switch (e) {
+            .comment_insert, .comment_delete, .comment_update => return s.announceComment(rt, at, b, e),
+            else => {},
+        }
         // Three events rather than one with an `action` field: a plugin that
         // only cares about a highlight being made should not have to be told
         // about every recolouring and then throw it away.
@@ -3842,7 +3855,7 @@ const Session = struct {
             .insert => .{ .AnnotationAdd, (b.marks.byKey(e.insert) orelse return).* },
             .update => .{ .AnnotationChange, (b.marks.byKey(e.update) orelse return).* },
             .delete => |m| .{ .AnnotationRemove, m },
-            .comment_insert, .comment_delete, .comment_update => return,
+            .comment_insert, .comment_delete, .comment_update => unreachable,
         };
         var hex: [7]u8 = undefined;
         rt.emit(.{ .event = event, .doc = s.handleOf(at), .path = b.path, .data = .{ .highlight = .{
@@ -3857,6 +3870,19 @@ const Session = struct {
             .kind = kindName(mark.kind),
             .style = styleName(mark),
         } } });
+    }
+
+    /// The comment events, each with the comment as `fenrir.comments()`
+    /// would list it.
+    fn announceComment(s: *Session, rt: *galdr.Runtime, at: u32, b: *Buffer, e: Marks.Effect) void {
+        const event: galdr.Runtime.Event, const c: Marks.Comment = switch (e) {
+            .comment_insert => |key| .{ .CommentAdd, b.marks.comments.items[b.marks.commentIndex(key) orelse return] },
+            .comment_update => |key| .{ .CommentChange, b.marks.comments.items[b.marks.commentIndex(key) orelse return] },
+            .comment_delete => |c| .{ .CommentRemove, c },
+            else => unreachable,
+        };
+        var names: [2][Library.name_len]u8 = undefined;
+        rt.emit(.{ .event = event, .doc = s.handleOf(at), .path = b.path, .data = .{ .comment = s.hostComment(b, c, &names) } });
     }
 
     /// What a mark's kind is called on the other side of the plugin API.
@@ -4512,6 +4538,10 @@ const Session = struct {
         .highlightAt = hostHighlightAt,
         .addHighlight = hostAddHighlight,
         .removeHighlight = hostRemoveHighlight,
+        .commentCount = hostCommentCount,
+        .commentAt = hostCommentAt,
+        .addComment = hostAddComment,
+        .removeComment = hostRemoveComment,
         .storeGet = hostStoreGet,
         .storeSet = hostStoreSet,
         .readFile = hostReadFile,
@@ -4621,6 +4651,7 @@ const Session = struct {
             // has copied this one into Lua.
             .color = hexOf(m.color, &s.hex_buf),
             .note = firstComment(b, m),
+            .anchor = Library.makeName(&s.name_bufs[0], m.anchor),
             .kind = kindName(m.kind),
             .style = styleName(m),
         };
@@ -4660,6 +4691,73 @@ const Session = struct {
         b.marks.beginGroup();
         defer b.marks.beginGroup();
         return (b.marks.removeAt(s.gpa, index) catch null) != null;
+    }
+
+    /// `fenrir.comments()` asks for the count and then each row, so the
+    /// order is worked out on the first and kept until the marks change.
+    fn commentOrder(s: *Session, at: u32) []const usize {
+        const b = s.buffer(at);
+        const stamp: @TypeOf(s.comment_order_for) = .{ .buffer = at, .revision = b.marks.revision };
+        if (!std.meta.eql(stamp, s.comment_order_for)) {
+            b.marks.readOrder(s.gpa, &s.comment_order) catch s.comment_order.clearRetainingCapacity();
+            s.comment_order_for = stamp;
+        }
+        return s.comment_order.items;
+    }
+
+    fn hostCommentCount(ptr: *anyopaque, doc: galdr.Host.Handle) usize {
+        const s = hostSession(ptr);
+        const at = s.bufferFor(doc) orelse return 0;
+        return s.commentOrder(at).len;
+    }
+
+    fn hostCommentAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host.Comment {
+        const s = hostSession(ptr);
+        const at = s.bufferFor(doc) orelse return null;
+        const order = s.commentOrder(at);
+        if (index >= order.len) return null;
+        return s.hostComment(s.buffer(at), s.buffer(at).marks.comments.items[order[index]], &s.name_bufs);
+    }
+
+    /// A comment as Galdr is handed it. The names are written into `names`,
+    /// which must outlive the call it is handed over in.
+    fn hostComment(s: *Session, b: *Buffer, c: Marks.Comment, names: *[2][Library.name_len]u8) galdr.Host.Comment {
+        const line = b.marks.firstLine(s.gpa, c.anchor);
+        return .{
+            .id = c.key,
+            .anchor = Library.makeName(&names[0], c.anchor),
+            .name = Library.makeName(&names[1], c.name),
+            .text = c.text,
+            .page = if (line) |i| b.marks.items()[i].page + 1 else 0,
+        };
+    }
+
+    fn hostAddComment(ptr: *anyopaque, doc: galdr.Host.Handle, c: galdr.Host.Comment) ?u64 {
+        const s = hostSession(ptr);
+        const at = s.bufferFor(doc) orelse return null;
+        const b = s.buffer(at);
+        // On a highlight's anchor, or an anchor by name; either way one
+        // with a line left, since a comment on nothing is never shown.
+        const anchor = if (c.on != 0)
+            (b.marks.byKey(c.on) orelse return null).anchor
+        else
+            Library.nameNumber(c.anchor) orelse return null;
+        if (anchor == 0 or b.marks.lineCount(anchor) == 0) return null;
+
+        b.marks.beginGroup();
+        defer b.marks.beginGroup();
+        const index = b.marks.addComment(s.gpa, .{ .anchor = anchor, .text = c.text }, false) catch return null;
+        return b.marks.comments.items[index].key;
+    }
+
+    fn hostRemoveComment(ptr: *anyopaque, doc: galdr.Host.Handle, id: u64) bool {
+        const s = hostSession(ptr);
+        const at = s.bufferFor(doc) orelse return false;
+        const b = s.buffer(at);
+        const index = b.marks.commentIndex(id) orelse return false;
+        b.marks.beginGroup();
+        defer b.marks.beginGroup();
+        return (b.marks.removeComment(s.gpa, index) catch null) != null;
     }
 
     fn hostStoreGet(ptr: *anyopaque, gpa: Allocator, plugin: []const u8, key: []const u8) ?[]u8 {
@@ -7078,6 +7176,7 @@ fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
     s.stroking.deinit(s.gpa);
     s.note.deinit(s.gpa);
+    s.comment_order.deinit(s.gpa);
     s.palette_rows.deinit(s.gpa);
     s.palette_text.deinit();
     s.doc_handles.deinit(s.gpa);
@@ -8521,6 +8620,68 @@ test "command lines: page numbers, relative pages, zoom, and unknown names" {
 
     try testing.expect(!s.exec("frobnicate now"));
     try testing.expect(std.mem.indexOf(u8, s.status, "frobnicate") != null);
+}
+
+test "a plugin comments on the real reader's marks, and hears each comment come and go" {
+    if (!galdr.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+
+    const rt = try galdr.Runtime.create(gpa, s.host(), .{});
+    try givePlugins(&s, rt);
+    defer {
+        rt.destroy();
+        s.plugins = null;
+    }
+
+    // Two lines of one selection, made the way `c` makes them.
+    const anchor = s.markBoxes(0, &.{
+        .{ .page = 1, .box = .fromRect(100, 700, 300, 712) },
+        .{ .page = 1, .box = .fromRect(100, 686, 300, 698) },
+    }, s.accent, .highlight);
+    s.applyEffects();
+    var name: [Library.name_len]u8 = undefined;
+    var script: [1024]u8 = undefined;
+    try testing.expect(rt.runString("init.lua", try std.fmt.bufPrint(&script,
+        \\heard = {{}}
+        \\local function hear(e) heard[#heard + 1] = e.event .. ":" .. e.text .. ":" .. e.anchor end
+        \\fenrir.on("CommentAdd", hear)
+        \\fenrir.on("CommentRemove", hear)
+        \\fenrir.on("CommentChange", hear)
+        \\local marks = fenrir.highlights()
+        \\assert(marks[1].anchor == "{s}" and marks[2].anchor == marks[1].anchor)
+        \\first = fenrir.comment{{ anchor = marks[2].id, text = "on the second line" }}
+        \\reply = fenrir.comment{{ anchor = "{s}", text = "a reply" }}
+    , .{ Library.makeName(&name, anchor), Library.makeName(&name, anchor) })));
+    s.applyEffects();
+
+    // Both on the one anchor, the first named as the anchor is; and read
+    // back in `]c`'s order, with the page the anchor begins on.
+    const said = s.buffer(0).marks.said(anchor);
+    try testing.expectEqual(@as(usize, 2), said.len);
+    try testing.expectEqual(anchor, said[0].name);
+    try testing.expect(rt.runString("check",
+        \\local all = fenrir.comments()
+        \\assert(#all == 2, #all)
+        \\assert(all[1].id == first and all[1].page == 2 and all[1].name == all[1].anchor)
+        \\assert(all[2].text == "a reply" and all[2].name ~= all[2].anchor)
+        \\assert(fenrir.highlights()[1].note == "on the second line")
+        \\assert(not pcall(fenrir.comment, { anchor = "f999", text = "on nothing" }))
+        \\assert(fenrir.uncomment(reply))
+    ));
+    s.applyEffects();
+
+    // An undo is the reader's, and the plugin hears it as it heard the rest.
+    _ = s.apply(.undo);
+    s.applyEffects();
+    try testing.expect(rt.runString("check",
+        \\assert(#heard == 4, #heard)
+        \\assert(heard[1]:find("^CommentAdd:on the second line:"))
+        \\assert(heard[3]:find("^CommentRemove:a reply:"))
+        \\assert(heard[4]:find("^CommentAdd:a reply:"))
+    ));
 }
 
 test "a plugin drives the real reader: bindings, commands, highlights, events" {
