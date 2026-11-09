@@ -304,6 +304,13 @@ const Change = struct {
     const Item = union(enum) { mark: Mark, comment: Comment };
 };
 
+/// What `lines` holds for one mark.
+const Line = packed struct(u8) {
+    heads: bool = false,
+    leads: bool = false,
+    _: u6 = 0,
+};
+
 list: std.ArrayList(Mark) = .empty,
 
 /// Every comment, ordered by anchor and then by when it was made, so that
@@ -319,6 +326,12 @@ next_name: u64 = 1,
 /// `revision` has moved past `led_revision`, never per frame; see `heads`.
 led: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 led_revision: u64 = 0,
+/// The same, per mark by index, which is how the frame asks it: a byte
+/// read, where the table is a hash and the comments a binary search. With
+/// four hundred marks the two cost the best frame a hundredth of a
+/// millisecond; built with `led`, they cost nothing a frame.
+lines: std.ArrayList(Line) = .empty,
+
 
 /// Bumped by every change. A view redraws when this is not the number it last
 /// drew.
@@ -358,6 +371,7 @@ pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.list.deinit(gpa);
     m.comments.deinit(gpa);
     m.led.deinit(gpa);
+    m.lines.deinit(gpa);
     m.effects.deinit(gpa);
     m.undo_stack.deinit(gpa);
     m.redo_stack.deinit(gpa);
@@ -645,13 +659,14 @@ fn commentSlot(m: Marks, c: Comment) usize {
 /// the marks change rather than a walk of the anchor's lines per mark.
 pub fn heads(m: *Marks, gpa: Allocator, index: usize) bool {
     if (m.led_revision != m.revision) m.relead(gpa) catch return false;
-    return m.led.get(m.list.items[index].anchor) == index;
+    return m.lines.items[index].heads;
 }
 
 /// Whether the mark at `index` is where its anchor's comments are shown:
 /// its first line, on an anchor that has any.
 pub fn leads(m: *Marks, gpa: Allocator, index: usize) bool {
-    return m.said(m.list.items[index].anchor).len != 0 and m.heads(gpa, index);
+    if (m.led_revision != m.revision) m.relead(gpa) catch return false;
+    return m.lines.items[index].leads;
 }
 
 fn relead(m: *Marks, gpa: Allocator) Allocator.Error!void {
@@ -659,6 +674,12 @@ fn relead(m: *Marks, gpa: Allocator) Allocator.Error!void {
     for (m.list.items, 0..) |mark, i| {
         const lead = try m.led.getOrPut(gpa, mark.anchor);
         if (!lead.found_existing or readsBefore(mark, m.list.items[lead.value_ptr.*])) lead.value_ptr.* = i;
+    }
+    try m.lines.resize(gpa, m.list.items.len);
+    @memset(m.lines.items, .{});
+    var it = m.led.iterator();
+    while (it.next()) |e| {
+        m.lines.items[e.value_ptr.*] = .{ .heads = true, .leads = m.said(e.key_ptr.*).len != 0 };
     }
     m.led_revision = m.revision;
 }
