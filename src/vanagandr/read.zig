@@ -713,6 +713,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Comparison
     // After the accent, because the theme carries it: `useTheme` puts the
     // chosen colour back on top of whichever theme was named.
     session.useTheme(written_theme orelse session.rememberedTheme());
+    session.comment_style = session.rememberedCommentStyle();
 
     for (files.items) |file| {
         _ = session.openBuffer(file) catch |err| {
@@ -1454,6 +1455,10 @@ const Session = struct {
     /// taken up, the one `]c` landed on after that. Asked through
     /// `focusedComment`, which mends it when an undo has taken it away.
     focus_comment: ?u64 = null,
+    /// What `c` leaves on the words it comments on: a highlight, or an arrow
+    /// for a reader who wants no colour on the text. The `comment_anchor`
+    /// setting, read when the reader starts and when it is changed.
+    comment_style: Marks.Style = .highlight,
     /// What note mode will write on enter. Set as it begins, because the
     /// keys that begin it mean different things: `a` the comment in hand,
     /// `c` a new one.
@@ -1801,6 +1806,21 @@ const Session = struct {
         return Theme.byName(name) orelse s.theme;
     }
 
+    /// What `comment_anchor` says, or a highlight when it says nothing this
+    /// build knows.
+    fn rememberedCommentStyle(s: *Session) Marks.Style {
+        const lib = s.library orelse return .highlight;
+        const said = (lib.get("comment_anchor") catch null) orelse return .highlight;
+        defer s.gpa.free(said);
+        return commentStyleNamed(said) orelse .highlight;
+    }
+
+    fn commentStyleNamed(name: []const u8) ?Marks.Style {
+        if (std.mem.eql(u8, name, "highlight")) return .highlight;
+        if (std.mem.eql(u8, name, "arrow")) return .arrow;
+        return null;
+    }
+
     /// Fills the settings page with what the library holds now.
     ///
     /// Called when the page opens and after every change, and nowhere near a
@@ -1887,6 +1907,11 @@ const Session = struct {
                 return;
             };
             s.useTheme(t);
+        } else if (std.mem.eql(u8, c.key, "comment_anchor")) {
+            s.comment_style = if (c.value.len == 0) .highlight else commentStyleNamed(c.value) orelse {
+                s.say("comment_anchor is highlight or arrow, not {s}", .{c.value[0..@min(c.value.len, 48)]});
+                return;
+            };
         } else if (std.mem.eql(u8, c.key, "accent")) {
             if (c.value.len != 0) {
                 const colour = Library.parseColor(c.value) orelse {
@@ -3666,7 +3691,7 @@ const Session = struct {
         if (boxes.items.len == 0) return s.noAnchor();
 
         const b = s.buffer(v.buffer);
-        const anchor = s.markBoxes(v.buffer, boxes.items, s.highlight, .highlight);
+        const anchor = s.markBoxes(v.buffer, boxes.items, s.highlight, s.comment_style);
         var first: ?Marks.Mark = null;
         for (b.marks.items()) |m| {
             if (m.anchor != anchor) continue;
@@ -4478,6 +4503,10 @@ const Session = struct {
         }
 
         const eq = std.mem.indexOfScalar(u8, args, '=') orelse {
+            if (std.mem.eql(u8, args, "comment_anchor")) {
+                s.say("comment_anchor = {s}", .{@tagName(s.comment_style)});
+                return true;
+            }
             if (!std.mem.eql(u8, args, "theme")) {
                 s.say("no setting called {s}", .{args[0..@min(args.len, 48)]});
                 return false;
@@ -4488,6 +4517,18 @@ const Session = struct {
 
         const name = std.mem.trim(u8, args[0..eq], " \t");
         const value = std.mem.trim(u8, args[eq + 1 ..], " \t");
+        // Through the settings page's door, which checks it, applies it and
+        // writes it down, so `:set` and a click cannot disagree.
+        if (std.mem.eql(u8, name, "comment_anchor")) {
+            if (commentStyleNamed(value) == null) {
+                s.say("comment_anchor is highlight or arrow, not {s}", .{value[0..@min(value.len, 48)]});
+                return false;
+            }
+            for (settings_page.builtin, 0..) |opt, i| {
+                if (std.mem.eql(u8, opt.key, name)) s.changeSetting(.{ .key = opt.key, .value = value, .index = i });
+            }
+            return true;
+        }
         if (!std.mem.eql(u8, name, "theme")) {
             s.say("no setting called {s}", .{name[0..@min(name.len, 48)]});
             return false;
@@ -5564,6 +5605,9 @@ const Session = struct {
                 ),
                 .underline, .strikeout => try over.fill(ruleOf(box, mark.style), c),
                 .squiggly => try squiggle(over, box, c),
+                // From the first line only: the arrow says where the words
+                // begin, and the outline in edit mode says where they run.
+                .arrow => if (b.marks.heads(s.gpa, i)) try arrow(over, box, lineStart(v, b, mark, box), c),
             }
             if (held) {
                 const pad = 2.0;
@@ -5776,6 +5820,46 @@ const Session = struct {
         const t = ruleWeight(box);
         const top = if (style == .underline) box.max_y - t else (box.min_y + box.max_y - t) * 0.5;
         return .fromRect(box.min_x, top, box.max_x, top + t);
+    }
+
+    /// Where the line a mark is on begins, in window x, so that an arrow
+    /// stops short of the line's first word and not of the mark's: a
+    /// selection begun mid-line would otherwise have its arrow drawn over
+    /// the words before it. The mark's own edge when the text is not known.
+    fn lineStart(v: *View, b: *Buffer, mark: Marks.Mark, box: Bounds) f32 {
+        const map = b.textMap(mark.page) orelse return box.min_x;
+        if (map.isEmpty()) return box.min_x;
+        const line = map.lines[map.lineAt(mark.box.min_x, (mark.box.min_y + mark.box.max_y) * 0.5)].box;
+        const start = v.windowBox(mark.page, .fromRect(line.min_x, line.min_y, line.min_x + 1, line.max_y));
+        return @min(start.min_x, box.min_x);
+    }
+
+    /// An arrow in the margin, pointing at the line `box` is on from left of
+    /// `start`, where its words begin: a shaft and a head, in the mark's
+    /// colour darkened to read on paper.
+    ///
+    /// The overlay draws axis-aligned boxes and nothing else, so the head is
+    /// a stack of slices about a pixel wide, each shorter than the last: a
+    /// triangle at any size worth drawing, for about a line's height in
+    /// instances, and only on an anchor's first line.
+    fn arrow(over: *DrawList, box: Bounds, start: f32, color: Color) !void {
+        const h = @max(box.height(), 4);
+        const tip = start - h * 0.25;
+        const head = h * 0.5;
+        const half = h * 0.3;
+        const mid = (box.min_y + box.max_y) * 0.5;
+        const t = @max(1.0, h * 0.1);
+        const ink: Color = .{ .r = color.r * 0.75, .g = color.g * 0.75, .b = color.b * 0.75, .a = 1 };
+        try over.fill(.fromRect(tip - head - h * 1.2, mid - t * 0.5, tip - head + 0.5, mid + t * 0.5), ink);
+
+        const slices: f32 = std.math.clamp(@ceil(head), 2, 24);
+        const step = head / slices;
+        var j: f32 = 0;
+        while (j < slices) : (j += 1) {
+            const y = half * (1 - (j + 0.5) / slices);
+            const x = tip - head + j * step;
+            try over.fill(.fromRect(x, mid - y, x + step + 0.25, mid + y), ink);
+        }
     }
 
     /// A squiggle along the foot of the box: half rings, the top of one and
@@ -9073,6 +9157,64 @@ test "a setting changed on the page goes through the same door as the command" {
     try testing.expect(s.chosen_accent != null);
     try testing.expectEqual(s.chosen_accent.?, s.accent);
     try testing.expectEqual(s.chosen_accent.?, s.highlight);
+}
+
+test "comment_anchor = arrow makes c point at the words, kept and read back" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    try putText(&s, 0, 3, 4);
+
+    // Refused by name, so a misspelling is not a highlight by default.
+    try testing.expect(!s.exec("set comment_anchor=arow"));
+    try testing.expect(s.exec("set comment_anchor=arrow"));
+    try testing.expectEqual(Marks.Style.arrow, s.comment_style);
+
+    s.keymap.mode = .visual;
+    _ = s.apply(.enter_visual);
+    _ = s.apply(.{ .move_cursor = .down });
+    s.keymap.mode = .note;
+    _ = s.apply(.comment_selection);
+    for ("see") |c| _ = s.apply(.{ .note_char = c });
+    s.keymap.mode = .edit;
+    _ = s.apply(.note_commit);
+    s.applyEffects();
+    for (s.buffer(0).marks.items()) |m| try testing.expectEqual(Marks.Style.arrow, m.style);
+    {
+        const rows = try lib.highlights("/docs/a.pdf");
+        defer lib.freeHighlights(rows, rows.len);
+        try testing.expectEqualStrings("arrow", rows[0].style);
+    }
+
+    // The next reader opens with it.
+    var again = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
+    defer closeSession(&again);
+    try giveLibrary(&again, lib);
+    try testing.expectEqual(Marks.Style.arrow, again.rememberedCommentStyle());
+}
+
+test "an arrow sits in the margin, its tip short of the words" {
+    const gpa = testing.allocator;
+    const line: Bounds = .fromRect(100, 200, 400, 220);
+    var d: DrawList = .init(gpa, .fromRect(0, 0, 1000, 1000));
+    defer d.deinit();
+    // A mark begun mid-line, on a line whose words begin at 60.
+    try Session.arrow(&d, line, 60, .{ .r = 1, .g = 0.9, .b = 0.2, .a = 1 });
+
+    var ink: Bounds = .empty;
+    for (d.instances.items) |i| ink = ink.add(.{ .x = i.dst[0], .y = i.dst[1] }).add(.{ .x = i.dst[2], .y = i.dst[3] });
+    // Nothing on the text, the line's earlier words included, and nothing
+    // taller than the line it points at.
+    try testing.expect(ink.max_x <= 60);
+    try testing.expect(ink.min_y >= line.min_y and ink.max_y <= line.max_y);
+    // A shaft and ten slices of head, for a line twenty tall.
+    try testing.expectEqual(@as(usize, 11), d.instances.items.len);
 }
 
 test "with no library every setting is unset, and saying so is not a crash" {

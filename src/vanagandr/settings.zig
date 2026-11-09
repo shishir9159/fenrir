@@ -87,6 +87,12 @@ pub const builtin = [_]Option{
         .about = "the zoom a document opens at, or fit",
         .unset = "fit",
     },
+    .{
+        .key = "comment_anchor",
+        .about = "what c leaves on the words: a highlight, or an arrow",
+        .choices = &.{ "highlight", "arrow" },
+        .unset = "highlight",
+    },
 };
 
 /// The longest value worth showing. A colour is seven bytes and a name is a

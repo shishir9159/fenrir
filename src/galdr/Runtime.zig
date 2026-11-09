@@ -3613,17 +3613,17 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
     _ = lua.lua_getfield(L, 1, "note");
     h.note = lua.toString(L, -1) orelse "";
 
-    // PDF's four names, exactly as `highlights()` reads them back: the
-    // author asked for `squiggly`, not `squiggle`. Don't take the names
-    // `Marks.Filter` also accepts for a person typing -- a plugin's style
-    // is what the file holds. Anything else is refused rather than made a
-    // highlight, so a misspelling is an error its author sees and not a
-    // mark that quietly looks wrong.
+    // PDF's four names and `arrow`, exactly as `highlights()` reads them
+    // back: the author asked for `squiggly`, not `squiggle`. Don't take the
+    // names `Marks.Filter` also accepts for a person typing -- a plugin's
+    // style is what the file holds. Anything else is refused rather than
+    // made a highlight, so a misspelling is an error its author sees and not
+    // a mark that quietly looks wrong.
     _ = lua.lua_getfield(L, 1, "style");
     if (lua.typeOf(L, -1) != .nil) {
         h.style = lua.toString(L, -1) orelse "";
         if (std.meta.stringToEnum(Marks.Style, h.style) == null)
-            lua.raise(L, "galdr: a highlight's style is \"highlight\", \"underline\", \"strikeout\" or \"squiggly\"");
+            lua.raise(L, "galdr: a highlight's style is \"highlight\", \"underline\", \"strikeout\", \"squiggly\" or \"arrow\"");
     }
 
     if (of(L).host.addHighlight(doc, h)) |id| lua.lua_pushinteger(L, @intCast(id)) else lua.lua_pushnil(L);

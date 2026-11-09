@@ -186,7 +186,8 @@ pub const marks_usage =
     \\    fenrir marks paper.pdf --add 3 72 700 300 712 yellow
     \\                                        add a highlight, for scripting
     \\    --style STYLE                       what --add makes: highlight,
-    \\                                        underline, strikeout or squiggly
+    \\                                        underline, strikeout, squiggly
+    \\                                        or arrow
     \\    fenrir marks paper.pdf --ink 3 72 700 120 690 160 705 red
     \\                                        draw a stroke, the same way
     \\    fenrir marks paper.pdf --comment f3 "is this right?"
@@ -230,7 +231,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
             i += 1;
             if (i == argv.len) return ctx.fail("--style needs a style", .{});
             style = std.meta.stringToEnum(Marks.Style, argv[i]) orelse
-                return ctx.fail("{s} is not a style: highlight, underline, strikeout or squiggly", .{argv[i]});
+                return ctx.fail("{s} is not a style: highlight, underline, strikeout, squiggly or arrow", .{argv[i]});
         } else if (std.mem.eql(u8, arg, "--add")) {
             if (i + 5 >= argv.len) return ctx.fail("--add needs PAGE X0 Y0 X1 Y1", .{});
             const page = std.fmt.parseInt(u32, argv[i + 1], 10) catch
@@ -535,6 +536,8 @@ pub const config_usage =
     \\      accent   the colour the interface draws its own marks in
     \\      theme    which set of colours the interface is drawn in
     \\      zoom     the zoom a document opens at, or `fit`
+    \\      comment_anchor
+    \\               what c leaves on the words: `highlight` or `arrow`
 ;
 
 pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
@@ -603,6 +606,12 @@ pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
                 lib.setTheme(v) catch |err| return ctx.fail("cannot set theme: {t}", .{err});
                 ctx.out.print("theme = {s}\n", .{v}) catch {};
                 return;
+            }
+            // And the same for what `c` leaves on the words, which a reader
+            // would otherwise read as a highlight without a word said.
+            if (std.mem.eql(u8, k, "comment_anchor")) {
+                if (!std.mem.eql(u8, v, "highlight") and !std.mem.eql(u8, v, "arrow"))
+                    return ctx.fail("comment_anchor is highlight or arrow, not {s}", .{v});
             }
             lib.set(k, v) catch |err| return ctx.fail("cannot set {s}: {t}", .{ k, err });
             ctx.out.print("{s} = {s}\n", .{ k, v }) catch {};

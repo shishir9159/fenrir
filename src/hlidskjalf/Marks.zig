@@ -83,12 +83,20 @@ const Marks = @This();
 pub const Kind = enum { block, ink };
 
 /// How a block marks its words: PDF's four text-markup subtypes, so that
-/// writing one into a file is a name and not a translation.
+/// writing one into a file is a name and not a translation -- and an arrow,
+/// which points at them from the margin and puts no colour on the text.
+///
+/// The arrow is the one that is not a text-markup subtype. A PDF holds it as
+/// a `/Line` with an arrowhead at the words' end, drawn from its anchor's
+/// first line, so it is still one annotation an anchor. It is what `c`
+/// leaves when the `comment_anchor` setting is `arrow`, for a reader who
+/// wants the page to stay as it was printed.
 pub const Style = enum {
     highlight,
     underline,
     strikeout,
     squiggly,
+    arrow,
 
     /// What a person calls it, where the tag is what PDF does.
     pub fn label(s: Style) []const u8 {
@@ -97,6 +105,7 @@ pub const Style = enum {
             .underline => "underline",
             .strikeout => "strike-through",
             .squiggly => "squiggle",
+            .arrow => "arrow",
         };
     }
 };
@@ -305,9 +314,9 @@ comments: std.ArrayList(Comment) = .empty,
 /// The next anchor or comment number to hand out.
 next_name: u64 = 1,
 
-/// For each anchor with a comment, the index of its first line in reading
-/// order: the mark the comment is shown on. Worked out again when
-/// `revision` has moved past `led_revision`, never per frame; see `leads`.
+/// For each anchor, the index of its first line in reading order: the mark
+/// a comment is shown on, and an arrow drawn from. Worked out again when
+/// `revision` has moved past `led_revision`, never per frame; see `heads`.
 led: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 led_revision: u64 = 0,
 
@@ -629,25 +638,27 @@ fn commentSlot(m: Marks, c: Comment) usize {
     return std.sort.partitionPoint(Comment, m.comments.items, c, before);
 }
 
-/// Whether the mark at `index` is where its anchor's comments are shown:
-/// the first of the anchor's lines in reading order, on an anchor that has
-/// any.
+/// Whether the mark at `index` is the first of its anchor's lines in
+/// reading order: where an arrow is drawn from.
 ///
 /// Asked of every mark every frame, so the answer is a table rebuilt when
 /// the marks change rather than a walk of the anchor's lines per mark.
-pub fn leads(m: *Marks, gpa: Allocator, index: usize) bool {
+pub fn heads(m: *Marks, gpa: Allocator, index: usize) bool {
     if (m.led_revision != m.revision) m.relead(gpa) catch return false;
-    const lead = m.led.get(m.list.items[index].anchor) orelse return false;
-    return lead == index;
+    return m.led.get(m.list.items[index].anchor) == index;
+}
+
+/// Whether the mark at `index` is where its anchor's comments are shown:
+/// its first line, on an anchor that has any.
+pub fn leads(m: *Marks, gpa: Allocator, index: usize) bool {
+    return m.said(m.list.items[index].anchor).len != 0 and m.heads(gpa, index);
 }
 
 fn relead(m: *Marks, gpa: Allocator) Allocator.Error!void {
-    const none = std.math.maxInt(usize);
     m.led.clearRetainingCapacity();
-    for (m.comments.items) |c| try m.led.put(gpa, c.anchor, none);
     for (m.list.items, 0..) |mark, i| {
-        const lead = m.led.getPtr(mark.anchor) orelse continue;
-        if (lead.* == none or readsBefore(mark, m.list.items[lead.*])) lead.* = i;
+        const lead = try m.led.getOrPut(gpa, mark.anchor);
+        if (!lead.found_existing or readsBefore(mark, m.list.items[lead.value_ptr.*])) lead.value_ptr.* = i;
     }
     m.led_revision = m.revision;
 }
@@ -1038,9 +1049,8 @@ pub fn readOrder(m: *Marks, gpa: Allocator, out: *std.ArrayList(usize)) Allocato
     std.mem.sort(usize, out.items, m, by);
 }
 
-/// The index of an anchor's first line in reading order, when it has a
-/// comment and a line: where the comment is shown, and the page a plugin is
-/// told it is on.
+/// The index of an anchor's first line in reading order, when it has one:
+/// where a comment is shown, and the page a plugin is told it is on.
 pub fn firstLine(m: *Marks, gpa: Allocator, anchor: u64) ?usize {
     if (m.led_revision != m.revision) m.relead(gpa) catch return null;
     return m.leadLine(anchor);
@@ -1067,11 +1077,10 @@ fn spotOf(m: *const Marks, c: Comment, filter: *const Filter) ?Spot {
     return .{ .mark = mark, .key = c.key };
 }
 
-/// The index of an anchor's first line in reading order, if it has a
-/// comment and a line. Needs `led` current.
+/// The index of an anchor's first line in reading order, if it has a line.
+/// Needs `led` current.
 fn leadLine(m: *const Marks, anchor: u64) ?usize {
-    const i = m.led.get(anchor) orelse return null;
-    return if (i == std.math.maxInt(usize)) null else i;
+    return m.led.get(anchor);
 }
 
 /// The first mark `filter` lets through at or after a point in reading
@@ -1766,4 +1775,23 @@ test "]c reads each comment, a thread through before the next anchor" {
     const only = m.jumpComment(gpa, top, null, true, &f).?;
     try testing.expectEqual(keyOf(&m, "low"), only.key);
     try testing.expectEqual(@as(usize, 1), only.of);
+}
+
+test "an anchor's first line heads it, with or without a comment" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    // An arrow over two lines, the lower made first, and nothing said yet:
+    // the arrow is drawn from the upper one all the same.
+    const anchor = m.newName();
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 600, 9, 610), .anchor = anchor, .style = .arrow }, true);
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 700, 9, 710), .anchor = anchor, .style = .arrow }, true);
+    try testing.expect(m.heads(gpa, 1));
+    try testing.expect(!m.heads(gpa, 0));
+    try testing.expect(!m.leads(gpa, 1));
+
+    // And it is a style like the others, which a filter can name.
+    try testing.expect(Filter.parse("arrow", &.{}).matches(m.items()[0], &.{}));
+    try testing.expectEqualStrings("arrow", Style.arrow.label());
 }
