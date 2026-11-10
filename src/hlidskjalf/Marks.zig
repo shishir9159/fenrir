@@ -54,6 +54,11 @@
 //! PDF it is the anchor's `/Contents`; later ones take numbers of their own.
 //! An anchor whose last mark goes takes its comments with it.
 //!
+//! A name another program wrote -- Acrobat's are UUIDs -- is not a number,
+//! and is given one from the top half of the range (`foreignName`), which
+//! fenrir's own never reach. Everything here goes on comparing `u64`s, and
+//! only what writes a name down asks how it is spelled (`spelling`).
+//!
 //! ## Coordinates
 //!
 //! A mark's box is in **PDF user space** -- points, y upwards, origin at the
@@ -321,6 +326,12 @@ comments: std.ArrayList(Comment) = .empty,
 /// The next anchor or comment number to hand out.
 next_name: u64 = 1,
 
+/// Names another program wrote, and the number each stands for here; the
+/// number is `foreign_base` and its place in `spelled`. Both hold the one
+/// copy, in `owned`.
+foreign: std.StringHashMapUnmanaged(u64) = .empty,
+spelled: std.ArrayList([]const u8) = .empty,
+
 /// For each anchor, the index of its first line in reading order: the mark
 /// a comment is shown on, and an arrow drawn from. Worked out again when
 /// `revision` has moved past `led_revision`, never per frame; see `heads`.
@@ -370,6 +381,8 @@ pub const history_limit = 1000;
 pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.list.deinit(gpa);
     m.comments.deinit(gpa);
+    m.foreign.deinit(gpa);
+    m.spelled.deinit(gpa);
     m.led.deinit(gpa);
     m.lines.deinit(gpa);
     m.effects.deinit(gpa);
@@ -458,9 +471,37 @@ pub fn newName(m: *Marks) u64 {
 }
 
 /// Keeps the next number past one already in use: each mark and comment
-/// read back from the library passes through here.
+/// read back from the library passes through here. A foreign name's number
+/// is not one fenrir counts from.
 fn claim(m: *Marks, n: u64) void {
+    if (n >= foreign_base) return;
     m.next_name = @max(m.next_name, n +| 1);
+}
+
+/// Where the numbers for other programs' names begin. Fenrir's own count up
+/// from one and would take a document of 2^63 annotations to get here.
+pub const foreign_base: u64 = 1 << 63;
+
+/// The number a name another program wrote stands for, the same one every
+/// time it is asked.
+pub fn foreignName(m: *Marks, gpa: Allocator, nm: []const u8) Allocator.Error!u64 {
+    std.debug.assert(nm.len != 0);
+    const got = try m.foreign.getOrPut(gpa, nm);
+    if (got.found_existing) return got.value_ptr.*;
+    errdefer _ = m.foreign.remove(nm);
+    const kept = try m.own(nm);
+    try m.spelled.append(gpa, kept);
+    got.key_ptr.* = kept;
+    got.value_ptr.* = foreign_base + m.spelled.items.len - 1;
+    return got.value_ptr.*;
+}
+
+/// How a name another program wrote is spelled, or null for one of
+/// fenrir's numbers, which the caller writes as its own.
+pub fn spelling(m: Marks, n: u64) ?[]const u8 {
+    if (n < foreign_base) return null;
+    const i = n - foreign_base;
+    return if (i < m.spelled.items.len) m.spelled.items[i] else null;
 }
 
 /// Removes the mark at `index`, returning it.
@@ -1235,6 +1276,25 @@ test "a group is undone as one step, and redone in the order it was made" {
     for (0..6) |i| {
         try testing.expectEqual(@as(f32, @floatFromInt(i)), m.items()[i + 1].box.min_y);
     }
+}
+
+test "another program's name is held as a number fenrir never hands out" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    const a = try m.foreignName(gpa, "305e35fa-f306-438a");
+    try testing.expectEqual(a, try m.foreignName(gpa, "305e35fa-f306-438a"));
+    try testing.expect(a != try m.foreignName(gpa, "ccbe0138"));
+    try testing.expectEqualStrings("305e35fa-f306-438a", m.spelling(a).?);
+    try testing.expect(m.spelling(7) == null);
+
+    // Lines and a comment on it are an anchor like any other, and the next
+    // name fenrir gives is still its own.
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 9, 9), .anchor = a }, true);
+    _ = try m.addComment(gpa, .{ .anchor = a, .text = "read" }, true);
+    try testing.expectEqual(a, m.said(a)[0].name);
+    try testing.expectEqual(@as(u64, 1), m.newName());
 }
 
 test "a comment changed twice in one group redoes to the last of them" {

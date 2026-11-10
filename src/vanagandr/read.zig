@@ -459,6 +459,12 @@ const shot_patience: u32 = 3000;
 /// a line of a paper is holding.
 const default_pen_width: f32 = 1.6;
 
+/// How the reader interprets a page: as `raster` does, less the annotations
+/// it took as marks at open (`readAnnots`). It draws those itself, where they
+/// can be recoloured and stepped through, and with their appearances in the
+/// pixels too every one would be on screen twice.
+const page_options: content.Options = .{ .taken = fenrir.annots.taken };
+
 /// What `[` and `]` may take the pen to. A stroke under the thin end would
 /// disappear at a fitted zoom and one over the thick end is a redaction.
 const min_pen_width: f32 = 0.4;
@@ -720,7 +726,6 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Comparison
             return ctx.fail("cannot open {s}: {t}", .{ file, err });
         };
     }
-    stage.mark("documents");
 
     // The first window, looking at the first document.
     const first = &session.buffers.items[0];
@@ -1697,6 +1702,9 @@ const Session = struct {
         const id: u32 = @intCast(s.buffers.items.len - 1);
         s.loadMarks(id);
         s.rememberFileId(path, doc);
+        if (s.stage) |g| g.mark("document");
+        s.readAnnots(id);
+        if (s.stage) |g| g.mark("annotations");
         return id;
     }
 
@@ -1966,8 +1974,7 @@ const Session = struct {
     }
 
     /// Reads this document's marks, and the comments on them, into its
-    /// buffer. A name that is not one fenrir wrote is read as no name, and
-    /// the mark becomes an anchor of its own.
+    /// buffer. A row with no name becomes an anchor of its own.
     fn loadMarks(s: *Session, index: u32) void {
         const lib = s.library orelse return;
         const b = s.buffer(index);
@@ -1983,7 +1990,7 @@ const Session = struct {
                 .box = .fromRect(h.x0, h.y0, h.x1, h.y1),
                 .color = color,
                 .style = std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight,
-                .anchor = Library.nameNumber(h.anchor) orelse 0,
+                .anchor = (s.nameOf(b, h.anchor) catch return) orelse 0,
             }, true) catch return;
         }
 
@@ -2001,7 +2008,7 @@ const Session = struct {
                 .points = k.points,
                 .width = if (k.width > 0) k.width else default_pen_width,
                 .color = Library.parseColor(k.color) orelse ink_colour,
-                .anchor = Library.nameNumber(k.anchor) orelse 0,
+                .anchor = (s.nameOf(b, k.anchor) catch return) orelse 0,
             }, true) catch return;
         }
 
@@ -2009,15 +2016,127 @@ const Session = struct {
         defer lib.freeComments(said, said.len);
 
         for (said) |c| {
-            const anchor = Library.nameNumber(c.anchor) orelse continue;
-            if (anchor == 0) continue;
+            const anchor = (s.nameOf(b, c.anchor) catch return) orelse continue;
             _ = b.marks.addComment(s.gpa, .{
                 .id = c.id,
                 .anchor = anchor,
-                .name = Library.nameNumber(c.nm) orelse 0,
+                .name = (s.nameOf(b, c.nm) catch return) orelse 0,
                 .text = c.text,
             }, true) catch return;
         }
+    }
+
+    /// The number a written name stands for in this buffer: one of fenrir's
+    /// read as the number it spells, anybody else's held as it was written
+    /// (`Marks.foreignName`). Null for no name.
+    fn nameOf(s: *Session, b: *Buffer, nm: []const u8) Allocator.Error!?u64 {
+        if (nm.len == 0) return null;
+        if (Library.nameNumber(nm)) |n| {
+            if (n < Marks.foreign_base) return n;
+        }
+        return try b.marks.foreignName(s.gpa, nm);
+    }
+
+    /// How a name is written down: the other half of `nameOf`.
+    fn spell(b: *const Buffer, n: u64, buf: *[Library.name_len]u8) []const u8 {
+        return b.marks.spelling(n) orelse Library.makeName(buf, n);
+    }
+
+    /// Takes the marks and comments already in the file: a highlight made
+    /// in Acrobat or Zotero, its note and the replies to it.
+    ///
+    /// Every page, once, at open, on this thread: no page of the document
+    /// has been asked of the rasterising thread yet, so it is still this
+    /// thread's to read. The whole document rather than each page as it is
+    /// wanted, because it costs little -- 3.5 ms for 1,486 annotations on
+    /// 286 pages, 1.0 ms for a paper with 328, best of five, ReleaseFast --
+    /// and a page at a time, the panel, `]c` and the next free name would
+    /// each wait on pages nobody had scrolled to. `--time` prints it.
+    ///
+    /// **The library wins.** Its rows are what this reader changed since the
+    /// file was written, so a name it already holds is not read again from
+    /// the file: an anchor's lines, or a comment.
+    fn readAnnots(s: *Session, index: u32) void {
+        const b = s.buffer(index);
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // What the library put there, asked once rather than once per
+        // annotation: `lineCount` walks every mark.
+        var held: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (b.marks.items()) |m| held.put(a, m.anchor, {}) catch return;
+        for (b.marks.comments.items) |c| held.put(a, c.name, {}) catch return;
+
+        for (b.pages, 0..) |p, page| {
+            const list = fenrir.annots.read(a, b.doc, p) catch continue;
+            if (list.len == 0) continue;
+            s.takeAnnots(a, b, @intCast(page), list, &held) catch return;
+        }
+    }
+
+    fn takeAnnots(
+        s: *Session,
+        a: Allocator,
+        b: *Buffer,
+        page: u32,
+        list: []const fenrir.annots.Annot,
+        held: *const std.AutoHashMapUnmanaged(u64, void),
+    ) Allocator.Error!void {
+        // The anchor each was taken as, so a reply finds its thread's.
+        const anchors = try a.alloc(u64, list.len);
+        for (list, anchors) |annot, *anchor| {
+            if (annot.kind == .reply) continue;
+            anchor.* = try s.nameOf(b, annot.name) orelse b.marks.newName();
+            if (held.contains(anchor.*)) continue;
+
+            switch (annot.kind) {
+                .ink => for (annot.paths) |path| {
+                    _ = try b.marks.add(s.gpa, .{
+                        .kind = .ink,
+                        .page = page,
+                        .points = path,
+                        .width = if (annot.width > 0) annot.width else default_pen_width,
+                        .color = annot.color orelse ink_colour,
+                        .anchor = anchor.*,
+                    }, true);
+                },
+                else => for (annot.lines) |box| {
+                    _ = try b.marks.add(s.gpa, .{
+                        .page = page,
+                        .box = box,
+                        .color = annot.color orelse s.highlight,
+                        .style = styleOfAnnot(annot.kind),
+                        .anchor = anchor.*,
+                    }, true);
+                },
+            }
+            // The markup's own note is the first comment, and has its name.
+            if (annot.text.len != 0) {
+                _ = try b.marks.addComment(s.gpa, .{ .anchor = anchor.*, .name = anchor.*, .text = annot.text }, true);
+            }
+        }
+
+        for (list) |annot| {
+            if (annot.kind != .reply or annot.text.len == 0) continue;
+            const thread = annot.thread orelse continue;
+            // A reply with no name of its own gets a new one rather than
+            // the anchor's, which would make it the note on the markup.
+            const name = try s.nameOf(b, annot.name) orelse b.marks.newName();
+            if (held.contains(name)) continue;
+            _ = try b.marks.addComment(s.gpa, .{ .anchor = anchors[thread], .name = name, .text = annot.text }, true);
+        }
+    }
+
+    fn styleOfAnnot(kind: fenrir.annots.Kind) Marks.Style {
+        return switch (kind) {
+            .highlight => .highlight,
+            .underline => .underline,
+            .strikeout => .strikeout,
+            .squiggly => .squiggly,
+            .arrow => .arrow,
+            .ink, .reply => unreachable,
+        };
     }
 
     /// Writes down that a document was opened, and where.
@@ -2071,7 +2190,7 @@ const Session = struct {
             return;
         }
 
-        var result = try content.page(gpa, b.doc, b.pages[job.page], .{});
+        var result = try content.page(gpa, b.doc, b.pages[job.page], page_options);
         defer result.deinit(gpa);
 
         // The text map first, and separately failable: a page whose pixels
@@ -3813,7 +3932,7 @@ const Session = struct {
                 const mark = b.marks.byKey(key) orelse return;
                 var hex: [7]u8 = undefined;
                 var name: [Library.name_len]u8 = undefined;
-                const anchor = Library.makeName(&name, mark.anchor);
+                const anchor = spell(b, mark.anchor, &name);
                 const id = switch (mark.kind) {
                     .block => lib.addHighlight(b.path, .{
                         .page = mark.page,
@@ -3853,8 +3972,8 @@ const Session = struct {
                 var anchor: [Library.name_len]u8 = undefined;
                 var own: [Library.name_len]u8 = undefined;
                 const id = lib.addComment(b.path, .{
-                    .anchor = @constCast(Library.makeName(&anchor, c.anchor)),
-                    .nm = @constCast(Library.makeName(&own, c.name)),
+                    .anchor = @constCast(spell(b, c.anchor, &anchor)),
+                    .nm = @constCast(spell(b, c.name, &own)),
                     .text = @constCast(c.text),
                 }, s.now()) catch return;
                 b.marks.setCommentId(key, id);
@@ -4692,7 +4811,7 @@ const Session = struct {
             // has copied this one into Lua.
             .color = hexOf(m.color, &s.hex_buf),
             .note = firstComment(b, m),
-            .anchor = Library.makeName(&s.name_bufs[0], m.anchor),
+            .anchor = spell(b, m.anchor, &s.name_bufs[0]),
             .kind = kindName(m.kind),
             .style = styleName(m),
         };
@@ -4766,8 +4885,8 @@ const Session = struct {
         const line = b.marks.firstLine(s.gpa, c.anchor);
         return .{
             .id = c.key,
-            .anchor = Library.makeName(&names[0], c.anchor),
-            .name = Library.makeName(&names[1], c.name),
+            .anchor = spell(b, c.anchor, &names[0]),
+            .name = spell(b, c.name, &names[1]),
             .text = c.text,
             .page = if (line) |i| b.marks.items()[i].page + 1 else 0,
         };
@@ -4782,7 +4901,7 @@ const Session = struct {
         const anchor = if (c.on != 0)
             (b.marks.byKey(c.on) orelse return null).anchor
         else
-            Library.nameNumber(c.anchor) orelse return null;
+            Library.nameNumber(c.anchor) orelse b.marks.foreign.get(c.anchor) orelse return null;
         if (anchor == 0 or b.marks.lineCount(anchor) == 0) return null;
 
         b.marks.beginGroup();
@@ -6618,7 +6737,7 @@ const Session = struct {
                 }
             else page: {
                 const b = s.buffer(job.buffer);
-                var result = content.page(gpa, b.doc, b.pages[job.page], .{}) catch break;
+                var result = content.page(gpa, b.doc, b.pages[job.page], page_options) catch break;
                 defer result.deinit(gpa);
 
                 if (text.build(gpa, result.list) catch null) |map| b.putMap(gpa, job.page, map);
@@ -7631,6 +7750,100 @@ test "visual mode: select with motions, highlight in a colour, undo it" {
     try testing.expectEqual(@as(usize, 0), marks.count());
     _ = s.apply(.redo);
     try testing.expectEqual(@as(usize, 2), marks.count());
+}
+
+/// A page carrying what Acrobat leaves and what a save by fenrir would: a
+/// highlight of two lines with a note and a reply, under names that are not
+/// fenrir's, and a stroke named `f7`.
+const annotated_pdf =
+    \\%PDF-1.7
+    \\1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+    \\2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+    \\3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800]
+    \\  /Annots [30 0 R 31 0 R 32 0 R 33 0 R] >> endobj
+    \\30 0 obj << /Subtype /Highlight /Rect [87 521 273 570] /NM (305e35fa) /C [1 0.75 0]
+    \\  /Contents (why) /QuadPoints [134 569 272 569 134 557 272 557 87 557 272 557 87 545 272 545] >> endobj
+    \\31 0 obj << /Subtype /Text /Rect [0 0 20 20] /IRT 30 0 R /NM (ccbe0138) /Contents (because) >> endobj
+    \\32 0 obj << /Subtype /Ink /Rect [0 0 99 99] /NM (f7) /InkList [[10 10 40 40]] >> endobj
+    \\33 0 obj << /Subtype /Link /Rect [0 0 99 99] >> endobj
+    \\trailer << /Root 1 0 R /Size 40 >>
+    \\startxref 0
+    \\%%EOF
+    \\
+;
+
+test "the file's annotations are marks and comments, and the library's names win" {
+    const gpa = testing.allocator;
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+    var s = try sessionOf(gpa, &buf, 1, 1000, 800);
+    defer closeSession(&s);
+    const b = s.buffer(0);
+    b.doc = &doc;
+
+    // The library already holds the stroke, as a journal row newer than
+    // the file: it is not read a second time.
+    _ = try b.marks.add(gpa, .{ .kind = .ink, .points = &.{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } }, .anchor = 7 }, true);
+    s.readAnnots(0);
+
+    const marks = &b.marks;
+    try testing.expectEqual(@as(usize, 3), marks.count());
+    const line = marks.items()[1];
+    try testing.expectEqual(Marks.Style.highlight, line.style);
+    try testing.expectApproxEqAbs(@as(f32, 545), marks.items()[2].box.min_y, 1e-3);
+    try testing.expectEqual(line.anchor, marks.items()[2].anchor);
+
+    // The note is the first comment and has the highlight's name; the reply
+    // keeps its own. Both are spelled back as they were written.
+    const said = marks.said(line.anchor);
+    try testing.expectEqual(@as(usize, 2), said.len);
+    try testing.expectEqualStrings("why", said[0].text);
+    try testing.expectEqualStrings("because", said[1].text);
+    var name: [Library.name_len]u8 = undefined;
+    try testing.expectEqualStrings("305e35fa", Session.spell(b, said[0].name, &name));
+    try testing.expectEqualStrings("ccbe0138", Session.spell(b, said[1].name, &name));
+
+    // None of it is a change, and fenrir's next name is past the stroke's.
+    try testing.expect(!marks.dirty);
+    try testing.expect(marks.newName() > 7);
+}
+
+test "a comment on another program's highlight is stored under that program's name" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+    var s = try sessionOf(gpa, &buf, 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    const b = s.buffer(0);
+    b.doc = &doc;
+    s.readAnnots(0);
+
+    const anchor = b.marks.items()[0].anchor;
+    _ = try b.marks.addComment(gpa, .{ .anchor = anchor, .text = "and so" }, false);
+    s.applyEffects();
+
+    const said = try lib.comments("/docs/a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqual(@as(usize, 1), said.len);
+    try testing.expectEqualStrings("305e35fa", said[0].anchor);
+    // Its own name is fenrir's: the anchor's went to the note in the file.
+    try testing.expect(Library.nameNumber(said[0].nm) != null);
+
+    // Read back on the next open, it lands on the same highlight.
+    var again = try sessionOf(gpa, &buf, 1, 1000, 800);
+    defer closeSession(&again);
+    try giveLibrary(&again, lib);
+    again.buffer(0).doc = &doc;
+    again.loadMarks(0);
+    again.readAnnots(0);
+    const lines = again.buffer(0).marks.items();
+    try testing.expectEqual(@as(usize, 3), again.buffer(0).marks.said(lines[0].anchor).len);
 }
 
 test "c on a selection makes one anchor and its first comment, and c in edit mode another" {
