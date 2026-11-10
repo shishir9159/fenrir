@@ -23,6 +23,7 @@ pub const annots = @import("gjoll/annots.zig");
 pub const Lexer = @import("gjoll/Lexer.zig");
 pub const Page = @import("gjoll/Page.zig");
 pub const Parser = @import("gjoll/Parser.zig");
+pub const Writer = @import("gjoll/Writer.zig");
 pub const content = @import("gjoll/content.zig");
 pub const filter = @import("gjoll/filter.zig");
 pub const image = @import("gjoll/image.zig");
@@ -118,6 +119,7 @@ test {
     _ = Lexer;
     _ = Page;
     _ = Parser;
+    _ = Writer;
     _ = content;
     _ = filter;
     _ = image;

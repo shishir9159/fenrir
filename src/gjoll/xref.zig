@@ -56,6 +56,10 @@ pub const Table = struct {
     /// True when the table came from `reconstruct` rather than from the file's
     /// own cross-reference data.
     recovered: bool = false,
+    /// Where the newest section is, as `startxref` gives it: what an update
+    /// appended to this file names as its `/Prev`. Zero for a recovered
+    /// table, which has no section to name.
+    start: u64 = 0,
 
     pub fn get(t: Table, num: u32) ?Entry {
         return t.entries.get(num);
@@ -77,9 +81,8 @@ pub const Table = struct {
 /// Loads the cross-reference chain. All allocation happens in `arena`, whose
 /// lifetime must cover the returned table.
 pub fn load(arena: Allocator, src: []const u8) Error!Table {
-    var table: Table = .{};
-
     const start = try findStartxref(src);
+    var table: Table = .{ .start = start };
 
     // Section offsets already visited, so a `/Prev` cycle terminates.
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;

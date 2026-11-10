@@ -67,8 +67,9 @@ fn writeAt(w: *Writer, doc: *Document, obj: Object, opts: Options, depth: u8) Er
 }
 
 /// Names round-trip through `#xx` for anything outside the regular character
-/// set, matching the escaping rule in §7.3.5.
-fn writeName(w: *Writer, name: []const u8) Error!void {
+/// set, matching the escaping rule in §7.3.5. `Writer.zig` writes names
+/// into a file through this too.
+pub fn writeName(w: *Writer, name: []const u8) Writer.Error!void {
     try w.writeByte('/');
     for (name) |c| {
         if (c < 0x21 or c > 0x7e or c == '#' or isDelimiterByte(c)) {
