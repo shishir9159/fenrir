@@ -57,6 +57,11 @@ pub const page = Interpreter.page;
 /// recurse inside the interpreter instead, so that they inherit its state.
 pub const stream = Interpreter.stream;
 
+/// What `page` puts under a page: the crop box to the origin, then the
+/// rotation. Whatever is placed on the page as a reader shows it goes
+/// through this, and so lands where the page draws.
+pub const pageMatrix = Interpreter.pageMatrix;
+
 test {
     _ = Font;
     _ = Interpreter;

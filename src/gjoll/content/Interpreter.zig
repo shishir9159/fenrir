@@ -93,6 +93,11 @@ pub const Options = struct {
     /// them looks finished rather than looking stripped. Off for a pass that
     /// wants only what the content stream says.
     annotations: bool = true,
+    /// Annotations the caller draws itself, which are left out. The reader
+    /// draws a highlight as a mark it can recolour and step through, and
+    /// with its appearance in the page as well it would be on screen twice.
+    /// Asked of each annotation before its appearance is looked at.
+    taken: ?*const fn (doc: *Document, annot: Dict) bool = null,
 };
 
 /// What the interpreter noticed while it ran. None of it stops a page; all of
@@ -259,16 +264,6 @@ pub fn page(gpa: Allocator, doc: *Document, p: Page, options: Options) Error!Res
 
     const w = crop.width();
     const h = crop.height();
-    const shift: Matrix = .translation(-crop.x0, -crop.y0);
-    const turn: Matrix = switch (rotation) {
-        .none => .identity,
-        // Clockwise on screen, in a Y-up space: see §7.7.3.3. The translation
-        // is what keeps the rotated page in the positive quadrant.
-        .cw90 => .{ .a = 0, .b = -1, .c = 1, .d = 0, .e = 0, .f = w },
-        .cw180 => .{ .a = -1, .b = 0, .c = 0, .d = -1, .e = w, .f = h },
-        .cw270 => .{ .a = 0, .b = 1, .c = -1, .d = 0, .e = h, .f = 0 },
-    };
-
     const box: Bounds = if (rotation.swapsAxes())
         .fromRect(0, 0, @floatCast(h), @floatCast(w))
     else
@@ -279,7 +274,27 @@ pub fn page(gpa: Allocator, doc: *Document, p: Page, options: Options) Error!Res
         p.annotations(doc) catch &.{}
     else
         &.{};
-    return run(gpa, doc, content, p.resources, box, shift.concat(turn), options, annots);
+    return run(gpa, doc, content, p.resources, box, pageMatrix(p, rotation), options, annots);
+}
+
+/// The transform under a page: the crop box's lower-left corner to the
+/// origin, then `rotation`. It takes a point in the file to where a reader
+/// shows it, and `annots` reads marks through it into the same place, so a
+/// highlight read back lands on the words the page draws.
+pub fn pageMatrix(p: Page, rotation: Page.Rotation) Matrix {
+    const crop = p.crop_box.normalized();
+    const w = crop.width();
+    const h = crop.height();
+    const shift: Matrix = .translation(-crop.x0, -crop.y0);
+    const turn: Matrix = switch (rotation) {
+        .none => .identity,
+        // Clockwise on screen, in a Y-up space: see §7.7.3.3. The translation
+        // is what keeps the rotated page in the positive quadrant.
+        .cw90 => .{ .a = 0, .b = -1, .c = 1, .d = 0, .e = 0, .f = w },
+        .cw180 => .{ .a = -1, .b = 0, .c = 0, .d = -1, .e = w, .f = h },
+        .cw270 => .{ .a = 0, .b = 1, .c = -1, .d = 0, .e = h, .f = 0 },
+    };
+    return shift.concat(turn);
 }
 
 /// Interprets a bare content stream against a resource dictionary and a base
@@ -1458,6 +1473,9 @@ fn drawAnnotation(it: *Interpreter, annot: Dict, page_resources: Dict, base: Mat
     // viewer that has one. It is never part of the page.
     if (try it.doc.get(annot, "Subtype")) |v| {
         if (v.isName("Popup")) return false;
+    }
+    if (it.options.taken) |taken| {
+        if (taken(it.doc, annot)) return false;
     }
 
     // §12.5.3. Bit 2 hides it everywhere; bit 6 hides it on screen and prints

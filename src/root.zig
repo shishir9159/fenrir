@@ -19,6 +19,7 @@
 const std = @import("std");
 
 pub const Document = @import("gjoll/Document.zig");
+pub const annots = @import("gjoll/annots.zig");
 pub const Lexer = @import("gjoll/Lexer.zig");
 pub const Page = @import("gjoll/Page.zig");
 pub const Parser = @import("gjoll/Parser.zig");
@@ -105,6 +106,7 @@ test {
     // so name every one of them explicitly rather than relying on the public
     // re-exports above.
     _ = Document;
+    _ = annots;
     _ = gelgja;
     _ = gleipnir;
     _ = mimir;
