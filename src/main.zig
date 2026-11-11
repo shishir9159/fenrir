@@ -229,6 +229,7 @@ fn writeUsage(ctx: *Context) !void {
 test {
     // Compile the command modules under `zig build test`.
     std.testing.refAllDecls(@This());
+    _ = @import("vanagandr/watch.zig");
 }
 
 test "the table holds exactly the commands this configuration has" {
