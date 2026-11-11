@@ -425,6 +425,55 @@ fn fromPdfDoc(gpa: Allocator, bytes: []const u8) Allocator.Error![]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// UTF-8 as a PDF text string, the reverse of `decode`: PDFDocEncoding when
+/// every character has a byte there, at a byte a character, and UTF-16BE
+/// behind its byte order mark when one has not. A comment in English costs
+/// what it says; one with a single arrow in it costs two bytes a character.
+/// Bytes that are not UTF-8 go through as they are, being nothing this
+/// could translate.
+pub fn encode(gpa: Allocator, text: []const u8) Allocator.Error![]u8 {
+    if (!std.unicode.utf8ValidateSlice(text)) return gpa.dupe(u8, text);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.ensureTotalCapacity(gpa, text.len);
+    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (it.nextCodepoint()) |cp| {
+        out.appendAssumeCapacity(pdfDocByte(cp) orelse break);
+    } else return out.toOwnedSlice(gpa);
+
+    out.clearRetainingCapacity();
+    try out.appendSlice(gpa, "\xfe\xff");
+    it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x10000) {
+            try out.appendSlice(gpa, &.{ @truncate(cp >> 8), @truncate(cp) });
+        } else {
+            const v = cp - 0x10000;
+            const high: u16 = @intCast(0xd800 + (v >> 10));
+            const low: u16 = @intCast(0xdc00 + (v & 0x3ff));
+            try out.appendSlice(gpa, &.{ @truncate(high >> 8), @truncate(high), @truncate(low >> 8), @truncate(low) });
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The byte PDFDocEncoding has for `cp`, if it has one. Not `cp` for every
+/// code point under 256: the C0 block holds accents there and not controls,
+/// and `0xa0` is the euro (Annex D.2), so those go to UTF-16 rather than come
+/// back as something else.
+fn pdfDocByte(cp: u21) ?u8 {
+    switch (cp) {
+        '\t', '\n', '\r', 0x20...0x7e => return @intCast(cp),
+        0xa1...0xac, 0xae...0xff => return @intCast(cp),
+        else => {},
+    }
+    for (pdfdoc_high, 0..) |c, i| {
+        if (c == cp and c != 0xfffd) return @intCast(0x80 + i);
+    }
+    return null;
+}
+
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
@@ -618,3 +667,23 @@ test "a title is decoded from both of the encodings a text string has" {
     try testing.expectEqualStrings("\u{fffd}!", broken);
 }
 
+test "a text string is written in the encoding that holds it, and decodes back" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { text: []const u8, wide: bool }{
+        .{ .text = "plain words", .wide = false },
+        // Latin-1 and the typography block have bytes of their own.
+        .{ .text = "caf\u{e9} \u{2014} \u{201c}x\u{201d} \u{20ac}", .wide = false },
+        // An arrow and an emoji have none, so the whole string goes wide.
+        .{ .text = "a \u{2192} b \u{1f600}", .wide = true },
+        // A non-breaking space is not the euro PDFDocEncoding puts at 0xa0.
+        .{ .text = "1\u{a0}000", .wide = true },
+    };
+    for (cases) |c| {
+        const bytes = try encode(gpa, c.text);
+        defer gpa.free(bytes);
+        try testing.expectEqual(c.wide, std.mem.startsWith(u8, bytes, "\xfe\xff"));
+        const back = try decode(gpa, bytes);
+        defer gpa.free(back);
+        try testing.expectEqualStrings(c.text, back);
+    }
+}
