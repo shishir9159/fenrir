@@ -2374,9 +2374,14 @@ const Session = struct {
         b.pages = loaded.pages;
         b.outline = loaded.outline;
 
-        s.gpa.free(d.digests);
+        // What the pages were, kept until each window's caret has asked.
+        const was = d.digests;
+        const old = loaded.old_digests orelse was;
+        defer {
+            s.gpa.free(was);
+            if (loaded.old_digests) |o| s.gpa.free(o);
+        }
         d.digests = loaded.digests;
-        if (loaded.old_digests) |old| s.gpa.free(old);
         d.held = loaded.stamp;
         d.seen = loaded.stamp;
         d.generation += 1;
@@ -2397,18 +2402,14 @@ const Session = struct {
             if (v.buffer != index) continue;
             v.pages = b.pages;
             v.refit();
-            // Indices into the old page's text, which the new one may not
-            // have: the caret goes to the top of its page, which is there.
-            v.cursor.page = @min(v.cursor.page, @as(u32, @intCast(b.pages.len - 1)));
-            v.cursor.line = 0;
-            v.cursor.column = 0;
-            v.cursor.caret = .empty;
-            v.anchor = null;
+            s.keepCursor(v, old, d.digests);
             v.clampScroll();
         }
         if (s.drag) |drag| {
-            if (drag.buffer == index) s.drag = null;
+            const kept = watch.unchanged(old, d.digests, drag.from.page) and watch.unchanged(old, d.digests, drag.to.page);
+            if (drag.buffer == index and !kept) s.drag = null;
         }
+        if (loaded.first) |page| s.placeStale(index, page);
         s.rows_for = .{};
 
         // The file's own annotations, read again: those the library holds
@@ -2448,6 +2449,45 @@ const Session = struct {
             });
         }
         d.heard = 0;
+    }
+
+    /// Where a window's caret is after its document is read again.
+    ///
+    /// On a page that reads as it did, where it was: its line and column
+    /// count the same text. On one that changed, it keeps its place on the
+    /// page and is put on the nearest glyph when the page's text comes
+    /// (`placeStale`). A page that is gone sends it to the top of the last.
+    /// A selection with an end on a changed page goes, and visual mode with
+    /// it.
+    ///
+    /// The author asked that a reload keep the caret; it first went to the
+    /// top of its page on every one. Do not go back to resetting it.
+    fn keepCursor(s: *Session, v: *View, old: []const u64, new: []const u64) void {
+        const kept = watch.unchanged(old, new, v.cursor.page);
+        const last: u32 = @intCast(v.pages.len - 1);
+        if (v.cursor.page > last) {
+            v.cursor.page = last;
+            v.cursor.line = 0;
+            v.cursor.column = 0;
+            v.cursor.caret = .empty;
+            v.cursor.stale = false;
+        } else if (!kept) {
+            v.cursor.stale = true;
+        }
+        const anchor = v.anchor orelse return;
+        if (kept and watch.unchanged(old, new, anchor.page)) return;
+        v.anchor = null;
+        if (v == s.layout().current() and s.keymap.mode.isVisual()) s.keymap.mode = .normal;
+    }
+
+    /// The text of `page` has come: a caret a reload left stale on it is put
+    /// on the glyph nearest where it was.
+    fn placeStale(s: *Session, index: u32, page: u32) void {
+        const map = s.buffer(index).textMap(page) orelse return;
+        var it = s.tabs.iterator();
+        while (it.next()) |v| {
+            if (v.buffer == index and v.cursor.stale and v.cursor.page == page) v.cursorNear(map);
+        }
     }
 
     /// Every cached picture of a buffer's pages is stale, and drawn until
@@ -2878,6 +2918,7 @@ const Session = struct {
         if (finished.map) |map| {
             s.buffer(finished.job.buffer).putMap(gpa, finished.job.page, map);
             finished.map = null;
+            s.placeStale(finished.job.buffer, finished.job.page);
         }
 
         const result = finished.result orelse {
@@ -3037,6 +3078,7 @@ const Session = struct {
             v.cursor.visible = true;
             return;
         };
+        if (v.cursor.stale) v.cursorNear(map);
 
         switch (v.moveCursor(step, map)) {
             .moved, .blocked => {},
@@ -3072,7 +3114,9 @@ const Session = struct {
             v.cursorToPage(page, map, false);
             return true;
         }
-        return b.hasMap(v.cursor.page);
+        const map = b.textMap(v.cursor.page) orelse return false;
+        if (v.cursor.stale) v.cursorNear(map);
+        return true;
     }
 
     /// The text position under a window point, or null if it is not over
@@ -10522,6 +10566,74 @@ test "a reload goes to the change, unless the change is already on screen" {
     // Nor does a reload that changed nothing.
     s.install(0, try reloadOf(gpa, 3, null, 0));
     try testing.expectEqual(kept, v.scroll);
+}
+
+/// What `watch.load` hands back when the pages' digests are `digests`, for
+/// a held document whose own are set to compare them with.
+fn reloadDigests(gpa: Allocator, digests: []const u64, first: ?u32) !watch.Outcome {
+    const outcome = try reloadOf(gpa, digests.len, first, 0);
+    @memcpy(outcome.loaded.digests, digests);
+    return outcome;
+}
+
+test "a reload keeps the caret where the page did not change, and finds it where it did" {
+    // The author asked for this: a reload first sent every caret to the top
+    // of its page, wherever the change was.
+    const gpa = testing.allocator;
+    var s = try watchedSession(gpa, 3);
+    defer closeWatched(&s);
+    const v = s.view();
+
+    // On the third line of the first page, which will not change.
+    s.disks.items[0].digests = try gpa.dupe(u64, &.{ 1, 2, 3 });
+    try putText(&s, 0, 4, 6);
+    v.cursorTo(.{ .page = 0, .line = 2, .column = 3 }, s.buffer(0).textMap(0).?);
+    const caret = v.cursor.caret;
+    s.install(0, try reloadDigests(gpa, &.{ 1, 9, 3 }, 1));
+    try testing.expectEqual(View.Position{ .page = 0, .line = 2, .column = 3 }, v.cursor.position());
+    try testing.expect(!v.cursor.stale);
+    try testing.expectEqual(caret, v.cursor.caret);
+
+    // On the second page, which will: kept by its place until the page's
+    // text comes, then put on the glyph there.
+    try putText(&s, 1, 4, 6);
+    v.cursorTo(.{ .page = 1, .line = 3, .column = 1 }, s.buffer(0).textMap(1).?);
+    s.install(0, try reloadDigests(gpa, &.{ 1, 8, 3 }, 1));
+    try testing.expect(v.cursor.stale);
+    try testing.expectEqual(@as(u32, 1), v.cursor.page);
+    try putText(&s, 1, 4, 6);
+    s.placeStale(0, 1);
+    try testing.expect(!v.cursor.stale);
+    try testing.expectEqual(View.Position{ .page = 1, .line = 3, .column = 1 }, v.cursor.position());
+
+    // A page taken off the end takes the caret to the top of the last.
+    s.install(0, try reloadDigests(gpa, &.{ 1, 8 }, 1));
+    try testing.expectEqual(View.Position{ .page = 1, .line = 3, .column = 1 }, v.cursor.position());
+    v.cursor.page = 2;
+    s.install(0, try reloadDigests(gpa, &.{1}, 0));
+    try testing.expectEqual(View.Position{ .page = 0, .line = 0, .column = 0 }, v.cursor.position());
+}
+
+test "a selection is kept through a reload only where neither end's page changed" {
+    const gpa = testing.allocator;
+    var s = try watchedSession(gpa, 3);
+    defer closeWatched(&s);
+    const v = s.view();
+    s.disks.items[0].digests = try gpa.dupe(u64, &.{ 1, 2, 3 });
+    try putText(&s, 0, 4, 6);
+
+    s.keymap.mode = .visual;
+    v.cursorTo(.{ .page = 0, .line = 0, .column = 0 }, s.buffer(0).textMap(0).?);
+    v.beginSelection();
+    v.cursorTo(.{ .page = 0, .line = 1, .column = 4 }, s.buffer(0).textMap(0).?);
+
+    s.install(0, try reloadDigests(gpa, &.{ 1, 7, 3 }, 1));
+    try testing.expect(v.selection() != null);
+    try testing.expectEqual(keys.Mode.visual, s.keymap.mode);
+
+    s.install(0, try reloadDigests(gpa, &.{ 6, 7, 3 }, 0));
+    try testing.expect(v.selection() == null);
+    try testing.expectEqual(keys.Mode.normal, s.keymap.mode);
 }
 
 test "a file caught halfway is not shown, and is not tried again" {

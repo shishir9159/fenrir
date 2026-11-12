@@ -124,6 +124,10 @@ pub const Cursor = struct {
     /// in a different column than it started -- the single most irritating
     /// bug a text cursor can have.
     goal: f32 = 0,
+    /// `line` and `column` count the text of the page as it was before the
+    /// file was read again, and the page changed. `caret` is still where it
+    /// was on the page, and `cursorNear` finds them again from it.
+    stale: bool = false,
 
     pub fn position(c: Cursor) Position {
         return .{ .page = c.page, .line = c.line, .column = c.column };
@@ -524,6 +528,7 @@ pub fn goTo(v: *View, p: Place) void {
 pub fn cursorToPage(v: *View, page: u32, map: text.Page, from_bottom: bool) void {
     v.cursor.page = page;
     v.cursor.visible = true;
+    v.cursor.stale = false;
     if (map.isEmpty()) {
         v.cursor.line = 0;
         v.cursor.column = 0;
@@ -698,6 +703,7 @@ pub fn enterPage(v: *View, page: u32, map: text.Page, step: Step) void {
 pub fn cursorTo(v: *View, at: Position, map: text.Page) void {
     v.cursor.page = at.page;
     v.cursor.visible = true;
+    v.cursor.stale = false;
     if (map.isEmpty()) {
         v.cursor.line = 0;
         v.cursor.column = 0;
@@ -708,6 +714,43 @@ pub fn cursorTo(v: *View, at: Position, map: text.Page) void {
     v.cursor.column = @min(at.column, map.lines[v.cursor.line].count);
     v.resolve(map);
     v.cursor.goal = v.cursor.caret.min_x;
+}
+
+/// Puts a `stale` cursor on the glyph nearest where its caret was, in the
+/// page's text as it is now. The goal it was keeping, it keeps.
+pub fn cursorNear(v: *View, map: text.Page) void {
+    v.cursor.stale = false;
+    const was = v.cursor.caret;
+    if (map.isEmpty() or was.isEmpty()) {
+        v.cursor.line = 0;
+        v.cursor.column = 0;
+        v.resolve(map);
+        return;
+    }
+    const line = map.lineAt(was.min_x, (was.min_y + was.max_y) * 0.5);
+    v.cursor.line = line;
+    v.cursor.column = caretColumn(map, line, was.min_x);
+    v.resolve(map);
+}
+
+/// The column whose caret `resolve` would put nearest `x`: a glyph's leading
+/// edge, or the end of the line. Not `columnAt`, which goes by middles: a
+/// caret is on the edge two glyphs share, and that would take the one
+/// before it.
+fn caretColumn(map: text.Page, line: u32, x: f32) u32 {
+    const l = map.lines[line];
+    if (l.count == 0) return 0;
+    const glyphs = l.glyphs(map);
+    var best: u32 = l.count;
+    var best_d = @abs(glyphs[l.count - 1].box.max_x - x);
+    for (glyphs, 0..) |g, i| {
+        const d = @abs(g.box.min_x - x);
+        if (d < best_d) {
+            best_d = d;
+            best = @intCast(i);
+        }
+    }
+    return best;
 }
 
 /// Starts a visual selection at the cursor.
@@ -1211,6 +1254,28 @@ test "entering a page by moving along the text lands on its first or last word" 
     v.enterPage(1, map, .down);
     try testing.expectEqual(@as(u32, 0), v.cursor.line);
     try testing.expectEqual(@as(u32, 4), v.cursor.column);
+}
+
+test "a stale cursor is put back by where it was on the page, not by its indices" {
+    const gpa = testing.allocator;
+    var map = try twoLines(gpa);
+    defer map.deinit(gpa);
+
+    var buf: [2]fenrir.Page = undefined;
+    var v = viewOf(fakePages(&buf, 2), 1, 700, 900);
+    // On the "f" of the second line.
+    v.cursorTo(.{ .page = 0, .line = 1, .column = 1 }, map);
+    const caret = v.cursor.caret;
+
+    // The page was read again with a line above it: the indices the cursor
+    // holds would be the first word of the page, and are not trusted.
+    v.cursor.line = 0;
+    v.cursor.column = 0;
+    v.cursor.stale = true;
+    v.cursorNear(map);
+    try testing.expect(!v.cursor.stale);
+    try testing.expectEqual(Position{ .page = 0, .line = 1, .column = 1 }, v.cursor.position());
+    try testing.expectEqual(caret.min_x, v.cursor.caret.min_x);
 }
 
 test "a selection is in reading order whichever way it was extended" {

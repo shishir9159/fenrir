@@ -352,6 +352,12 @@ pub fn firstChange(old: []const u64, new: []const u64) ?u32 {
     return if (new.len == 0) null else @intCast(new.len - 1);
 }
 
+/// Whether page `page` reads as it did: there before and after, and its
+/// digest did not move. What its text map counted then, it counts now.
+pub fn unchanged(old: []const u64, new: []const u64, page: u32) bool {
+    return page < old.len and page < new.len and old[page] == new[page];
+}
+
 /// Where on a changed page to look: how far below its top the first word
 /// that differs is, and the new page's text map, which the reader's cache
 /// takes at no further cost.
