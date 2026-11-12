@@ -12,12 +12,14 @@
 //!
 //! ## Noticing
 //!
-//! A stat, at most four times a second: size, modification time and inode,
-//! the `Stamp`. A new stamp is acted on once two polls agree on it, because
-//! TeX writes in place and a file caught halfway through is not one to show;
-//! and the bytes are taken only if they end in `%%EOF` (`complete`), open,
-//! and have a page. No platform notifier: a stat four times a second costs
-//! nothing measurable, and the window layer's interface stays as it is.
+//! The system says when the file's directory changes (`Notice`): inotify on
+//! Linux, a pending change notification on Windows. Only then is the file
+//! looked at, by a stat -- size, modification time and which file it is,
+//! the `Stamp` -- once it has been quiet for `settle_ns`. A new stamp is acted on once two
+//! looks agree on it, because TeX writes in place and a file caught halfway
+//! through is not one to show; and the bytes are taken only if they end in
+//! `%%EOF` (`complete`), open, and have a page. Where the system says
+//! nothing, the file is stat'ed every `interval_ns` instead.
 //!
 //! ## Where it changed
 //!
@@ -41,17 +43,29 @@ const Object = fenrir.Object;
 const Page = fenrir.Page;
 const Wyhash = std.hash.Wyhash;
 
-/// How often the file is looked at.
-pub const interval_ns: u64 = 250 * std.time.ns_per_ms;
+/// How often a file is looked at where nothing says it changed: twice a
+/// second, as the author asked.
+pub const interval_ns: u64 = 500 * std.time.ns_per_ms;
 
-/// What a stat says about a file: enough to tell that it was written.
+/// How long a file must be quiet after a notice before it is looked at, and
+/// how long between looks while it is still moving.
+pub const settle_ns: u64 = 100 * std.time.ns_per_ms;
+
+const interval_s: f32 = @as(f32, @floatFromInt(interval_ns)) / std.time.ns_per_s;
+const settle_s: f32 = @as(f32, @floatFromInt(settle_ns)) / std.time.ns_per_s;
+
+/// What a stat says about a file: enough to tell that it was written. Only
+/// ever compared with another from `stat`, so each is in the system's own
+/// units.
 pub const Stamp = struct {
     size: u64 = 0,
     mtime: i96 = 0,
-    inode: Io.File.INode = 0,
+    /// Which file it is, as far as a rename over it can tell: the inode, or
+    /// on Windows the change time, which a rename moves.
+    identity: u128 = 0,
 
     pub fn eql(a: Stamp, b: Stamp) bool {
-        return a.size == b.size and a.mtime == b.mtime and a.inode == b.inode;
+        return a.size == b.size and a.mtime == b.mtime and a.identity == b.identity;
     }
 };
 
@@ -59,7 +73,7 @@ pub const Stamp = struct {
 pub const Disk = struct {
     /// The file the held `Document` was read from.
     held: Stamp = .{},
-    /// What the last poll found.
+    /// What the last look found.
     seen: Stamp = .{},
     /// Bytes that would not open, not tried again until the file moves on.
     refused: Stamp = .{},
@@ -74,6 +88,16 @@ pub const Disk = struct {
     /// The names of the anchors and comments read out of the file rather
     /// than the library: what a reload takes away and reads again.
     taken: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// What says the file changed, while watching; null where the system
+    /// will not, and the file is looked at every `interval_ns` instead.
+    notice: ?*Notice = null,
+    /// Told of a change, and not yet found still.
+    stirred: bool = false,
+    /// Seconds until the file is next looked at.
+    wait: f32 = 0,
+    /// Seconds from the first notice of a change to the look that found it
+    /// still, for `--time`.
+    heard: f32 = 0,
 
     pub const Reload = enum { none, auto, forced };
 
@@ -82,18 +106,91 @@ pub const Disk = struct {
         gpa.free(d.digests);
         d.taken.deinit(gpa);
         if (d.hold) |*h| h.release(io.?);
+        if (d.notice) |n| n.stop(gpa);
         d.* = .{};
     }
 };
 
+/// Whether to look at the file this frame, `dt` seconds after the last.
+/// `said` is what its `Notice` said, or null for a file with none.
+///
+/// Told of a change, the file is looked at once it has been quiet for
+/// `settle_ns`, and again each `settle_ns` until `due` finds it still: a
+/// build writing in pieces is looked at once the pieces stop coming, not
+/// between two of them. With nothing to tell, every `interval_ns`. Nothing
+/// here touches the disk.
+pub fn tick(d: *Disk, dt: f32, said: ?Notice.Said) bool {
+    const told = said orelse {
+        d.wait -= dt;
+        if (d.wait > 0) return false;
+        d.wait = interval_s;
+        return true;
+    };
+    if (d.stirred) d.heard += dt;
+    if (told != .nothing) {
+        if (!d.stirred) d.heard = 0;
+        d.stirred = true;
+        d.wait = settle_s;
+        return false;
+    }
+    if (!d.stirred) return false;
+    d.wait -= dt;
+    if (d.wait > 0) return false;
+    d.wait = settle_s;
+    return true;
+}
+
 /// The file's stamp now, or null when it cannot be seen -- gone for the
 /// moment, as it is while a build replaces it.
 pub fn stat(io: Io, path: []const u8) ?Stamp {
+    if (builtin.os.tag == .windows) return statByName(path);
     const s = Io.Dir.cwd().statFile(io, path, .{}) catch return null;
-    return .{ .size = s.size, .mtime = s.mtime.nanoseconds, .inode = s.inode };
+    return .{ .size = s.size, .mtime = s.mtime.nanoseconds, .identity = s.inode };
 }
 
-/// Whether a poll that found `now` should read the file again. The whole of
+/// Asked of the file's name and not of a handle opened on it. A copy or a
+/// build that holds the file shut refuses every handle, and `Io`'s open
+/// waits a refusal out with sleeps -- on the frame thread, up to a second a
+/// stat: a file copied over took 1,028 ms from its notice to its reload,
+/// against about 220 ms this way. Attributes are given whatever the file is
+/// shared as.
+fn statByName(path: []const u8) ?Stamp {
+    const w = std.os.windows;
+    const cwd = Io.Dir.cwd().handle;
+    const wide = Io.Threaded.sliceToPrefixedFileW(cwd, path, .{}) catch return null;
+    const span = wide.span();
+    var name = w.UNICODE_STRING.init(span);
+    var info: NetworkOpen = undefined;
+    const status = NtQueryFullAttributesFile(&.{
+        .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(span)) null else cwd,
+        .ObjectName = &name,
+    }, &info);
+    if (status != .SUCCESS) return null;
+    return .{
+        .size = @intCast(@max(info.EndOfFile, 0)),
+        .mtime = info.LastWriteTime,
+        .identity = @as(u64, @bitCast(info.ChangeTime)),
+    };
+}
+
+/// `FILE_NETWORK_OPEN_INFORMATION`, which the standard library does not
+/// declare, nor the call that fills it.
+const NetworkOpen = extern struct {
+    CreationTime: i64,
+    LastAccessTime: i64,
+    LastWriteTime: i64,
+    ChangeTime: i64,
+    AllocationSize: i64,
+    EndOfFile: i64,
+    FileAttributes: u32,
+};
+
+extern "ntdll" fn NtQueryFullAttributesFile(
+    ObjectAttributes: *const std.os.windows.OBJECT.ATTRIBUTES,
+    FileInformation: *NetworkOpen,
+) callconv(.winapi) std.os.windows.NTSTATUS;
+
+/// Whether a look that found `now` should read the file again. The whole of
 /// the decision, and nothing in it touches the disk.
 pub fn due(d: *Disk, now: Stamp) bool {
     // The file the reader holds. This equality is also what will keep a
@@ -102,14 +199,19 @@ pub fn due(d: *Disk, now: Stamp) bool {
     // reload -- do not take it out.
     if (now.eql(d.held)) {
         d.seen = now;
+        d.stirred = false;
         return false;
     }
-    if (now.eql(d.refused)) return false;
-    // Still moving: wait for a second poll to find it where this one did.
+    if (now.eql(d.refused)) {
+        d.stirred = false;
+        return false;
+    }
+    // Still moving: wait for a second look to find it where this one did.
     if (!now.eql(d.seen)) {
         d.seen = now;
         return false;
     }
+    d.stirred = false;
     return true;
 }
 
@@ -445,6 +547,249 @@ const Clock = struct {
     }
 };
 
+// -- being told ---------------------------------------------------------------
+
+/// What the system says about a file: that it was written, replaced or
+/// removed. Asked every frame (`take`), and the file is looked at only after
+/// it says so (`tick`), so a file nobody touches is never stat'ed at all.
+///
+/// **The author asked for notices** in place of a stat four times a second:
+/// inotify on Linux, the directory's change notification on Windows, and a
+/// stat twice a second only where neither is to be had -- another system,
+/// or a share that refuses them. Do not go back to polling alone as the
+/// simpler of the two.
+///
+/// The directory is watched and not the file, because a build that writes a
+/// new file and renames it over the old one leaves a watch on the old file
+/// watching nothing. What is reported in it is matched by the file's name.
+///
+/// On Windows asking costs no system call: the request stays pending in the
+/// kernel, which writes its status block when something changes, and `take`
+/// reads the block, as `HasOverlappedIoCompleted` does. On Linux it is a
+/// `read` of the queue, so `take` reads it at most every `settle_ns`.
+pub const Notice = struct {
+    os: Os,
+
+    pub const Said = enum {
+        nothing,
+        /// Something by the file's name, or more than the system kept a
+        /// record of.
+        changed,
+        /// The system will say no more: the directory went, or would not be
+        /// asked again. The file is looked at every `interval_ns` instead.
+        gone,
+    };
+
+    pub const Error = Allocator.Error || error{ Unsupported, Refused };
+
+    const Os = switch (builtin.os.tag) {
+        .windows => Windows,
+        .linux => Linux,
+        else => struct {
+            fn start(_: *@This(), _: Allocator, _: []const u8) Error!void {
+                return error.Unsupported;
+            }
+            fn stop(_: *@This(), _: Allocator) bool {
+                return true;
+            }
+            fn take(_: *@This(), _: f32) Said {
+                return .gone;
+            }
+        },
+    };
+
+    /// On the heap, because the system writes into it where it is.
+    pub fn start(gpa: Allocator, path: []const u8) Error!*Notice {
+        const n = try gpa.create(Notice);
+        errdefer gpa.destroy(n);
+        try n.os.start(gpa, path);
+        return n;
+    }
+
+    pub fn stop(n: *Notice, gpa: Allocator) void {
+        // Not handed back while the system may still write into it.
+        if (n.os.stop(gpa)) gpa.destroy(n);
+    }
+
+    /// What has happened since the last call, `dt` seconds ago.
+    pub fn take(n: *Notice, dt: f32) Said {
+        return n.os.take(dt);
+    }
+
+    const Windows = struct {
+        dir: w.HANDLE,
+        /// Written by the system when a change finishes the pending request.
+        iosb: w.IO_STATUS_BLOCK,
+        /// The file's name, as the directory's records spell it.
+        name: []u16,
+        /// What the records are written into, at a `DWORD`'s alignment.
+        records: [4096]u8 align(4),
+
+        const w = std.os.windows;
+
+        fn start(o: *Windows, gpa: Allocator, path: []const u8) Error!void {
+            o.name = std.unicode.wtf8ToWtf16LeAlloc(gpa, std.fs.path.basename(path)) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidWtf8 => return error.Refused,
+            };
+            errdefer gpa.free(o.name);
+
+            const cwd = Io.Dir.cwd().handle;
+            const wide = Io.Threaded.sliceToPrefixedFileW(cwd, std.fs.path.dirname(path) orelse ".", .{}) catch return error.Refused;
+            const span = wide.span();
+            var name = w.UNICODE_STRING.init(span);
+            var iosb: w.IO_STATUS_BLOCK = undefined;
+            const status = w.ntdll.NtCreateFile(
+                &o.dir,
+                .{ .SPECIFIC = .{ .FILE_DIRECTORY = .{ .LIST = true } }, .STANDARD = .{ .SYNCHRONIZE = true } },
+                &.{
+                    .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(span)) null else cwd,
+                    .ObjectName = &name,
+                },
+                &iosb,
+                null,
+                .{ .NORMAL = true },
+                // Nothing kept from anyone: the directory is only listened to.
+                .VALID_FLAGS,
+                .OPEN,
+                // Asynchronous, so that a request is left pending, not waited on.
+                .{ .DIRECTORY_FILE = true, .IO = .ASYNCHRONOUS },
+                null,
+                0,
+            );
+            if (status != .SUCCESS) return error.Refused;
+            errdefer w.CloseHandle(o.dir);
+            if (!o.ask()) return error.Refused;
+        }
+
+        /// Leaves a request pending until the next change.
+        fn ask(o: *Windows) bool {
+            o.iosb.u.Status = .PENDING;
+            const status = w.ntdll.NtNotifyChangeDirectoryFileEx(
+                o.dir,
+                null,
+                null,
+                null,
+                &o.iosb,
+                &o.records,
+                o.records.len,
+                // Renamed in or out, written or grown; not read, and not its
+                // attributes, which a backup or an indexer touches.
+                .{ .FILE_NAME = true, .SIZE = true, .LAST_WRITE = true },
+                .FALSE,
+                .Notify,
+            );
+            return status == .PENDING or status == .SUCCESS;
+        }
+
+        fn take(o: *Windows, dt: f32) Said {
+            _ = dt;
+            // Written by the system, not by this thread.
+            const said: Said = switch (@atomicLoad(w.NTSTATUS, &o.iosb.u.Status, .acquire)) {
+                .PENDING => return .nothing,
+                .SUCCESS => if (o.iosb.Information == 0) .changed else o.names(o.iosb.Information),
+                // More changed than there was room to say.
+                .NOTIFY_ENUM_DIR => .changed,
+                else => return .gone,
+            };
+            return if (o.ask()) said else .gone;
+        }
+
+        /// Whether the records name the file.
+        fn names(o: *Windows, len: usize) Said {
+            var at: usize = 0;
+            while (at + @sizeOf(w.FILE.NOTIFY.INFORMATION) <= len) {
+                const info: *w.FILE.NOTIFY.INFORMATION = @ptrCast(@alignCast(&o.records[at]));
+                if (at + @sizeOf(w.FILE.NOTIFY.INFORMATION) + info.FileNameLength > len) break;
+                const name = info.fileName();
+                // A change made through a short name, `PAPER~1.PDF`, is
+                // reported by it: taken as the file, at the cost of a stat.
+                if (w.eqlIgnoreCaseWtf16(name, o.name) or std.mem.indexOfScalar(u16, name, '~') != null) return .changed;
+                if (info.NextEntryOffset == 0) break;
+                at += info.NextEntryOffset;
+            }
+            return .nothing;
+        }
+
+        fn stop(o: *Windows, gpa: Allocator) bool {
+            gpa.free(o.name);
+            var done = true;
+            if (@atomicLoad(w.NTSTATUS, &o.iosb.u.Status, .acquire) == .PENDING) {
+                var cancel: w.IO_STATUS_BLOCK = undefined;
+                _ = w.ntdll.NtCancelIoFileEx(o.dir, &o.iosb, &cancel);
+                // The handle is signalled once the request is finished and
+                // its block written. A second is far more than that takes.
+                const second: w.LARGE_INTEGER = -10_000_000;
+                _ = w.ntdll.NtWaitForSingleObject(o.dir, .FALSE, &second);
+                done = @atomicLoad(w.NTSTATUS, &o.iosb.u.Status, .acquire) != .PENDING;
+            }
+            w.CloseHandle(o.dir);
+            return done;
+        }
+    };
+
+    const Linux = struct {
+        fd: i32,
+        name: []u8,
+        /// Seconds since the queue was last read.
+        since: f32,
+        events: [4096]u8 align(@alignOf(linux.inotify_event)),
+
+        const linux = std.os.linux;
+
+        fn start(o: *Linux, gpa: Allocator, path: []const u8) Error!void {
+            o.name = try gpa.dupe(u8, std.fs.path.basename(path));
+            errdefer gpa.free(o.name);
+            o.since = 0;
+            const dir = try gpa.dupeSentinel(u8, std.fs.path.dirname(path) orelse ".", 0);
+            defer gpa.free(dir);
+
+            const fd = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
+            if (linux.errno(fd) != .SUCCESS) return error.Refused;
+            o.fd = @intCast(fd);
+            errdefer _ = linux.close(o.fd);
+            // Written and closed, or renamed in: done. Modified: perhaps not
+            // yet, and `tick` waits for it to be quiet.
+            const mask = linux.IN.MODIFY | linux.IN.CLOSE_WRITE | linux.IN.MOVED_TO |
+                linux.IN.CREATE | linux.IN.DELETE | linux.IN.ONLYDIR;
+            if (linux.errno(linux.inotify_add_watch(o.fd, dir, mask)) != .SUCCESS) return error.Refused;
+        }
+
+        fn take(o: *Linux, dt: f32) Said {
+            o.since += dt;
+            if (o.since < settle_s) return .nothing;
+            o.since = 0;
+            var said: Said = .nothing;
+            while (true) {
+                const got = linux.read(o.fd, &o.events, o.events.len);
+                switch (linux.errno(got)) {
+                    .SUCCESS => {},
+                    .AGAIN => return said,
+                    .INTR => continue,
+                    else => return .gone,
+                }
+                var at: usize = 0;
+                while (at + @sizeOf(linux.inotify_event) <= got) {
+                    const e: *const linux.inotify_event = @ptrCast(@alignCast(&o.events[at]));
+                    at += @sizeOf(linux.inotify_event) + e.len;
+                    // The directory went, and its watch with it.
+                    if (e.mask & linux.IN.IGNORED != 0) return .gone;
+                    if (e.mask & linux.IN.Q_OVERFLOW != 0) said = .changed;
+                    if (e.getName()) |name| {
+                        if (std.mem.eql(u8, name, o.name)) said = .changed;
+                    }
+                }
+            }
+        }
+
+        fn stop(o: *Linux, gpa: Allocator) bool {
+            _ = linux.close(o.fd);
+            gpa.free(o.name);
+            return true;
+        }
+    };
+};
+
 // -- holding it ---------------------------------------------------------------
 
 /// The file held open so that no other program can change it, while the
@@ -672,7 +1017,90 @@ test "a file is complete when it ends in %%EOF, white space and all" {
     try testing.expect(!complete(""));
 }
 
-test "a poll reads again only when two agree on a stamp that is not held" {
+test "a notice is looked into once the file is quiet, and nothing else is" {
+    var d: Disk = .{ .held = .{ .size = 1 }, .seen = .{ .size = 1 } };
+    // Told nothing, a file is never looked at, however long it is open.
+    for (0..100) |_| try testing.expect(!tick(&d, 0.05, .nothing));
+
+    // Told twice, as a build writes in pieces: looked at once it has been
+    // quiet for `settle_ns` after the second.
+    try testing.expect(!tick(&d, 0.016, .changed));
+    try testing.expect(!tick(&d, 0.05, .nothing));
+    try testing.expect(!tick(&d, 0.016, .changed));
+    try testing.expect(!tick(&d, 0.06, .nothing));
+    try testing.expect(tick(&d, 0.05, .nothing));
+
+    // Found moving, so looked at again a settle later; found still, read.
+    try testing.expect(!due(&d, .{ .size = 2 }));
+    try testing.expect(d.stirred);
+    try testing.expect(!tick(&d, 0.05, .nothing));
+    try testing.expect(tick(&d, 0.06, .nothing));
+    try testing.expect(due(&d, .{ .size = 2 }));
+
+    // And not looked at again until the next notice.
+    try testing.expect(!d.stirred);
+    for (0..100) |_| try testing.expect(!tick(&d, 0.05, .nothing));
+}
+
+test "where nothing will say a file changed, it is looked at twice a second" {
+    var d: Disk = .{};
+    var looks: u32 = 0;
+    // A second of frames a sixty-fourth long, which add up exactly.
+    for (0..64) |_| {
+        if (tick(&d, 1.0 / 64.0, null)) looks += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), looks);
+}
+
+/// Asks `n` until it says something, for up to two seconds.
+fn listen(n: *Notice) !Notice.Said {
+    for (0..400) |_| {
+        // A whole second a call, so Linux reads its queue every time.
+        const said = n.take(1);
+        if (said != .nothing) return said;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return .nothing;
+}
+
+/// Lets what one change sets off arrive, and takes it.
+fn drain(n: *Notice) !void {
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    while (n.take(1) == .changed) {}
+}
+
+test "a notice comes when the file is written or replaced, and not for its neighbours" {
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "paper.pdf", .data = "%PDF-1.7\n%%EOF\n" });
+    const path = try tmp.dir.realPathFileAlloc(io, "paper.pdf", gpa);
+    defer gpa.free(path);
+
+    const n = try Notice.start(gpa, path);
+    defer n.stop(gpa);
+    try testing.expectEqual(Notice.Said.nothing, n.take(1));
+
+    // A build's log beside the paper is not the paper.
+    try tmp.dir.writeFile(io, .{ .sub_path = "paper.log", .data = "pass 1" });
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectEqual(Notice.Said.nothing, n.take(1));
+
+    // Written in place, as TeX writes it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "paper.pdf", .data = "%PDF-1.7\n1 0 obj\n%%EOF\n" });
+    try testing.expectEqual(Notice.Said.changed, try listen(n));
+    try drain(n);
+
+    // Written beside it and renamed over it, as a careful build does.
+    try tmp.dir.writeFile(io, .{ .sub_path = "paper.tmp", .data = "%PDF-1.7\n2 0 obj\n%%EOF\n" });
+    try drain(n);
+    try tmp.dir.rename("paper.tmp", tmp.dir, "paper.pdf", io);
+    try testing.expectEqual(Notice.Said.changed, try listen(n));
+}
+
+test "a look reads again only when two agree on a stamp that is not held" {
     var d: Disk = .{ .held = .{ .size = 10, .mtime = 1 }, .seen = .{ .size = 10, .mtime = 1 } };
     // Unchanged.
     try testing.expect(!due(&d, .{ .size = 10, .mtime = 1 }));
@@ -767,4 +1195,25 @@ test "a file held while not watching cannot be written by anyone else" {
 
     // Let go of, it can be written again.
     std.os.windows.CloseHandle(try Hold.ntOpen(path, writing, .VALID_FLAGS));
+}
+
+test "a file a copy holds shut is still stamped, and at once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "copied.pdf", .data = "%PDF-1.7\n%%EOF\n" });
+    const path = try tmp.dir.realPathFileAlloc(io, "copied.pdf", testing.allocator);
+    defer testing.allocator.free(path);
+    const before = stat(io, path).?;
+
+    // As `Copy-Item` holds what it writes: sharing nothing at all. `Io`'s
+    // stat would sleep out the refusal, a second at a time.
+    const copying = try Hold.ntOpen(path, .{ .WRITE = true }, .{});
+    defer std.os.windows.CloseHandle(copying);
+    const start = Io.Clock.awake.now(io);
+    const during = stat(io, path) orelse return error.NotStamped;
+    const took = start.durationTo(Io.Clock.awake.now(io)).nanoseconds;
+    try testing.expect(during.eql(before));
+    try testing.expect(took < 50 * std.time.ns_per_ms);
 }

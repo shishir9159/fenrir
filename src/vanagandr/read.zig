@@ -1337,8 +1337,6 @@ const Session = struct {
     /// unless asked for. Never in a comparison, whose `Rerun` reads the
     /// buffers' bytes on a thread of its own while a reload would free them.
     watching: bool = false,
-    /// Seconds since the files were last looked at.
-    since_poll: f32 = 0,
     /// `--time`, which prints a line for every reload.
     timing: bool = false,
     /// The tabpages, and the tree of windows in each. The one on screen is
@@ -1715,14 +1713,19 @@ const Session = struct {
         // Held before it is read, so that nothing changes between the bytes
         // read and the file held; and its stamp taken before it is read, so
         // that a write during the read is noticed. Watched, it is never held
-        // open at all: see `watch.load`.
+        // open at all, see `watch.load`, and is listened to from before the
+        // stamp, so that no write falls between the two.
         var disk: watch.Disk = .{};
         errdefer disk.deinit(gpa, s.io);
         if (s.io) |io| {
-            if (!s.watching) disk.hold = watch.Hold.take(io, file) catch |err| blk: {
-                s.ctx.note("{s} is not held ({t}): another program may change it", .{ file, err });
-                break :blk null;
-            };
+            if (s.watching) {
+                disk.notice = s.noticeOf(file);
+            } else {
+                disk.hold = watch.Hold.take(io, file) catch |err| blk: {
+                    s.ctx.note("{s} is not held ({t}): another program may change it", .{ file, err });
+                    break :blk null;
+                };
+            }
             disk.held = watch.stat(io, file) orelse .{};
             disk.seen = disk.held;
         }
@@ -2275,31 +2278,53 @@ const Session = struct {
             if (on) {
                 if (d.hold) |*h| h.release(io);
                 d.hold = null;
+                d.notice = s.noticeOf(b.path);
                 continue;
             }
+            if (d.notice) |n| n.stop(s.gpa);
+            d.notice = null;
+            d.stirred = false;
             d.hold = watch.Hold.take(io, b.path) catch null;
             const stamp = watch.stat(io, b.path) orelse continue;
             if (!stamp.eql(d.held) and d.reload == .none) d.reload = .auto;
         }
     }
 
-    /// Looks at each followed file, at most every `watch.interval_ns`, by
-    /// its stamp: a stat and never a read, and nothing allocated. `dt` is
-    /// the frame clock's, which the loop reads anyway.
+    /// What tells the reader that `path` changed, or null where nothing
+    /// will, and it is looked at every `watch.interval_ns` instead.
+    fn noticeOf(s: *Session, path: []const u8) ?*watch.Notice {
+        return watch.Notice.start(s.gpa, path) catch |err| {
+            // Expected where there are no notices, and not worth a line.
+            if (err != error.Unsupported) s.ctx.note("{s} is looked at twice a second: no notices ({t})", .{ path, err });
+            return null;
+        };
+    }
+
+    /// Asks each followed file's notice what happened, and looks at the
+    /// file -- a stat, never a read, and nothing allocated -- only when
+    /// `watch.tick` says to. `dt` is the frame clock's, which the loop reads
+    /// anyway.
     fn poll(s: *Session, dt: f32) void {
         if (!s.watching) return;
-        s.since_poll += dt;
-        if (s.since_poll < poll_interval) return;
-        s.since_poll = 0;
         const io = s.io orelse return;
         for (s.disks.items, s.buffers.items) |*d, b| {
-            if (d.reload != .none) continue;
+            var said: ?watch.Notice.Said = null;
+            if (d.notice) |n| {
+                said = n.take(dt);
+                if (said == .gone) {
+                    n.stop(s.gpa);
+                    d.notice = null;
+                    said = null;
+                    s.say("{s} is looked at twice a second: no more notices", .{b.title});
+                }
+            }
+            // Taken while a reload is pending too, so that a write during
+            // one is looked into after it.
+            if (!watch.tick(d, dt, said) or d.reload != .none) continue;
             const stamp = watch.stat(io, b.path) orelse continue;
             if (watch.due(d, stamp)) d.reload = .auto;
         }
     }
-
-    const poll_interval: f32 = @as(f32, @floatFromInt(watch.interval_ns)) / std.time.ns_per_s;
 
     /// A file waiting to be read again, as a job.
     fn reloadJob(s: *Session) ?Job {
@@ -2415,11 +2440,14 @@ const Session = struct {
         }
         if (s.timing) {
             const ns = loaded.ns;
-            s.ctx.note("watch  gen {d}  read {d:.1}ms  open {d:.1}  annots {d:.1}  digest {d:.1}  locate {d:.1}  install {d:.1}", .{
-                d.generation,    msOf(ns.read),   msOf(ns.open),                      msOf(ns.annots),
+            // `heard`: from the first notice to the look that found the file
+            // still, so the rest of the line is what it cost after that.
+            s.ctx.note("watch  gen {d}  heard {d:.0}ms  read {d:.1}  open {d:.1}  annots {d:.1}  digest {d:.1}  locate {d:.1}  install {d:.1}", .{
+                d.generation,    d.heard * 1000,  msOf(ns.read),                      msOf(ns.open), msOf(ns.annots),
                 msOf(ns.digest), msOf(ns.locate), if (lap) |*l| msOf(l.lap()) else 0,
             });
         }
+        d.heard = 0;
     }
 
     /// Every cached picture of a buffer's pages is stale, and drawn until
