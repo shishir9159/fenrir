@@ -92,6 +92,15 @@ pub fn hasMap(b: Buffer, page: u32) bool {
     return false;
 }
 
+/// Every map, for a document read again from its file: they are of pages
+/// that are not its pages any more.
+pub fn dropMaps(b: *Buffer, gpa: Allocator) void {
+    for (&b.maps) |*m| {
+        m.map.deinit(gpa);
+        m.* = .{};
+    }
+}
+
 /// Takes ownership of a text map, evicting the least recently asked for.
 pub fn putMap(b: *Buffer, gpa: Allocator, page: u32, map: text.Page) void {
     b.clock += 1;

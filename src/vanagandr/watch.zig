@@ -71,12 +71,17 @@ pub const Disk = struct {
     reload: Reload = .none,
     /// The file held shut against other programs, while not watching.
     hold: ?Hold = null,
+    /// The names of the anchors and comments read out of the file rather
+    /// than the library: what a reload takes away and reads again.
+    taken: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     pub const Reload = enum { none, auto, forced };
 
-    pub fn deinit(d: *Disk, gpa: Allocator, io: Io) void {
+    /// `io` is null where nothing was ever held: in a test.
+    pub fn deinit(d: *Disk, gpa: Allocator, io: ?Io) void {
         gpa.free(d.digests);
-        if (d.hold) |*h| h.release(io);
+        d.taken.deinit(gpa);
+        if (d.hold) |*h| h.release(io.?);
         d.* = .{};
     }
 };
@@ -120,6 +125,11 @@ pub fn complete(bytes: []const u8) bool {
 /// What page `p` draws, as a number: its boxes and turn, the raw bytes of
 /// its content streams and of every form and image it names, and its
 /// annotations with the raw bytes of each one's appearance.
+///
+/// The annotations because the author asked that a file whose only change
+/// is an appearance stream -- a highlight added or redrawn in another
+/// program -- is reloaded as a change, and taken to its page. Do not leave
+/// them out as "not the page's content".
 ///
 /// Not `digest.Digests`, which follows references into fonts: TeX subsets a
 /// font again whenever one new glyph is used, and every page from the first
@@ -322,8 +332,13 @@ pub const Loaded = struct {
     down: f32 = 0,
     /// That page's text map, owned.
     map: ?text.Page = null,
+    /// Each page's annotations, read here because this thread owns the new
+    /// document, and so that installing it does not walk the file on the
+    /// frame thread. In `annots_arena`.
+    annots: []const []const fenrir.annots.Annot = &.{},
+    annots_arena: ?std.heap.ArenaAllocator = null,
     /// What each step cost, for `--time`.
-    ns: struct { read: u64 = 0, open: u64 = 0, digest: u64 = 0, locate: u64 = 0 } = .{},
+    ns: struct { read: u64 = 0, open: u64 = 0, annots: u64 = 0, digest: u64 = 0, locate: u64 = 0 } = .{},
 
     pub fn deinit(l: *Loaded, gpa: Allocator) void {
         l.doc.deinit();
@@ -331,6 +346,7 @@ pub const Loaded = struct {
         gpa.free(l.digests);
         if (l.old_digests) |d| gpa.free(d);
         if (l.map) |*m| m.deinit(gpa);
+        if (l.annots_arena) |*a| a.deinit();
         l.* = undefined;
     }
 };
@@ -376,6 +392,12 @@ fn loadAt(gpa: Allocator, io: Io, path: []const u8, stamp: Stamp, old: Old, forc
     const outline = fenrir.outline.all(doc, pages) catch &.{};
     const open_ns = clock.lap();
 
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const annots = try arena.allocator().alloc([]const fenrir.annots.Annot, pages.len);
+    for (pages, annots) |p, *list| list.* = fenrir.annots.read(arena.allocator(), doc, p) catch &.{};
+    const annots_ns = clock.lap();
+
     const digests = try digestAll(gpa, doc, pages);
     errdefer gpa.free(digests);
     const old_digests: ?[]u64 = if (old.digests.len == old.pages.len and old.pages.len != 0)
@@ -392,6 +414,8 @@ fn loadAt(gpa: Allocator, io: Io, path: []const u8, stamp: Stamp, old: Old, forc
         .digests = digests,
         .old_digests = old_digests,
         .stamp = stamp,
+        .annots = annots,
+        .annots_arena = arena,
     };
     loaded.first = firstChange(old_digests orelse old.digests, digests);
     if (loaded.first) |page| {
@@ -401,7 +425,7 @@ fn loadAt(gpa: Allocator, io: Io, path: []const u8, stamp: Stamp, old: Old, forc
             loaded.map = at.map;
         }
     }
-    loaded.ns = .{ .read = read_ns, .open = open_ns, .digest = digest_ns, .locate = clock.lap() };
+    loaded.ns = .{ .read = read_ns, .open = open_ns, .annots = annots_ns, .digest = digest_ns, .locate = clock.lap() };
     return .{ .loaded = loaded };
 }
 
@@ -426,6 +450,11 @@ const Clock = struct {
 /// The file held open so that no other program can change it, while the
 /// reader is not watching. Watching is off unless asked for, so this is how
 /// a document is open by default.
+///
+/// **The author asked for both halves:** watching off by default, and a file
+/// that is not watched locked against every other program. Do not make the
+/// lock advisory on Windows, nor turn watching on by default, to spare a
+/// TeX build its sharing violation: `--watch`, or `watch = on`, is the way.
 ///
 /// On Windows it is enforced: the file is opened sharing reading and nothing
 /// else, so a program that opens it to write, truncate, rename or delete it

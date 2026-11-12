@@ -538,6 +538,8 @@ pub const config_usage =
     \\      zoom     the zoom a document opens at, or `fit`
     \\      comment_anchor
     \\               what c leaves on the words: `highlight` or `arrow`
+    \\      watch    `on` to follow a file another program rewrites; `off`,
+    \\               the default, holds it so that none can
 ;
 
 pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
@@ -612,6 +614,10 @@ pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
             if (std.mem.eql(u8, k, "comment_anchor")) {
                 if (!std.mem.eql(u8, v, "highlight") and !std.mem.eql(u8, v, "arrow"))
                     return ctx.fail("comment_anchor is highlight or arrow, not {s}", .{v});
+            }
+            if (std.mem.eql(u8, k, "watch")) {
+                if (!std.mem.eql(u8, v, "on") and !std.mem.eql(u8, v, "off"))
+                    return ctx.fail("watch is on or off, not {s}", .{v});
             }
             lib.set(k, v) catch |err| return ctx.fail("cannot set {s}: {t}", .{ k, err });
             ctx.out.print("{s} = {s}\n", .{ k, v }) catch {};

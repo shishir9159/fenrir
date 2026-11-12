@@ -99,6 +99,10 @@ pub const Event = enum {
     Start,
     /// A document was opened. `{doc, path, title, pages}`.
     DocOpen,
+    /// A document was read again from its file, which another program
+    /// rewrote while it was open. `{doc, path, title, pages}`; the handle
+    /// is the same document's.
+    DocReload,
     /// A document or a view took the focus. `{doc, path}`.
     ///
     /// The one to listen on to follow the person. `PageChanged` and

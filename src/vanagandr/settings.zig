@@ -93,6 +93,12 @@ pub const builtin = [_]Option{
         .choices = &.{ "highlight", "arrow" },
         .unset = "highlight",
     },
+    .{
+        .key = "watch",
+        .about = "follow a file another program rewrites; off holds it shut",
+        .choices = &.{ "off", "on" },
+        .unset = "off",
+    },
 };
 
 /// The longest value worth showing. A colour is seven bytes and a name is a

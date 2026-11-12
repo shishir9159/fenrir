@@ -560,6 +560,59 @@ fn replace(m: *Marks, gpa: Allocator, index: usize, before: Mark, after: Mark) A
     try m.record(gpa, .{ .group = m.currentGroup(), .kind = .changed, .before = .{ .mark = before }, .after = .{ .mark = after }, .index = index });
 }
 
+/// Takes out every mark and comment that has no row and whose name is in
+/// `gone`: what was read from a file that has been read again, and is about
+/// to be read afresh. Returns how many went.
+///
+/// Not a change anybody made: nothing is written, nothing can be undone, and
+/// the steps in the history that name them go with them, or an undo would
+/// bring back what the file no longer has. A mark the library holds stays,
+/// as it does at open: the library wins.
+pub fn forget(m: *Marks, gpa: Allocator, gone: *const std.AutoHashMapUnmanaged(u64, void)) Allocator.Error!usize {
+    var keys: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer keys.deinit(gpa);
+
+    var kept: usize = 0;
+    for (m.list.items) |mark| {
+        if (!mark.saved() and gone.contains(mark.anchor)) {
+            try keys.put(gpa, mark.key, {});
+            continue;
+        }
+        m.list.items[kept] = mark;
+        kept += 1;
+    }
+    m.list.shrinkRetainingCapacity(kept);
+
+    kept = 0;
+    for (m.comments.items) |c| {
+        if (!c.saved() and gone.contains(c.name)) {
+            try keys.put(gpa, c.key, {});
+            continue;
+        }
+        m.comments.items[kept] = c;
+        kept += 1;
+    }
+    m.comments.shrinkRetainingCapacity(kept);
+
+    if (keys.count() == 0) return 0;
+    m.revision +%= 1;
+    for ([_]*std.ArrayList(Change){ &m.undo_stack, &m.redo_stack }) |stack| {
+        var left: usize = 0;
+        for (stack.items) |c| {
+            const item = if (c.kind == .removed) c.before else c.after;
+            const key = switch (item) {
+                .mark => |mark| mark.key,
+                .comment => |comment| comment.key,
+            };
+            if (keys.contains(key)) continue;
+            stack.items[left] = c;
+            left += 1;
+        }
+        stack.shrinkRetainingCapacity(left);
+    }
+    return keys.count();
+}
+
 /// Records the row a mark was given, once the library has written it.
 pub fn setId(m: *Marks, key: u64, id: i64) void {
     const mark = m.byKey(key) orelse return;
@@ -1875,4 +1928,35 @@ test "an anchor's first line heads it, with or without a comment" {
     // And it is a style like the others, which a filter can name.
     try testing.expect(Filter.parse("arrow", &.{}).matches(m.items()[0], &.{}));
     try testing.expectEqualStrings("arrow", Style.arrow.label());
+}
+
+test "what a file read again replaces is forgotten, and the library's marks stay" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    // Read from the file at open: anchor 7, and its note.
+    _ = try m.add(gpa, .{ .anchor = 7, .box = .fromRect(0, 0, 10, 10) }, true);
+    _ = try m.addComment(gpa, .{ .anchor = 7, .name = 7, .text = "from the file" }, true);
+    // The library's row on the same anchor, which wins as it does at open.
+    _ = try m.add(gpa, .{ .id = 3, .anchor = 7, .box = .fromRect(0, 20, 10, 30) }, true);
+    // Made now, and then the file's mark recoloured: two steps of history.
+    m.beginGroup();
+    _ = try m.add(gpa, .{ .anchor = 9, .box = .fromRect(0, 40, 10, 50) }, false);
+    m.beginGroup();
+    try m.recolour(gpa, 0, .{ .r = 0, .g = 1, .b = 0 });
+
+    var gone: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer gone.deinit(gpa);
+    try gone.put(gpa, 7, {});
+    try testing.expectEqual(@as(usize, 2), try m.forget(gpa, &gone));
+    try testing.expectEqual(@as(usize, 2), m.count());
+    try testing.expectEqual(@as(i64, 3), m.items()[0].id);
+    try testing.expectEqual(@as(usize, 0), m.comments.items.len);
+
+    // The recolour went with its mark; the mark made now can still be
+    // taken back, and then there is nothing left to undo.
+    try testing.expect(try m.undo(gpa));
+    try testing.expectEqual(@as(usize, 1), m.count());
+    try testing.expect(!try m.undo(gpa));
 }

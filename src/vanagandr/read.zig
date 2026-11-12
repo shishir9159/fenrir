@@ -76,6 +76,7 @@ const palette_mod = @import("palette.zig");
 const panels = @import("panels.zig");
 const rails_mod = @import("rails.zig");
 const settings_page = @import("settings.zig");
+const watch = @import("watch.zig");
 
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
@@ -185,6 +186,12 @@ const view_flags =
     \\    --size WxH   The window's initial size.
     \\    --samples N  Multisampling for the page raster: 1, 2, 4 or 8.
     \\                 Defaults to 8.
+    \\    --watch      Follow the file: when another program rewrites it, as
+    \\                 a TeX build does, the new one takes its place at the
+    \\                 first page that changed. Without it the file is held
+    \\                 so that no other program can change it while it is
+    \\                 open. The watch setting chooses; this is on for one
+    \\                 session.
     \\
 ;
 
@@ -268,6 +275,7 @@ const colon_commands =
     \\    :zoom 150, :fit page a zoom, or the width, the height or a page
     \\    :set theme=light     the colours the interface is drawn in
     \\    :settings            all of them, as a page over the document
+    \\    :reload, :e!         read the document again from its file
     \\
 ++ (if (caps.splits)
     \\    :sp, :vs, :close     split below, split beside, close the window
@@ -507,6 +515,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Comparison
     var timing = false;
     var bench: ?BenchKind = null;
     var config_dir: ?[]const u8 = null;
+    var watch_flag = false;
     var on_device = false;
     var backend: Backend = if (have_gpu and !have_cpu) .gpu else .cpu;
 
@@ -619,6 +628,8 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Comparison
                     .adaptive
                 else
                     return ctx.fail("--vsync wants on, off or adaptive", .{});
+            } else if (std.mem.eql(u8, arg, "--watch")) {
+                watch_flag = true;
             } else if (std.mem.eql(u8, arg, "--size")) {
                 i += 1;
                 if (i >= args.len) return ctx.fail("--size needs WxH", .{});
@@ -646,6 +657,9 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Comparison
 
     if (files.items.len == 0) return ctx.fail("read needs a file", .{});
     if (comparison != null and files.items.len != 2) return ctx.fail("a comparison is of two documents", .{});
+    // `Rerun` reads both documents' bytes on a thread of its own, and a
+    // reload frees them.
+    if (comparison != null and watch_flag) return ctx.fail("a comparison does not watch its files", .{});
     if (zoom) |z| {
         if (!(z > 0) or !std.math.isFinite(z)) {
             return ctx.fail("a zoom has to be positive and finite", .{});
@@ -720,6 +734,10 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Comparison
     // chosen colour back on top of whichever theme was named.
     session.useTheme(written_theme orelse session.rememberedTheme());
     session.comment_style = session.rememberedCommentStyle();
+    // Before the documents open: a document not watched is held from the
+    // moment it is read.
+    session.watching = comparison == null and (watch_flag or session.rememberedWatch());
+    session.timing = timing;
 
     for (files.items) |file| {
         _ = session.openBuffer(file) catch |err| {
@@ -934,6 +952,9 @@ const Slot = struct {
     used: u64 = 0,
     /// The page laid over its partner in a comparison, not the page alone.
     overlay: bool = false,
+    /// Of a document since read again from its file: drawn until the new
+    /// page arrives, so there is no blank flash, and never `cached`.
+    stale: bool = false,
 
     const no_page = std.math.maxInt(u32);
 
@@ -1006,6 +1027,8 @@ const Recorded = struct {
         source: ?Scene = null,
         /// Where this page landed in `scene` after the last rebuild.
         range: Scene.Range = .{},
+        /// As `Slot.stale`.
+        stale: bool = false,
     };
 
     fn deinit(rc: *Recorded, gpa: Allocator) void {
@@ -1018,7 +1041,7 @@ const Recorded = struct {
 
     fn has(rc: *const Recorded, buffer: u32, page: u32) bool {
         for (rc.pages) |e| {
-            if (e.buffer == buffer and e.page == page and e.source != null) return true;
+            if (e.buffer == buffer and e.page == page and e.source != null and !e.stale) return true;
         }
         return false;
     }
@@ -1028,7 +1051,14 @@ const Recorded = struct {
     fn insert(rc: *Recorded, gpa: Allocator, buffer: u32, page: u32, source: Scene) Allocator.Error!void {
         var chosen: usize = 0;
         var oldest: u64 = std.math.maxInt(u64);
+        // A page read again takes the place of its old recording, which was
+        // drawn until now: nothing draws blank paper over a page it has.
         for (&rc.pages, 0..) |*e, i| {
+            if (e.source != null and e.buffer == buffer and e.page == page) {
+                chosen = i;
+                break;
+            }
+        } else for (&rc.pages, 0..) |*e, i| {
             if (e.source == null) {
                 chosen = i;
                 break;
@@ -1110,7 +1140,8 @@ const Job = struct {
     /// is looking at -- rasterising them would be a hundred times the work
     /// for pixels that go straight in the bin. `.overlay` is a page of the
     /// first document of a comparison laid over its partner in the second.
-    const Want = enum { page, text, overlay };
+    /// `.reload` is the buffer's file read again, and no page; see `install`.
+    const Want = enum { page, text, overlay, reload };
 
     fn eql(a: Job, b: Job) bool {
         return a.buffer == b.buffer and a.page == b.page and
@@ -1151,6 +1182,8 @@ const Rasteriser = struct {
         job: Job,
         result: ?Result,
         map: ?text.Page = null,
+        /// A `.reload`'s, and nothing else's.
+        reload: ?watch.Outcome = null,
 
         const Result = union(Backend) {
             cpu: Session.Image,
@@ -1296,6 +1329,18 @@ const Session = struct {
     /// dependencies run one way. Touched only from `produce`, which is to say
     /// only on the rasterising thread, for the same reason `Document` is.
     faces: std.ArrayList(glyphmod.Cache) = .empty,
+    /// One a buffer, beside `faces` and under the same rule: the file each
+    /// document was read from, and whether it is held shut. See `watch.zig`.
+    disks: std.ArrayList(watch.Disk) = .empty,
+    /// Whether files are followed when another program rewrites them, or
+    /// held so that none can: `--watch`, else the `watch` setting, off
+    /// unless asked for. Never in a comparison, whose `Rerun` reads the
+    /// buffers' bytes on a thread of its own while a reload would free them.
+    watching: bool = false,
+    /// Seconds since the files were last looked at.
+    since_poll: f32 = 0,
+    /// `--time`, which prints a line for every reload.
+    timing: bool = false,
     /// The tabpages, and the tree of windows in each. The one on screen is
     /// `layout()`, which is what almost everything here means by "the
     /// windows": a tab nobody is looking at is drawn by nothing and
@@ -1633,6 +1678,8 @@ const Session = struct {
         s.tabs.deinit(s.gpa);
         for (s.faces.items) |*c| c.deinit();
         s.faces.deinit(s.gpa);
+        for (s.disks.items) |*d| d.deinit(s.gpa, s.io);
+        s.disks.deinit(s.gpa);
         for (s.buffers.items) |*b| {
             b.doc.deinit();
             s.gpa.destroy(b.doc);
@@ -1665,6 +1712,21 @@ const Session = struct {
     fn openBuffer(s: *Session, file: []const u8) !u32 {
         const gpa = s.gpa;
 
+        // Held before it is read, so that nothing changes between the bytes
+        // read and the file held; and its stamp taken before it is read, so
+        // that a write during the read is noticed. Watched, it is never held
+        // open at all: see `watch.load`.
+        var disk: watch.Disk = .{};
+        errdefer disk.deinit(gpa, s.io);
+        if (s.io) |io| {
+            if (!s.watching) disk.hold = watch.Hold.take(io, file) catch |err| blk: {
+                s.ctx.note("{s} is not held ({t}): another program may change it", .{ file, err });
+                break :blk null;
+            };
+            disk.held = watch.stat(io, file) orelse .{};
+            disk.seen = disk.held;
+        }
+
         // With `gpa` and not `ctx.gpa`: `Document` owns these bytes and frees
         // them with the allocator it was opened with.
         const bytes = try s.ctx.readFileWith(gpa, file);
@@ -1685,6 +1747,8 @@ const Session = struct {
         // out of bounds on its first page.
         try s.faces.append(gpa, .init(gpa));
         errdefer _ = s.faces.pop();
+        try s.disks.append(gpa, disk);
+        errdefer _ = s.disks.pop();
 
         try s.buffers.append(gpa, .{
             .path = path,
@@ -1703,7 +1767,7 @@ const Session = struct {
         s.loadMarks(id);
         s.rememberFileId(path, doc);
         if (s.stage) |g| g.mark("document");
-        s.readAnnots(id);
+        s.readAnnots(id, null);
         if (s.stage) |g| g.mark("annotations");
         return id;
     }
@@ -1920,6 +1984,12 @@ const Session = struct {
                 s.say("comment_anchor is highlight or arrow, not {s}", .{c.value[0..@min(c.value.len, 48)]});
                 return;
             };
+        } else if (std.mem.eql(u8, c.key, "watch")) {
+            if (c.value.len != 0 and !std.mem.eql(u8, c.value, "on") and !std.mem.eql(u8, c.value, "off")) {
+                s.say("watch is on or off, not {s}", .{c.value[0..@min(c.value.len, 48)]});
+                return;
+            }
+            s.setWatching(std.mem.eql(u8, c.value, "on"));
         } else if (std.mem.eql(u8, c.key, "accent")) {
             if (c.value.len != 0) {
                 const colour = Library.parseColor(c.value) orelse {
@@ -2056,7 +2126,12 @@ const Session = struct {
     /// **The library wins.** Its rows are what this reader changed since the
     /// file was written, so a name it already holds is not read again from
     /// the file: an anchor's lines, or a comment.
-    fn readAnnots(s: *Session, index: u32) void {
+    ///
+    /// A reload hands in what the worker read beside the file
+    /// (`watch.Loaded.annots`), so that the frame thread does not walk the
+    /// file again: on a 286-page book that walk was most of what installing
+    /// a reload cost.
+    fn readAnnots(s: *Session, index: u32, already: ?[]const []const fenrir.annots.Annot) void {
         const b = s.buffer(index);
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
@@ -2068,10 +2143,12 @@ const Session = struct {
         for (b.marks.items()) |m| held.put(a, m.anchor, {}) catch return;
         for (b.marks.comments.items) |c| held.put(a, c.name, {}) catch return;
 
+        // What a reload takes away and reads again.
+        const taken: ?*std.AutoHashMapUnmanaged(u64, void) = if (index < s.disks.items.len) &s.disks.items[index].taken else null;
         for (b.pages, 0..) |p, page| {
-            const list = fenrir.annots.read(a, b.doc, p) catch continue;
+            const list = if (already) |read| (if (page < read.len) read[page] else &.{}) else fenrir.annots.read(a, b.doc, p) catch continue;
             if (list.len == 0) continue;
-            s.takeAnnots(a, b, @intCast(page), list, &held) catch return;
+            s.takeAnnots(a, b, @intCast(page), list, &held, taken) catch return;
         }
     }
 
@@ -2082,6 +2159,7 @@ const Session = struct {
         page: u32,
         list: []const fenrir.annots.Annot,
         held: *const std.AutoHashMapUnmanaged(u64, void),
+        taken: ?*std.AutoHashMapUnmanaged(u64, void),
     ) Allocator.Error!void {
         // The anchor each was taken as, so a reply finds its thread's.
         const anchors = try a.alloc(u64, list.len);
@@ -2089,6 +2167,7 @@ const Session = struct {
             if (annot.kind == .reply) continue;
             anchor.* = try s.nameOf(b, annot.name) orelse b.marks.newName();
             if (held.contains(anchor.*)) continue;
+            if (taken) |t| try t.put(s.gpa, anchor.*, {});
 
             switch (annot.kind) {
                 .ink => for (annot.paths) |path| {
@@ -2124,6 +2203,7 @@ const Session = struct {
             // the anchor's, which would make it the note on the markup.
             const name = try s.nameOf(b, annot.name) orelse b.marks.newName();
             if (held.contains(name)) continue;
+            if (taken) |t| try t.put(s.gpa, name, {});
             _ = try b.marks.addComment(s.gpa, .{ .anchor = anchors[thread], .name = name, .text = annot.text }, true);
         }
     }
@@ -2174,6 +2254,219 @@ const Session = struct {
         s.rememberPlace(s.layout().current());
     }
 
+    // -- watching ------------------------------------------------------------
+
+    /// What the `watch` setting says: on, or anything else, which is off.
+    fn rememberedWatch(s: *Session) bool {
+        const lib = s.library orelse return false;
+        const said = (lib.get("watch") catch null) orelse return false;
+        defer s.gpa.free(said);
+        return std.mem.eql(u8, said, "on");
+    }
+
+    /// Follows the files, or holds them shut. Turned off, a file another
+    /// program wrote while it was followed is read once more, so that what
+    /// is held is what is shown.
+    fn setWatching(s: *Session, on: bool) void {
+        if (s.diff != null or s.watching == on) return;
+        s.watching = on;
+        const io = s.io orelse return;
+        for (s.disks.items, s.buffers.items) |*d, b| {
+            if (on) {
+                if (d.hold) |*h| h.release(io);
+                d.hold = null;
+                continue;
+            }
+            d.hold = watch.Hold.take(io, b.path) catch null;
+            const stamp = watch.stat(io, b.path) orelse continue;
+            if (!stamp.eql(d.held) and d.reload == .none) d.reload = .auto;
+        }
+    }
+
+    /// Looks at each followed file, at most every `watch.interval_ns`, by
+    /// its stamp: a stat and never a read, and nothing allocated. `dt` is
+    /// the frame clock's, which the loop reads anyway.
+    fn poll(s: *Session, dt: f32) void {
+        if (!s.watching) return;
+        s.since_poll += dt;
+        if (s.since_poll < poll_interval) return;
+        s.since_poll = 0;
+        const io = s.io orelse return;
+        for (s.disks.items, s.buffers.items) |*d, b| {
+            if (d.reload != .none) continue;
+            const stamp = watch.stat(io, b.path) orelse continue;
+            if (watch.due(d, stamp)) d.reload = .auto;
+        }
+    }
+
+    const poll_interval: f32 = @as(f32, @floatFromInt(watch.interval_ns)) / std.time.ns_per_s;
+
+    /// A file waiting to be read again, as a job.
+    fn reloadJob(s: *Session) ?Job {
+        for (s.disks.items, 0..) |d, i| {
+            if (d.reload != .none) return .{ .buffer = @intCast(i), .page = 0, .zoom = 0, .want = .reload };
+        }
+        return null;
+    }
+
+    /// What the worker is asked for next.
+    ///
+    /// **While a reload is pending, nothing else.** A page asked of the old
+    /// document after it would be drawn from a document `install` frees, and
+    /// with nothing else posted the worker is parked when the reload comes
+    /// back -- which is what lets `install` free it on this thread.
+    fn jobToPost(s: *Session) ?Job {
+        return s.reloadJob() orelse s.nextJob();
+    }
+
+    /// Puts what a reload read in place of what the buffer had: the
+    /// document, its pages and outline, and everything that knew them.
+    /// Only from `collectPage`, with the worker parked; see `jobToPost`.
+    fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
+        var lap: ?Lap = if (s.io) |io| .start(io) else null;
+        const d = &s.disks.items[index];
+        const b = s.buffer(index);
+        const forced = d.reload == .forced;
+        d.reload = .none;
+
+        var loaded = switch (outcome) {
+            .refused => |r| {
+                d.refused = r.stamp;
+                if (forced) {
+                    s.say("{s} would not open: {t}", .{ b.title, r.why });
+                } else {
+                    s.say("{s} is incomplete; showing gen {d}", .{ b.title, d.generation });
+                }
+                return;
+            },
+            .loaded => |l| l,
+        };
+
+        const before = b.pages.len;
+        b.doc.deinit();
+        s.gpa.destroy(b.doc);
+        b.doc = loaded.doc;
+        b.pages = loaded.pages;
+        b.outline = loaded.outline;
+
+        s.gpa.free(d.digests);
+        d.digests = loaded.digests;
+        if (loaded.old_digests) |old| s.gpa.free(old);
+        d.held = loaded.stamp;
+        d.seen = loaded.stamp;
+        d.generation += 1;
+
+        s.stalePages(index, @intCast(b.pages.len));
+        b.dropMaps(s.gpa);
+        if (loaded.map) |*m| {
+            if (loaded.first) |page| b.putMap(s.gpa, page, m.*) else m.deinit(s.gpa);
+        }
+        // Keyed by the old document's object numbers.
+        if (index < s.faces.items.len) {
+            s.faces.items[index].deinit();
+            s.faces.items[index] = .init(s.gpa);
+        }
+
+        var it = s.tabs.iterator();
+        while (it.next()) |v| {
+            if (v.buffer != index) continue;
+            v.pages = b.pages;
+            v.refit();
+            // Indices into the old page's text, which the new one may not
+            // have: the caret goes to the top of its page, which is there.
+            v.cursor.page = @min(v.cursor.page, @as(u32, @intCast(b.pages.len - 1)));
+            v.cursor.line = 0;
+            v.cursor.column = 0;
+            v.cursor.caret = .empty;
+            v.anchor = null;
+            v.clampScroll();
+        }
+        if (s.drag) |drag| {
+            if (drag.buffer == index) s.drag = null;
+        }
+        s.rows_for = .{};
+
+        // The file's own annotations, read again: those the library holds
+        // stay, as they do at open.
+        _ = b.marks.forget(s.gpa, &d.taken) catch 0;
+        d.taken.clearRetainingCapacity();
+        s.readAnnots(index, loaded.annots);
+        if (loaded.annots_arena) |*a| a.deinit();
+
+        if (loaded.first) |page| s.showChange(index, page, loaded.down);
+        if (s.view().buffer == index and s.find.query().len != 0) s.requery();
+
+        var count_buf: [32]u8 = undefined;
+        const counted = if (b.pages.len == before) "" else std.fmt.bufPrint(&count_buf, ", {d} pages", .{b.pages.len}) catch "";
+        if (loaded.first) |page| {
+            s.say("gen {d}: page {d} changed{s}", .{ d.generation, page + 1, counted });
+        } else {
+            s.say("gen {d}: no page changed{s}", .{ d.generation, counted });
+        }
+
+        if (s.plugins) |rt| {
+            const doc = s.handleOf(index);
+            rt.emit(.{ .event = .DocReload, .doc = doc, .path = b.path, .data = .{ .document = .{
+                .handle = doc,
+                .path = b.path,
+                .title = b.title,
+                .pages = @intCast(b.pages.len),
+            } } });
+        }
+        if (s.timing) {
+            const ns = loaded.ns;
+            s.ctx.note("watch  gen {d}  read {d:.1}ms  open {d:.1}  annots {d:.1}  digest {d:.1}  locate {d:.1}  install {d:.1}", .{
+                d.generation,    msOf(ns.read),   msOf(ns.open),                      msOf(ns.annots),
+                msOf(ns.digest), msOf(ns.locate), if (lap) |*l| msOf(l.lap()) else 0,
+            });
+        }
+    }
+
+    /// Every cached picture of a buffer's pages is stale, and drawn until
+    /// its page comes again; a page past the new end is dropped.
+    fn stalePages(s: *Session, index: u32, pages: u32) void {
+        for (&s.slots) |*slot| {
+            if (slot.buffer != index or slot.page == Slot.no_page) continue;
+            if (slot.page >= pages) {
+                slot.page = Slot.no_page;
+                slot.stale = false;
+            } else slot.stale = true;
+        }
+        var dropped = false;
+        for (&s.recorded.pages) |*e| {
+            if (e.buffer != index or e.source == null) continue;
+            if (e.page >= pages) {
+                e.source.?.deinit(s.gpa);
+                e.* = .{};
+                dropped = true;
+            } else e.stale = true;
+        }
+        if (dropped) s.recorded.rebuild(s.gpa) catch {};
+        s.placed = null;
+        // A page that would not draw before may now.
+        for (&s.failures) |*f| {
+            if (f.buffer == index) f.* = .{ .buffer = 0, .page = Slot.no_page, .zoom = 0 };
+        }
+    }
+
+    /// Takes a window on the buffer to where a reload changed it: the focused
+    /// one if it shows the buffer, else the first that does. A change already
+    /// on screen moves nothing, and the other windows keep their place.
+    fn showChange(s: *Session, index: u32, page: u32, down: f32) void {
+        const v = if (s.view().buffer == index) s.view() else blk: {
+            var it = s.layout().iterator();
+            while (it.next()) |w| {
+                if (w.buffer == index) break :blk w;
+            }
+            return;
+        };
+        if (page >= v.pages.len) return;
+        const at = v.pageTop(page) + down * v.zoom;
+        if (at >= v.scroll and at <= v.scroll + v.height()) return;
+        // What led up to the change stays on screen above it, as for `]d`.
+        v.goTo(.{ .page = page, .offset = down - v.height() * lead_in / v.zoom, .zoom = v.zoom });
+    }
+
     // -- work ----------------------------------------------------------------
 
     /// One job's worth of work, on the rasterising thread, in whichever form
@@ -2182,6 +2475,16 @@ const Session = struct {
     fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
         const gpa = s.gpa;
         const b = s.buffer(job.buffer);
+
+        // The file again, read beside the document it replaces, which this
+        // thread owns. `reload` was written before the job was posted, and
+        // the post's lock orders the two.
+        if (job.want == .reload) {
+            const d = &s.disks.items[job.buffer];
+            const old: watch.Old = .{ .doc = b.doc, .pages = b.pages, .digests = d.digests };
+            out.reload = watch.load(gpa, s.ctx.io, b.path, old, d.reload == .forced, page_options);
+            return;
+        }
 
         // Two pages and no text map: the cursor's map is a `.page` job's,
         // asked for separately when the cursor wants it.
@@ -2213,6 +2516,11 @@ const Session = struct {
 
     /// Frees a finished job the frame loop is not going to use.
     fn discard(s: *Session, f: *Rasteriser.Finished) void {
+        if (f.reload) |*o| switch (o.*) {
+            .loaded => |*l| l.deinit(s.gpa),
+            .refused => {},
+        };
+        f.reload = null;
         if (f.map) |*m| m.deinit(s.gpa);
         f.map = null;
         const result = &(f.result orelse return);
@@ -2347,7 +2655,9 @@ const Session = struct {
 
     fn cachedSlot(s: *const Session, buf: u32, page: u32, zoom: f32, overlay: bool) ?*const Slot {
         for (&s.slots) |*slot| {
-            if (slot.matches(buf, page, zoom, overlay)) return slot;
+            // A stale page is still drawn, by `slotFor`, and is not the page
+            // that was asked for.
+            if (slot.matches(buf, page, zoom, overlay) and !slot.stale) return slot;
         }
         return null;
     }
@@ -2512,6 +2822,15 @@ const Session = struct {
         const gpa = s.gpa;
         var finished = worker.collect() orelse return null;
 
+        if (finished.job.want == .reload) {
+            // The worker is parked: nothing else was posted while this was
+            // pending (`jobToPost`), so the document it replaces is this
+            // thread's to free.
+            const outcome = finished.reload orelse return null;
+            s.install(finished.job.buffer, outcome);
+            return null;
+        }
+
         if (finished.job.want == .text) {
             // The scan's own page, and it is not cached: the buffer keeps
             // eight maps for the cursor to walk through, and a search that
@@ -2564,7 +2883,13 @@ const Session = struct {
             return null;
         }
 
-        const slot = try s.claim(renderer, list, image.width, image.height);
+        // A page read again goes where its old pixels are, which were drawn
+        // until now: nothing draws blank paper over a page it has.
+        const slot = if (s.slotFor(finished.job.buffer, finished.job.page, finished.job.zoom, finished.job.want == .overlay)) |old|
+            try resize(renderer, list, old, image.width, image.height)
+        else
+            try s.claim(renderer, list, image.width, image.height);
+        slot.stale = false;
         slot.buffer = finished.job.buffer;
         slot.page = finished.job.page;
         slot.zoom = finished.job.zoom;
@@ -2649,10 +2974,14 @@ const Session = struct {
             }
         }
 
-        const slot = &s.slots[chosen];
+        return resize(renderer, list, &s.slots[chosen], width, height);
+    }
+
+    fn resize(renderer: *lyngvi.Renderer, list: *DrawList, slot: *Slot, width: u32, height: u32) !*Slot {
         if (slot.width != width or slot.height != height) {
-            // A device-wide wait. Only on a zoom change or a document whose
-            // pages differ in size, which is not per frame.
+            // A device-wide wait. Only on a zoom change, a document whose
+            // pages differ in size, or a page read again, none of which is
+            // per frame.
             try renderer.resizeTexture(slot.gpu, width, height);
             list.setTextureSize(slot.list, width, height);
         }
@@ -4182,6 +4511,14 @@ const Session = struct {
             },
             .bnext => s.showBuffer(1),
             .bprevious => s.showBuffer(-1),
+            .reload => {
+                if (s.diff != null) {
+                    s.say("a comparison does not reload", .{});
+                    return false;
+                }
+                if (v.buffer >= s.disks.items.len) return false;
+                s.disks.items[v.buffer].reload = .forced;
+            },
             .page => {
                 // `:page 12`, `:page +2`, `:page -1`.
                 const relative = args.len > 0 and (args[0] == '+' or args[0] == '-');
@@ -4626,6 +4963,10 @@ const Session = struct {
                 s.say("comment_anchor = {s}", .{@tagName(s.comment_style)});
                 return true;
             }
+            if (std.mem.eql(u8, args, "watch")) {
+                s.say("watch = {s}", .{if (s.watching) "on" else "off"});
+                return true;
+            }
             if (!std.mem.eql(u8, args, "theme")) {
                 s.say("no setting called {s}", .{args[0..@min(args.len, 48)]});
                 return false;
@@ -4638,9 +4979,13 @@ const Session = struct {
         const value = std.mem.trim(u8, args[eq + 1 ..], " \t");
         // Through the settings page's door, which checks it, applies it and
         // writes it down, so `:set` and a click cannot disagree.
-        if (std.mem.eql(u8, name, "comment_anchor")) {
-            if (commentStyleNamed(value) == null) {
+        if (std.mem.eql(u8, name, "comment_anchor") or std.mem.eql(u8, name, "watch")) {
+            if (name[0] == 'c' and commentStyleNamed(value) == null) {
                 s.say("comment_anchor is highlight or arrow, not {s}", .{value[0..@min(value.len, 48)]});
+                return false;
+            }
+            if (name[0] == 'w' and !std.mem.eql(u8, value, "on") and !std.mem.eql(u8, value, "off")) {
+                s.say("watch is on or off, not {s}", .{value[0..@min(value.len, 48)]});
                 return false;
             }
             for (settings_page.builtin, 0..) |opt, i| {
@@ -7020,7 +7365,8 @@ const Session = struct {
                 if (drawn >= limit) break;
             }
 
-            const input = try window.events().take(clock.tick());
+            const dt = clock.tick();
+            const input = try window.events().take(dt);
             const client = window.size();
 
             if (window.events().resized or swapchain.extent.width != client.width or
@@ -7039,6 +7385,7 @@ const Session = struct {
                 @floatFromInt(swapchain.extent.height),
             ));
             if (s.handle(input)) break;
+            s.poll(dt);
 
             // Collect whatever the rasterising thread finished, and ask it
             // for the next page. Neither waits: the frame is drawn from what
@@ -7068,7 +7415,7 @@ const Session = struct {
                     if (s.firstMissing() != null) b.pending = .start(ctx.io);
                 }
             }
-            if (s.nextJob()) |job| worker.post(job);
+            if (s.jobToPost()) |job| worker.post(job);
 
             // One resumption each for the handlers that yielded, and no more:
             // a handler that gave the frame back gets it back on the next
@@ -7394,6 +7741,8 @@ fn closeSession(s: *Session) void {
     s.tab_names.deinit(s.gpa);
     s.tab_text.deinit(s.gpa);
     s.tab_ends.deinit(s.gpa);
+    for (s.disks.items) |*d| d.deinit(s.gpa, null);
+    s.disks.deinit(s.gpa);
     for (s.buffers.items) |*b| {
         b.marks.deinit(s.gpa);
         for (&b.maps) |*m| m.map.deinit(s.gpa);
@@ -7785,7 +8134,7 @@ test "the file's annotations are marks and comments, and the library's names win
     // The library already holds the stroke, as a journal row newer than
     // the file: it is not read a second time.
     _ = try b.marks.add(gpa, .{ .kind = .ink, .points = &.{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } }, .anchor = 7 }, true);
-    s.readAnnots(0);
+    s.readAnnots(0, null);
 
     const marks = &b.marks;
     try testing.expectEqual(@as(usize, 3), marks.count());
@@ -7822,7 +8171,7 @@ test "a comment on another program's highlight is stored under that program's na
     try giveLibrary(&s, lib);
     const b = s.buffer(0);
     b.doc = &doc;
-    s.readAnnots(0);
+    s.readAnnots(0, null);
 
     const anchor = b.marks.items()[0].anchor;
     _ = try b.marks.addComment(gpa, .{ .anchor = anchor, .text = "and so" }, false);
@@ -7841,7 +8190,7 @@ test "a comment on another program's highlight is stored under that program's na
     try giveLibrary(&again, lib);
     again.buffer(0).doc = &doc;
     again.loadMarks(0);
-    again.readAnnots(0);
+    again.readAnnots(0, null);
     const lines = again.buffer(0).marks.items();
     try testing.expectEqual(@as(usize, 3), again.buffer(0).marks.said(lines[0].anchor).len);
 }
@@ -10039,4 +10388,155 @@ test "ink is drawn over the page, and only on the pages a window can see" {
     over.reset(.fromRect(0, 0, 1000, 800));
     try s.drawInk(v, b, .{ .first = 0, .end = 0 }, &over);
     try testing.expectEqual(@as(u32, 0), over.count());
+}
+
+// -- watching -----------------------------------------------------------------
+
+/// A document of `n` Letter-sized pages with nothing on them, on the heap
+/// as a buffer holds one.
+fn blankDocument(gpa: Allocator, n: usize) !*fenrir.Document {
+    var src: Io.Writer.Allocating = .init(gpa);
+    errdefer src.deinit();
+    try src.writer.writeAll("%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [");
+    for (0..n) |i| try src.writer.print("{d} 0 R ", .{i + 3});
+    try src.writer.print("] /Count {d} >> endobj\n", .{n});
+    for (0..n) |i| try src.writer.print("{d} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] >> endobj\n", .{i + 3});
+    try src.writer.writeAll("trailer << /Root 1 0 R >>\nstartxref 0\n%%EOF\n");
+
+    const doc = try gpa.create(fenrir.Document);
+    errdefer gpa.destroy(doc);
+    doc.* = try fenrir.open(gpa, try src.toOwnedSlice());
+    return doc;
+}
+
+/// A session on a real document of `n` pages, with its disk beside it: what
+/// a reload is installed into. There is no worker; `install` is handed what
+/// `watch.load` would have made.
+fn watchedSession(gpa: Allocator, n: usize) !Session {
+    const doc = try blankDocument(gpa, n);
+    errdefer {
+        doc.deinit();
+        gpa.destroy(doc);
+    }
+    var s = try sessionOf(gpa, @constCast(try fenrir.pages.all(doc)), 1, 600, 900);
+    s.buffers.items[0].doc = doc;
+    try s.disks.append(gpa, .{});
+    return s;
+}
+
+fn closeWatched(s: *Session) void {
+    const doc = s.buffers.items[0].doc;
+    doc.deinit();
+    s.gpa.destroy(doc);
+    closeSession(s);
+}
+
+/// What `watch.load` hands back for a file of `n` blank pages that changed
+/// at `first`, `down` points below its top.
+fn reloadOf(gpa: Allocator, n: usize, first: ?u32, down: f32) !watch.Outcome {
+    const doc = try blankDocument(gpa, n);
+    const digests = try gpa.alloc(u64, n);
+    @memset(digests, 0);
+    return .{ .loaded = .{
+        .doc = doc,
+        .pages = try fenrir.pages.all(doc),
+        .outline = &.{},
+        .digests = digests,
+        .stamp = .{ .size = 1, .mtime = 1 },
+        .first = first,
+        .down = down,
+    } };
+}
+
+test "a reload leaves its buffer's pages stale, drawn until they come again" {
+    const gpa = testing.allocator;
+    var s = try watchedSession(gpa, 3);
+    defer closeWatched(&s);
+    s.slots[0] = .{ .buffer = 0, .page = 0, .zoom = 1, .gpu = 1 };
+    s.slots[1] = .{ .buffer = 0, .page = 2, .zoom = 1, .gpu = 2 };
+    // Another document's page, which a reload of this one leaves alone.
+    s.slots[2] = .{ .buffer = 1, .page = 0, .zoom = 1, .gpu = 3 };
+
+    s.install(0, try reloadOf(gpa, 2, null, 0));
+    try testing.expect(s.slots[0].stale);
+    // Past the new end.
+    try testing.expectEqual(Slot.no_page, s.slots[1].page);
+    try testing.expect(!s.slots[2].stale);
+
+    // Still drawn, and asked for again.
+    const v = s.view();
+    try testing.expect(s.slotFor(0, 0, 1, false) != null);
+    try testing.expect(!s.cached(v, 0));
+    try testing.expectEqual(@as(usize, 2), v.pages.len);
+    try testing.expectEqual(@as(u32, 2), s.disks.items[0].generation);
+    try testing.expect(s.disks.items[0].held.eql(.{ .size = 1, .mtime = 1 }));
+    try testing.expectEqualStrings("gen 2: no page changed, 2 pages", s.status);
+}
+
+test "a reload goes to the change, unless the change is already on screen" {
+    const gpa = testing.allocator;
+    var s = try watchedSession(gpa, 3);
+    defer closeWatched(&s);
+    const v = s.view();
+    v.scroll = 0;
+
+    // A hundred points down the third page, which is below the window: it
+    // lands a quarter of the way down, as `]d` puts a change.
+    s.install(0, try reloadOf(gpa, 3, 2, 100));
+    const at = v.pageTop(2) + 100 * v.zoom;
+    try testing.expectApproxEqAbs(v.height() * Session.lead_in, at - v.scroll, 1);
+    try testing.expectEqualStrings("gen 2: page 3 changed", s.status);
+
+    // On screen now, so a second change there moves nothing.
+    const kept = v.scroll;
+    s.install(0, try reloadOf(gpa, 3, 2, 150));
+    try testing.expectEqual(kept, v.scroll);
+    // Nor does a reload that changed nothing.
+    s.install(0, try reloadOf(gpa, 3, null, 0));
+    try testing.expectEqual(kept, v.scroll);
+}
+
+test "a file caught halfway is not shown, and is not tried again" {
+    const gpa = testing.allocator;
+    var s = try watchedSession(gpa, 2);
+    defer closeWatched(&s);
+    s.disks.items[0].reload = .auto;
+    s.install(0, .{ .refused = .{ .stamp = .{ .size = 7 }, .why = error.Incomplete } });
+    try testing.expectEqualStrings("a.pdf is incomplete; showing gen 1", s.status);
+    try testing.expect(s.disks.items[0].refused.eql(.{ .size = 7 }));
+    try testing.expectEqual(watch.Disk.Reload.none, s.disks.items[0].reload);
+    try testing.expectEqual(@as(usize, 2), s.view().pages.len);
+}
+
+test "while a reload is pending, nothing else is asked of the worker" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 4), 1, 600, 900);
+    defer closeSession(&s);
+    try s.disks.append(gpa, .{});
+
+    // Pages are missing, and would be asked for.
+    try testing.expectEqual(Job.Want.page, s.jobToPost().?.want);
+    s.disks.items[0].reload = .auto;
+    try testing.expectEqual(Job.Want.reload, s.jobToPost().?.want);
+}
+
+test ":reload reads the document again, and :set watch follows the file or holds it" {
+    const gpa = testing.allocator;
+    var buf: [2]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 600, 900);
+    defer closeSession(&s);
+    try s.disks.append(gpa, .{});
+
+    try testing.expect(s.exec("e!"));
+    try testing.expectEqual(watch.Disk.Reload.forced, s.disks.items[0].reload);
+
+    // Off unless asked for.
+    try testing.expect(!s.watching);
+    try testing.expect(s.exec("set watch=on"));
+    try testing.expect(s.watching);
+    try testing.expect(!s.exec("set watch=maybe"));
+    try testing.expect(s.watching);
+    try testing.expect(s.exec("set watch=off"));
+    try testing.expect(!s.watching);
 }
