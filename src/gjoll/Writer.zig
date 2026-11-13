@@ -582,7 +582,10 @@ fn annotate(w: *Writer, doc: *Document) !u32 {
     const num = w.fresh();
     var annot: Dict = .empty;
     try annot.put(a, "Subtype", .{ .name = "Highlight" });
-    try annot.put(a, "Rect", .{ .array = &.{ hundredths(10), hundredths(20.499999), hundredths(0.25), .{ .integer = 4 } } });
+    // Copied into the writer's arena: an array literal of numbers made at
+    // run time is this function's stack, gone by `finish`. A debug build
+    // read it back intact; ReleaseFast reused it and crashed.
+    try annot.put(a, "Rect", .{ .array = try a.dupe(Object, &.{ hundredths(10), hundredths(20.499999), hundredths(0.25), .{ .integer = 4 } }) });
     try annot.put(a, "NM", .{ .string = "f1" });
     try w.put(num, .{ .dict = annot });
 
