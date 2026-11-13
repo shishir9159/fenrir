@@ -1564,7 +1564,7 @@ const Session = struct {
     status_buf: [512]u8 = undefined,
     /// The mode and the count beside it, for the frame being built.
     mode_buf: [96]u8 = undefined,
-    /// A highlight's colour as text, for the one `highlightAt` being answered.
+    /// A highlight's colour as text, for the one `markAt` being answered.
     hex_buf: [7]u8 = undefined,
     /// Names as text, for the one highlight or comment being answered: an
     /// anchor's, and a comment's own.
@@ -2052,8 +2052,8 @@ const Session = struct {
         const lib = s.library orelse return;
         const b = s.buffer(index);
 
-        const list = lib.highlights(b.path) catch return;
-        defer lib.freeHighlights(list, list.len);
+        const list = lib.marks(b.path) catch return;
+        defer lib.freeMarks(list, list.len);
 
         for (list) |h| {
             const color = Library.parseColor(h.color) orelse s.highlight;
@@ -4335,7 +4335,7 @@ const Session = struct {
                 var name: [Library.name_len]u8 = undefined;
                 const anchor = spell(b, mark.anchor, &name);
                 const id = switch (mark.kind) {
-                    .block => lib.addHighlight(b.path, .{
+                    .block => lib.addMark(b.path, .{
                         .page = mark.page,
                         .x0 = mark.box.min_x,
                         .y0 = mark.box.min_y,
@@ -4356,7 +4356,7 @@ const Session = struct {
                 b.marks.setId(key, id);
             },
             .delete => |mark| if (mark.saved()) switch (mark.kind) {
-                .block => lib.removeHighlight(mark.id) catch {},
+                .block => lib.removeMark(mark.id) catch {},
                 .ink => lib.removeStroke(mark.id) catch {},
             },
             .update => |key| {
@@ -4364,7 +4364,7 @@ const Session = struct {
                 if (!mark.saved()) return;
                 var hex: [7]u8 = undefined;
                 switch (mark.kind) {
-                    .block => lib.updateHighlight(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)) catch {},
+                    .block => lib.updateMark(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)) catch {},
                     .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex)) catch {},
                 }
             },
@@ -4403,7 +4403,7 @@ const Session = struct {
             .comment_insert, .comment_delete, .comment_update => unreachable,
         };
         var hex: [7]u8 = undefined;
-        rt.emit(.{ .event = event, .doc = s.handleOf(at), .path = b.path, .data = .{ .highlight = .{
+        rt.emit(.{ .event = event, .doc = s.handleOf(at), .path = b.path, .data = .{ .mark = .{
             .id = mark.key,
             .page = mark.page + 1,
             .x0 = mark.box.min_x,
@@ -5111,10 +5111,10 @@ const Session = struct {
         .mode = hostMode,
         .cursor = hostCursor,
         .selection = hostSelection,
-        .highlightCount = hostHighlightCount,
-        .highlightAt = hostHighlightAt,
-        .addHighlight = hostAddHighlight,
-        .removeHighlight = hostRemoveHighlight,
+        .markCount = hostMarkCount,
+        .markAt = hostMarkAt,
+        .addMark = hostAddMark,
+        .removeMark = hostRemoveMark,
         .commentCount = hostCommentCount,
         .commentAt = hostCommentAt,
         .addComment = hostAddComment,
@@ -5204,13 +5204,13 @@ const Session = struct {
         return .{ fromOne(sel[0]), fromOne(sel[1]) };
     }
 
-    fn hostHighlightCount(ptr: *anyopaque, doc: galdr.Host.Handle) usize {
+    fn hostMarkCount(ptr: *anyopaque, doc: galdr.Host.Handle) usize {
         const s = hostSession(ptr);
         const at = s.bufferFor(doc) orelse return 0;
         return s.buffer(at).marks.count();
     }
 
-    fn hostHighlightAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host.Highlight {
+    fn hostMarkAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host.Mark {
         const s = hostSession(ptr);
         const at = s.bufferFor(doc) orelse return null;
         const b = s.buffer(at);
@@ -5234,7 +5234,7 @@ const Session = struct {
         };
     }
 
-    fn hostAddHighlight(ptr: *anyopaque, doc: galdr.Host.Handle, h: galdr.Host.Highlight) ?u64 {
+    fn hostAddMark(ptr: *anyopaque, doc: galdr.Host.Handle, h: galdr.Host.Mark) ?u64 {
         const s = hostSession(ptr);
         const at = s.bufferFor(doc) orelse return null;
         const b = s.buffer(at);
@@ -5260,7 +5260,7 @@ const Session = struct {
     /// that matters: `Marks.next_key` starts at 1 in every document, so an
     /// id saved from A and removed against "whatever is focused now" takes
     /// an unrelated mark out of an unrelated file.
-    fn hostRemoveHighlight(ptr: *anyopaque, doc: galdr.Host.Handle, id: u64) bool {
+    fn hostRemoveMark(ptr: *anyopaque, doc: galdr.Host.Handle, id: u64) bool {
         const s = hostSession(ptr);
         const at = s.bufferFor(doc) orelse return false;
         const b = s.buffer(at);
@@ -8511,8 +8511,8 @@ test "edit mode walks highlights in reading order, recolours, comments and delet
     s.highlightBoxes(0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
     s.applyEffects();
     {
-        const rows = try lib.highlights("/docs/a.pdf");
-        defer lib.freeHighlights(rows, rows.len);
+        const rows = try lib.marks("/docs/a.pdf");
+        defer lib.freeMarks(rows, rows.len);
         try testing.expectEqual(@as(usize, 2), rows.len);
     }
 
@@ -8535,8 +8535,8 @@ test "edit mode walks highlights in reading order, recolours, comments and delet
     s.applyEffects();
 
     {
-        const rows = try lib.highlights("/docs/a.pdf");
-        defer lib.freeHighlights(rows, rows.len);
+        const rows = try lib.marks("/docs/a.pdf");
+        defer lib.freeMarks(rows, rows.len);
         var found = false;
         for (rows) |r| {
             if (r.y0 != 600) continue;
@@ -8560,8 +8560,8 @@ test "edit mode walks highlights in reading order, recolours, comments and delet
     try testing.expectEqual(@as(usize, 1), marks.count());
     try testing.expect(s.focus_mark != null);
     {
-        const rows = try lib.highlights("/docs/a.pdf");
-        defer lib.freeHighlights(rows, rows.len);
+        const rows = try lib.marks("/docs/a.pdf");
+        defer lib.freeMarks(rows, rows.len);
         try testing.expectEqual(@as(usize, 1), rows.len);
         const said = try lib.comments("/docs/a.pdf");
         defer lib.freeComments(said, said.len);
@@ -8572,8 +8572,8 @@ test "edit mode walks highlights in reading order, recolours, comments and delet
     _ = s.apply(.undo);
     s.applyEffects();
     {
-        const rows = try lib.highlights("/docs/a.pdf");
-        defer lib.freeHighlights(rows, rows.len);
+        const rows = try lib.marks("/docs/a.pdf");
+        defer lib.freeMarks(rows, rows.len);
         try testing.expectEqual(@as(usize, 2), rows.len);
         const said = try lib.comments("/docs/a.pdf");
         defer lib.freeComments(said, said.len);
@@ -9286,7 +9286,7 @@ test "highlights come back out of the library the next time it is opened" {
 
     // Written through the session, so the row and the in-memory mark are
     // made by the same call a keypress would make.
-    _ = try lib.addHighlight(s.buffer(0).path, .{
+    _ = try lib.addMark(s.buffer(0).path, .{
         .page = 2,
         .x0 = 100,
         .y0 = 700,
@@ -9368,7 +9368,7 @@ test "a plugin comments on the real reader's marks, and hears each comment come 
         \\fenrir.on("CommentAdd", hear)
         \\fenrir.on("CommentRemove", hear)
         \\fenrir.on("CommentChange", hear)
-        \\local marks = fenrir.highlights()
+        \\local marks = fenrir.marks()
         \\assert(marks[1].anchor == "{s}" and marks[2].anchor == marks[1].anchor)
         \\first = fenrir.comment{{ anchor = marks[2].id, text = "on the second line" }}
         \\reply = fenrir.comment{{ anchor = "{s}", text = "a reply" }}
@@ -9385,7 +9385,7 @@ test "a plugin comments on the real reader's marks, and hears each comment come 
         \\assert(#all == 2, #all)
         \\assert(all[1].id == first and all[1].page == 2 and all[1].name == all[1].anchor)
         \\assert(all[2].text == "a reply" and all[2].name ~= all[2].anchor)
-        \\assert(fenrir.highlights()[1].note == "on the second line")
+        \\assert(fenrir.marks()[1].note == "on the second line")
         \\assert(not pcall(fenrir.comment, { anchor = "f999", text = "on nothing" }))
         \\assert(fenrir.uncomment(reply))
     ));
@@ -9425,7 +9425,7 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
         \\fenrir.on("DocEnter", function(e) entered = (entered or 0) + 1 end)
         \\fenrir.keymap("n", "g", function() fenrir.go(fenrir.document().pages) end)
         \\fenrir.command("Mark", function(args)
-        \\  fenrir.highlight{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", style = "squiggly", note = "from lua" }
+        \\  fenrir.mark{ page = tonumber(args), x0 = 72, y0 = 700, x1 = 300, y1 = 712, color = "blue", style = "squiggly", note = "from lua" }
         \\end)
     ));
 
@@ -9821,8 +9821,8 @@ test "comment_anchor = arrow makes c point at the words, kept and read back" {
     s.applyEffects();
     for (s.buffer(0).marks.items()) |m| try testing.expectEqual(Marks.Style.arrow, m.style);
     {
-        const rows = try lib.highlights("/docs/a.pdf");
-        defer lib.freeHighlights(rows, rows.len);
+        const rows = try lib.marks("/docs/a.pdf");
+        defer lib.freeMarks(rows, rows.len);
         try testing.expectEqualStrings("arrow", rows[0].style);
     }
 

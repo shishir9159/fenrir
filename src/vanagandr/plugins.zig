@@ -347,22 +347,22 @@ const Headless = struct {
                 return null;
             }
         }.f,
-        .highlightCount = struct {
+        .markCount = struct {
             fn f(_: *anyopaque, _: Host.Handle) usize {
                 return 0;
             }
         }.f,
-        .highlightAt = struct {
-            fn f(_: *anyopaque, _: Host.Handle, _: usize) ?Host.Highlight {
+        .markAt = struct {
+            fn f(_: *anyopaque, _: Host.Handle, _: usize) ?Host.Mark {
                 return null;
             }
         }.f,
-        .addHighlight = struct {
-            fn f(_: *anyopaque, _: Host.Handle, _: Host.Highlight) ?u64 {
+        .addMark = struct {
+            fn f(_: *anyopaque, _: Host.Handle, _: Host.Mark) ?u64 {
                 return null;
             }
         }.f,
-        .removeHighlight = struct {
+        .removeMark = struct {
             fn f(_: *anyopaque, _: Host.Handle, _: u64) bool {
                 return false;
             }

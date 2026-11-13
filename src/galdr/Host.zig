@@ -50,9 +50,9 @@ pub const Position = struct {
     column: u32,
 };
 
-pub const Highlight = struct {
+pub const Mark = struct {
     /// The session's key for it: stable for the life of the reader, and what
-    /// `fenrir.unhighlight` takes.
+    /// `fenrir.unmark` takes.
     id: u64 = 0,
     page: u32,
     x0: f32,
@@ -129,10 +129,10 @@ pub const VTable = struct {
     cursor: *const fn (ptr: *anyopaque, doc: Handle) ?Position,
     selection: *const fn (ptr: *anyopaque, doc: Handle) ?[2]Position,
 
-    highlightCount: *const fn (ptr: *anyopaque, doc: Handle) usize,
-    highlightAt: *const fn (ptr: *anyopaque, doc: Handle, index: usize) ?Highlight,
-    addHighlight: *const fn (ptr: *anyopaque, doc: Handle, h: Highlight) ?u64,
-    removeHighlight: *const fn (ptr: *anyopaque, doc: Handle, id: u64) bool,
+    markCount: *const fn (ptr: *anyopaque, doc: Handle) usize,
+    markAt: *const fn (ptr: *anyopaque, doc: Handle, index: usize) ?Mark,
+    addMark: *const fn (ptr: *anyopaque, doc: Handle, h: Mark) ?u64,
+    removeMark: *const fn (ptr: *anyopaque, doc: Handle, id: u64) bool,
 
     /// The comments, in the order `]c` reads them: by where their anchors
     /// begin, a thread at a time.
@@ -207,20 +207,20 @@ pub fn selection(h: Host, doc: Handle) ?[2]Position {
     return h.vtable.selection(h.ptr, doc);
 }
 
-pub fn highlightCount(h: Host, doc: Handle) usize {
-    return h.vtable.highlightCount(h.ptr, doc);
+pub fn markCount(h: Host, doc: Handle) usize {
+    return h.vtable.markCount(h.ptr, doc);
 }
 
-pub fn highlightAt(h: Host, doc: Handle, index: usize) ?Highlight {
-    return h.vtable.highlightAt(h.ptr, doc, index);
+pub fn markAt(h: Host, doc: Handle, index: usize) ?Mark {
+    return h.vtable.markAt(h.ptr, doc, index);
 }
 
-pub fn addHighlight(h: Host, doc: Handle, hl: Highlight) ?u64 {
-    return h.vtable.addHighlight(h.ptr, doc, hl);
+pub fn addMark(h: Host, doc: Handle, hl: Mark) ?u64 {
+    return h.vtable.addMark(h.ptr, doc, hl);
 }
 
-pub fn removeHighlight(h: Host, doc: Handle, id: u64) bool {
-    return h.vtable.removeHighlight(h.ptr, doc, id);
+pub fn removeMark(h: Host, doc: Handle, id: u64) bool {
+    return h.vtable.removeMark(h.ptr, doc, id);
 }
 
 pub fn commentCount(h: Host, doc: Handle) usize {

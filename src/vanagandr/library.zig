@@ -209,7 +209,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var file: ?[]const u8 = null;
     var db_path: ?[]const u8 = null;
     var clear = false;
-    var add: ?Library.Highlight = null;
+    var add: ?Library.Mark = null;
     var style: Marks.Style = .highlight;
     var colour: []const u8 = "";
     var ink_page: ?u32 = null;
@@ -323,7 +323,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         // Both tables, because `--clear` means the document goes back to
         // being unmarked, and a reader who cleared their marks and still
         // found ink on page four would rightly call that a bug.
-        const n = lib.clearHighlights(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
+        const n = lib.clearMarks(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         const k = lib.clearStrokes(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         // And what was written on them, which has nothing left to be about.
         const c = lib.clearComments(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
@@ -355,7 +355,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         }
         var anchor: [Library.name_len]u8 = undefined;
         row.anchor = @constCast(try nextName(ctx, &lib, key, &anchor));
-        _ = lib.addHighlight(key, row, now(ctx.io)) catch |err|
+        _ = lib.addMark(key, row, now(ctx.io)) catch |err|
             return ctx.fail("cannot add: {t}", .{err});
         ctx.out.print("added {s} {s} on page {d}\n", .{ style.label(), row.anchor, h.page + 1 }) catch {};
         return;
@@ -384,8 +384,8 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         return;
     }
 
-    const list = lib.highlights(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
-    defer lib.freeHighlights(list, list.len);
+    const list = lib.marks(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeMarks(list, list.len);
 
     const strokes = lib.strokes(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeStrokes(strokes, strokes.len);
@@ -452,8 +452,8 @@ fn nextName(ctx: *Context, lib: *Library, key: []const u8, buf: *[Library.name_l
 /// the anchor's name, because in a PDF it is the anchor's `/Contents`; a
 /// later one is a reply and takes a name of its own.
 fn addComment(ctx: *Context, lib: *Library, key: []const u8, anchor: []const u8, text: []const u8) !void {
-    const blocks = lib.highlights(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
-    defer lib.freeHighlights(blocks, blocks.len);
+    const blocks = lib.marks(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freeMarks(blocks, blocks.len);
     const strokes = lib.strokes(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeStrokes(strokes, strokes.len);
     const said = lib.comments(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});

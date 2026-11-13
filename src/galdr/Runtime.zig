@@ -169,7 +169,7 @@ pub const Data = union(enum) {
     /// Null for a selection that was cleared, which is a change like any
     /// other and is the reason this is an optional rather than no event.
     selection: ?[2]Host.Position,
-    highlight: Host.Highlight,
+    mark: Host.Mark,
     comment: Host.Comment,
 };
 
@@ -1378,17 +1378,17 @@ pub const api = [_]Entry{
     .{ .name = "page", .func = apiPage, .cap = .document_read, .args = "(doc)", .returns = "n", .about = "the page it is showing, from 1" },
     .{ .name = "cursor", .func = apiCursor, .cap = .document_read, .args = "(doc)", .returns = "{ page, line, column }", .about = "where the caret is, or nil" },
     .{ .name = "selection", .func = apiSelection, .cap = .document_read, .args = "(doc)", .returns = "{ from, to }", .about = "what is selected, either way it was made, or nil" },
-    .{ .name = "highlights", .func = apiHighlights, .cap = .document_read, .args = "(doc)", .returns = "list", .about = "every mark in a document; kind is \"block\" or \"ink\"" },
+    .{ .name = "marks", .func = apiMarks, .cap = .document_read, .args = "(doc)", .returns = "list", .about = "every mark in a document; kind is \"block\" or \"ink\"" },
 
     .{
-        .name = "highlight",
-        .func = apiHighlight,
+        .name = "mark",
+        .func = apiMark,
         .cap = .document_write,
         .args = "{ doc =, page =, x0 =, y0 =, x1 =, y1 =, color =, style =, note = }",
         .returns = "id",
         .about = "makes one, in PDF points, so it survives zoom and reopening",
     },
-    .{ .name = "unhighlight", .func = apiUnhighlight, .cap = .document_write, .args = "(id, doc)", .returns = "ok", .about = "removes one, by the id fenrir.highlight gave back" },
+    .{ .name = "unmark", .func = apiUnmark, .cap = .document_write, .args = "(id, doc)", .returns = "ok", .about = "removes one, by the id fenrir.mark gave back" },
 
     .{ .name = "comments", .func = apiComments, .cap = .document_read, .args = "(doc)", .returns = "list", .about = "every comment, in the order ]c reads them; anchor is the highlights' own" },
     .{
@@ -1487,7 +1487,7 @@ pub const globals = [_]Entry{
 /// The whole of the enforcement. A function that was not asked for is not in
 /// the table, so calling it is the error Lua already has a message for --
 /// "attempt to call a nil value" -- rather than a refusal this file would
-/// have to invent, and a plugin can ask `if fenrir.highlight then` without
+/// have to invent, and a plugin can ask `if fenrir.mark then` without
 /// anything else being added for it to ask with.
 /// What a function's second upvalue says: the capability it needs, nothing,
 /// or that it is the manifest -- the one call a plugin makes before it has
@@ -2375,9 +2375,9 @@ fn pushPayload(L: ?*lua.State, payload: Payload) void {
             lua.lua_setfield(L, -2, "to");
         },
         // The same fields an annotation has anywhere else in this API, from
-        // the same function: an event's table and `fenrir.highlights`' rows
+        // the same function: an event's table and `fenrir.marks`' rows
         // that disagreed about a field would be a bug nobody could read.
-        .highlight => |h| fillHighlight(L, h),
+        .mark => |h| fillMark(L, h),
         .comment => |c| fillComment(L, c),
     }
 }
@@ -3533,15 +3533,15 @@ fn apiSelection(L: ?*lua.State) callconv(.c) c_int {
     return 1;
 }
 
-fn pushHighlight(L: ?*lua.State, h: Host.Highlight) void {
+fn pushMark(L: ?*lua.State, h: Host.Mark) void {
     lua.lua_createtable(L, 0, 10);
-    fillHighlight(L, h);
+    fillMark(L, h);
 }
 
 /// Writes an annotation's fields into the table on top of the stack. Split
-/// from `pushHighlight` because an event fills a table it was already given
+/// from `pushMark` because an event fills a table it was already given
 /// and a row makes its own, and the fields have to be the same either way.
-fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
+fn fillMark(L: ?*lua.State, h: Host.Mark) void {
     lua.lua_pushinteger(L, @intCast(h.id));
     lua.lua_setfield(L, -2, "id");
     lua.lua_pushinteger(L, h.page);
@@ -3566,29 +3566,29 @@ fn fillHighlight(L: ?*lua.State, h: Host.Highlight) void {
     }
 }
 
-fn apiHighlights(L: ?*lua.State) callconv(.c) c_int {
+fn apiMarks(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     const doc = checkDoc(L, 1);
     const rt = of(L);
-    const n = rt.host.highlightCount(doc);
+    const n = rt.host.markCount(doc);
     lua.lua_createtable(L, @intCast(@min(n, 1 << 20)), 0);
     var i: usize = 0;
     var out: lua.Integer = 1;
     while (i < n) : (i += 1) {
-        const h = rt.host.highlightAt(doc, i) orelse continue;
-        pushHighlight(L, h);
+        const h = rt.host.markAt(doc, i) orelse continue;
+        pushMark(L, h);
         lua.lua_rawseti(L, -2, out);
         out += 1;
     }
     return 1;
 }
 
-/// `fenrir.highlight{page=, x0=, y0=, x1=, y1=, color=, style=, note=}`,
+/// `fenrir.mark{page=, x0=, y0=, x1=, y1=, color=, style=, note=}`,
 /// returning the new highlight's id.
-fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
+fn apiMark(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     lua.luaL_checktype(L, 1, @intFromEnum(lua.Type.table));
-    var h: Host.Highlight = .{ .page = 0, .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+    var h: Host.Mark = .{ .page = 0, .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
 
     // Which document, before anything is read out of it: a handler that
     // yielded and came back to another file writes where it was told to.
@@ -3617,7 +3617,7 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
     _ = lua.lua_getfield(L, 1, "note");
     h.note = lua.toString(L, -1) orelse "";
 
-    // PDF's four names and `arrow`, exactly as `highlights()` reads them
+    // PDF's four names and `arrow`, exactly as `marks()` reads them
     // back: the author asked for `squiggly`, not `squiggle`. Don't take the
     // names `Marks.Filter` also accepts for a person typing -- a plugin's
     // style is what the file holds. Anything else is refused rather than
@@ -3630,21 +3630,21 @@ fn apiHighlight(L: ?*lua.State) callconv(.c) c_int {
             lua.raise(L, "galdr: a highlight's style is \"highlight\", \"underline\", \"strikeout\", \"squiggly\" or \"arrow\"");
     }
 
-    if (of(L).host.addHighlight(doc, h)) |id| lua.lua_pushinteger(L, @intCast(id)) else lua.lua_pushnil(L);
+    if (of(L).host.addMark(doc, h)) |id| lua.lua_pushinteger(L, @intCast(id)) else lua.lua_pushnil(L);
     return 1;
 }
 
-/// `fenrir.unhighlight(id, doc)`.
+/// `fenrir.unmark(id, doc)`.
 ///
 /// The handle matters most here. Mark ids start from 1 in every document,
 /// so an id read from A and removed against whatever is focused now takes
 /// an unrelated mark out of an unrelated file -- which is a loss, not a
 /// mistake that can be seen and undone.
-fn apiUnhighlight(L: ?*lua.State) callconv(.c) c_int {
+fn apiUnmark(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     const id = lua.luaL_checkinteger(L, 1);
     const doc = checkDoc(L, 2);
-    const removed = id > 0 and of(L).host.removeHighlight(doc, @intCast(id));
+    const removed = id > 0 and of(L).host.removeMark(doc, @intCast(id));
     lua.lua_pushboolean(L, @intFromBool(removed));
     return 1;
 }
@@ -3684,8 +3684,8 @@ fn apiComments(L: ?*lua.State) callconv(.c) c_int {
 
 /// `fenrir.comment{anchor=, text=, doc=}`, returning the new comment's id.
 ///
-/// `anchor` is an anchor's name, as `highlights` and `comments` give it, or
-/// the id of a highlight, as `fenrir.highlight` gives it back -- so a plugin
+/// `anchor` is an anchor's name, as `marks` and `comments` give it, or
+/// the id of a highlight, as `fenrir.mark` gives it back -- so a plugin
 /// can comment on what it has just marked without looking the name up.
 /// Anything else, and an anchor that is not there, is an error: a comment
 /// on nothing would be lost on the next save.
@@ -3718,7 +3718,7 @@ fn apiComment(L: ?*lua.State) callconv(.c) c_int {
     return 1;
 }
 
-/// `fenrir.uncomment(id, doc)`, by the same rule as `unhighlight`.
+/// `fenrir.uncomment(id, doc)`, by the same rule as `unmark`.
 fn apiUncomment(L: ?*lua.State) callconv(.c) c_int {
     _ = authority(L);
     const id = lua.luaL_checkinteger(L, 1);
@@ -3826,14 +3826,14 @@ const FakeHost = struct {
         path: []const u8,
         title: []const u8,
         pages: u32 = 12,
-        highlights: std.ArrayList(Host.Highlight) = .empty,
+        marks: std.ArrayList(Host.Mark) = .empty,
         /// Each comment's text is copied, unlike a highlight's strings, so
         /// a test can read back what a script wrote.
         comments: std.ArrayList(Host.Comment) = .empty,
         next_key: u64 = 1,
 
         fn deinit(d: *Doc) void {
-            d.highlights.deinit(testing.allocator);
+            d.marks.deinit(testing.allocator);
             for (d.comments.items) |c| testing.allocator.free(c.text);
             d.comments.deinit(testing.allocator);
         }
@@ -3972,20 +3972,20 @@ const FakeHost = struct {
                 return null;
             }
         }.f,
-        .highlightCount = struct {
+        .markCount = struct {
             fn f(ptr: *anyopaque, doc: Host.Handle) usize {
                 const d = self(ptr).find(doc) orelse return 0;
-                return d.highlights.items.len;
+                return d.marks.items.len;
             }
         }.f,
-        .highlightAt = struct {
-            fn f(ptr: *anyopaque, doc: Host.Handle, i: usize) ?Host.Highlight {
+        .markAt = struct {
+            fn f(ptr: *anyopaque, doc: Host.Handle, i: usize) ?Host.Mark {
                 const d = self(ptr).find(doc) orelse return null;
-                return if (i < d.highlights.items.len) d.highlights.items[i] else null;
+                return if (i < d.marks.items.len) d.marks.items[i] else null;
             }
         }.f,
-        .addHighlight = struct {
-            fn f(ptr: *anyopaque, doc: Host.Handle, h: Host.Highlight) ?u64 {
+        .addMark = struct {
+            fn f(ptr: *anyopaque, doc: Host.Handle, h: Host.Mark) ?u64 {
                 const d = self(ptr).find(doc) orelse return null;
                 var copy = h;
                 copy.id = d.next_key;
@@ -3996,17 +3996,17 @@ const FakeHost = struct {
                 // A real host's block always has one, and `highlight` when
                 // none was asked for. The enum's name, since Lua's is not kept.
                 copy.style = @tagName(std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight);
-                d.highlights.append(testing.allocator, copy) catch return null;
+                d.marks.append(testing.allocator, copy) catch return null;
                 d.next_key += 1;
                 return copy.id;
             }
         }.f,
-        .removeHighlight = struct {
+        .removeMark = struct {
             fn f(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
                 const d = self(ptr).find(doc) orelse return false;
-                for (d.highlights.items, 0..) |h, i| {
+                for (d.marks.items, 0..) |h, i| {
                     if (h.id != id) continue;
-                    _ = d.highlights.orderedRemove(i);
+                    _ = d.marks.orderedRemove(i);
                     return true;
                 }
                 return false;
@@ -4030,7 +4030,7 @@ const FakeHost = struct {
             fn f(ptr: *anyopaque, doc: Host.Handle, c: Host.Comment) ?u64 {
                 const d = self(ptr).find(doc) orelse return null;
                 if (c.on != 0) {
-                    for (d.highlights.items) |h| {
+                    for (d.marks.items) |h| {
                         if (h.id == c.on) break;
                     } else return null;
                 }
@@ -4306,7 +4306,7 @@ test "events reach their handlers, which can be turned off" {
         .title = "a.pdf",
         .pages = 9,
     } } });
-    rt.emit(.{ .event = .AnnotationAdd, .data = .{ .highlight = .{
+    rt.emit(.{ .event = .AnnotationAdd, .data = .{ .mark = .{
         .page = 2,
         .x0 = 0,
         .y0 = 0,
@@ -4485,14 +4485,14 @@ test "the reader's state reads out and writes back" {
         \\assert(fenrir.mode() == "normal")
         \\assert(fenrir.cursor().line == 7)
         \\assert(fenrir.selection() == nil)
-        \\local id = fenrir.highlight{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712, color = "#ff0000" }
-        \\assert(#fenrir.highlights() == 1)
-        \\assert(fenrir.highlights()[1].page == 2)
-        \\assert(fenrir.highlights()[1].style == "highlight")
-        \\fenrir.highlight{ page = 2, x0 = 10, y0 = 600, x1 = 90, y1 = 612, style = "squiggly" }
-        \\assert(fenrir.highlights()[2].style == "squiggly")
-        \\assert(fenrir.unhighlight(id))
-        \\assert(#fenrir.highlights() == 1)
+        \\local id = fenrir.mark{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712, color = "#ff0000" }
+        \\assert(#fenrir.marks() == 1)
+        \\assert(fenrir.marks()[1].page == 2)
+        \\assert(fenrir.marks()[1].style == "highlight")
+        \\fenrir.mark{ page = 2, x0 = 10, y0 = 600, x1 = 90, y1 = 612, style = "squiggly" }
+        \\assert(fenrir.marks()[2].style == "squiggly")
+        \\assert(fenrir.unmark(id))
+        \\assert(#fenrir.marks() == 1)
         \\assert(fenrir.store.get("k") == nil)
         \\fenrir.store.set("k", "v")
         \\assert(fenrir.store.get("k") == "v")
@@ -4500,11 +4500,11 @@ test "the reader's state reads out and writes back" {
     ));
     try testing.expectEqualStrings("vsplit", fake.execs.items[0]);
     try testing.expect(!rt.runString("bad", "fenrir.go(0)"));
-    try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1 }"));
+    try testing.expect(!rt.runString("bad", "fenrir.mark{ page = 1 }"));
     // PDF's name and no other: the person's word for it is refused.
-    try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = 'squiggle' }"));
-    try testing.expect(!rt.runString("bad", "fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = {} }"));
-    try testing.expect(rt.runString("check", "assert(#fenrir.highlights() == 1)"));
+    try testing.expect(!rt.runString("bad", "fenrir.mark{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = 'squiggle' }"));
+    try testing.expect(!rt.runString("bad", "fenrir.mark{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1, style = {} }"));
+    try testing.expect(rt.runString("check", "assert(#fenrir.marks() == 1)"));
 }
 
 test "a plugin writes comments on what it marked, reads them, and takes them away" {
@@ -4515,7 +4515,7 @@ test "a plugin writes comments on what it marked, reads them, and takes them awa
     defer rt.destroy();
 
     try testing.expect(rt.runString("check",
-        \\local id = fenrir.highlight{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712 }
+        \\local id = fenrir.mark{ page = 2, x0 = 10, y0 = 700, x1 = 90, y1 = 712 }
         \\local c = fenrir.comment{ anchor = id, text = "why?" }
         \\fenrir.comment{ anchor = "f7", text = "because" }
         \\local all = fenrir.comments()
@@ -4571,10 +4571,10 @@ test "a manifest takes away what it did not ask for, and only from itself" {
     var fake: FakeHost = .{ .files = &.{
         .{ "plugins/reader.lua",
         \\fenrir.manifest{ about = "reads", version = "1.2", capabilities = { "document.read" } }
-        \\reader_has = { page = fenrir.page ~= nil, mark = fenrir.highlight ~= nil, say = fenrir.notify ~= nil }
+        \\reader_has = { page = fenrir.page ~= nil, mark = fenrir.mark ~= nil, say = fenrir.notify ~= nil }
         \\reader_page = fenrir.page()
         },
-        .{ "plugins/writer.lua", "writer_has = { mark = fenrir.highlight ~= nil, say = fenrir.notify ~= nil }" },
+        .{ "plugins/writer.lua", "writer_has = { mark = fenrir.mark ~= nil, say = fenrir.notify ~= nil }" },
     } };
     defer fake.deinit();
     const rt = try start(&fake);
@@ -4855,7 +4855,7 @@ test "a restricted plugin stays restricted in a module it requires" {
     // module after it: the cache used to be keyed by name alone, and the
     // first requirer's environment was the one every later plugin got.
     var fake: FakeHost = .{ .files = &.{
-        .{ "lua/shared.lua", "runs = (runs or 0) + 1 return { mark = function() return fenrir.highlight ~= nil end }" },
+        .{ "lua/shared.lua", "runs = (runs or 0) + 1 return { mark = function() return fenrir.mark ~= nil end }" },
         .{ "plugins/narrow.lua",
         \\fenrir.manifest{ capabilities = { "ui" } }
         \\at_load = require("shared").mark()
@@ -4882,7 +4882,7 @@ test "a capability taken away stops a function that was already captured" {
     if (!lua.available) return error.SkipZigTest;
     var fake: FakeHost = .{ .files = &.{
         .{ "plugins/late.lua",
-        \\local mark = fenrir.highlight
+        \\local mark = fenrir.mark
         \\fenrir.manifest{ capabilities = { "ui" } }
         \\captured = pcall(mark, { page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 })
         },
@@ -4919,7 +4919,7 @@ test "a suspended handler reads and writes the document it was told about" {
         \\  coroutine.yield()
         \\  held = fenrir.document(doc).path
         \\  loose = fenrir.document().path
-        \\  fenrir.highlight{ doc = doc, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
+        \\  fenrir.mark{ doc = doc, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
         \\end)
     ));
     rt.emit(.{ .event = .DocOpen, .doc = a, .path = "/a.pdf", .data = .{ .document = .{
@@ -4939,8 +4939,8 @@ test "a suspended handler reads and writes the document it was told about" {
         \\assert(held == "/a.pdf", tostring(held))
         \\assert(loose == "/b.pdf", "the focus-following answer followed nothing")
     ));
-    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].highlights.items.len);
-    try testing.expectEqual(@as(usize, 0), fake.docs.items[1].highlights.items.len);
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].marks.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[1].marks.items.len);
     try testing.expectEqual(@as(usize, 0), rt.messages.items.len);
 }
 
@@ -4959,24 +4959,24 @@ test "a mark id is removed from the document it belongs to, or from none" {
     var buf: [320]u8 = undefined;
     try testing.expect(rt.runString("marks", try std.fmt.bufPrint(&buf,
         \\A, B = {d}, {d}
-        \\a_id = fenrir.highlight{{ doc = A, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }}
-        \\b_id = fenrir.highlight{{ doc = B, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }}
+        \\a_id = fenrir.mark{{ doc = A, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }}
+        \\b_id = fenrir.mark{{ doc = B, page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }}
     , .{ a, b })));
     try testing.expect(rt.runString("check", "assert(a_id == 1 and b_id == 1, a_id .. ' ' .. b_id)"));
 
     // B has the focus and A's id is removed against A's handle: A's mark
     // goes and B's, which has the same id, stays.
     fake.focus(b);
-    try testing.expect(rt.runString("remove", "assert(fenrir.unhighlight(a_id, A))"));
-    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].highlights.items.len);
-    try testing.expectEqual(@as(usize, 1), fake.docs.items[1].highlights.items.len);
+    try testing.expect(rt.runString("remove", "assert(fenrir.unmark(a_id, A))"));
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].marks.items.len);
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[1].marks.items.len);
 
     // And a handle whose document has closed names nothing at all, rather
     // than finding whatever is in front now.
     fake.close(a);
-    try testing.expect(!rt.runString("stale", "fenrir.unhighlight(b_id, A)"));
+    try testing.expect(!rt.runString("stale", "fenrir.unmark(b_id, A)"));
     try testing.expect(std.mem.indexOf(u8, rt.messages.items[rt.messages.items.len - 1], "not open") != null);
-    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].highlights.items.len);
+    try testing.expectEqual(@as(usize, 1), fake.docs.items[0].marks.items.len);
 }
 
 // -- the limits ---------------------------------------------------------------
@@ -5099,7 +5099,7 @@ test "removing a handler cancels the callback that is part way through" {
     try testing.expect(rt.runString("init.lua",
         \\local function body()
         \\  coroutine.yield()
-        \\  fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
+        \\  fenrir.mark{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
         \\  wrote = (wrote or 0) + 1
         \\end
         \\by_id = fenrir.on("Start", body)
@@ -5117,7 +5117,7 @@ test "removing a handler cancels the callback that is part way through" {
 
     try testing.expectEqual(@as(usize, 0), rt.waiting());
     try testing.expect(rt.runString("check", "assert(wrote == nil, tostring(wrote))"));
-    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].highlights.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].marks.items.len);
 
     // A new handler under the same name cannot bring the old job back.
     try testing.expect(rt.runString("again", "fenrir.on('Start', function() end, 'mine')"));
@@ -5370,10 +5370,10 @@ test "unloading a plugin takes everything of it, jobs included" {
         .{ "plugins/guest.lua",
         \\fenrir.command("Guest", function() end)
         \\fenrir.keymap("n", "u", function() end)
-        \\escaped = fenrir.highlight
+        \\escaped = fenrir.mark
         \\fenrir.on("Start", function()
         \\  coroutine.yield()
-        \\  fenrir.highlight{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
+        \\  fenrir.mark{ page = 1, x0 = 0, y0 = 0, x1 = 1, y1 = 1 }
         \\end)
         },
     } };
@@ -5388,7 +5388,7 @@ test "unloading a plugin takes everything of it, jobs included" {
     try testing.expectEqual(@as(?u32, 3), rt.unload("guest"));
     var frames: usize = 0;
     while (rt.waiting() != 0 and frames < 10) : (frames += 1) rt.pump();
-    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].highlights.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.docs.items[0].marks.items.len);
     try testing.expectEqual(@as(?bool, null), rt.runCommand("Guest", ""));
 
     // A built-in key the plugin had shadowed is the reader's again, and a
@@ -5409,14 +5409,14 @@ test "the table answers for itself, before a plugin has said what it wants" {
         \\-- to guess first, so asking is not one of the things that closes
         \\-- the door on declaring.
         \\local want = { "ui" }
-        \\if fenrir.api.has("highlight") then want[#want + 1] = "document.write" end
+        \\if fenrir.api.has("mark") then want[#want + 1] = "document.write" end
         \\assert(not fenrir.api.has("link"), "link is not there yet")
         \\assert(fenrir.api.version >= 1, "a number, so >= works")
         \\fenrir.manifest{ about = "asks for what is there", capabilities = want }
         \\asked = #want
         \\-- And still there once the table has been narrowed.
         \\assert(fenrir.api.has("store.get") and fenrir.api.has("fenrir.api.has"))
-        \\assert(fenrir.highlight ~= nil, "document.write was asked for")
+        \\assert(fenrir.mark ~= nil, "document.write was asked for")
         \\assert(fenrir.document == nil, "document.read was not")
         },
         .{ "plugins/mute.lua",

@@ -16,7 +16,7 @@
 //! and a `fenrir` table in place of `vim`:
 //!
 //!     fenrir.keymap("n", "<C-d>", function() fenrir.exec("page +1") end)
-//!     fenrir.command("Wc", function() fenrir.notify(#fenrir.highlights()) end)
+//!     fenrir.command("Wc", function() fenrir.notify(#fenrir.marks()) end)
 //!     fenrir.on("page", function(p) fenrir.store.set("last", p) end)
 //!
 //! What it is not is Neovim's *trust*. A plugin here runs in a sandbox with

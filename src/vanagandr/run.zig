@@ -193,14 +193,14 @@ const Driver = struct {
     /// a handler that yielded and came back reads and writes the document
     /// it was told about rather than whichever one this happens to say now.
     at: usize = 0,
-    /// Marks read for the document being asked about, so that `highlightAt`
+    /// Marks read for the document being asked about, so that `markAt`
     /// can answer by index the way the reader's does.
     ///
     /// Two lists and one index space, highlights then ink -- which is the
     /// order the reader's `Marks` holds them in, and it has to be the same
-    /// order or `fenrir.highlights()` would mean one thing in a window and
+    /// order or `fenrir.marks()` would mean one thing in a window and
     /// another in a script.
-    marks: []Library.Highlight = &.{},
+    marks: []Library.Mark = &.{},
     ink: []Library.Stroke = &.{},
     /// What was written on them, which a highlight hands over as its `note`.
     comments: []Library.Comment = &.{},
@@ -214,7 +214,7 @@ const Driver = struct {
     fn deinit(d: *Driver) void {
         const gpa = d.ctx.gpa;
         if (d.library) |lib| {
-            lib.freeHighlights(d.marks, d.marks.len);
+            lib.freeMarks(d.marks, d.marks.len);
             lib.freeStrokes(d.ink, d.ink.len);
             lib.freeComments(d.comments, d.comments.len);
             var l = lib;
@@ -351,10 +351,10 @@ const Driver = struct {
                 return null;
             }
         }.f,
-        .highlightCount = highlightCount,
-        .highlightAt = highlightAt,
-        .addHighlight = addHighlight,
-        .removeHighlight = removeHighlight,
+        .markCount = markCount,
+        .markAt = markAt,
+        .addMark = addMark,
+        .removeMark = removeMark,
         .commentCount = commentCount,
         .commentAt = commentAt,
         .addComment = addComment,
@@ -414,10 +414,10 @@ const Driver = struct {
         const lib = d.library orelse return;
         const o = d.find(doc) orelse return;
         if (std.mem.eql(u8, d.marks_for, o.path) and d.marks_for.len != 0) return;
-        lib.freeHighlights(d.marks, d.marks.len);
+        lib.freeMarks(d.marks, d.marks.len);
         lib.freeStrokes(d.ink, d.ink.len);
         lib.freeComments(d.comments, d.comments.len);
-        d.marks = lib.highlights(o.path) catch &.{};
+        d.marks = lib.marks(o.path) catch &.{};
         d.ink = lib.strokes(o.path) catch &.{};
         d.comments = lib.comments(o.path) catch &.{};
         d.marks_for = o.path;
@@ -454,7 +454,7 @@ const Driver = struct {
 
     fn forget(d: *Driver) void {
         const lib = d.library orelse return;
-        lib.freeHighlights(d.marks, d.marks.len);
+        lib.freeMarks(d.marks, d.marks.len);
         lib.freeStrokes(d.ink, d.ink.len);
         lib.freeComments(d.comments, d.comments.len);
         d.marks = &.{};
@@ -463,14 +463,14 @@ const Driver = struct {
         d.marks_for = "";
     }
 
-    fn highlightCount(ptr: *anyopaque, doc: Host.Handle) usize {
+    fn markCount(ptr: *anyopaque, doc: Host.Handle) usize {
         const d = of(ptr);
         if (d.find(doc) == null) return 0;
         d.loadMarks(doc);
         return d.marks.len + d.ink.len;
     }
 
-    fn highlightAt(ptr: *anyopaque, doc: Host.Handle, index: usize) ?Host.Highlight {
+    fn markAt(ptr: *anyopaque, doc: Host.Handle, index: usize) ?Host.Mark {
         const d = of(ptr);
         if (d.find(doc) == null) return null;
         d.loadMarks(doc);
@@ -501,7 +501,7 @@ const Driver = struct {
     /// the box is not what it is. Where the pen went is not offered -- the
     /// API has no shape for a point list, and a plugin that wants one should
     /// have it added rather than inferred from a bounding box.
-    fn strokeAt(d: *Driver, index: usize) ?Host.Highlight {
+    fn strokeAt(d: *Driver, index: usize) ?Host.Mark {
         if (index >= d.ink.len) return null;
         const k = d.ink[index];
         const box = Marks.inkBounds(k.points, k.width);
@@ -530,7 +530,7 @@ const Driver = struct {
         return "";
     }
 
-    fn addHighlight(ptr: *anyopaque, doc: Host.Handle, h: Host.Highlight) ?u64 {
+    fn addMark(ptr: *anyopaque, doc: Host.Handle, h: Host.Mark) ?u64 {
         const d = of(ptr);
         const lib = d.library orelse return null;
         const o = d.find(doc) orelse return null;
@@ -539,7 +539,7 @@ const Driver = struct {
         // is the first comment on it and has to name the same anchor.
         var name: [Library.name_len]u8 = undefined;
         const anchor = Library.makeName(&name, (lib.highestName(o.path) catch return null) + 1);
-        const id = lib.addHighlight(o.path, .{
+        const id = lib.addMark(o.path, .{
             .page = h.page - 1,
             .x0 = @min(h.x0, h.x1),
             .y0 = @min(h.y0, h.y1),
@@ -623,7 +623,7 @@ const Driver = struct {
         return true;
     }
 
-    fn removeHighlight(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
+    fn removeMark(ptr: *anyopaque, doc: Host.Handle, id: u64) bool {
         const d = of(ptr);
         const lib = d.library orelse return false;
         // Against the document the caller named. A mark id is the library's
@@ -631,7 +631,7 @@ const Driver = struct {
         // handle to a document that has gone is still an answer of no.
         if (d.find(doc) == null) return false;
         if (id == 0 or id > std.math.maxInt(i64)) return false;
-        lib.removeHighlight(@intCast(id)) catch return false;
+        lib.removeMark(@intCast(id)) catch return false;
         d.forget();
         return true;
     }

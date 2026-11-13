@@ -2,10 +2,9 @@
 //! opened, where you were in each, and the handful of settings that are
 //! yours rather than a command line's.
 //!
-//! Three tables and a version number. The schema is small on purpose -- this
-//! is a reader's memory, not a catalogue -- and it is migrated by
-//! `user_version` rather than by a table of migrations, because there is
-//! exactly one sequence of versions and no branching.
+//! A handful of tables and a version number. The schema is small on purpose
+//! -- this is a reader's memory, not a catalogue -- and is created whole at
+//! `user_version` 1; see `schema_version` for why there are no migrations.
 //!
 //! ## What is stored, and what is not
 //!
@@ -17,16 +16,16 @@
 //! been moved or deleted is not noticed until it is opened; `forget` and
 //! `--clear` are how a list is trimmed.
 //!
-//! Highlights and ink are the things here that are a *change to a document*
+//! Marks and ink are the things here that are a *change to a document*
 //! rather than a note about reading it, and they are still kept here rather
 //! than written into the PDF: writing an annotation back means rewriting the
 //! file, and a reader should not modify what it was asked to display until
 //! someone asks it to. `fenrir` will grow a command that exports them as real
 //! `/Annots`; until then they live beside the document and not in it.
 //!
-//! Ink is the same kind of fact as a highlight and is kept the same way: a
+//! Ink is the same kind of fact as a mark and is kept the same way: a
 //! page, a colour, and geometry in that page's own user-space points. It has
-//! a table of its own rather than more columns on `highlight` because the
+//! a table of its own rather than more columns on `mark` because the
 //! two differ in what geometry *is* -- a box is four numbers and a stroke is
 //! a list of them -- and a table whose meaning depends on which of its
 //! columns are null is a table nobody can read.
@@ -69,11 +68,18 @@ const Library = @This();
 
 pub const Error = Db.Error;
 
-/// The schema this build expects. A file from an older version is migrated
-/// forward on open; one from a *newer* version is left alone and opened
-/// read-only in effect, because a later fenrir may have added a column this
-/// one would drop on write.
-pub const schema_version: i64 = 6;
+/// The schema this build expects. A file from a *newer* version is left
+/// alone and opened read-only in effect, because a later fenrir may have
+/// added a column this one would drop on write.
+///
+/// One, and created whole by `create`: fenrir has not been released, so no
+/// file exists anywhere that needs carrying forward. The author asked that
+/// the versions before this be folded into one and their `ALTER TABLE`
+/// steps removed. Until the first release a change to a table is a change
+/// to `create`, with this left at 1 -- do not add a migration back for it.
+/// A library from a build before the fold says 2 to 6 and is opened
+/// read-only; it is deleted, not upgraded.
+pub const schema_version: i64 = 1;
 
 gpa: Allocator,
 db: Db,
@@ -91,7 +97,7 @@ pub fn open(gpa: Allocator, path: []const u8) Error!Library {
         lib.future = true;
         return lib;
     }
-    if (found < schema_version) try lib.migrate(found);
+    if (found < schema_version) try lib.create();
     return lib;
 }
 
@@ -101,7 +107,7 @@ pub fn close(lib: *Library) void {
 
 /// What version the file on disk says it is. Public because `fenrir health`
 /// asks: a library that opened and a library at the version this build
-/// understands are two facts, and `open` has already migrated between them.
+/// understands are two facts.
 pub fn userVersion(lib: Library) Error!i64 {
     var s = try lib.db.prepare("PRAGMA user_version");
     defer s.finalize();
@@ -109,162 +115,82 @@ pub fn userVersion(lib: Library) Error!i64 {
     return s.columnInt(0);
 }
 
-/// Brings a file at version `from` up to `schema_version`.
+/// Every table, in one transaction with the version that says they exist,
+/// so a file is never left with half of them.
 ///
-/// Each step is one `if`, in order, with no `else`: a file three versions old
-/// runs three of them. `PRAGMA user_version` cannot be parameterised, which
-/// is why the last statement is the only formatted SQL in this file.
-fn migrate(lib: *Library, from: i64) Error!void {
-    if (from < 1) {
-        try lib.db.exec(
-            \\BEGIN;
-            \\CREATE TABLE IF NOT EXISTS settings (
-            \\    key   TEXT PRIMARY KEY,
-            \\    value TEXT NOT NULL
-            \\) WITHOUT ROWID;
-            \\CREATE TABLE IF NOT EXISTS recent (
-            \\    path      TEXT PRIMARY KEY,
-            \\    title     TEXT NOT NULL DEFAULT '',
-            \\    page      INTEGER NOT NULL DEFAULT 0,
-            \\    zoom      REAL NOT NULL DEFAULT 0,
-            \\    opens     INTEGER NOT NULL DEFAULT 0,
-            \\    opened_at INTEGER NOT NULL DEFAULT 0
-            \\) WITHOUT ROWID;
-            \\CREATE INDEX IF NOT EXISTS recent_by_time ON recent (opened_at DESC);
-            \\COMMIT;
-        );
-    }
-
-    if (from < 2) {
-        // Where in the page, and the highlights drawn on it.
-        //
-        // `offset` is *points from the top of that page*, not pixels: a pixel
-        // offset would put you somewhere else on reopening at another zoom or
-        // on another screen, which is the bug that makes resuming not worth
-        // having. Added with a default so that a version-1 file migrates
-        // without a rewrite -- every existing row means "the top of the page",
-        // which is where those readers were left.
-        //
-        // A highlight's box is in the same user-space points, and `path` is
-        // the document rather than a foreign key, so that forgetting a recent
-        // file does not silently throw away what was marked in it.
-        try lib.db.exec(
-            \\BEGIN;
-            \\ALTER TABLE recent ADD COLUMN offset REAL NOT NULL DEFAULT 0;
-            \\CREATE TABLE IF NOT EXISTS highlight (
-            \\    id         INTEGER PRIMARY KEY,
-            \\    path       TEXT NOT NULL,
-            \\    page       INTEGER NOT NULL,
-            \\    x0         REAL NOT NULL,
-            \\    y0         REAL NOT NULL,
-            \\    x1         REAL NOT NULL,
-            \\    y1         REAL NOT NULL,
-            \\    color      TEXT NOT NULL DEFAULT '',
-            \\    note       TEXT NOT NULL DEFAULT '',
-            \\    created_at INTEGER NOT NULL DEFAULT 0
-            \\);
-            \\CREATE INDEX IF NOT EXISTS highlight_by_doc ON highlight (path, page);
-            \\COMMIT;
-        );
-    }
-
-    if (from < 3) {
-        // Ink. The same shape as `highlight` -- a path, a page, a colour --
-        // with the box replaced by the two things a pen has that a
-        // highlighter does not: where it went, and how wide it was.
-        //
-        // `points` is text and not a blob, which is the one decision in this
-        // table worth arguing. A blob of f32 pairs is eight bytes a point
-        // against about twelve, and it round-trips exactly. Text keeps the
-        // promise the rest of this file makes -- that this is a file a person
-        // can open and read -- and what it costs is a hundredth of a point,
-        // which is a three-thousandth of a millimetre and is not a thing
-        // anybody can draw. Size is `Marks.simplify`'s to worry about, and it
-        // has far more of it to give than an encoding does.
-        try lib.db.exec(
-            \\BEGIN;
-            \\CREATE TABLE IF NOT EXISTS ink (
-            \\    id         INTEGER PRIMARY KEY,
-            \\    path       TEXT NOT NULL,
-            \\    page       INTEGER NOT NULL,
-            \\    color      TEXT NOT NULL DEFAULT '',
-            \\    width      REAL NOT NULL DEFAULT 0,
-            \\    points     TEXT NOT NULL DEFAULT '',
-            \\    created_at INTEGER NOT NULL DEFAULT 0
-            \\);
-            \\CREATE INDEX IF NOT EXISTS ink_by_doc ON ink (path, page);
-            \\COMMIT;
-        );
-    }
-
-    if (from < 4) {
-        // A note on a stroke.
-        //
-        // `Marks.setNote` has always taken one on either kind of mark, and a
-        // stroke is focusable, so the reader accepted a note on ink and had
-        // nowhere to write it: the ink arm of the writer was
-        // `updateStroke(id, colour)` and there was no column for it. The note
-        // lived for the session and was gone at the next open.
-        try lib.db.exec(
-            \\BEGIN;
-            \\ALTER TABLE ink ADD COLUMN note TEXT NOT NULL DEFAULT '';
-            \\COMMIT;
-        );
-    }
-
-    if (from < 5) {
-        // How a highlight marks its words, by PDF's names for the four ways:
-        // `highlight`, `underline`, `strikeout`, `squiggly`. Names and not
-        // numbers, so the file still reads, and so writing one into a PDF
-        // has nothing to translate. Every row before this was a highlight.
-        try lib.db.exec(
-            \\BEGIN;
-            \\ALTER TABLE highlight ADD COLUMN style TEXT NOT NULL DEFAULT 'highlight';
-            \\COMMIT;
-        );
-    }
-
-    if (from < 6) {
-        // Comments as records of their own, many to an anchor, and links
-        // between them. See "Anchors, comments and links" at the top.
-        //
-        // `path` on each new table rather than a key into `document`, for
-        // the reason `highlight` has one: forgetting a document's place must
-        // not take what was written on it. `other` on a link is the other
-        // document's `/ID`, and empty when both comments are in this one.
-        //
-        // The marks already here are given anchors and their notes become
-        // comments, in one transaction with the tables, so a file is never
-        // left with the tables and without the names.
-        //
-        // The `note` columns stay, with what they held, and nothing writes
-        // them again. A build from before version 6 opens this file read-only
-        // and still selects them, and finds the notes as they were; dropping
-        // them would leave it reading no marks at all.
-        try lib.db.exec("BEGIN");
-        lib.addComments() catch |err| {
-            lib.db.exec("ROLLBACK") catch {};
-            return err;
-        };
-        try lib.db.exec("COMMIT");
-    }
-
-    var buf: [64]u8 = undefined;
-    const sql = std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{schema_version}, 0) catch return error.Failed;
-    try lib.db.exec(sql);
-}
-
-/// Version 6's tables, and names for the marks made before them.
-fn addComments(lib: *Library) Error!void {
+/// `recent.offset` is *points from the top of that page*, not pixels: a
+/// pixel offset would put you somewhere else on reopening at another zoom or
+/// on another screen, which is the bug that makes resuming not worth having.
+///
+/// `mark` is a box over words, in the same user-space points; `style` is how
+/// it marks them, by PDF's names for the four ways -- `highlight`,
+/// `underline`, `strikeout`, `squiggly` -- so the file still reads and
+/// writing one into a PDF has nothing to translate. It is called `mark` and
+/// not `highlight` because a highlight is one of the four.
+///
+/// `ink` is the same shape with the box replaced by the two things a pen has
+/// that a highlighter does not: where it went, and how wide it was. `points`
+/// is text and not a blob, which is the one decision here worth arguing. A
+/// blob of f32 pairs is eight bytes a point against about twelve, and it
+/// round-trips exactly. Text keeps the promise the rest of this file makes --
+/// that this is a file a person can open and read -- and what it costs is a
+/// hundredth of a point, which is a three-thousandth of a millimetre and is
+/// not a thing anybody can draw. Size is `Marks.simplify`'s to worry about,
+/// and it has far more of it to give than an encoding does.
+///
+/// Every table names its document by `path` rather than by a key into
+/// `document` or `recent`, so that forgetting a recent file, or where a
+/// document was left, does not silently throw away what was written on it.
+/// `other` on a link is the other document's `/ID`, and empty when both
+/// comments are in this one. See "Anchors, comments and links" at the top.
+fn create(lib: *Library) Error!void {
     try lib.db.exec(
+        \\BEGIN;
+        \\CREATE TABLE IF NOT EXISTS settings (
+        \\    key   TEXT PRIMARY KEY,
+        \\    value TEXT NOT NULL
+        \\) WITHOUT ROWID;
+        \\CREATE TABLE IF NOT EXISTS recent (
+        \\    path      TEXT PRIMARY KEY,
+        \\    title     TEXT NOT NULL DEFAULT '',
+        \\    page      INTEGER NOT NULL DEFAULT 0,
+        \\    offset    REAL NOT NULL DEFAULT 0,
+        \\    zoom      REAL NOT NULL DEFAULT 0,
+        \\    opens     INTEGER NOT NULL DEFAULT 0,
+        \\    opened_at INTEGER NOT NULL DEFAULT 0
+        \\) WITHOUT ROWID;
+        \\CREATE INDEX IF NOT EXISTS recent_by_time ON recent (opened_at DESC);
+        \\CREATE TABLE IF NOT EXISTS mark (
+        \\    id         INTEGER PRIMARY KEY,
+        \\    path       TEXT NOT NULL,
+        \\    page       INTEGER NOT NULL,
+        \\    x0         REAL NOT NULL,
+        \\    y0         REAL NOT NULL,
+        \\    x1         REAL NOT NULL,
+        \\    y1         REAL NOT NULL,
+        \\    color      TEXT NOT NULL DEFAULT '',
+        \\    style      TEXT NOT NULL DEFAULT 'highlight',
+        \\    anchor     TEXT NOT NULL DEFAULT '',
+        \\    created_at INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE INDEX IF NOT EXISTS mark_by_doc ON mark (path, page);
+        \\CREATE TABLE IF NOT EXISTS ink (
+        \\    id         INTEGER PRIMARY KEY,
+        \\    path       TEXT NOT NULL,
+        \\    page       INTEGER NOT NULL,
+        \\    color      TEXT NOT NULL DEFAULT '',
+        \\    width      REAL NOT NULL DEFAULT 0,
+        \\    points     TEXT NOT NULL DEFAULT '',
+        \\    anchor     TEXT NOT NULL DEFAULT '',
+        \\    created_at INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE INDEX IF NOT EXISTS ink_by_doc ON ink (path, page);
         \\CREATE TABLE IF NOT EXISTS document (
         \\    id      INTEGER PRIMARY KEY,
         \\    path    TEXT NOT NULL UNIQUE,
         \\    file_id TEXT NOT NULL DEFAULT ''
         \\);
         \\CREATE INDEX IF NOT EXISTS document_by_file ON document (file_id);
-        \\ALTER TABLE highlight ADD COLUMN anchor TEXT NOT NULL DEFAULT '';
-        \\ALTER TABLE ink ADD COLUMN anchor TEXT NOT NULL DEFAULT '';
         \\CREATE TABLE IF NOT EXISTS comment (
         \\    id          INTEGER PRIMARY KEY,
         \\    path        TEXT NOT NULL,
@@ -285,125 +211,9 @@ fn addComments(lib: *Library) Error!void {
         \\    created_at INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE INDEX IF NOT EXISTS link_by_doc ON link (path);
+        \\PRAGMA user_version = 1;
+        \\COMMIT;
     );
-    try lib.nameAnchors();
-}
-
-/// Gives every mark made before version 6 an anchor, and makes each note
-/// the first comment on its anchor.
-///
-/// The rows do not say which selection made them. A selection's lines were
-/// written in one pass, though, with one clock reading, one colour and one
-/// style, down a page or onto the next -- so consecutive rows that agree on
-/// all of that are taken for one anchor. The mistake this can make is two
-/// highlights made within one second in one colour becoming one anchor,
-/// which is one annotation of two lines in a PDF and invisible on the page.
-/// The mistake it avoids is a six-line highlight written as six
-/// annotations, which is six comments in another reader's pane. A stroke is
-/// an anchor of its own.
-fn nameAnchors(lib: *Library) Error!void {
-    var arena_state: std.heap.ArenaAllocator = .init(lib.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var paths: std.ArrayList([]const u8) = .empty;
-    {
-        var s = try lib.db.prepare("SELECT path FROM highlight UNION SELECT path FROM ink");
-        defer s.finalize();
-        while (try s.step()) try paths.append(arena, try arena.dupe(u8, s.columnText(0)));
-    }
-
-    var name_block = try lib.db.prepare("UPDATE highlight SET anchor = ?2 WHERE id = ?1");
-    defer name_block.finalize();
-    var name_stroke = try lib.db.prepare("UPDATE ink SET anchor = ?2 WHERE id = ?1");
-    defer name_stroke.finalize();
-    var add_comment = try lib.db.prepare(
-        \\INSERT INTO comment (path, anchor, nm, text, created_at, modified_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-    );
-    defer add_comment.finalize();
-
-    const Row = struct { id: i64, anchor: u64, note: []const u8, at: i64 };
-    var rows: std.ArrayList(Row) = .empty;
-    for (paths.items) |path| {
-        rows.clearRetainingCapacity();
-        var last: u64 = 0;
-
-        // Read out whole before anything is written, so no update lands
-        // under a statement still walking the table.
-        {
-            var s = try lib.db.prepare(
-                \\SELECT id, page, color, style, created_at, note FROM highlight
-                \\WHERE path = ?1 ORDER BY id
-            );
-            defer s.finalize();
-            s.bindText(1, path);
-            var page: i64 = -2;
-            var at: i64 = 0;
-            var color: []const u8 = "";
-            var style: []const u8 = "";
-            while (try s.step()) {
-                const row_page = s.columnInt(1);
-                const row_at = s.columnInt(4);
-                const same = row_at != 0 and row_at == at and
-                    (row_page == page or row_page == page + 1) and
-                    std.mem.eql(u8, s.columnText(2), color) and
-                    std.mem.eql(u8, s.columnText(3), style);
-                if (!same) last += 1;
-                page = row_page;
-                at = row_at;
-                color = try arena.dupe(u8, s.columnText(2));
-                style = try arena.dupe(u8, s.columnText(3));
-                try rows.append(arena, .{
-                    .id = s.columnInt(0),
-                    .anchor = last,
-                    .note = try arena.dupe(u8, s.columnText(5)),
-                    .at = row_at,
-                });
-            }
-        }
-        const blocks = rows.items.len;
-        {
-            var s = try lib.db.prepare("SELECT id, created_at, note FROM ink WHERE path = ?1 ORDER BY id");
-            defer s.finalize();
-            s.bindText(1, path);
-            while (try s.step()) {
-                last += 1;
-                try rows.append(arena, .{
-                    .id = s.columnInt(0),
-                    .anchor = last,
-                    .note = try arena.dupe(u8, s.columnText(2)),
-                    .at = s.columnInt(1),
-                });
-            }
-        }
-
-        // A second note on one anchor is a reply, named after every anchor.
-        var next = last + 1;
-        var commented: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        for (rows.items, 0..) |r, i| {
-            var anchor_buf: [name_len]u8 = undefined;
-            const anchor = makeName(&anchor_buf, r.anchor);
-            const named = if (i < blocks) name_block else name_stroke;
-            named.reset();
-            named.bindInt(1, r.id);
-            named.bindText(2, anchor);
-            try named.exec();
-
-            if (r.note.len == 0) continue;
-            var own_buf: [name_len]u8 = undefined;
-            const first = !(try commented.getOrPut(arena, r.anchor)).found_existing;
-            const nm = if (first) anchor else makeName(&own_buf, next);
-            if (!first) next += 1;
-            add_comment.reset();
-            add_comment.bindText(1, path);
-            add_comment.bindText(2, anchor);
-            add_comment.bindText(3, nm);
-            add_comment.bindText(4, r.note);
-            add_comment.bindInt(5, r.at);
-            try add_comment.exec();
-        }
-    }
 }
 
 // -- names --------------------------------------------------------------------
@@ -461,7 +271,7 @@ pub fn nameNumber(nm: []const u8) ?u64 {
 /// the rows is a second thing to be wrong.
 pub fn highestName(lib: Library, path: []const u8) Error!u64 {
     var s = try lib.db.prepare(
-        \\SELECT anchor FROM highlight WHERE path = ?1
+        \\SELECT anchor FROM mark WHERE path = ?1
         \\UNION SELECT anchor FROM ink WHERE path = ?1
         \\UNION SELECT nm FROM comment WHERE path = ?1
     );
@@ -740,14 +550,15 @@ fn readRecent(lib: Library, s: Db.Stmt) Error!Recent {
     };
 }
 
-// -- highlights ---------------------------------------------------------------
+// -- marks ------------------------------------------------------------------
 
-/// One highlight, as the file holds it.
+/// One mark over words -- a highlight, an underline, a strike-through or a
+/// squiggle -- as the file holds it.
 ///
 /// The box is in the page's own user-space points, which is the only
 /// coordinate that survives a different zoom, a different window and a
 /// different machine. See `hlidskjalf/Marks.zig`, whose `Mark` this mirrors.
-pub const Highlight = struct {
+pub const Mark = struct {
     id: i64 = 0,
     page: u32 = 0,
     x0: f32 = 0,
@@ -769,14 +580,14 @@ fn styleOf(style: []const u8) []const u8 {
     return if (style.len == 0) "highlight" else style;
 }
 
-/// Writes a highlight and returns the row it was given, so the caller can
+/// Writes a mark and returns the row it was given, so the caller can
 /// delete exactly this one later.
-pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Error!i64 {
+pub fn addMark(lib: Library, path: []const u8, h: Mark, now: i64) Error!i64 {
     if (lib.future) return 0;
     var buf: [name_len]u8 = undefined;
     const anchor = if (h.anchor.len != 0) h.anchor else try lib.nextName(path, &buf);
     var s = try lib.db.prepare(
-        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, style, anchor, created_at)
+        \\INSERT INTO mark (path, page, x0, y0, x1, y1, color, style, anchor, created_at)
         \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
     );
     defer s.finalize();
@@ -794,13 +605,13 @@ pub fn addHighlight(lib: Library, path: []const u8, h: Highlight, now: i64) Erro
     return lib.db.lastInsertRowId();
 }
 
-/// Rewrites what can change about a highlight once it exists: its colour and
-/// its style. Its box and page never change -- a highlight moved to other
-/// words is a different highlight, and is removed and added as one. What is
+/// Rewrites what can change about a mark once it exists: its colour and its
+/// style. Its box and page never change -- a mark moved to other words is a
+/// different mark, and is removed and added as one. What is
 /// written about it is a comment on its anchor.
-pub fn updateHighlight(lib: Library, id: i64, color: []const u8, style: []const u8) Error!void {
+pub fn updateMark(lib: Library, id: i64, color: []const u8, style: []const u8) Error!void {
     if (lib.future) return;
-    var s = try lib.db.prepare("UPDATE highlight SET color = ?2, style = ?3 WHERE id = ?1");
+    var s = try lib.db.prepare("UPDATE mark SET color = ?2, style = ?3 WHERE id = ?1");
     defer s.finalize();
     s.bindInt(1, id);
     s.bindText(2, color);
@@ -808,31 +619,31 @@ pub fn updateHighlight(lib: Library, id: i64, color: []const u8, style: []const 
     try s.exec();
 }
 
-pub fn removeHighlight(lib: Library, id: i64) Error!void {
+pub fn removeMark(lib: Library, id: i64) Error!void {
     if (lib.future) return;
-    var s = try lib.db.prepare("DELETE FROM highlight WHERE id = ?1");
+    var s = try lib.db.prepare("DELETE FROM mark WHERE id = ?1");
     defer s.finalize();
     s.bindInt(1, id);
     try s.exec();
 }
 
-pub fn clearHighlights(lib: Library, path: []const u8) Error!u32 {
+pub fn clearMarks(lib: Library, path: []const u8) Error!u32 {
     if (lib.future) return 0;
-    var s = try lib.db.prepare("DELETE FROM highlight WHERE path = ?1");
+    var s = try lib.db.prepare("DELETE FROM mark WHERE path = ?1");
     defer s.finalize();
     s.bindText(1, path);
     try s.exec();
     return lib.db.changes();
 }
 
-/// Every highlight on a document, oldest first so that they are drawn in the
+/// Every mark on a document, oldest first so that they are drawn in the
 /// order they were made.
-pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
-    var out: std.ArrayList(Highlight) = .empty;
-    errdefer lib.freeHighlights(out.items, out.items.len);
+pub fn marks(lib: Library, path: []const u8) Error![]Mark {
+    var out: std.ArrayList(Mark) = .empty;
+    errdefer lib.freeMarks(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, page, x0, y0, x1, y1, color, style, anchor FROM highlight
+        \\SELECT id, page, x0, y0, x1, y1, color, style, anchor FROM mark
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -859,14 +670,14 @@ pub fn highlights(lib: Library, path: []const u8) Error![]Highlight {
     return out.toOwnedSlice(lib.gpa);
 }
 
-pub fn freeHighlight(lib: Library, h: Highlight) void {
+pub fn freeMark(lib: Library, h: Mark) void {
     lib.gpa.free(h.color);
     lib.gpa.free(h.style);
     lib.gpa.free(h.anchor);
 }
 
-pub fn freeHighlights(lib: Library, list: []Highlight, n: usize) void {
-    for (list[0..n]) |h| lib.freeHighlight(h);
+pub fn freeMarks(lib: Library, list: []Mark, n: usize) void {
+    for (list[0..n]) |h| lib.freeMark(h);
     if (list.len != 0) lib.gpa.free(list);
 }
 
@@ -875,7 +686,7 @@ pub fn freeHighlights(lib: Library, list: []Highlight, n: usize) void {
 /// One freehand stroke, as the file holds it.
 ///
 /// The points are in the page's own user-space points, for the reason a
-/// highlight's box is: a stroke is a fact about the document, and a stroke
+/// mark's box is: a stroke is a fact about the document, and a stroke
 /// stored in device pixels would land somewhere else at the next zoom.
 ///
 /// `width` is in those same points, so the pen keeps its thickness relative
@@ -889,7 +700,7 @@ pub const Stroke = struct {
     color: []u8 = &.{},
     width: f32 = 0,
     points: []Point = &.{},
-    /// The anchor it is, as for a highlight. A stroke is always an anchor of
+    /// The anchor it is, as for a mark. A stroke is always an anchor of
     /// its own.
     anchor: []u8 = &.{},
 };
@@ -1016,8 +827,8 @@ pub fn freeStrokes(lib: Library, list: []Stroke, n: usize) void {
     if (list.len != 0) lib.gpa.free(list);
 }
 
-/// `x y x y ...`, two decimals, which is a hundredth of a point. See the
-/// migration for why this is text at all.
+/// `x y x y ...`, two decimals, which is a hundredth of a point. See
+/// `create` for why this is text at all.
 ///
 /// Takes its buffer rather than allocating: the caller knows how many points
 /// there are and `point_chars` says what each costs, so the one allocation
@@ -1340,31 +1151,14 @@ fn memory() !Library {
     return Library.open(testing.allocator, ":memory:");
 }
 
-/// Undoes every migration above `to`, rows and all, so a test can write the
-/// rows an older release would have and open them again.
-fn rewind(lib: *Library, to: i64) !void {
-    if (to < 6) try lib.db.exec(
-        \\DROP TABLE comment;
-        \\DROP TABLE link;
-        \\DROP TABLE document;
-        \\ALTER TABLE highlight DROP COLUMN anchor;
-        \\ALTER TABLE ink DROP COLUMN anchor;
-    );
-    if (to < 5) try lib.db.exec("ALTER TABLE highlight DROP COLUMN style");
-    if (to < 4) try lib.db.exec("ALTER TABLE ink DROP COLUMN note");
-    if (to < 3) try lib.db.exec("DROP TABLE ink");
-    var buf: [64]u8 = undefined;
-    try lib.db.exec(try std.fmt.bufPrintSentinel(&buf, "PRAGMA user_version = {d}", .{to}, 0));
-}
-
-test "a fresh database is migrated to the schema this build knows" {
+test "a fresh database is created at the schema this build knows" {
     if (!Db.available) return error.SkipZigTest;
     var lib = try memory();
     defer lib.close();
     try testing.expectEqual(schema_version, try lib.userVersion());
-    // Migrating again is a no-op, which is what makes opening an existing
-    // file the same code path as creating one.
-    try lib.migrate(schema_version);
+    // Creating again is a no-op, which is what makes opening an existing
+    // file the same code path as making one.
+    try lib.create();
     try testing.expectEqual(schema_version, try lib.userVersion());
 }
 
@@ -1509,45 +1303,12 @@ test "the place in a page is remembered, not just which page" {
     try testing.expectApproxEqAbs(@as(f32, 20), later.offset, 0.01);
 }
 
-test "a version-1 file gains the offset column without losing its rows" {
-    if (!Db.available) return error.SkipZigTest;
-    const gpa = testing.allocator;
-
-    // A database as the previous release left it: the old schema, one row,
-    // and `user_version` at 1.
-    var db = try Db.open(gpa, ":memory:");
-    defer db.close();
-    try db.exec(
-        \\CREATE TABLE recent (
-        \\    path TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
-        \\    page INTEGER NOT NULL DEFAULT 0, zoom REAL NOT NULL DEFAULT 0,
-        \\    opens INTEGER NOT NULL DEFAULT 0, opened_at INTEGER NOT NULL DEFAULT 0
-        \\) WITHOUT ROWID;
-        \\CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-        \\INSERT INTO recent (path, title, page, zoom, opens, opened_at)
-        \\VALUES ('old.pdf', 'old', 5, 1.25, 3, 99);
-        \\PRAGMA user_version = 1;
-    );
-
-    var lib: Library = .{ .gpa = gpa, .db = db };
-    try lib.migrate(1);
-    try testing.expectEqual(schema_version, try lib.userVersion());
-
-    // The row survived, and where it was read stopped is the top of the page
-    // it was on -- which is where that reader actually left off.
-    const seen = (try lib.lastSeen("old.pdf")).?;
-    defer lib.freeRecent(seen);
-    try testing.expectEqual(@as(u32, 5), seen.page);
-    try testing.expectEqual(@as(u32, 3), seen.opens);
-    try testing.expectApproxEqAbs(@as(f32, 0), seen.offset, 0.001);
-}
-
 test "a highlight round-trips, and is deleted by the id it was given" {
     if (!Db.available) return error.SkipZigTest;
     var lib = try memory();
     defer lib.close();
 
-    const id = try lib.addHighlight("a.pdf", .{
+    const id = try lib.addMark("a.pdf", .{
         .page = 2,
         .x0 = 100,
         .y0 = 700,
@@ -1556,12 +1317,12 @@ test "a highlight round-trips, and is deleted by the id it was given" {
         .color = @constCast("#f7e733"),
     }, 1000);
     try testing.expect(id != 0);
-    _ = try lib.addHighlight("a.pdf", .{ .page = 4, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1001);
-    _ = try lib.addHighlight("b.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1002);
+    _ = try lib.addMark("a.pdf", .{ .page = 4, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1001);
+    _ = try lib.addMark("b.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1002);
 
     {
-        const list = try lib.highlights("a.pdf");
-        defer lib.freeHighlights(list, list.len);
+        const list = try lib.marks("a.pdf");
+        defer lib.freeMarks(list, list.len);
         // This document's own, oldest first, so they redraw in the order they
         // were made.
         try testing.expectEqual(@as(usize, 2), list.len);
@@ -1574,18 +1335,18 @@ test "a highlight round-trips, and is deleted by the id it was given" {
 
     // Deleting one takes exactly that row, and leaves the other document's
     // marks alone.
-    try lib.removeHighlight(id);
+    try lib.removeMark(id);
     {
-        const list = try lib.highlights("a.pdf");
-        defer lib.freeHighlights(list, list.len);
+        const list = try lib.marks("a.pdf");
+        defer lib.freeMarks(list, list.len);
         try testing.expectEqual(@as(usize, 1), list.len);
         try testing.expectEqual(@as(u32, 4), list[0].page);
     }
 
-    try testing.expectEqual(@as(u32, 1), try lib.clearHighlights("a.pdf"));
+    try testing.expectEqual(@as(u32, 1), try lib.clearMarks("a.pdf"));
     {
-        const list = try lib.highlights("b.pdf");
-        defer lib.freeHighlights(list, list.len);
+        const list = try lib.marks("b.pdf");
+        defer lib.freeMarks(list, list.len);
         try testing.expectEqual(@as(usize, 1), list.len);
     }
 }
@@ -1600,11 +1361,11 @@ test "forgetting a document does not throw away what was highlighted in it" {
     defer lib.close();
 
     try lib.visit("a.pdf", "A", .{}, 1);
-    _ = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
     try lib.forgetAll();
 
-    const list = try lib.highlights("a.pdf");
-    defer lib.freeHighlights(list, list.len);
+    const list = try lib.marks("a.pdf");
+    defer lib.freeMarks(list, list.len);
     try testing.expectEqual(@as(usize, 1), list.len);
 }
 
@@ -1613,36 +1374,21 @@ test "a highlight's colour and style can be changed in place" {
     var lib = try memory();
     defer lib.close();
 
-    const id = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    const id = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
     {
         // Not saying is saying `highlight`, in the file as well.
-        const list = try lib.highlights("a.pdf");
-        defer lib.freeHighlights(list, list.len);
+        const list = try lib.marks("a.pdf");
+        defer lib.freeMarks(list, list.len);
         try testing.expectEqualStrings("highlight", list[0].style);
     }
-    try lib.updateHighlight(id, "#3fa34d", "squiggly");
+    try lib.updateMark(id, "#3fa34d", "squiggly");
 
-    const list = try lib.highlights("a.pdf");
-    defer lib.freeHighlights(list, list.len);
+    const list = try lib.marks("a.pdf");
+    defer lib.freeMarks(list, list.len);
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqual(id, list[0].id);
     try testing.expectEqualStrings("#3fa34d", list[0].color);
     try testing.expectEqualStrings("squiggly", list[0].style);
-}
-
-test "a version-4 file's highlights stay highlights" {
-    if (!Db.available) return error.SkipZigTest;
-    var lib = try memory();
-    defer lib.close();
-
-    _ = try lib.addHighlight("old.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
-    try rewind(&lib, 4);
-    try lib.migrate(4);
-    try testing.expectEqual(schema_version, try lib.userVersion());
-
-    const list = try lib.highlights("old.pdf");
-    defer lib.freeHighlights(list, list.len);
-    try testing.expectEqualStrings("highlight", list[0].style);
 }
 
 test "a stroke round-trips through the file, points and all" {
@@ -1688,13 +1434,13 @@ test "ink and highlights are two tables and are cleared separately" {
 
     var points = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 } };
     _ = try lib.addStroke("a.pdf", .{ .page = 0, .points = &points }, 1);
-    _ = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
 
     try testing.expectEqual(@as(u32, 1), try lib.clearStrokes("a.pdf"));
 
-    const marks = try lib.highlights("a.pdf");
-    defer lib.freeHighlights(marks, marks.len);
-    try testing.expectEqual(@as(usize, 1), marks.len);
+    const list = try lib.marks("a.pdf");
+    defer lib.freeMarks(list, list.len);
+    try testing.expectEqual(@as(usize, 1), list.len);
 }
 
 test "a stroke of one point, or one whose points will not parse, is not a stroke" {
@@ -1735,58 +1481,6 @@ test "a stroke's colour changes in place, and it keeps its anchor" {
     try testing.expectEqualStrings("f1", list[0].anchor);
 }
 
-test "a version-3 file's ink comes through every version, and is named" {
-    if (!Db.available) return error.SkipZigTest;
-
-    var lib = try memory();
-    defer lib.close();
-
-    // The ink table as the previous release left it, with a stroke in it.
-    try rewind(&lib, 3);
-    try lib.db.exec(
-        \\INSERT INTO ink (path, page, color, width, points, created_at)
-        \\VALUES ('old.pdf', 1, '#c04040', 2, '10.00 20.00 30.00 40.00', 1);
-    );
-    try lib.migrate(3);
-    try testing.expectEqual(schema_version, try lib.userVersion());
-
-    const list = try lib.strokes("old.pdf");
-    defer lib.freeStrokes(list, list.len);
-    try testing.expectEqual(@as(usize, 1), list.len);
-    try testing.expectEqual(@as(usize, 2), list[0].points.len);
-    try testing.expectEqualStrings("f1", list[0].anchor);
-
-    // With nothing written on it, there is nothing to have become a comment.
-    const said = try lib.comments("old.pdf");
-    defer lib.freeComments(said, said.len);
-    try testing.expectEqual(@as(usize, 0), said.len);
-}
-
-test "a version-2 file gains the ink table without losing its highlights" {
-    if (!Db.available) return error.SkipZigTest;
-    const gpa = testing.allocator;
-
-    var lib = try memory();
-    defer lib.close();
-    _ = try lib.addHighlight("old.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
-
-    // Wound back to where the previous release left it, then opened again.
-    try rewind(&lib, 2);
-    try lib.migrate(2);
-    try testing.expectEqual(schema_version, try lib.userVersion());
-
-    const marks = try lib.highlights("old.pdf");
-    defer lib.freeHighlights(marks, marks.len);
-    try testing.expectEqual(@as(usize, 1), marks.len);
-
-    var points = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 1, .y = 1 } };
-    _ = try lib.addStroke("old.pdf", .{ .points = &points }, 1);
-    const ink = try lib.strokes("old.pdf");
-    defer lib.freeStrokes(ink, ink.len);
-    try testing.expectEqual(@as(usize, 1), ink.len);
-    _ = gpa;
-}
-
 test "a name is f and base 36, and only fenrir's are counted" {
     var buf: [name_len]u8 = undefined;
     try testing.expectEqualStrings("f1", makeName(&buf, 1));
@@ -1807,21 +1501,21 @@ test "a mark written without an anchor is the next name, and comments count" {
     var lib = try memory();
     defer lib.close();
 
-    _ = try lib.addHighlight("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
     var points = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 9, .y = 9 } };
     _ = try lib.addStroke("a.pdf", .{ .points = &points }, 1);
     // A reply's name is past every anchor's, and another program's is not
     // a number at all.
     _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f9"), .text = @constCast("why") }, 1);
     _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f2"), .nm = @constCast("{8a7d-41c2}") }, 1);
-    _ = try lib.addHighlight("a.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 1, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
     // Each document counts its own.
-    _ = try lib.addHighlight("b.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    _ = try lib.addMark("b.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
 
-    const marks = try lib.highlights("a.pdf");
-    defer lib.freeHighlights(marks, marks.len);
-    try testing.expectEqualStrings("f1", marks[0].anchor);
-    try testing.expectEqualStrings("fa", marks[1].anchor);
+    const list = try lib.marks("a.pdf");
+    defer lib.freeMarks(list, list.len);
+    try testing.expectEqualStrings("f1", list[0].anchor);
+    try testing.expectEqualStrings("fa", list[1].anchor);
     const ink = try lib.strokes("a.pdf");
     defer lib.freeStrokes(ink, ink.len);
     try testing.expectEqualStrings("f2", ink[0].anchor);
@@ -1830,61 +1524,8 @@ test "a mark written without an anchor is the next name, and comments count" {
 
     // A writer that names its own anchor keeps it, which is how six lines
     // of one selection are one anchor.
-    _ = try lib.addHighlight("a.pdf", .{ .page = 2, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("fa") }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 2, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("fa") }, 1);
     try testing.expectEqual(@as(u64, 10), try lib.highestName("a.pdf"));
-}
-
-test "a version-5 file's marks become anchors, and their notes the first comments" {
-    if (!Db.available) return error.SkipZigTest;
-    var lib = try memory();
-    defer lib.close();
-
-    // What version 5 wrote: a three-line selection highlighted in one go,
-    // with notes on its first and last lines; a highlight made in the same
-    // second in another colour; one written by a script with no clock; a
-    // stroke with a note; and another document's highlight.
-    try rewind(&lib, 5);
-    try lib.db.exec(
-        \\INSERT INTO highlight (path, page, x0, y0, x1, y1, color, note, style, created_at) VALUES
-        \\  ('a.pdf', 2, 0, 700, 9, 710, '#f7e733', 'first', 'highlight', 100),
-        \\  ('a.pdf', 2, 0, 690, 9, 700, '#f7e733', '', 'highlight', 100),
-        \\  ('a.pdf', 3, 0, 790, 9, 800, '#f7e733', 'second', 'highlight', 100),
-        \\  ('a.pdf', 3, 0, 500, 9, 510, '#3fa34d', '', 'highlight', 100),
-        \\  ('a.pdf', 4, 0, 500, 9, 510, '#3fa34d', '', 'highlight', 0),
-        \\  ('b.pdf', 0, 0, 500, 9, 510, '', '', 'highlight', 100);
-        \\INSERT INTO ink (path, page, color, width, points, note, created_at) VALUES
-        \\  ('a.pdf', 1, '', 1, '0 0 9 9', 'pen', 120);
-    );
-    try lib.migrate(5);
-    try testing.expectEqual(schema_version, try lib.userVersion());
-
-    const marks = try lib.highlights("a.pdf");
-    defer lib.freeHighlights(marks, marks.len);
-    const want = [_][]const u8{ "f1", "f1", "f1", "f2", "f3" };
-    for (want, marks) |w, m| try testing.expectEqualStrings(w, m.anchor);
-    const ink = try lib.strokes("a.pdf");
-    defer lib.freeStrokes(ink, ink.len);
-    try testing.expectEqualStrings("f4", ink[0].anchor);
-
-    // The first note on the selection is its anchor's comment; the second is
-    // a reply, named past every anchor; the stroke's is its own.
-    const list = try lib.comments("a.pdf");
-    defer lib.freeComments(list, list.len);
-    try testing.expectEqual(@as(usize, 3), list.len);
-    try testing.expectEqualStrings("f1", list[0].anchor);
-    try testing.expectEqualStrings("f1", list[0].nm);
-    try testing.expectEqualStrings("first", list[0].text);
-    try testing.expectEqual(@as(i64, 100), list[0].created_at);
-    try testing.expectEqualStrings("f1", list[1].anchor);
-    try testing.expectEqualStrings("f5", list[1].nm);
-    try testing.expectEqualStrings("second", list[1].text);
-    try testing.expectEqualStrings("f4", list[2].anchor);
-    try testing.expectEqualStrings("f4", list[2].nm);
-
-    // Another document's names start again.
-    const other = try lib.highlights("b.pdf");
-    defer lib.freeHighlights(other, other.len);
-    try testing.expectEqualStrings("f1", other[0].anchor);
 }
 
 test "comments are many to an anchor, and change and go by row" {
