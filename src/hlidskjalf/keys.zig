@@ -18,7 +18,9 @@
 //!   enter highlights the selection, `_` underlines it, `-` strikes it
 //!   through and `~` squiggles it; `d` removes marks under it, a digit
 //!   highlights it in that colour. `c` highlights it and starts a comment
-//!   on it.
+//!   on it. This is the keyboard's only way to select, and the author asked
+//!   that it stay so: no shifted motions or select-all in another mode, and
+//!   no "keyboard selection beyond visual mode" as a feature still to come.
 //! * **edit** -- changing marks that exist. `i` walks to the mark at or after
 //!   the cursor; `n` and `N` go between them; a digit recolours, `m _ - ~`
 //!   restyle, `d` deletes, `a` edits the comment in hand and `c` starts
