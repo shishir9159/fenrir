@@ -78,6 +78,8 @@ const rails_mod = @import("rails.zig");
 const settings_page = @import("settings.zig");
 const watch = @import("watch.zig");
 
+const compare = @import("read/compare.zig");
+
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
 const gleipnir = fenrir.gleipnir;
@@ -1031,7 +1033,7 @@ const Recorded = struct {
         stale: bool = false,
     };
 
-    fn deinit(rc: *Recorded, gpa: Allocator) void {
+    pub fn deinit(rc: *Recorded, gpa: Allocator) void {
         for (&rc.pages) |*e| {
             if (e.source) |*s| s.deinit(gpa);
         }
@@ -1121,7 +1123,7 @@ fn absolutePath(ctx: *Context, gpa: Allocator, file: []const u8) ?[]u8 {
 /// One page of one document, at one zoom: everything that decides what a
 /// rasterisation will produce, and so everything needed to say whether one is
 /// still wanted.
-const Job = struct {
+pub const Job = struct {
     buffer: u32,
     page: u32,
     zoom: f32,
@@ -1141,9 +1143,9 @@ const Job = struct {
     /// for pixels that go straight in the bin. `.overlay` is a page of the
     /// first document of a comparison laid over its partner in the second.
     /// `.reload` is the buffer's file read again, and no page; see `install`.
-    const Want = enum { page, text, overlay, reload };
+    pub const Want = enum { page, text, overlay, reload };
 
-    fn eql(a: Job, b: Job) bool {
+    pub fn eql(a: Job, b: Job) bool {
         return a.buffer == b.buffer and a.page == b.page and
             a.zoom == b.zoom and a.want == b.want and std.meta.eql(a.shift, b.shift);
     }
@@ -1268,50 +1270,7 @@ const Rasteriser = struct {
     }
 };
 
-/// A comparison made again with the second document moved, off the frame
-/// thread: a nudge is a key held down, and every pair that differs is two
-/// pages drawn again.
-///
-/// It opens its own views of the two files, as `raster --jobs` does. The
-/// buffers' `Document`s belong to the rasterising thread, and the bytes
-/// under them are only ever read.
-const Rerun = struct {
-    thread: ?std.Thread = null,
-    done: std.atomic.Value(bool) = .init(false),
-    /// What it was asked. Written before it starts and read by nobody else
-    /// until `done`.
-    gpa: Allocator = undefined,
-    io: Io = undefined,
-    bytes: [2][]const u8 = undefined,
-    pairs: []const diff_mod.Pair = &.{},
-    options: diff_mod.Options = .{},
-    /// What it found, or why it found nothing.
-    results: ?[]diff_mod.Result = null,
-    failed: ?anyerror = null,
-    /// A nudge came while it ran. What it is comparing is already stale,
-    /// and it starts again when it is back.
-    again: bool = false,
-
-    fn work(r: *Rerun) void {
-        var time: diff_mod.Timing = .{};
-        r.results = diff_mod.compare(r.gpa, r.io, r.bytes, r.pairs, r.options, &time) catch |err| blk: {
-            r.failed = err;
-            break :blk null;
-        };
-        r.done.store(true, .release);
-    }
-
-    /// Waits for it, on the way out: it reads bytes the buffers own.
-    fn finish(r: *Rerun) void {
-        const thread = r.thread orelse return;
-        thread.join();
-        r.thread = null;
-        if (r.results) |results| diff_mod.freeResults(r.gpa, results);
-        r.results = null;
-    }
-};
-
-const Session = struct {
+pub const Session = struct {
     ctx: *Context,
     /// The reader's heap, not the CLI's arena, and safe to call from the
     /// rasterising thread.
@@ -1524,16 +1483,16 @@ const Session = struct {
     diff: ?ComparisonIfCompared = null,
     /// Where each document's window was when the two were last held
     /// together, to tell which one has moved. See `lockComparison`.
-    diff_seen: [2]Seen = @splat(.{}),
+    diff_seen: [2]compare.Seen = @splat(.{}),
     /// The change `]d` last landed on, and where that left its window.
     diff_at: ?struct { change: u32, side: u1, scroll: f32 } = null,
     /// How the comparison is on screen. `gd` turns it.
-    diff_showing: Showing = .side_by_side,
+    diff_showing: compare.Showing = .side_by_side,
     /// How far the second document is moved against the first, as last
     /// nudged. The comparison's own offset is the one its regions were
     /// found with, and catches up when `rerun` comes back.
     diff_offset: [2]f32 = .{ 0, 0 },
-    rerun: Rerun = .{},
+    rerun: compare.Rerun = .{},
     /// Each document's scrollbar ticks, as fractions of its height, and the
     /// zoom they were worked out at.
     diff_ticks: [2]struct { zoom: f32 = 0, at: std.ArrayList(f32) = .empty } = @splat(.{}),
@@ -1662,7 +1621,7 @@ const Session = struct {
 
     pub const Image = struct { pixels: []u8, width: u32, height: u32 };
 
-    fn deinit(s: *Session) void {
+    pub fn deinit(s: *Session) void {
         s.rerun.finish();
         if (s.chrome) |c| c.destroy();
         // Before the buffers: a plugin's last handlers may still read them.
@@ -1787,7 +1746,7 @@ const Session = struct {
         lib.setFileId(path, Library.hexId(&hex, doc.fileId() orelse "")) catch {};
     }
 
-    fn buffer(s: *Session, index: u32) *Buffer {
+    pub fn buffer(s: *Session, index: u32) *Buffer {
         return &s.buffers.items[index];
     }
 
@@ -1827,11 +1786,11 @@ const Session = struct {
     }
 
     /// The tabpage on screen. Every window command means this one.
-    fn layout(s: *Session) *Layout {
+    pub fn layout(s: *Session) *Layout {
         return s.tabs.current();
     }
 
-    fn view(s: *Session) *View {
+    pub fn view(s: *Session) *View {
         return s.layout().current();
     }
 
@@ -2532,7 +2491,7 @@ const Session = struct {
         const at = v.pageTop(page) + down * v.zoom;
         if (at >= v.scroll and at <= v.scroll + v.height()) return;
         // What led up to the change stays on screen above it, as for `]d`.
-        v.goTo(.{ .page = page, .offset = down - v.height() * lead_in / v.zoom, .zoom = v.zoom });
+        v.goTo(.{ .page = page, .offset = down - v.height() * compare.lead_in / v.zoom, .zoom = v.zoom });
     }
 
     // -- work ----------------------------------------------------------------
@@ -2557,7 +2516,7 @@ const Session = struct {
         // Two pages and no text map: the cursor's map is a `.page` job's,
         // asked for separately when the cursor wants it.
         if (job.want == .overlay) {
-            out.result = .{ .cpu = try s.rasteriseOverlay(job) };
+            out.result = .{ .cpu = try compare.rasteriseOverlay(s, job) };
             return;
         }
 
@@ -2629,7 +2588,7 @@ const Session = struct {
 
     /// The page on white paper at a zoom, or at half of it as often as the
     /// canvas has to be halved to fit `max_page_pixels`.
-    fn drawCanvas(
+    pub fn drawCanvas(
         s: *Session,
         buffer_index: u32,
         page: u32,
@@ -2714,7 +2673,7 @@ const Session = struct {
     /// and two windows at two zooms need two CPU entries and one GPU entry.
     fn cached(s: *const Session, v: *const View, page: u32) bool {
         // An overlay is pixels on either backend: see `rasteriseOverlay`.
-        if (s.overlaid(v)) return s.cachedSlot(v.buffer, page, v.zoom, true) != null;
+        if (compare.overlaid(s, v)) return s.cachedSlot(v.buffer, page, v.zoom, true) != null;
         return switch (s.backend) {
             .cpu => s.cachedSlot(v.buffer, page, v.zoom, false) != null,
             .gpu => s.recorded.has(v.buffer, page),
@@ -2742,7 +2701,7 @@ const Session = struct {
     /// Windows are asked in layout order and pages top-down within each, so a
     /// fresh split fills in the way a person reads rather than in page order.
     /// The focused window goes first, because that is the one being looked at.
-    fn firstMissing(s: *Session) ?Job {
+    pub fn firstMissing(s: *Session) ?Job {
         if (s.missingIn(s.layout().current())) |job| return job;
         var it = s.layout().iterator();
         while (it.next()) |v| {
@@ -2832,7 +2791,7 @@ const Session = struct {
 
         var after = range.end;
         while (after < @min(range.end + read_ahead, v.pages.len)) : (after += 1) {
-            const job: Job = .{ .buffer = v.buffer, .page = after, .zoom = v.zoom, .want = s.pixelsFor(v), .shift = s.shiftFor(v) };
+            const job: Job = .{ .buffer = v.buffer, .page = after, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
             if (s.failed(job)) continue;
             if (!s.cached(v, after)) return job;
         }
@@ -2840,7 +2799,7 @@ const Session = struct {
         var back: u32 = 0;
         while (back < read_ahead and back < range.first) : (back += 1) {
             const page = range.first - 1 - back;
-            const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = s.pixelsFor(v), .shift = s.shiftFor(v) };
+            const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
             if (s.failed(job)) continue;
             if (!s.cached(v, page)) return job;
         }
@@ -2851,7 +2810,7 @@ const Session = struct {
         const range = v.visiblePages();
         var i = range.first;
         while (i < range.end) : (i += 1) {
-            const job: Job = .{ .buffer = v.buffer, .page = i, .zoom = v.zoom, .want = s.pixelsFor(v), .shift = s.shiftFor(v) };
+            const job: Job = .{ .buffer = v.buffer, .page = i, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
             if (s.failed(job)) continue;
             if (!s.cached(v, i)) return job;
         }
@@ -3001,7 +2960,7 @@ const Session = struct {
     /// "did the zoom change"; with four it is a question that has to be asked
     /// of all of them, because the window that asked may have closed while
     /// another one still wants the page.
-    fn wantedNow(s: *Session, job: Job) bool {
+    pub fn wantedNow(s: *Session, job: Job) bool {
         // An overlay drawn before the last nudge shows the old offset.
         if (job.want == .overlay and !std.meta.eql(job.shift, s.diff_offset)) return false;
         var it = s.layout().iterator();
@@ -3644,485 +3603,6 @@ const Session = struct {
         return if (said.len == 0) "" else said[0].text;
     }
 
-    // -- a comparison ----------------------------------------------------------
-
-    /// The two windows of `fenrir diff`: the first document on the left and
-    /// the second on the right, both fitted, and both at the first change.
-    ///
-    /// After the layout has a size and the first window its fit, because a
-    /// split halves the window and each half fits to what it is given.
-    fn arrangeComparison(s: *Session) void {
-        const cmp = s.diff orelse return;
-        if (s.layout().count() < 2) s.splitWindow(.vertical);
-
-        // A split focuses the new window, which is the one on the right.
-        const right = s.view();
-        right.buffer = 1;
-        right.pages = s.buffer(1).pages;
-        right.cursor = .{};
-        right.scroll = 0;
-        right.pan = 0;
-        right.refit();
-        _ = s.layout().focusSide(.left);
-        s.dirty_title = true;
-
-        if (cmp.changes.len == 0) {
-            s.status = "no differences";
-        } else {
-            s.jumpChange(true);
-        }
-        s.lockComparison();
-    }
-
-    /// How a comparison is on screen, in the order `gd` goes round them:
-    /// diff-pdf's view, its `Ctrl+D` overlay, and its `Ctrl+<` and `Ctrl+>`.
-    const Showing = enum {
-        side_by_side,
-        /// One window on the first document's pages, each drawn as both
-        /// pages laid over each other.
-        overlay,
-        first,
-        second,
-
-        /// The word `:diff` takes for each.
-        fn byName(name: []const u8) ?Showing {
-            const names = [_]struct { []const u8, Showing }{
-                .{ "side", .side_by_side },
-                .{ "overlay", .overlay },
-                .{ "first", .first },
-                .{ "second", .second },
-            };
-            for (names) |n| if (std.mem.eql(u8, n[0], name)) return n[1];
-            return null;
-        }
-
-        fn label(s: Showing) []const u8 {
-            return switch (s) {
-                .side_by_side => "side by side",
-                .overlay => "laid over each other -- red only in the first, blue only in the second",
-                .first => "the first document alone",
-                .second => "the second document alone",
-            };
-        }
-    };
-
-    /// `gd` and `gD`: round the ways of showing a comparison.
-    fn turnComparison(s: *Session, delta: i32) void {
-        const n: i32 = @typeInfo(Showing).@"enum".field_names.len;
-        const next = @mod(@as(i32, @intFromEnum(s.diff_showing)) + delta, n);
-        s.showComparison(@enumFromInt(next));
-    }
-
-    /// Shows the comparison as `want`, at the place the reader is now.
-    ///
-    /// Two windows for side by side and one for the rest. The one kept is
-    /// the focused one, moved to the page of its new document that was
-    /// compared with the page it was on -- which is what makes flipping
-    /// between the first alone and the second alone a blink comparator: the
-    /// page does not move, and the eye catches what did.
-    fn showComparison(s: *Session, want: Showing) void {
-        const cmp = s.diff orelse {
-            s.status = "nothing is being compared -- fenrir diff A B";
-            return;
-        };
-        if (want == s.diff_showing) return;
-
-        const v = s.view();
-        const side: u1 = if (v.buffer == 1) 1 else 0;
-        const at = v.place();
-        const pages: [2]u32 = .{
-            if (side == 0) at.page else cmp.partner(1, at.page),
-            if (side == 1) at.page else cmp.partner(0, at.page),
-        };
-
-        s.layout().only(s.gpa);
-        s.placed = null;
-        const kept = s.view();
-        const alone: u1 = if (want == .second) 1 else 0;
-        s.showDocument(kept, alone, .{ .page = pages[alone], .offset = at.offset, .zoom = at.zoom });
-
-        if (want == .side_by_side) {
-            s.splitWindow(.vertical);
-            // The new window is focused, and on the right.
-            s.showDocument(s.view(), 1, .{ .page = pages[1], .offset = at.offset, .zoom = at.zoom });
-            _ = s.layout().focusSide(.left);
-            s.diff_seen = @splat(.{});
-        }
-        s.diff_showing = want;
-        s.dirty_title = true;
-        s.say("{s}", .{want.label()});
-    }
-
-    /// A window put on a document at a place. A fitted window fits the
-    /// rectangle it has now -- half the width it had, or twice -- and a free
-    /// one keeps the zoom it was at; the place is in points either way.
-    fn showDocument(s: *Session, v: *View, index: u32, place: View.Place) void {
-        v.buffer = index;
-        v.pages = s.buffer(index).pages;
-        v.cursor = .{};
-        v.anchor = null;
-        if (v.fit == .free) v.zoom = place.zoom else v.refit();
-        v.goTo(place);
-    }
-
-    /// Whether this window draws the overlay rather than its own pages.
-    fn overlaid(s: *const Session, v: *const View) bool {
-        return s.diff_showing == .overlay and v.buffer == 0;
-    }
-
-    /// What the worker is asked for to put this window's pages on screen.
-    fn pixelsFor(s: *const Session, v: *const View) Job.Want {
-        return if (s.overlaid(v)) .overlay else .page;
-    }
-
-    fn shiftFor(s: *const Session, v: *const View) [2]f32 {
-        return if (s.overlaid(v)) s.diff_offset else .{ 0, 0 };
-    }
-
-    /// `<C-arrows>`: the second document a point further across or down.
-    fn nudge(s: *Session, by: [2]i8) void {
-        s.setOffset(.{
-            s.diff_offset[0] + @as(f32, @floatFromInt(by[0])),
-            s.diff_offset[1] + @as(f32, @floatFromInt(by[1])),
-        });
-    }
-
-    /// Moves the second document against the first and compares them again.
-    ///
-    /// The overlay follows at once, since it is drawn with the offset it is
-    /// asked for; the washes and `]d` follow when the comparison comes back,
-    /// because until then the regions they would draw are the old ones.
-    fn setOffset(s: *Session, offset: [2]f32) void {
-        if (s.diff == null) {
-            s.status = "nothing is being compared -- fenrir diff A B";
-            return;
-        }
-        s.diff_offset = offset;
-        s.compareAgain();
-        var buf: [64]u8 = undefined;
-        s.say("comparing again, the second document {s}", .{offsetWords(&buf, offset)});
-    }
-
-    /// `2pt right, 1pt up`.
-    fn offsetWords(buf: []u8, offset: [2]f32) []const u8 {
-        if (offset[0] == 0 and offset[1] == 0) return "where it was";
-        var w: Io.Writer = .fixed(buf);
-        if (offset[0] != 0) w.print("{d}pt {s}", .{ @abs(offset[0]), if (offset[0] > 0) "right" else "left" }) catch {};
-        if (offset[0] != 0 and offset[1] != 0) w.writeAll(", ") catch {};
-        if (offset[1] != 0) w.print("{d}pt {s}", .{ @abs(offset[1]), if (offset[1] > 0) "down" else "up" }) catch {};
-        return w.buffered();
-    }
-
-    /// Starts the comparison again with the offset in force, unless one is
-    /// already running -- then it is started again when that one is back,
-    /// with whatever the offset is by then. A held key is a nudge a frame,
-    /// and comparing for each would be comparing for none.
-    fn compareAgain(s: *Session) void {
-        const cmp = s.diff orelse return;
-        if (s.rerun.thread != null) {
-            s.rerun.again = true;
-            return;
-        }
-        const io = s.io orelse return;
-        s.rerun = .{
-            .gpa = cmp.gpa,
-            .io = io,
-            .bytes = .{ s.buffer(0).doc.bytes, s.buffer(1).doc.bytes },
-            .pairs = cmp.pairs,
-            .options = cmp.options,
-        };
-        s.rerun.options.offset = s.diff_offset;
-        s.rerun.options.output_dir = null;
-        // Every core: somebody is waiting on this, and the rasterising
-        // thread has one page at a time to do.
-        s.rerun.options.jobs = diff_mod.cpuCount();
-        s.rerun.thread = std.Thread.spawn(.{}, Rerun.work, .{&s.rerun}) catch {
-            s.status = "could not start comparing again";
-            return;
-        };
-    }
-
-    /// Takes the comparison made again, if it is back. Every frame, and it
-    /// never waits.
-    fn collectRerun(s: *Session) void {
-        const thread = s.rerun.thread orelse return;
-        if (!s.rerun.done.load(.acquire)) return;
-        thread.join();
-        s.rerun.thread = null;
-        const cmp = s.diff.?;
-
-        const results = s.rerun.results orelse {
-            s.say("could not compare again: {t}", .{s.rerun.failed orelse error.Unexpected});
-            return;
-        };
-        s.rerun.results = null;
-        if (s.rerun.again or !std.meta.eql(s.rerun.options.offset, s.diff_offset)) {
-            diff_mod.freeResults(cmp.gpa, results);
-            s.rerun.again = false;
-            s.compareAgain();
-            return;
-        }
-        cmp.replace(results) catch {
-            diff_mod.freeResults(cmp.gpa, results);
-            s.status = "out of memory comparing again";
-            return;
-        };
-        cmp.options.offset = s.rerun.options.offset;
-        s.diff_at = null;
-        for (&s.diff_ticks) |*t| t.zoom = 0;
-
-        var buf: [64]u8 = undefined;
-        s.say("{d} change{s}, the second document {s}", .{
-            cmp.changes.len,
-            if (cmp.changes.len == 1) "" else "s",
-            offsetWords(&buf, cmp.options.offset),
-        });
-    }
-
-    /// A page of the first document and its partner in the second, drawn at
-    /// the job's zoom and laid over each other as `--output-diff` lays them.
-    ///
-    /// One picture the size of the first document's page, uploaded as that
-    /// page's texture on either backend: the GPU path draws outlines, and
-    /// "red where only one of two outlines is" is not a blend mode it has or
-    /// should grow for this.
-    ///
-    /// **Runs on the rasterising thread**, which owns both documents.
-    fn rasteriseOverlay(s: *Session, job: Job) !Image {
-        const cmp = s.diff.?;
-        const gpa = s.gpa;
-        const pair = cmp.pairs[cmp.pair_of[0][job.page]];
-
-        var canvases: [2]?gleipnir.raster.Canvas = .{ null, null };
-        defer for (&canvases) |*c| if (c.*) |*canvas| canvas.deinit(gpa);
-        for ([2]?u32{ job.page, pair.b }, 0..) |maybe, side| {
-            const page = maybe orelse continue;
-            const b = s.buffer(@intCast(side));
-            var result = try content.page(gpa, b.doc, b.pages[page], .{});
-            defer result.deinit(gpa);
-            canvases[side] = try s.drawCanvas(@intCast(side), page, result.list, job.zoom, if (side == 1) job.shift else .{ 0, 0 }, b);
-        }
-
-        const a = canvases[0].?.fb;
-        var blank: ?gleipnir.Framebuffer = null;
-        defer if (blank) |*fb| fb.deinit(gpa);
-        const b = if (canvases[1]) |c| c.fb else blk: {
-            blank = try diff_mod.blank(gpa, a);
-            break :blk blank.?;
-        };
-
-        var out = try gleipnir.Framebuffer.init(gpa, a.width, a.height, .srgb);
-        defer out.deinit(gpa);
-        diff_mod.overlay(out, a, b, cmp.options.channel_tolerance, false);
-        return .{ .pixels = try out.toRgba8(gpa), .width = out.width, .height = out.height };
-    }
-
-    /// Where a window was, to tell whether it has moved since.
-    const Seen = struct {
-        scroll: f32 = -1,
-        zoom: f32 = 0,
-        pan: f32 = 0,
-
-        fn of(v: *const View) Seen {
-            return .{ .scroll = v.scroll, .zoom = v.zoom, .pan = v.pan };
-        }
-    };
-
-    /// Holds the two documents' windows together. Whichever moved since the
-    /// last frame leads, and the other is put on the page its page was
-    /// compared with, as far down it, at the same zoom.
-    ///
-    /// Compared rather than hooked into every scroll: a window moves with a
-    /// key, the wheel, the scrollbar, a jump, a fit and a resize, and a lock
-    /// that had to be told about each would be a lock that slips on the one
-    /// somebody forgot.
-    fn lockComparison(s: *Session) void {
-        const cmp = s.diff orelse return;
-        const views = s.comparedViews();
-        const a = views[0] orelse return;
-        const b = views[1] orelse return;
-
-        const moved = [2]bool{
-            !std.meta.eql(s.diff_seen[0], Seen.of(a)),
-            !std.meta.eql(s.diff_seen[1], Seen.of(b)),
-        };
-        if (moved[0] or moved[1]) {
-            // Both moved, as on a resize that refits each: the one being
-            // looked at is the one to keep still.
-            const lead: u1 = if (moved[0] and moved[1])
-                (if (s.view() == b) 1 else 0)
-            else if (moved[0]) 0 else 1;
-            const from = views[lead].?;
-            const to = views[lead ^ 1].?;
-            const at = from.place();
-            to.zoom = from.zoom;
-            to.fit = from.fit;
-            to.pan = from.pan;
-            to.goTo(.{ .page = cmp.partner(lead, at.page), .offset = at.offset, .zoom = from.zoom });
-        }
-        s.diff_seen = .{ .of(a), .of(b) };
-    }
-
-    /// The first window on each document, in this tabpage.
-    fn comparedViews(s: *Session) [2]?*View {
-        var views: [2]?*View = .{ null, null };
-        var it = s.layout().iterator();
-        while (it.next()) |v| {
-            if (v.buffer < 2 and views[v.buffer] == null) views[v.buffer] = v;
-        }
-        return views;
-    }
-
-    /// `]d` and `[d`: the next or previous change, from the one landed on
-    /// last if the window has stayed where that left it, and otherwise from
-    /// where a jump would have put one -- a quarter of the way down.
-    fn jumpChange(s: *Session, forwards: bool) void {
-        const cmp = s.diff orelse {
-            s.status = "nothing is being compared -- fenrir diff A B";
-            return;
-        };
-        const n = cmp.changes.len;
-        if (n == 0) {
-            s.status = "no differences";
-            return;
-        }
-        const v = s.view();
-        const side: u1 = if (v.buffer == 1) 1 else 0;
-
-        var wrapped = false;
-        var next: usize = undefined;
-        const stayed = if (s.diff_at) |at| at.side == side and at.scroll == v.scroll else false;
-        if (stayed) {
-            const at = s.diff_at.?.change;
-            wrapped = if (forwards) at + 1 == n else at == 0;
-            next = if (forwards) (at + 1) % n else (at + n - 1) % n;
-        } else {
-            next = s.changeFrom(v, side, forwards, &wrapped);
-        }
-        s.goToChange(next);
-        const round: []const u8 = if (!wrapped) "" else if (forwards) ", from the top" else ", from the end";
-        s.say("change {d}/{d}{s}", .{ next + 1, n, round });
-    }
-
-    /// Puts the focused window at change `next`, and the other with it.
-    fn goToChange(s: *Session, next: usize) void {
-        const cmp = s.diff orelse return;
-        const v = s.view();
-        const side: u1 = if (v.buffer == 1) 1 else 0;
-
-        // A page only the other document has is shown in that document's
-        // window, which then leads: placing this one beside the page before
-        // it would leave the added page below the bottom of both.
-        const change = cmp.changes[next];
-        const pair = cmp.pairs[change.pair];
-        const own: u1 = if ((if (side == 0) pair.a else pair.b) == null) side ^ 1 else side;
-        const moving = s.comparedViews()[own] orelse v;
-        const to = cmp.changeAt(own, change);
-        // What led up to the change stays on screen above it.
-        moving.goTo(.{ .page = to.page, .offset = to.down - moving.height() * lead_in / moving.zoom, .zoom = moving.zoom });
-        if (moving != v) s.diff_seen[side] = .of(v);
-        s.lockComparison();
-        s.diff_at = .{ .change = @intCast(next), .side = side, .scroll = v.scroll };
-    }
-
-    /// How far down the window a jump puts a change.
-    const lead_in = 0.25;
-
-    /// The first change below the line a jump would put one on, or the last
-    /// above it. Changes are in page order on both sides, so their tops are
-    /// summed as the walk goes rather than asked for one at a time.
-    fn changeFrom(s: *Session, v: *View, side: u1, forwards: bool, wrapped: *bool) usize {
-        const cmp = s.diff.?;
-        const line = v.scroll + v.height() * lead_in;
-        var top: f32 = View.gap;
-        var page: u32 = 0;
-        var before: ?usize = null;
-        for (cmp.changes, 0..) |c, i| {
-            const at = cmp.changeAt(side, c);
-            while (page < at.page) : (page += 1) top += v.pageSize(page)[1] + View.gap;
-            const y = top + at.down * v.zoom;
-            // A pixel's slack each way, so the change a jump has just put on
-            // the line is neither the next nor the previous one.
-            if (forwards and y > line + 1) return i;
-            if (!forwards and y < line - 1) before = i;
-        }
-        if (before) |i| return i;
-        wrapped.* = true;
-        return if (forwards) 0 else cmp.changes.len - 1;
-    }
-
-    /// Red on the first document and green on the second, over each change on
-    /// the pages a window can see; a whole page one document has alone is
-    /// washed from edge to edge.
-    ///
-    /// Fixed colours and not the theme's, because the page's colours are the
-    /// document's: see "A colour drawn on the page cannot come from the
-    /// theme" in `ui.md`.
-    fn drawChanges(s: *Session, v: *View, range: View.Visible, over: *DrawList) !void {
-        const cmp = s.diff orelse return;
-        // The overlay is its own picture of the changes, in its own colours.
-        if (v.buffer > 1 or s.overlaid(v)) return;
-        const side: u1 = @intCast(v.buffer);
-        const wash: Color = if (side == 0) diff_removed else diff_added;
-
-        var page = range.first;
-        while (page < range.end) : (page += 1) {
-            const r = cmp.resultOn(side, page);
-            if (!r.differs()) continue;
-            if (r.regions.len == 0) {
-                try over.fill(v.pageRect(page), wash.withAlpha(0.12));
-                continue;
-            }
-            // The regions say where the pixels moved, lightly; the words
-            // that went or came are what a reader reads, and are washed as a
-            // highlighter would.
-            const height = v.pageBox(page).max_y;
-            for (r.regions) |region| {
-                const box = v.windowBox(page, cmp.regionIn(side, region, height));
-                try over.fill(box, wash.withAlpha(0.08));
-                try over.border(box, .all(0), 1, wash.withAlpha(0.7));
-            }
-            for (if (side == 0) r.removed else r.added) |words| {
-                try over.fill(v.windowBox(page, words), wash.withAlpha(0.3));
-            }
-        }
-    }
-
-    /// Where each change is on this window's scrollbar, as a tick beside the
-    /// track, the way diff-pdf's gutter marks a page.
-    ///
-    /// Worked out from the page tops once per zoom and kept: a document of
-    /// five hundred pages and a thousand changes would otherwise walk every
-    /// page above each change, every frame.
-    fn drawChangeTicks(s: *Session, v: *View, bar: View.Scrollbar, list: *DrawList) !void {
-        const cmp = s.diff orelse return;
-        if (v.buffer > 1) return;
-        const side: u1 = @intCast(v.buffer);
-        const ticks = &s.diff_ticks[side];
-        if (ticks.zoom != v.zoom) {
-            ticks.at.clearRetainingCapacity();
-            const total = v.documentHeight();
-            var top: f32 = View.gap;
-            var page: u32 = 0;
-            for (cmp.changes) |c| {
-                const at = cmp.changeAt(side, c);
-                // Changes are in page order, so the tops are summed once.
-                while (page < at.page) : (page += 1) top += v.pageSize(page)[1] + View.gap;
-                try ticks.at.append(s.gpa, (top + at.down * v.zoom) / total);
-            }
-            ticks.zoom = v.zoom;
-        }
-
-        // Across the thumb's column and a little either side, over the thumb,
-        // so a change inside the visible stretch is marked there too.
-        const track = bar.travel + bar.height;
-        const wash: Color = if (side == 0) diff_removed else diff_added;
-        for (ticks.at.items) |f| {
-            const y = @round(bar.top + f * track);
-            try list.fill(.fromRect(bar.x0 - 3, y - 1, bar.x1 + 2, y + 2), wash);
-        }
-    }
-
     fn recolourMark(s: *Session, colour: u8) void {
         const i = s.focusedMarkIndex() orelse return;
         const b = s.buffer(s.view().buffer);
@@ -4499,7 +3979,7 @@ const Session = struct {
     }
 
     /// Puts a message of any lifetime on the message line.
-    fn say(s: *Session, comptime fmt: []const u8, args: anytype) void {
+    pub fn say(s: *Session, comptime fmt: []const u8, args: anytype) void {
         s.status = std.fmt.bufPrint(&s.status_buf, fmt, args) catch blk: {
             // Too long for the line: as much as fits.
             const n = @min(s.status_buf.len, fmt.len);
@@ -4523,7 +4003,7 @@ const Session = struct {
     const Origin = enum { console, plugin };
 
     /// Returns false when the line did nothing, having said why.
-    fn exec(s: *Session, raw: []const u8) bool {
+    pub fn exec(s: *Session, raw: []const u8) bool {
         return s.execFrom(raw, .console);
     }
 
@@ -4659,8 +4139,8 @@ const Session = struct {
                     s.say("{d} of {d} marks match", .{ n, b.marks.count() });
                 }
             },
-            .dnext => s.jumpChange(true),
-            .dprevious => s.jumpChange(false),
+            .dnext => compare.jumpChange(s, true),
+            .dprevious => compare.jumpChange(s, false),
             .diff => {
                 if (args.len == 0) {
                     if (s.diff == null) {
@@ -4672,7 +4152,7 @@ const Session = struct {
                     // `:diff offset X Y` in points, or nothing to put it back.
                     var it = std.mem.tokenizeScalar(u8, args["offset".len..], ' ');
                     const x = it.next() orelse {
-                        s.setOffset(.{ 0, 0 });
+                        compare.setOffset(s, .{ 0, 0 });
                         return false;
                     };
                     const y = it.next() orelse "0";
@@ -4682,14 +4162,14 @@ const Session = struct {
                         s.status = ":diff offset takes two numbers of points, across and down";
                         return false;
                     }
-                    s.setOffset(.{ dx.?, dy.? });
+                    compare.setOffset(s, .{ dx.?, dy.? });
                     return false;
                 }
-                const want = Showing.byName(args) orelse {
+                const want = compare.Showing.byName(args) orelse {
                     s.say(":diff takes side, overlay, first, second or offset X Y", .{});
                     return false;
                 };
-                s.showComparison(want);
+                compare.showComparison(s, want);
             },
             .lua => {
                 // Not from a plugin. `:lua` is arbitrary Lua at the
@@ -5426,7 +4906,7 @@ const Session = struct {
     /// the chrome keeps for exactly this reason, and not of a box tree that
     /// does not exist yet.
     fn handle(s: *Session, in: lyngvi.Input) bool {
-        s.collectRerun();
+        compare.collectRerun(s);
         if (s.interfaceHasInput()) {
             var it = s.layout().iterator();
             while (it.next()) |v| v.clampScroll();
@@ -5444,7 +4924,7 @@ const Session = struct {
             if (s.apply(cmd)) return true;
         }
         s.applyEffects();
-        s.lockComparison();
+        compare.lockComparison(s);
 
         var it = s.layout().iterator();
         while (it.next()) |v| v.clampScroll();
@@ -5518,7 +4998,7 @@ const Session = struct {
     ///
     /// Separate from `handle` so that tests can drive the reader with the
     /// commands a keystroke would produce, without inventing keystrokes.
-    fn apply(s: *Session, cmd: keys.Command) bool {
+    pub fn apply(s: *Session, cmd: keys.Command) bool {
         const v = s.view();
         switch (cmd) {
             .none => {},
@@ -5537,8 +5017,8 @@ const Session = struct {
             .go_tab => |delta| s.goTab(delta),
             .window_to_tab => s.windowToTab(),
 
-            .diff_view => |delta| s.turnComparison(delta),
-            .nudge => |by| s.nudge(by),
+            .diff_view => |delta| compare.turnComparison(s, delta),
+            .nudge => |by| compare.nudge(s, by),
 
             .next_buffer => s.showBuffer(1),
             .previous_buffer => s.showBuffer(-1),
@@ -5629,7 +5109,7 @@ const Session = struct {
             .next_mark => s.jumpMark(.{ .forwards = true }),
             .previous_mark => s.jumpMark(.{ .forwards = false }),
             .jump_mark => |j| s.jumpMark(j),
-            .jump_change => |forwards| s.jumpChange(forwards),
+            .jump_change => |forwards| compare.jumpChange(s, forwards),
             .recolour_mark => |colour| s.recolourMark(colour),
             .restyle_mark => |style| s.restyleMark(style),
             .delete_mark => s.deleteMark(),
@@ -5884,7 +5364,7 @@ const Session = struct {
         v.cursorTo(at, map);
     }
 
-    fn splitWindow(s: *Session, dir: Layout.Direction) void {
+    pub fn splitWindow(s: *Session, dir: Layout.Direction) void {
         // A split copies the window, and a copied selection would be two
         // windows each claiming to be selecting.
         s.clearSelection();
@@ -6011,11 +5491,6 @@ const Session = struct {
     /// the sort of half-applied theme this file was meant not to have.
     const white: Color = .white;
 
-    /// A comparison's washes: what the first document has and the second
-    /// does not, and the other way round. diff-pdf's view uses the same two.
-    const diff_removed: Color = .{ .r = 0.86, .g = 0.15, .b = 0.15 };
-    const diff_added: Color = .{ .r = 0.1, .g = 0.62, .b = 0.25 };
-
     fn compose(s: *Session, list: *DrawList, over: *DrawList) !void {
         s.stamp += 1;
         s.recorded.stamp = s.stamp;
@@ -6055,7 +5530,7 @@ const Session = struct {
     fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
         const b = s.buffer(v.buffer);
         const range = v.visiblePages();
-        const overlay = s.overlaid(v);
+        const overlay = compare.overlaid(s, v);
 
         var i = range.first;
         while (i < range.end) : (i += 1) {
@@ -6089,7 +5564,7 @@ const Session = struct {
             }
         }
 
-        try s.drawChanges(v, range, over);
+        try compare.drawChanges(s, v, range, over);
         try s.drawMarks(v, b, range, over);
         try s.drawInk(v, b, range, over);
         try s.drawSearchHits(v, range, over);
@@ -6484,7 +5959,7 @@ const Session = struct {
             .all(3),
             .{ .r = s.accent.r, .g = s.accent.g, .b = s.accent.b, .a = alpha },
         );
-        try s.drawChangeTicks(v, bar, list);
+        try compare.drawChangeTicks(s, v, bar, list);
     }
 
     /// Everything the GPU placement depends on, hashed: if this has not
@@ -6512,7 +5987,7 @@ const Session = struct {
         var it = s.layout().iterator();
         while (it.next()) |v| {
             mix(&h, v.buffer);
-            mix(&h, @intFromBool(s.overlaid(v)));
+            mix(&h, @intFromBool(compare.overlaid(s, v)));
             mix(&h, v.scroll);
             mix(&h, v.pan);
             mix(&h, v.zoom);
@@ -6536,7 +6011,7 @@ const Session = struct {
         var it = s.layout().iterator();
         while (it.next()) |v| {
             // An overlaid window shows a picture, not the recorded outlines.
-            if (s.overlaid(v)) continue;
+            if (compare.overlaid(s, v)) continue;
             const box: [4]f32 = .{ v.rect.min_x, v.rect.min_y, v.rect.max_x, v.rect.max_y };
             const range = v.visiblePages();
             var i = range.first;
@@ -6833,7 +6308,7 @@ const Session = struct {
     /// buffer's marks -- `Marks.revision` is bumped by every one of them. A
     /// reader sitting still with the annotations open rebuilds nothing, which
     /// is the rule about doing no work per frame that can be done on change.
-    fn panelRows(s: *Session, which: rails_mod.Panel) []const panels.Row {
+    pub fn panelRows(s: *Session, which: rails_mod.Panel) []const panels.Row {
         const v = s.view();
         const b = s.buffer(v.buffer);
         const stamp: @TypeOf(s.rows_for) = .{
@@ -6905,8 +6380,8 @@ const Session = struct {
                         },
                         .page = page + 1,
                         .swatch = switch (r.kind) {
-                            .only_a => diff_removed,
-                            .only_b => diff_added,
+                            .only_a => compare.diff_removed,
+                            .only_b => compare.diff_added,
                             else => null,
                         },
                         // From one: zero is `State.chosen`'s "none".
@@ -7041,7 +6516,7 @@ const Session = struct {
             .changes => if (s.diff) |cmp| {
                 for (cmp.changes, 0..) |change, i| {
                     if (change.pair + 1 != chosen.id) continue;
-                    s.goToChange(i);
+                    compare.goToChange(s, i);
                     s.say("change {d}/{d}", .{ i + 1, cmp.changes.len });
                     break;
                 }
@@ -7133,7 +6608,7 @@ const Session = struct {
             if (v.fit_on_open) v.fitTo(.width);
             if (v.scroll == 0) v.scrollToPage(start_page);
         }
-        s.arrangeComparison();
+        compare.arrangeComparison(s);
 
         var list: DrawList = .init(gpa, .fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
         defer list.deinit();
@@ -7148,7 +6623,7 @@ const Session = struct {
             if (slot >= cache_slots) break;
 
             const image = if (job.want == .overlay)
-                s.rasteriseOverlay(job) catch {
+                compare.rasteriseOverlay(s, job) catch {
                     s.noteFailure(job);
                     continue;
                 }
@@ -7278,7 +6753,7 @@ const Session = struct {
                 if (settings.page_given) v.scrollToPage(settings.start_page);
             }
         }
-        s.arrangeComparison();
+        compare.arrangeComparison(s);
         s.remember(s.view());
         // The window exists and every window is where it will start, so a
         // plugin reacting to `start` can split, scroll or zoom and see it.
@@ -7726,101 +7201,19 @@ const Session = struct {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+const fixtures = @import("read/fixtures.zig");
+const closeSession = fixtures.closeSession;
+const fakePages = fixtures.fakePages;
+const giveLibrary = fixtures.giveLibrary;
+const givePlugins = fixtures.givePlugins;
+const putText = fixtures.putText;
+const sessionOf = fixtures.sessionOf;
 
 test {
-    // The tests of a feature this build left out are left out with it. See
-    // `comparison_tests`.
-    if (caps.compare) _ = comparison_tests;
-}
-
-/// Hands a test session a library, or skips the test in a build with none.
-///
-/// A test cannot write `s.library = lib` directly: in a build with no
-/// database the field has no payload type, by design -- see `Session.library`.
-/// The assignment lives inside the comptime branch so it is analysed only
-/// where it means something, which is what lets `-Dsqlite=false` compile its
-/// test binary and skip rather than fail. `if (!caps.sqlite) return
-/// error.SkipZigTest;` would not do: the line after it would still be
-/// analysed.
-fn giveLibrary(s: *Session, lib: Library) error{SkipZigTest}!void {
-    if (caps.sqlite) {
-        s.library = lib;
-        return;
-    }
-    return error.SkipZigTest;
-}
-
-/// The same, for Galdr. `-Dlua=false` skips these tests rather than failing
-/// to compile them.
-fn givePlugins(s: *Session, rt: *galdr.Runtime) error{SkipZigTest}!void {
-    if (caps.lua) {
-        s.plugins = rt;
-        return;
-    }
-    return error.SkipZigTest;
-}
-
-/// `n` identical Letter-sized pages, with nothing in them: the layout reads
-/// only the boxes, so a page needs no document behind it to be laid out.
-fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
-    const letter: fenrir.Page.Rect = .{ .x0 = 0, .y0 = 0, .x1 = 600, .y1 = 800 };
-    for (buf[0..n], 0..) |*p, i| p.* = .{
-        .index = @intCast(i),
-        .ref = .{ .num = 0, .gen = 0 },
-        .dict = .empty,
-        .resources = .empty,
-        .media_box = letter,
-        .crop_box = letter,
-        .rotate = .none,
-    };
-    return buf[0..n];
-}
-
-/// A session with one buffer of `n` blank pages and one window on it. No
-/// document: everything tested here reads `pages` and the caches.
-fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !Session {
-    var s: Session = .{ .ctx = undefined, .gpa = gpa, .samples = .four, .palette_text = .init(gpa) };
-    errdefer s.deinit();
-    try s.buffers.append(gpa, .{
-        .path = try gpa.dupe(u8, "/docs/a.pdf"),
-        .title = "a.pdf",
-        .pages = pages,
-    });
-    s.next_doc_handle += 1;
-    try s.doc_handles.append(gpa, s.next_doc_handle);
-    try s.tabs.init(gpa, .{ .buffer = 0, .pages = pages, .zoom = zoom });
-    s.tabs.arrange(.fromRect(0, 0, w, h));
-    return s;
-}
-
-/// `Session.deinit` frees documents, and a test session has none.
-fn closeSession(s: *Session) void {
-    s.cmdline.deinit(s.gpa);
-    s.stroking.deinit(s.gpa);
-    s.note.deinit(s.gpa);
-    s.comment_order.deinit(s.gpa);
-    s.palette_rows.deinit(s.gpa);
-    s.palette_text.deinit();
-    s.doc_handles.deinit(s.gpa);
-    s.rail_left.deinit(s.gpa);
-    s.rail_right.deinit(s.gpa);
-    s.plugin_settings.deinit(s.gpa);
-    s.rail_panels.deinit(s.gpa);
-    s.rows.deinit(s.gpa);
-    s.search.deinit(s.gpa);
-    s.recorded.deinit(s.gpa);
-    s.tabs.deinit(s.gpa);
-    s.tab_names.deinit(s.gpa);
-    s.tab_text.deinit(s.gpa);
-    s.tab_ends.deinit(s.gpa);
-    for (s.disks.items) |*d| d.deinit(s.gpa, null);
-    s.disks.deinit(s.gpa);
-    for (s.buffers.items) |*b| {
-        b.marks.deinit(s.gpa);
-        for (&b.maps) |*m| m.map.deinit(s.gpa);
-        s.gpa.free(b.path);
-    }
-    s.buffers.deinit(s.gpa);
+    // The files the session is split into, named so that their tests run
+    // whichever of them this build's session reaches. A file whose tests
+    // need a capability gates them itself: see `compare.comparison_tests`.
+    _ = compare;
 }
 
 test "a split is two windows on one document, scrolling apart" {
@@ -8064,45 +7457,6 @@ test "closing the last window is a quit, and closing others is not" {
     try testing.expect(s.closeWindow());
     try testing.expectEqual(@as(u32, 1), s.layout().count());
     try testing.expect(!s.closeWindow());
-}
-
-/// `rows` lines of `cols` glyphs each, twenty points apart, as page `page`'s
-/// text map in buffer 0. Words are two glyphs long.
-/// `rows` lines of `cols` glyphs, as two words a line.
-///
-/// Two runs and not one, because that is the only shape a word gap can
-/// reach this layer in: a `TJ` kern moves the text matrix and so ends the
-/// run, which means the next word starts a few points right of where the
-/// last one finished. Inside a run the glyphs are flush against each other,
-/// and `w` has nothing to stop at.
-fn putText(s: *Session, page: u32, rows: usize, cols: usize) !void {
-    const gpa = s.gpa;
-    const glyphs = try gpa.alloc(gelgja.DisplayList.Glyph, rows * cols);
-    defer gpa.free(glyphs);
-    const cmds = try gpa.alloc(gelgja.DisplayList.DrawCmd, rows * 2);
-    defer gpa.free(cmds);
-
-    const word = @max(cols / 2, 1);
-    const advance = 10 * @as(f32, @floatFromInt(word));
-    for (0..rows) |row| {
-        for (0..cols) |col| {
-            const within: f32 = @floatFromInt(col % word);
-            glyphs[row * cols + col] = .{ .code = 'a', .offset = .{ .x = 10 * within, .y = 0 } };
-        }
-        for (0..2) |w| {
-            const first = row * cols + w * word;
-            cmds[row * 2 + w] = .{ .text = .{
-                .size = 10,
-                .transform = .translation(
-                    100 + @as(f32, @floatFromInt(w)) * (advance + 6),
-                    700 - 20 * @as(f32, @floatFromInt(row)),
-                ),
-                .glyphs = .{ .start = @intCast(first), .count = @intCast(@min(word, cols - w * word)) },
-                .advance = advance,
-            } };
-        }
-    }
-    s.buffer(0).putMap(gpa, page, try text.build(gpa, .{ .glyphs = glyphs, .cmds = cmds }));
 }
 
 test "a selection runs in reading order, inclusive, and across pages" {
@@ -8868,216 +8222,6 @@ test "showing another document in a window keeps the place in the first" {
     try testing.expectEqual(@as(usize, 10), s.view().pages.len);
     try testing.expect(was > 0);
 }
-
-/// The comparison tests, which only a build that has a comparison can run.
-///
-/// Nested in a struct the test block below references only when the
-/// capability is on: a test declaration inside a container that is never
-/// analysed is never registered. `error.SkipZigTest` could not have done
-/// this -- the body would still have to compile, and `Session.diff` has no
-/// payload type in a build with no comparison.
-const comparison_tests = struct {
-    /// Six pages against seven: one change a third of the way down page three,
-    /// and a seventh page only the second document has. Regions measured at one
-    /// pixel a point, so they read as points.
-    fn comparedSession(gpa: Allocator, buf: []fenrir.Page, results: *[7]diff_mod.Result, cmp: *diff_mod.Comparison) !Session {
-        var s = try sessionOf(gpa, fakePages(buf, 6), 1, 1000, 800);
-        errdefer closeSession(&s);
-        try s.buffers.append(gpa, .{
-            .path = try gpa.dupe(u8, "/docs/b.pdf"),
-            .title = "b.pdf",
-            .pages = fakePages(buf[6..], 7),
-        });
-        const pairs = try diff_mod.pairByNumber(gpa, 6, 7);
-        errdefer gpa.free(pairs);
-        results.* = @splat(.{ .kind = .same_list });
-        results[2] = .{ .kind = .differ, .pixels = 400, .regions = &.{.{ .x0 = 40, .y0 = 300, .x1 = 240, .y1 = 320 }} };
-        results[6] = .{ .kind = .only_b };
-        cmp.* = try .init(gpa, pairs, results, .{ 6, 7 }, .{ .dpi = 72 });
-        s.diff = cmp;
-        return s;
-    }
-
-    fn closeCompared(s: *Session, cmp: *diff_mod.Comparison) void {
-        s.gpa.free(cmp.pairs);
-        cmp.deinit();
-        for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
-        closeSession(s);
-    }
-
-    test "a comparison opens side by side at its first change, and the windows move together" {
-        const gpa = testing.allocator;
-        var buf: [13]fenrir.Page = undefined;
-        var results: [7]diff_mod.Result = undefined;
-        var cmp: diff_mod.Comparison = undefined;
-        var s = try comparedSession(gpa, &buf, &results, &cmp);
-        defer closeCompared(&s, &cmp);
-
-        s.arrangeComparison();
-        try testing.expectEqual(@as(u32, 2), s.layout().count());
-        const views = s.comparedViews();
-        const a = views[0].?;
-        const b = views[1].?;
-        // The first document on the left, and focused.
-        try testing.expect(a.rect.min_x < b.rect.min_x);
-        try testing.expectEqual(a, s.view());
-
-        // At the change, a quarter of the way down, in both.
-        try testing.expectEqual(@as(u32, 2), a.currentPage());
-        const line = a.scroll + a.height() * 0.25;
-        try testing.expectApproxEqAbs(a.pageTop(2) + 300, line, 0.5);
-        try testing.expectEqual(a.scroll, b.scroll);
-        try testing.expectEqualStrings("change 1/2", s.status);
-
-        // Scrolling or zooming either one moves the other.
-        b.scroll += 120;
-        s.lockComparison();
-        try testing.expectEqual(b.scroll, a.scroll);
-        a.setZoom(1.5);
-        s.lockComparison();
-        try testing.expectEqual(@as(f32, 1.5), b.zoom);
-        try testing.expectEqual(a.currentPage(), b.currentPage());
-    }
-
-    test "]d shows a page only one document has in that document's window, and wraps" {
-        const gpa = testing.allocator;
-        var buf: [13]fenrir.Page = undefined;
-        var results: [7]diff_mod.Result = undefined;
-        var cmp: diff_mod.Comparison = undefined;
-        var s = try comparedSession(gpa, &buf, &results, &cmp);
-        defer closeCompared(&s, &cmp);
-        s.arrangeComparison();
-
-        s.jumpChange(true);
-        const views = s.comparedViews();
-        // The seventh page is the second document's, and its window has it;
-        // the first document's stays beside its last page rather than past it.
-        try testing.expectEqual(@as(u32, 6), views[1].?.currentPage());
-        try testing.expectEqual(@as(u32, 5), views[0].?.currentPage());
-        try testing.expectEqualStrings("change 2/2", s.status);
-
-        s.jumpChange(true);
-        try testing.expectEqualStrings("change 1/2, from the top", s.status);
-        try testing.expectEqual(@as(u32, 2), views[0].?.currentPage());
-
-        // Backwards from the first is the last.
-        s.jumpChange(false);
-        try testing.expectEqualStrings("change 2/2, from the end", s.status);
-    }
-
-    test "gd goes round side by side, the overlay, and each document alone, at one place" {
-        const gpa = testing.allocator;
-        var buf: [13]fenrir.Page = undefined;
-        var results: [7]diff_mod.Result = undefined;
-        var cmp: diff_mod.Comparison = undefined;
-        var s = try comparedSession(gpa, &buf, &results, &cmp);
-        defer closeCompared(&s, &cmp);
-        s.arrangeComparison();
-        const scroll = s.view().scroll;
-
-        // The overlay: one window, on the first document's pages, asking the
-        // worker for pictures of both rather than for the page.
-        _ = s.apply(.{ .diff_view = 1 });
-        try testing.expectEqual(Session.Showing.overlay, s.diff_showing);
-        try testing.expectEqual(@as(u32, 1), s.layout().count());
-        try testing.expectEqual(@as(u32, 0), s.view().buffer);
-        try testing.expectEqual(Job.Want.overlay, s.firstMissing().?.want);
-        try testing.expectEqual(scroll, s.view().scroll);
-
-        // Each alone, and the blink between them keeps the place.
-        _ = s.apply(.{ .diff_view = 1 });
-        try testing.expectEqual(Job.Want.page, s.firstMissing().?.want);
-        _ = s.apply(.{ .diff_view = 1 });
-        try testing.expectEqual(Session.Showing.second, s.diff_showing);
-        try testing.expectEqual(@as(u32, 1), s.view().buffer);
-        try testing.expectEqual(scroll, s.view().scroll);
-        _ = s.apply(.{ .diff_view = -1 });
-        try testing.expectEqual(@as(u32, 0), s.view().buffer);
-        try testing.expectEqual(scroll, s.view().scroll);
-
-        // And back to two windows, first on the left, still together.
-        _ = s.apply(.{ .diff_view = -1 });
-        _ = s.apply(.{ .diff_view = -1 });
-        try testing.expectEqual(Session.Showing.side_by_side, s.diff_showing);
-        const views = s.comparedViews();
-        try testing.expect(views[0].?.rect.min_x < views[1].?.rect.min_x);
-        s.lockComparison();
-        try testing.expectEqual(views[0].?.scroll, views[1].?.scroll);
-    }
-
-    test "the changes panel is a row a page that differs, numbered from the window's side" {
-        const gpa = testing.allocator;
-        var buf: [13]fenrir.Page = undefined;
-        var results: [7]diff_mod.Result = undefined;
-        var cmp: diff_mod.Comparison = undefined;
-        var s = try comparedSession(gpa, &buf, &results, &cmp);
-        defer closeCompared(&s, &cmp);
-        s.arrangeComparison();
-        results[2].detail = "\"fox\" → \"cat\"";
-
-        const rows = s.panelRows(.changes);
-        try testing.expectEqual(@as(usize, 2), rows.len);
-        try testing.expectEqualStrings("\"fox\" → \"cat\"", rows[0].label);
-        try testing.expectEqual(@as(u32, 3), rows[0].page);
-        // The seventh page is the second document's alone. From the first
-        // document's window it stands beside that document's last page.
-        try testing.expectEqualStrings("only in the second document", rows[1].label);
-        try testing.expectEqual(@as(u32, 6), rows[1].page);
-        try testing.expectEqual(@as(u64, 7), rows[1].id);
-    }
-
-    test "a nudge moves the overlay at once, and a picture of the old offset is not wanted" {
-        const gpa = testing.allocator;
-        var buf: [13]fenrir.Page = undefined;
-        var results: [7]diff_mod.Result = undefined;
-        var cmp: diff_mod.Comparison = undefined;
-        var s = try comparedSession(gpa, &buf, &results, &cmp);
-        defer closeCompared(&s, &cmp);
-        s.arrangeComparison();
-        s.showComparison(.overlay);
-
-        const before = s.firstMissing().?;
-        _ = s.apply(.{ .nudge = .{ 1, 0 } });
-        _ = s.apply(.{ .nudge = .{ 1, 0 } });
-        _ = s.apply(.{ .nudge = .{ 0, -1 } });
-        try testing.expectEqual([2]f32{ 2, -1 }, s.diff_offset);
-        try testing.expectEqualStrings("comparing again, the second document 2pt right, 1pt up", s.status);
-
-        const after = s.firstMissing().?;
-        try testing.expectEqual([2]f32{ 2, -1 }, after.shift);
-        try testing.expect(!before.eql(after));
-        try testing.expect(!s.wantedNow(before));
-        try testing.expect(s.wantedNow(after));
-
-        // The regions stay the ones they were found at until the comparison
-        // made again comes back.
-        try testing.expectEqual([2]f32{ 0, 0 }, cmp.options.offset);
-        _ = s.exec("diff offset");
-        try testing.expectEqual([2]f32{ 0, 0 }, s.diff_offset);
-    }
-
-    test "a comparison made again on its own thread comes back with the offset's answer" {
-        var one: [512]u8 = undefined;
-        var two: [512]u8 = undefined;
-        const pairs = [_]diff_mod.Pair{.{ .a = 0, .b = 0 }};
-        var r: Rerun = .{
-            .gpa = testing.allocator,
-            .io = testing.io,
-            .bytes = .{ diff_mod.rectanglePdf(&one, 72), diff_mod.rectanglePdf(&two, 108) },
-            .pairs = &pairs,
-            .options = .{ .dpi = 36, .offset = .{ -36, 0 } },
-        };
-        r.thread = try std.Thread.spawn(.{}, Rerun.work, .{&r});
-        defer r.finish();
-        r.thread.?.join();
-        r.thread = null;
-
-        try testing.expect(r.done.load(.acquire));
-        try testing.expectEqual(diff_mod.Result.Kind.same_pixels, r.results.?[0].kind);
-        diff_mod.freeResults(r.gpa, r.results.?);
-        r.results = null;
-    }
-};
 
 test "a tabpage keeps its own windows, and gt goes between them" {
     const gpa = testing.allocator;
@@ -10556,7 +9700,7 @@ test "a reload goes to the change, unless the change is already on screen" {
     // lands a quarter of the way down, as `]d` puts a change.
     s.install(0, try reloadOf(gpa, 3, 2, 100));
     const at = v.pageTop(2) + 100 * v.zoom;
-    try testing.expectApproxEqAbs(v.height() * Session.lead_in, at - v.scroll, 1);
+    try testing.expectApproxEqAbs(v.height() * compare.lead_in, at - v.scroll, 1);
     try testing.expectEqualStrings("gen 2: page 3 changed", s.status);
 
     // On screen now, so a second change there moves nothing.
