@@ -12,9 +12,9 @@ const fenrir = @import("fenrir");
 
 const library = @import("../library.zig");
 const Library = library.Library;
-const read = @import("../read.zig");
-const Session = read.Session;
-const Job = read.Job;
+const marks = @import("marks.zig");
+const Job = @import("../read.zig").Job;
+const Session = @import("../read.zig").Session;
 
 const galdr = fenrir.galdr;
 const hlidskjalf = fenrir.hlidskjalf;
@@ -245,8 +245,8 @@ pub fn announceEffect(s: *Session, at: u32, b: *Buffer, e: Marks.Effect) void {
         .y0 = mark.box.min_y,
         .x1 = mark.box.max_x,
         .y1 = mark.box.max_y,
-        .color = Session.hexOf(mark.color, &hex),
-        .note = Session.firstComment(b, mark),
+        .color = marks.hexOf(mark.color, &hex),
+        .note = marks.firstComment(b, mark),
         .kind = kindName(mark.kind),
         .style = styleName(mark),
     } } });
@@ -438,9 +438,9 @@ fn hostMarkAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host
     const s = hostSession(ptr);
     const at = bufferFor(s, doc) orelse return null;
     const b = s.buffer(at);
-    const marks = b.marks.items();
-    if (index >= marks.len) return null;
-    const m = marks[index];
+    const all = b.marks.items();
+    if (index >= all.len) return null;
+    const m = all[index];
     return .{
         .id = m.key,
         .page = m.page + 1,
@@ -450,9 +450,9 @@ fn hostMarkAt(ptr: *anyopaque, doc: galdr.Host.Handle, index: usize) ?galdr.Host
         .y1 = m.box.max_y,
         // Valid until the next call, which Galdr does not make until it
         // has copied this one into Lua.
-        .color = Session.hexOf(m.color, &s.hex_buf),
-        .note = Session.firstComment(b, m),
-        .anchor = Session.spell(b, m.anchor, &s.name_bufs[0]),
+        .color = marks.hexOf(m.color, &s.hex_buf),
+        .note = marks.firstComment(b, m),
+        .anchor = marks.spell(b, m.anchor, &s.name_bufs[0]),
         .kind = kindName(m.kind),
         .style = styleName(m),
     };
@@ -526,8 +526,8 @@ fn hostComment(s: *Session, b: *Buffer, c: Marks.Comment, names: *[2][Library.na
     const line = b.marks.firstLine(s.gpa, c.anchor);
     return .{
         .id = c.key,
-        .anchor = Session.spell(b, c.anchor, &names[0]),
-        .name = Session.spell(b, c.name, &names[1]),
+        .anchor = marks.spell(b, c.anchor, &names[0]),
+        .name = marks.spell(b, c.name, &names[1]),
         .text = c.text,
         .page = if (line) |i| b.marks.items()[i].page + 1 else 0,
     };
@@ -662,11 +662,11 @@ test "a plugin comments on the real reader's marks, and hears each comment come 
     }
 
     // Two lines of one selection, made the way `c` makes them.
-    const anchor = s.markBoxes(0, &.{
+    const anchor = marks.markBoxes(&s, 0, &.{
         .{ .page = 1, .box = .fromRect(100, 700, 300, 712) },
         .{ .page = 1, .box = .fromRect(100, 686, 300, 698) },
     }, s.accent, .highlight);
-    s.applyEffects();
+    marks.applyEffects(&s);
     var name: [Library.name_len]u8 = undefined;
     var script: [1024]u8 = undefined;
     try testing.expect(rt.runString("init.lua", try std.fmt.bufPrint(&script,
@@ -680,7 +680,7 @@ test "a plugin comments on the real reader's marks, and hears each comment come 
         \\first = fenrir.comment{{ anchor = marks[2].id, text = "on the second line" }}
         \\reply = fenrir.comment{{ anchor = "{s}", text = "a reply" }}
     , .{ Library.makeName(&name, anchor), Library.makeName(&name, anchor) })));
-    s.applyEffects();
+    marks.applyEffects(&s);
 
     // Both on the one anchor, the first named as the anchor is; and read
     // back in `]c`'s order, with the page the anchor begins on.
@@ -696,11 +696,11 @@ test "a plugin comments on the real reader's marks, and hears each comment come 
         \\assert(not pcall(fenrir.comment, { anchor = "f999", text = "on nothing" }))
         \\assert(fenrir.uncomment(reply))
     ));
-    s.applyEffects();
+    marks.applyEffects(&s);
 
     // An undo is the reader's, and the plugin hears it as it heard the rest.
     _ = s.apply(.undo);
-    s.applyEffects();
+    marks.applyEffects(&s);
     try testing.expect(rt.runString("check",
         \\assert(#heard == 4, #heard)
         \\assert(heard[1]:find("^CommentAdd:on the second line:"))
@@ -749,17 +749,17 @@ test "a plugin drives the real reader: bindings, commands, highlights, events" {
 
     // A plugin command from the command line.
     try testing.expect(s.exec("Mark 3"));
-    s.applyEffects();
-    const marks = s.buffer(0).marks.items();
-    try testing.expectEqual(@as(usize, 1), marks.len);
-    try testing.expectEqual(@as(u32, 2), marks[0].page);
-    try testing.expectEqualStrings("from lua", Session.firstComment(s.buffer(0), marks[0]));
-    try testing.expectEqual(Library.parseColor("blue").?, marks[0].color);
-    try testing.expectEqual(Marks.Style.squiggly, marks[0].style);
+    marks.applyEffects(&s);
+    const made = s.buffer(0).marks.items();
+    try testing.expectEqual(@as(usize, 1), made.len);
+    try testing.expectEqual(@as(u32, 2), made[0].page);
+    try testing.expectEqualStrings("from lua", marks.firstComment(s.buffer(0), made[0]));
+    try testing.expectEqual(Library.parseColor("blue").?, made[0].color);
+    try testing.expectEqual(Marks.Style.squiggly, made[0].style);
 
     // Undo is the reader's, and the plugin hears about both.
     _ = s.apply(.undo);
-    s.applyEffects();
+    marks.applyEffects(&s);
     reportChanges(&s);
     try testing.expect(s.exec("lua assert(events[1] == 'AnnotationAdd:3' and events[2] == 'AnnotationRemove:3', table.concat(events, ',')) assert(last_page == 10)"));
     try testing.expectEqual(@as(usize, 0), rt.messages.items.len);

@@ -12,9 +12,8 @@ const Io = std.Io;
 const fenrir = @import("fenrir");
 
 const diff_mod = @import("../diff.zig");
-const read = @import("../read.zig");
-const Job = read.Job;
-const Session = read.Session;
+const Job = @import("../read.zig").Job;
+const Session = @import("../read.zig").Session;
 
 const content = fenrir.content;
 const gleipnir = fenrir.gleipnir;
