@@ -37,7 +37,7 @@ const text = hlidskjalf.text;
 pub const default_pen_width: f32 = 1.6;
 
 /// What ink that names no colour is drawn in: a stroke stored without one,
-/// and the pen until a digit picks another. See `Session.penColor`.
+/// and the pen until a digit picks another. See `ink.penColor`.
 pub const ink_colour: Color = .{ .r = 0.13, .g = 0.19, .b = 0.35, .a = 1 };
 
 /// The colour a digit names. `1` is the default highlight colour, which is
