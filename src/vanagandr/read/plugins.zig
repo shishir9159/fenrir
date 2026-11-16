@@ -643,6 +643,7 @@ fn hostListDir(ptr: *anyopaque, gpa: Allocator, rel: []const u8) ?[][]u8 {
 
 const testing = std.testing;
 const fixtures = @import("fixtures.zig");
+const windows = @import("windows.zig");
 const closeSession = fixtures.closeSession;
 const fakePages = fixtures.fakePages;
 const givePlugins = fixtures.givePlugins;
@@ -880,9 +881,9 @@ test "moving between two documents at the same place still says so" {
     ));
 
     reportChanges(&s);
-    s.showBuffer(1);
+    windows.showBuffer(&s, 1);
     reportChanges(&s);
-    s.showBuffer(-1);
+    windows.showBuffer(&s, -1);
     reportChanges(&s);
 
     try testing.expect(rt.runString("check",

@@ -14,6 +14,7 @@ const fenrir = @import("fenrir");
 const diff_mod = @import("../diff.zig");
 const Job = @import("../read.zig").Job;
 const Session = @import("../read.zig").Session;
+const windows = @import("windows.zig");
 
 const content = fenrir.content;
 const gleipnir = fenrir.gleipnir;
@@ -74,7 +75,7 @@ pub const Rerun = struct {
 /// split halves the window and each half fits to what it is given.
 pub fn arrangeComparison(s: *Session) void {
     const cmp = s.diff orelse return;
-    if (s.layout().count() < 2) s.splitWindow(.vertical);
+    if (s.layout().count() < 2) windows.splitWindow(s, .vertical);
 
     // A split focuses the new window, which is the one on the right.
     const right = s.view();
@@ -163,7 +164,7 @@ pub fn showComparison(s: *Session, want: Showing) void {
     showDocument(s, kept, alone, .{ .page = pages[alone], .offset = at.offset, .zoom = at.zoom });
 
     if (want == .side_by_side) {
-        s.splitWindow(.vertical);
+        windows.splitWindow(s, .vertical);
         // The new window is focused, and on the right.
         showDocument(s, s.view(), 1, .{ .page = pages[1], .offset = at.offset, .zoom = at.zoom });
         _ = s.layout().focusSide(.left);

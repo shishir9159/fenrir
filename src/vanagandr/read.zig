@@ -85,6 +85,7 @@ const interface = @import("read/interface.zig");
 const marks = @import("read/marks.zig");
 const plugins_mod = @import("read/plugins.zig");
 const search_mod = @import("read/search.zig");
+const windows = @import("read/windows.zig");
 
 const content = fenrir.content;
 const gelgja = fenrir.gelgja;
@@ -1711,28 +1712,6 @@ pub const Session = struct {
         return s.layout().current();
     }
 
-    /// Points the focused window at another open document. `<C-w>n`.
-    pub fn showBuffer(s: *Session, delta: i32) void {
-        if (s.buffers.items.len < 2) return;
-        const v = s.view();
-        const n: i32 = @intCast(s.buffers.items.len);
-        const next: u32 = @intCast(@mod(@as(i32, @intCast(v.buffer)) + delta + n, n));
-        if (next == v.buffer) return;
-
-        // Where this window was in the old document is worth keeping: coming
-        // back to it with `<C-w>b` should not have lost your place.
-        s.rememberPlace(v);
-
-        v.buffer = next;
-        v.pages = s.buffer(next).pages;
-        v.cursor = .{};
-        v.scroll = 0;
-        v.pan = 0;
-        _ = s.restore(v, next, false, true);
-        v.clampScroll();
-        s.dirty_title = true;
-    }
-
     // -- what the library remembers ------------------------------------------
 
     /// Draws everything after this in `t`, with whatever accent is in force.
@@ -1763,7 +1742,7 @@ pub const Session = struct {
     /// `--page` and `--zoom` win: an explicit argument is a person saying
     /// where to start, and remembering over the top of that is the kind of
     /// helpfulness that has to be fought.
-    fn restore(s: *Session, v: *View, index: u32, page_given: bool, zoom_free: bool) ?View.Place {
+    pub fn restore(s: *Session, v: *View, index: u32, page_given: bool, zoom_free: bool) ?View.Place {
         if (!s.remembers_place) return null;
         const lib = s.library orelse return null;
         const b = s.buffer(index);
@@ -1792,7 +1771,7 @@ pub const Session = struct {
     }
 
     /// Writes down where a window was left, without counting another opening.
-    fn rememberPlace(s: *Session, v: *View) void {
+    pub fn rememberPlace(s: *Session, v: *View) void {
         if (!s.remembers_place) return;
         const lib = s.library orelse return;
         const b = s.buffer(v.buffer);
@@ -2654,15 +2633,15 @@ pub const Session = struct {
 
         switch (entry.id) {
             .quit => {
-                if (!s.closeWindow()) s.quit = true;
+                if (!windows.closeWindow(s)) s.quit = true;
             },
             .quit_all => s.quit = true,
-            .split => s.splitWindow(.horizontal),
-            .vsplit => s.splitWindow(.vertical),
-            .close => _ = s.closeWindow(),
+            .split => windows.splitWindow(s, .horizontal),
+            .vsplit => windows.splitWindow(s, .vertical),
+            .close => _ = windows.closeWindow(s),
             .only => s.layout().only(s.gpa),
-            .tabnew => s.newTab(),
-            .tabclose => if (!s.closeTab()) {
+            .tabnew => windows.newTab(s),
+            .tabclose => if (!windows.closeTab(s)) {
                 s.say("this is the only tabpage; :q leaves the reader", .{});
                 return false;
             },
@@ -2672,20 +2651,20 @@ pub const Session = struct {
             .tabnext, .tabprevious => {
                 const back = entry.id == .tabprevious;
                 if (args.len == 0) {
-                    s.goTab(if (back) -1 else 1);
+                    windows.goTab(s, if (back) -1 else 1);
                 } else if (std.fmt.parseInt(u32, args, 10)) |n| {
                     if (n == 0 or n > s.tabs.count()) {
                         s.say("there is no tabpage {d}", .{n});
                         return false;
                     }
-                    s.showTab(n - 1);
+                    windows.showTab(s, n - 1);
                 } else |_| {
                     s.say(":{s} takes a tabpage number, or nothing", .{name});
                     return false;
                 }
             },
-            .bnext => s.showBuffer(1),
-            .bprevious => s.showBuffer(-1),
+            .bnext => windows.showBuffer(s, 1),
+            .bprevious => windows.showBuffer(s, -1),
             .reload => {
                 if (s.diff != null) {
                     s.say("a comparison does not reload", .{});
@@ -2998,26 +2977,26 @@ pub const Session = struct {
         const v = s.view();
         switch (cmd) {
             .none => {},
-            .quit => if (!s.closeWindow()) return true,
+            .quit => if (!windows.closeWindow(s)) return true,
             .quit_all => return true,
 
-            .split => |dir| s.splitWindow(dir),
-            .close_window => _ = s.closeWindow(),
+            .split => |dir| windows.splitWindow(s, dir),
+            .close_window => _ = windows.closeWindow(s),
             .only_window => s.layout().only(s.gpa),
             .focus_side => |side| _ = s.layout().focusSide(side),
             .cycle_window => |back| s.layout().cycle(s.gpa, back),
             .equalise => s.layout().equalise(),
 
-            .new_tab => s.newTab(),
-            .close_tab => _ = s.closeTab(),
-            .go_tab => |delta| s.goTab(delta),
-            .window_to_tab => s.windowToTab(),
+            .new_tab => windows.newTab(s),
+            .close_tab => _ = windows.closeTab(s),
+            .go_tab => |delta| windows.goTab(s, delta),
+            .window_to_tab => windows.windowToTab(s),
 
             .diff_view => |delta| compare.turnComparison(s, delta),
             .nudge => |by| compare.nudge(s, by),
 
-            .next_buffer => s.showBuffer(1),
-            .previous_buffer => s.showBuffer(-1),
+            .next_buffer => windows.showBuffer(s, 1),
+            .previous_buffer => windows.showBuffer(s, -1),
 
             // Straight through. The wheel already arrives in document pixels:
             // the platform layer multiplied the notch by the system's line
@@ -3202,7 +3181,7 @@ pub const Session = struct {
 
         // Before anything else: a gesture that began on the line between two
         // windows belongs to that line until it is let go.
-        if (s.dragSplit(in, down, pressed)) return;
+        if (windows.dragSplit(s, in, down, pressed)) return;
 
         // Then the pen, which claims the whole gesture the way a divider
         // does -- a stroke that stopped because the pointer crossed a mark or
@@ -3284,151 +3263,6 @@ pub const Session = struct {
         const p = cursor.positionAt(s, v, in.mouse) orelse return;
         s.drag = .{ .buffer = v.buffer, .from = p, .to = p };
         cursor.carryCursor(s, v, p);
-    }
-
-    /// How far either side of the line a press still counts as taking hold
-    /// of it. The line is two pixels; nobody can hit two pixels.
-    const divider_slack: f32 = 4;
-
-    /// The line between two windows, taken hold of and moved. True when the
-    /// gesture belongs to a divider, and nothing below should see it.
-    ///
-    /// The divider is remembered for the whole drag rather than looked up
-    /// each frame, because the pointer runs ahead of the line the moment it
-    /// reaches a window's minimum -- and a lookup would then find nothing and
-    /// drop the gesture just as someone leans into it.
-    fn dragSplit(s: *Session, in: lyngvi.Input, down: bool, pressed: bool) bool {
-        if (down and pressed and s.split_drag == null) {
-            s.split_drag = s.layout().dividerAt(in.mouse, divider_slack);
-        }
-        const d = s.split_drag orelse return false;
-
-        if (down) {
-            s.layout().moveDivider(d, if (d.dir == .vertical) in.mouse.x else in.mouse.y);
-        } else {
-            s.split_drag = null;
-        }
-
-        // Everything below the early return is skipped, and that includes the
-        // button bookkeeping `dragScrollbar` does. Without this the release
-        // that ends a drag still looks like a press on the frame after it,
-        // and the next press anywhere is swallowed.
-        s.view().was_down = down;
-        return true;
-    }
-
-    pub fn splitWindow(s: *Session, dir: Layout.Direction) void {
-        // A split copies the window, and a copied selection would be two
-        // windows each claiming to be selecting.
-        cursor.clearSelection(s);
-        if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
-
-        const made = s.layout().split(s.gpa, dir) catch null;
-        if (made == null) {
-            s.status = "no room to split";
-            return;
-        }
-        s.placed = null;
-    }
-
-    /// Closes the focused window. False when it was the last one anywhere,
-    /// which the caller turns into a quit.
-    ///
-    /// The last window of a tabpage closes the tabpage, as `:q` does in Vim:
-    /// a tabpage with no windows in it is not a thing, so the only question
-    /// is whether there is another tabpage to fall back to.
-    fn closeWindow(s: *Session) bool {
-        if (s.layout().count() < 2) return s.closeTab();
-        s.rememberPlace(s.view());
-        _ = s.layout().close(s.gpa);
-        s.placed = null;
-        return true;
-    }
-
-    // -- tabpages ------------------------------------------------------------
-
-    /// A tabpage of one window, looking at whatever this one is. `:tabnew`.
-    ///
-    /// Looking at the same document, and not at nothing: a reader opens a tab
-    /// to keep an arrangement, not to be handed an empty one. `<C-w>n` in the
-    /// new tab is what moves it to another buffer, exactly as it would in a
-    /// split.
-    fn newTab(s: *Session) void {
-        const copy = s.leavingTab();
-        _ = s.tabs.open(s.gpa, copy) catch {
-            s.say("no memory for another tabpage", .{});
-            return;
-        };
-        s.enteredTab();
-    }
-
-    /// Closes the tabpage on screen. False when it is the only one, which
-    /// `closeWindow` turns into a quit and `:tabclose` reports.
-    fn closeTab(s: *Session) bool {
-        if (s.tabs.count() < 2) return false;
-
-        // Every window in it, not only the focused one: the whole
-        // arrangement is going, and each was somewhere in a document.
-        var it = s.layout().iterator();
-        while (it.next()) |v| s.rememberPlace(v);
-
-        cursor.clearSelection(s);
-        if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
-        _ = s.tabs.close(s.gpa);
-        s.enteredTab();
-        return true;
-    }
-
-    /// `gt` and `gT`.
-    fn goTab(s: *Session, delta: i32) void {
-        if (s.tabs.count() < 2) return;
-        _ = s.leavingTab();
-        s.tabs.go(delta);
-        s.enteredTab();
-    }
-
-    /// A tabpage by number, from zero. What `:tabnext 2` and a click on the
-    /// bar both go through.
-    fn showTab(s: *Session, index: u32) void {
-        if (index >= s.tabs.count() or index == s.tabs.active) return;
-        _ = s.leavingTab();
-        s.tabs.show(index);
-        s.enteredTab();
-    }
-
-    /// The focused window, moved into a tabpage of its own. `<C-w>T`.
-    fn windowToTab(s: *Session) void {
-        if (s.layout().count() < 2) {
-            s.say("this window is the whole tabpage already", .{});
-            return;
-        }
-        _ = s.leavingTab();
-        _ = s.tabs.moveToNewTab(s.gpa) catch {
-            s.say("no memory for another tabpage", .{});
-            return;
-        };
-        s.enteredTab();
-    }
-
-    /// Everything that has to happen before this tabpage stops being the one
-    /// on screen, and a copy of the window that was focused in it.
-    ///
-    /// A selection belongs to the window it was dragged in, and a window on
-    /// another tabpage is one nobody can see the selection in -- so it goes,
-    /// the way a split's does and for the same reason.
-    fn leavingTab(s: *Session) View {
-        const copy = s.view().*;
-        cursor.clearSelection(s);
-        if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
-        s.rememberPlace(s.view());
-        return copy;
-    }
-
-    /// And after: the pages on the device belong to whichever windows are
-    /// showing, and which those are has just changed.
-    fn enteredTab(s: *Session) void {
-        s.placed = null;
-        s.dirty_title = true;
     }
 
     // -- the frame -----------------------------------------------------------
@@ -3638,10 +3472,10 @@ pub const Session = struct {
     /// of the two a click belonged to: a pointer over a rail is never also
     /// over a page, so there is nothing to arbitrate. The panels are the ones
     /// that overlay, and they are asked about separately.
-    fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
+    pub fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
         if (s.chrome == null) return .fromRect(0, 0, width, @max(height, 1));
         const left = rails_mod.width;
-        const top = s.tabInset();
+        const top = windows.tabInset(s);
         return .fromRect(
             left,
             top,
@@ -3710,109 +3544,18 @@ pub const Session = struct {
         return st;
     }
 
-    /// How much of the window the tab bar takes off the top.
-    ///
-    /// Zero for a single tabpage, which is every session until somebody opens
-    /// a second one: a bar showing one tab says what the title bar says and
-    /// costs a row of the page to say it. Asked here rather than of the
-    /// chrome because `windowRect` needs the answer before the chrome for
-    /// this frame has been built.
-    fn tabInset(s: *const Session) f32 {
-        return if (s.tabs.count() > 1) chrome_mod.tab_height else 0;
-    }
-
-    /// What is written on each tab: the document its focused window is
-    /// looking at, and how many windows are in it when there is more than
-    /// one.
-    ///
-    /// The count is on the tab because it is the one thing that distinguishes
-    /// two tabs on the same document, which is the normal way a second tab
-    /// begins -- `:tabnew` opens on what you were reading.
-    fn tabLabels(s: *Session) []const []const u8 {
-        const stamp = s.tabsKey();
-        if (stamp == s.tabs_for) return s.tab_names.items;
-        s.tabs_for = stamp;
-
-        s.tab_text.clearRetainingCapacity();
-        s.tab_ends.clearRetainingCapacity();
-        s.tab_names.clearRetainingCapacity();
-
-        var i: u32 = 0;
-        while (i < s.tabs.count()) : (i += 1) {
-            const l = s.tabs.at(i);
-            const title = s.buffer(l.current().buffer).title;
-            // Through a buffer rather than a writer over the list: the name
-            // is a basename and a number, and a fixed print cannot fail on
-            // anything but a pathological title -- which then keeps its own
-            // name and loses only the count.
-            var buf: [192]u8 = undefined;
-            const name = if (l.count() > 1)
-                std.fmt.bufPrint(&buf, "{s} ({d})", .{ title[0..@min(title.len, 160)], l.count() }) catch title
-            else
-                title;
-            s.tab_text.appendSlice(s.gpa, name) catch break;
-            s.tab_ends.append(s.gpa, @intCast(s.tab_text.items.len)) catch break;
-        }
-
-        // The slices last, once the bytes have stopped moving.
-        var from: u32 = 0;
-        for (s.tab_ends.items) |to| {
-            s.tab_names.append(s.gpa, s.tab_text.items[from..to]) catch break;
-            from = to;
-        }
-        return s.tab_names.items;
-    }
-
-    /// Everything the bar would draw differently, hashed. Compared rather
-    /// than invalidated by hand, for the reason `placementKey` is: a flag set
-    /// in every place that opens, closes or retitles a tab is a flag that
-    /// will be forgotten in one of them.
-    fn tabsKey(s: *Session) u64 {
-        var h: u64 = 1469598103934665603;
-        const mix = struct {
-            fn go(acc: *u64, value: u64) void {
-                acc.* = (acc.* ^ value) *% 1099511628211;
-            }
-        }.go;
-
-        mix(&h, s.tabs.count());
-        mix(&h, s.tabs.active);
-        var i: u32 = 0;
-        while (i < s.tabs.count()) : (i += 1) {
-            const l = s.tabs.at(i);
-            mix(&h, l.current().buffer);
-            mix(&h, l.count());
-        }
-        return h;
-    }
-
-    /// What the tab bar was asked for, carried out.
-    ///
-    /// A tab closed by its cross is shown first and closed after, so that
-    /// closing one is the same act as clicking it and typing `:tabclose` --
-    /// one path through the session, and the windows in it get their places
-    /// written down on the way out either way.
-    fn applyTabs(s: *Session, r: thviti.widgets.tabs.Result) void {
-        if (r.activated) |i| s.showTab(i);
-        if (r.closed) |i| {
-            s.showTab(i);
-            _ = s.closeTab();
-        }
-        if (r.added) s.newTab();
-    }
-
     fn updateTitle(s: *Session, window: lyngvi.Window) void {
         const v = s.view();
         const page = v.currentPage();
-        const windows = s.layout().count();
+        const count = s.layout().count();
         if (!s.dirty_title and page == s.shown.page and v.zoom == s.shown.zoom and
-            v.buffer == s.shown.buffer and windows == s.shown.windows) return;
+            v.buffer == s.shown.buffer and count == s.shown.windows) return;
 
         s.dirty_title = false;
-        s.shown = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .windows = windows };
+        s.shown = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .windows = count };
 
         var buf: [1024]u8 = undefined;
-        window.setTitle(s.titleText(&buf, page, windows));
+        window.setTitle(s.titleText(&buf, page, count));
     }
 
     /// What the operating system's title bar says: the document, and where
@@ -3825,7 +3568,7 @@ pub const Session = struct {
     /// here is what a title is actually for -- telling one window from
     /// another in a task switcher, where the page you are on is useful and
     /// the mode you are in is not.
-    fn titleText(s: *Session, buf: []u8, page: u32, windows: u32) []const u8 {
+    fn titleText(s: *Session, buf: []u8, page: u32, count: u32) []const u8 {
         const v = s.view();
         const base = s.buffer(v.buffer).title;
         var w: std.Io.Writer = .fixed(buf);
@@ -3833,7 +3576,7 @@ pub const Session = struct {
         w.print("{s} -- page {d} of {d} -- {d:.0}%", .{
             base[0..@min(base.len, 160)], page + 1, v.pages.len, v.percent(),
         }) catch return buf[0..w.end];
-        if (windows > 1) w.print(" -- {d} windows", .{windows}) catch return buf[0..w.end];
+        if (count > 1) w.print(" -- {d} windows", .{count}) catch return buf[0..w.end];
         return buf[0..w.end];
     }
 
@@ -3855,7 +3598,7 @@ pub const Session = struct {
         s.backend = .cpu;
 
         s.tabs.arrange(.fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
-        s.applySplits(splits);
+        windows.applySplits(s, splits);
 
         var it = s.layout().iterator();
         while (it.next()) |v| {
@@ -3940,13 +3683,6 @@ pub const Session = struct {
         }) catch {};
     }
 
-    /// `--split vh`: the splits a scripted shot asked for.
-    fn applySplits(s: *Session, spec: []const u8) void {
-        for (spec) |c| {
-            s.splitWindow(if (c == 'v') .vertical else .horizontal);
-        }
-    }
-
     // -- the window ----------------------------------------------------------
 
     fn open(s: *Session, settings: Settings) !void {
@@ -3996,7 +3732,7 @@ pub const Session = struct {
             v.dpi_scale = scale;
             if (v.fit_on_open) v.fitTo(.width);
         }
-        s.applySplits(settings.splits);
+        windows.applySplits(s, settings.splits);
         {
             // After the splits, because a split refits the zoom and a zoom
             // moves where every page starts: scrolling to `--page` first
@@ -4246,9 +3982,9 @@ pub const Session = struct {
                 // Before anything that starts below the bar: the rails and
                 // the panel are floated against the top of the window and
                 // have to be told how much of it is already spoken for.
-                c.top = s.tabInset();
+                c.top = windows.tabInset(s);
                 const want = try c.status(s.statusLine());
-                if (try c.tabBar(s.tabLabels(), s.tabs.active)) |asked_tabs| s.applyTabs(asked_tabs);
+                if (try c.tabBar(windows.tabLabels(s), s.tabs.active)) |asked_tabs| windows.applyTabs(s, asked_tabs);
                 const asked = try c.rightRail(interface.railLine(s));
                 if (asked) |wanted| interface.applyRail(s, wanted);
                 if (try c.leftRail(interface.modeRail(s))) |wanted| interface.applyRail(s, wanted);
@@ -4474,30 +4210,7 @@ test {
     _ = marks;
     _ = plugins_mod;
     _ = search_mod;
-}
-
-test "a split is two windows on one document, scrolling apart" {
-    const gpa = testing.allocator;
-    var buf: [12]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
-    defer closeSession(&s);
-
-    s.splitWindow(.vertical);
-    try testing.expectEqual(@as(u32, 2), s.layout().count());
-
-    // Both are looking at the same buffer...
-    var it = s.layout().iterator();
-    while (it.next()) |v| try testing.expectEqual(@as(u32, 0), v.buffer);
-
-    // ...and scrolling one does not move the other, which is the whole point
-    // of the scroll living in the view.
-    s.view().scroll = 500;
-    var others: u32 = 0;
-    var walk = s.layout().iterator();
-    while (walk.next()) |v| {
-        if (v != s.layout().current() and v.scroll != 500) others += 1;
-    }
-    try testing.expectEqual(@as(u32, 1), others);
+    _ = windows;
 }
 
 test "every window's visible pages are asked for, focused window first" {
@@ -4508,7 +4221,7 @@ test "every window's visible pages are asked for, focused window first" {
     defer closeSession(&s);
 
     s.view().scrollToPage(20);
-    s.splitWindow(.vertical);
+    windows.splitWindow(&s, .vertical);
     s.view().scrollToPage(4);
 
     // The focused window is the one that just scrolled to page 4.
@@ -4529,7 +4242,7 @@ test "two windows at different zooms need two rasters and one recording" {
     var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
     defer closeSession(&s);
 
-    s.splitWindow(.vertical);
+    windows.splitWindow(&s, .vertical);
     s.view().setZoom(2);
 
     const a = s.layout().viewAt(0);
@@ -4684,19 +4397,6 @@ test "a page rendered for a window that has closed is not cached" {
     try testing.expect(!s.wantedNow(.{ .buffer = 9, .page = 0, .zoom = 1 }));
 }
 
-test "closing the last window is a quit, and closing others is not" {
-    const gpa = testing.allocator;
-    var buf: [4]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
-    defer closeSession(&s);
-
-    try testing.expect(!s.closeWindow());
-    s.splitWindow(.vertical);
-    try testing.expect(s.closeWindow());
-    try testing.expectEqual(@as(u32, 1), s.layout().count());
-    try testing.expect(!s.closeWindow());
-}
-
 test "the status line carries the mode and what the mode has to show" {
     const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
@@ -4736,164 +4436,6 @@ test "the title bar keeps the document and drops the mode line" {
     const text_of = s.titleText(&title, 0, 1);
     try testing.expect(std.mem.indexOf(u8, text_of, "page 1 of 2") != null);
     try testing.expect(std.mem.indexOf(u8, text_of, "VISUAL") == null);
-}
-
-test "showing another document in a window keeps the place in the first" {
-    const gpa = testing.allocator;
-    var buf: [20]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
-    defer closeSession(&s);
-
-    try s.buffers.append(gpa, .{
-        .path = try gpa.dupe(u8, "/docs/b.pdf"),
-        .title = "b.pdf",
-        .pages = fakePages(buf[10..], 6),
-    });
-
-    s.view().scrollToPage(5);
-    const was = s.view().scroll;
-
-    s.showBuffer(1);
-    try testing.expectEqual(@as(u32, 1), s.view().buffer);
-    try testing.expectEqual(@as(usize, 6), s.view().pages.len);
-    try testing.expectApproxEqAbs(@as(f32, 0), s.view().scroll, 0.001);
-
-    // And back, which without a library does not restore the place -- so the
-    // test asserts what it can: the pages are the first document's again.
-    s.showBuffer(-1);
-    try testing.expectEqual(@as(u32, 0), s.view().buffer);
-    try testing.expectEqual(@as(usize, 10), s.view().pages.len);
-    try testing.expect(was > 0);
-}
-
-test "a tabpage keeps its own windows, and gt goes between them" {
-    const gpa = testing.allocator;
-    var buf: [8]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
-    defer closeSession(&s);
-
-    s.view().scroll = 300;
-    _ = s.apply(.{ .split = .vertical });
-    _ = s.apply(.new_tab);
-
-    try testing.expectEqual(@as(u32, 2), s.tabs.count());
-    // The new tabpage is one window on the same document, where that window
-    // was: a tab is an arrangement, not a second file.
-    try testing.expectEqual(@as(u32, 1), s.layout().count());
-    try testing.expectEqual(@as(u32, 0), s.view().buffer);
-    try testing.expectApproxEqAbs(@as(f32, 300), s.view().scroll, 0.001);
-
-    s.view().scroll = 0;
-    _ = s.apply(.{ .go_tab = 1 });
-    try testing.expectEqual(@as(u32, 2), s.layout().count());
-    try testing.expectApproxEqAbs(@as(f32, 300), s.view().scroll, 0.001);
-}
-
-test "the last window of a tabpage closes the tabpage, not the reader" {
-    const gpa = testing.allocator;
-    var buf: [8]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
-    defer closeSession(&s);
-
-    _ = s.apply(.new_tab);
-    try testing.expectEqual(@as(u32, 2), s.tabs.count());
-
-    // `q` in a tab of one window: the tab goes and the reader stays.
-    try testing.expect(!s.apply(.quit));
-    try testing.expectEqual(@as(u32, 1), s.tabs.count());
-
-    // And on the last window of the last tabpage it is a quit again.
-    try testing.expect(s.apply(.quit));
-}
-
-test "a window moved to its own tabpage is one window in each" {
-    const gpa = testing.allocator;
-    var buf: [8]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
-    defer closeSession(&s);
-
-    // Nothing to move: one window is a tabpage already, and the reader says
-    // so rather than making an identical tab beside it.
-    _ = s.apply(.window_to_tab);
-    try testing.expectEqual(@as(u32, 1), s.tabs.count());
-
-    _ = s.apply(.{ .split = .horizontal });
-    _ = s.apply(.window_to_tab);
-    try testing.expectEqual(@as(u32, 2), s.tabs.count());
-    try testing.expectEqual(@as(u32, 1), s.layout().count());
-    _ = s.apply(.{ .go_tab = -1 });
-    try testing.expectEqual(@as(u32, 1), s.layout().count());
-    // The window left behind took the whole rectangle back.
-    try testing.expectApproxEqAbs(@as(f32, 800), s.view().rect.height(), 0.001);
-}
-
-test "the tab commands on the : line reach the same places the keys do" {
-    const gpa = testing.allocator;
-    var buf: [8]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
-    defer closeSession(&s);
-
-    try testing.expect(s.exec("tabnew"));
-    try testing.expect(s.exec("tabnew"));
-    try testing.expectEqual(@as(u32, 3), s.tabs.count());
-
-    try testing.expect(s.exec("tabnext 1"));
-    try testing.expectEqual(@as(u32, 0), s.tabs.active);
-    try testing.expect(!s.exec("tabnext 9"));
-    try testing.expectEqual(@as(u32, 0), s.tabs.active);
-    try testing.expect(s.exec("tabprevious"));
-    try testing.expectEqual(@as(u32, 2), s.tabs.active);
-
-    try testing.expect(s.exec("tabonly"));
-    try testing.expectEqual(@as(u32, 1), s.tabs.count());
-    // And the only tabpage will not close: leaving is `:q`'s job.
-    try testing.expect(!s.exec("tabclose"));
-}
-
-test "a tab is named for its document, and says how many windows are in it" {
-    const gpa = testing.allocator;
-    var buf: [8]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
-    defer closeSession(&s);
-
-    _ = s.apply(.new_tab);
-    _ = s.apply(.{ .split = .vertical });
-    _ = s.apply(.{ .split = .horizontal });
-
-    const names = s.tabLabels();
-    try testing.expectEqual(@as(usize, 2), names.len);
-    try testing.expectEqualStrings("a.pdf", names[0]);
-    try testing.expectEqualStrings("a.pdf (3)", names[1]);
-
-    // Nothing the bar would draw has changed, so nothing is rebuilt: the
-    // slices are the same bytes, not equal copies of them.
-    const again = s.tabLabels();
-    try testing.expectEqual(names.ptr, again.ptr);
-    try testing.expectEqual(names[1].ptr, again[1].ptr);
-
-    // A window closed is a different bar, and the name follows it.
-    _ = s.apply(.close_window);
-    try testing.expectEqualStrings("a.pdf (2)", s.tabLabels()[1]);
-}
-
-test "the bar takes a row off the pages, and only once there are two tabs" {
-    const gpa = testing.allocator;
-    var buf: [8]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);
-    defer closeSession(&s);
-
-    // One tabpage: a bar showing one tab would say what the title bar says,
-    // so there is no bar and the page keeps the row.
-    try testing.expectEqual(@as(f32, 0), s.tabInset());
-    _ = s.apply(.new_tab);
-    try testing.expectEqual(chrome_mod.tab_height, s.tabInset());
-    _ = s.apply(.close_tab);
-    try testing.expectEqual(@as(f32, 0), s.tabInset());
-
-    // And with no interface at all -- a test, and `--shot --path cpu` --
-    // the windows get the whole thing however many tabpages there are.
-    _ = s.apply(.new_tab);
-    try testing.expectEqual(@as(f32, 0), s.windowRect(1000, 800).min_y);
 }
 
 test "a job only equals a job for the same page of the same document at the same zoom" {
@@ -4987,34 +4529,6 @@ test "command lines: page numbers, relative pages, zoom, and unknown names" {
 
     try testing.expect(!s.exec("frobnicate now"));
     try testing.expect(std.mem.indexOf(u8, s.status, "frobnicate") != null);
-}
-
-test "dragging the line between two windows resizes both of them" {
-    const gpa = testing.allocator;
-    var buf: [12]fenrir.Page = undefined;
-    var s = try sessionOf(gpa, fakePages(&buf, 10), 1, 1000, 800);
-    defer closeSession(&s);
-
-    s.splitWindow(.vertical);
-    const left = s.layout().viewAt(0);
-    const line = left.rect.max_x;
-
-    // A press on the line, then a drag well to the left of it.
-    s.pointer(.{ .mouse = .{ .x = line + 1, .y = 400 }, .buttons = .{ .left = true } });
-    try testing.expect(s.split_drag != null);
-    s.pointer(.{ .mouse = .{ .x = 300, .y = 400 }, .buttons = .{ .left = true } });
-    try testing.expectApproxEqAbs(@as(f32, 300), left.rect.max_x, 1e-3);
-
-    // Letting go ends it, and the gesture never became a text selection.
-    s.pointer(.{ .mouse = .{ .x = 300, .y = 400 } });
-    try testing.expect(s.split_drag == null);
-    try testing.expect(s.drag == null);
-
-    // A press away from the line is not a drag on it, and the next press
-    // after a divider drag still registers.
-    s.pointer(.{ .mouse = .{ .x = 150, .y = 400 }, .buttons = .{ .left = true } });
-    try testing.expect(s.split_drag == null);
-    try testing.expectApproxEqAbs(@as(f32, 300), left.rect.max_x, 1e-3);
 }
 
 test "a theme reaches the page's backdrop and not only the chrome" {

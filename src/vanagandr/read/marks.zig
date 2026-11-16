@@ -1015,6 +1015,7 @@ pub fn squiggle(over: *DrawList, box: Bounds, color: Color) !void {
 
 const testing = std.testing;
 const fixtures = @import("fixtures.zig");
+const windows = @import("windows.zig");
 const interface = @import("interface.zig");
 const closeSession = fixtures.closeSession;
 const fakePages = fixtures.fakePages;
@@ -1030,7 +1031,7 @@ test "a highlight made in one window is in the other" {
     var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
     defer closeSession(&s);
 
-    s.splitWindow(.vertical);
+    windows.splitWindow(&s, .vertical);
     const before = s.buffer(0).marks.revision;
 
     highlightBoxes(&s, 0, &.{.{ .page = 1, .box = .fromRect(100, 700, 300, 712) }}, s.accent);
