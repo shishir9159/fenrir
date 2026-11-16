@@ -19,6 +19,7 @@ const panels = @import("../panels.zig");
 const rails_mod = @import("../rails.zig");
 const settings_page = @import("../settings.zig");
 const Session = @import("../read.zig").Session;
+const reload = @import("reload.zig");
 const compare = @import("compare.zig");
 const marks = @import("marks.zig");
 
@@ -130,7 +131,7 @@ pub fn changeSetting(s: *Session, c: settings_page.Change) void {
             s.say("watch is on or off, not {s}", .{c.value[0..@min(c.value.len, 48)]});
             return;
         }
-        s.setWatching(std.mem.eql(u8, c.value, "on"));
+        reload.setWatching(s, std.mem.eql(u8, c.value, "on"));
     } else if (std.mem.eql(u8, c.key, "accent")) {
         if (c.value.len != 0) {
             const colour = Library.parseColor(c.value) orelse {
