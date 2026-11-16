@@ -1015,6 +1015,7 @@ pub fn squiggle(over: *DrawList, box: Bounds, color: Color) !void {
 
 const testing = std.testing;
 const fixtures = @import("fixtures.zig");
+const interface = @import("interface.zig");
 const closeSession = fixtures.closeSession;
 const fakePages = fixtures.fakePages;
 const giveLibrary = fixtures.giveLibrary;
@@ -1287,7 +1288,7 @@ test "a selection's lines are one anchor, and marking them again keeps its comme
     try commentOn(marks, gpa, 0, "one claim");
 
     // The comment on the first line, and the other two under it.
-    const rows = s.panelRows(.annotations);
+    const rows = interface.panelRows(&s, .annotations);
     try testing.expectEqual(@as(usize, 3), rows.len);
     try testing.expectEqualStrings("one claim", rows[0].label);
     try testing.expectEqual(@as(u8, 0), rows[0].depth);
@@ -1584,7 +1585,7 @@ test "]a walks what :filter lets the panel show, and the rows are those" {
 
     try testing.expect(s.exec("filter #question"));
     try testing.expectEqualStrings("2 of 3 marks match", s.status);
-    try testing.expectEqual(@as(usize, 2), s.panelRows(.annotations).len);
+    try testing.expectEqual(@as(usize, 2), interface.panelRows(&s, .annotations).len);
 
     // Over the green one, which the panel does not show.
     _ = s.apply(.{ .jump_mark = .{ .forwards = true } });
@@ -1595,9 +1596,9 @@ test "]a walks what :filter lets the panel show, and the rows are those" {
 
     // A colour by its swatch's name; then nothing, which is everything.
     try testing.expect(s.exec("filter green"));
-    try testing.expectEqual(@as(usize, 1), s.panelRows(.annotations).len);
+    try testing.expectEqual(@as(usize, 1), interface.panelRows(&s, .annotations).len);
     try testing.expect(s.exec("filter"));
-    try testing.expectEqual(@as(usize, 3), s.panelRows(.annotations).len);
+    try testing.expectEqual(@as(usize, 3), interface.panelRows(&s, .annotations).len);
 }
 
 // The author asked for edit mode to walk the filter as `]a` does. `n` and `N`

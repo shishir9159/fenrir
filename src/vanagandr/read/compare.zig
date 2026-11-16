@@ -553,6 +553,7 @@ pub const diff_added: Color = .{ .r = 0.1, .g = 0.62, .b = 0.25 };
 
 const testing = std.testing;
 const fixtures = @import("fixtures.zig");
+const interface = @import("interface.zig");
 const closeSession = fixtures.closeSession;
 const fakePages = fixtures.fakePages;
 const sessionOf = fixtures.sessionOf;
@@ -709,7 +710,7 @@ const comparison_tests = struct {
         arrangeComparison(&s);
         results[2].detail = "\"fox\" → \"cat\"";
 
-        const rows = s.panelRows(.changes);
+        const rows = interface.panelRows(&s, .changes);
         try testing.expectEqual(@as(usize, 2), rows.len);
         try testing.expectEqualStrings("\"fox\" → \"cat\"", rows[0].label);
         try testing.expectEqual(@as(u32, 3), rows[0].page);
