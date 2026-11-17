@@ -291,6 +291,7 @@ pub fn applyTabs(s: *Session, r: thviti.widgets.tabs.Result) void {
 
 const testing = std.testing;
 const fixtures = @import("fixtures.zig");
+const frame = @import("frame.zig");
 const closeSession = fixtures.closeSession;
 const fakePages = fixtures.fakePages;
 const sessionOf = fixtures.sessionOf;
@@ -515,5 +516,5 @@ test "the bar takes a row off the pages, and only once there are two tabs" {
     // And with no interface at all -- a test, and `--shot --path cpu` --
     // the windows get the whole thing however many tabpages there are.
     _ = s.apply(.new_tab);
-    try testing.expectEqual(@as(f32, 0), s.windowRect(1000, 800).min_y);
+    try testing.expectEqual(@as(f32, 0), frame.windowRect(&s, 1000, 800).min_y);
 }

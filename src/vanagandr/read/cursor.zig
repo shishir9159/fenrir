@@ -10,6 +10,7 @@ const std = @import("std");
 const fenrir = @import("fenrir");
 
 const Session = @import("../read.zig").Session;
+const frame = @import("frame.zig");
 
 const gelgja = fenrir.gelgja;
 const hlidskjalf = fenrir.hlidskjalf;
@@ -205,10 +206,10 @@ pub fn drawSelection(s: *Session, v: *View, over: *DrawList) !void {
 
     s.boxes.clearRetainingCapacity();
     selectionBoxes(s, v.buffer, sel[0], sel[1], lines, &s.boxes) catch return;
-    const radius = Session.markRadius(v.zoom);
+    const radius = frame.markRadius(v.zoom);
     for (s.boxes.items) |pb| {
         if (pb.page >= v.pages.len) continue;
-        const block = Session.blockOf(v.windowBox(pb.page, pb.box), v.zoom);
+        const block = frame.blockOf(v.windowBox(pb.page, pb.box), v.zoom);
         try over.rounded(block, .all(radius), selection_block);
         // A hairline the same grey at full strength, so the ends of the
         // selection are legible against a figure or a dark background as

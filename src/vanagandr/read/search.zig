@@ -11,6 +11,7 @@ const fenrir = @import("fenrir");
 const find_mod = @import("../find.zig");
 const Job = render.Job;
 const Session = @import("../read.zig").Session;
+const frame = @import("frame.zig");
 const render = @import("render.zig");
 
 const gelgja = fenrir.gelgja;
@@ -127,11 +128,11 @@ pub fn drawSearchHits(s: *Session, v: *View, range: View.Visible, over: *DrawLis
     }
     const standing = s.search.at() != null;
 
-    const radius = Session.markRadius(v.zoom);
+    const radius = frame.markRadius(v.zoom);
     for (hits, 0..) |hit, i| {
         if (hit.page < range.first or hit.page >= range.end) continue;
         const on = standing and i >= s.search.current and i <= last;
-        const block = Session.blockOf(v.windowBox(hit.page, hit.box), v.zoom);
+        const block = frame.blockOf(v.windowBox(hit.page, hit.box), v.zoom);
         try over.rounded(block, .all(radius), if (on) current_block else match_block);
         try over.border(block, .all(radius), 1, if (on) current_edge else match_edge);
     }

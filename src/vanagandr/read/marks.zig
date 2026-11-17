@@ -13,6 +13,7 @@ const fenrir = @import("fenrir");
 const library = @import("../library.zig");
 const Library = library.Library;
 const Session = @import("../read.zig").Session;
+const frame = @import("frame.zig");
 const cursor = @import("cursor.zig");
 const plugins_mod = @import("plugins.zig");
 
@@ -897,8 +898,8 @@ pub fn drawMarks(
         const c = mark.color;
         switch (mark.style) {
             .highlight => try over.rounded(
-                Session.blockOf(box, v.zoom),
-                .all(Session.markRadius(v.zoom)),
+                frame.blockOf(box, v.zoom),
+                .all(frame.markRadius(v.zoom)),
                 .{ .r = c.r, .g = c.g, .b = c.b, .a = if (held) 0.55 else 0.35 },
             ),
             .underline, .strikeout => try over.fill(ruleOf(box, mark.style), c),
