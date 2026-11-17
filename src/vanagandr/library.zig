@@ -502,7 +502,7 @@ fn toByte(v: f32) u8 {
     return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
 }
 
-/// The path a document is keyed under. Must match `read.zig`'s
+/// The path a document is keyed under. Must match `read/Session.zig`'s
 /// `absolutePath` exactly, which is why it is the same call: a highlight
 /// added here under a relative path would be invisible to the reader.
 /// The key every command uses for a document in the library: its real path,

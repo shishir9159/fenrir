@@ -10,7 +10,7 @@ const std = @import("std");
 const fenrir = @import("fenrir");
 
 const chrome_mod = @import("../chrome.zig");
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const cursor = @import("cursor.zig");
 
 const hlidskjalf = fenrir.hlidskjalf;

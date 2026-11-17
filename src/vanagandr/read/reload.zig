@@ -12,11 +12,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const fenrir = @import("fenrir");
 
-const read = @import("../read.zig");
 const watch = @import("../watch.zig");
 const Job = render.Job;
 const Lap = frame.Lap;
-const Session = read.Session;
+const Session = @import("Session.zig");
 const frame = @import("frame.zig");
 const render = @import("render.zig");
 const Slot = render.Slot;

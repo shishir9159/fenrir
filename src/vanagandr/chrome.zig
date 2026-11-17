@@ -3,8 +3,8 @@
 //! Until this file the reader drew no text in its own window at all: the mode
 //! line was the operating system's *title bar*, which is a real place to put
 //! one and is the only place available to a window that cannot write in
-//! itself. `titleText` in `read.zig` said as much -- "the title is the only
-//! text this window draws".
+//! itself. `titleText` in `read/Session.zig` said as much -- "the title is
+//! the only text this window draws".
 //!
 //! So everything needed to write in the window arrives here together, because
 //! none of it is useful in halves: Þviti to lay a tree out, Týr to turn the
@@ -17,9 +17,9 @@
 //! `Chrome` knows about fonts, an atlas, a box tree and a draw list. It does
 //! not know what a buffer is, what a split is, or that documents exist: the
 //! bar is handed a `Status`, which is a few strings and numbers, and
-//! `read.zig` fills it in. That is the division `Host.zig` draws for Galdr,
-//! and it is what lets the bar be built and measured in a test with no
-//! window, no device and no PDF.
+//! `read/Session.zig` fills it in. That is the division `Host.zig` draws for
+//! Galdr, and it is what lets the bar be built and measured in a test with
+//! no window, no device and no PDF.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -173,7 +173,7 @@ pub const Chrome = struct {
     ///
     /// `under` records no glyphs and never samples this. It is registered
     /// anyway, because ids are handed out in creation order on both sides and
-    /// `read.zig` asserts that a page's device id equals its list id --
+    /// `read/render.zig` asserts that a page's device id equals its list id --
     /// skipping this one here would put every page slot one ahead on the
     /// list for the rest of the session.
     pub fn attach(

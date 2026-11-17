@@ -14,7 +14,7 @@ const library = @import("../library.zig");
 const Library = library.Library;
 const marks = @import("marks.zig");
 const Job = render.Job;
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const render = @import("render.zig");
 const cursor = @import("cursor.zig");
 

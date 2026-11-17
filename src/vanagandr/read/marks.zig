@@ -12,7 +12,7 @@ const fenrir = @import("fenrir");
 
 const library = @import("../library.zig");
 const Library = library.Library;
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const frame = @import("frame.zig");
 const cursor = @import("cursor.zig");
 const plugins_mod = @import("plugins.zig");

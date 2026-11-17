@@ -9,7 +9,7 @@
 const std = @import("std");
 const fenrir = @import("fenrir");
 
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const frame = @import("frame.zig");
 
 const gelgja = fenrir.gelgja;

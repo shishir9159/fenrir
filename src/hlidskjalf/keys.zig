@@ -2,8 +2,8 @@
 //!
 //! Separated from the reader so that every binding can be tested without a
 //! window, a device, or a document -- which is the only way a keymap this
-//! size stays correct. `read.zig` calls `command` and switches on the answer;
-//! it never asks which key was pressed.
+//! size stays correct. `read/Session.zig` calls `command` and switches on the
+//! answer; it never asks which key was pressed.
 //!
 //! ## Modes
 //!

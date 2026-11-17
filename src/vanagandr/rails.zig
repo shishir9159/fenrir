@@ -9,10 +9,10 @@
 //!
 //! ## A rail is reserved, not floated
 //!
-//! `read.zig` takes the rail's width off the window rectangle exactly as it
-//! takes the status bar's height, so a rail never covers the page and a
-//! pointer over a rail is never also over a page. That costs one refit when a
-//! rail is toggled -- `Layout.arrange` calls `refit` on every rectangle it
+//! `read/frame.zig` takes the rail's width off the window rectangle exactly
+//! as it takes the status bar's height, so a rail never covers the page and
+//! a pointer over a rail is never also over a page. That costs one refit when
+//! a rail is toggled -- `Layout.arrange` calls `refit` on every rectangle it
 //! hands out -- and it buys away the whole question of which of the two a
 //! click belonged to. The panels are the ones that overlay; see `panels.zig`.
 //!

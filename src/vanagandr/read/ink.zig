@@ -8,7 +8,7 @@ const std = @import("std");
 const fenrir = @import("fenrir");
 
 const Library = @import("../library.zig").Library;
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const marks = @import("marks.zig");
 
 const gelgja = fenrir.gelgja;

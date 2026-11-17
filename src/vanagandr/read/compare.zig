@@ -13,7 +13,7 @@ const fenrir = @import("fenrir");
 
 const diff_mod = @import("../diff.zig");
 const Job = render.Job;
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const render = @import("render.zig");
 const windows = @import("windows.zig");
 

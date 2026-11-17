@@ -10,7 +10,7 @@ const fenrir = @import("fenrir");
 
 const find_mod = @import("../find.zig");
 const Job = render.Job;
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const frame = @import("frame.zig");
 const render = @import("render.zig");
 

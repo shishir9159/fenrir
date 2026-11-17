@@ -16,7 +16,7 @@ const find_mod = @import("../find.zig");
 const palette_mod = @import("../palette.zig");
 const rails_mod = @import("../rails.zig");
 const settings_page = @import("../settings.zig");
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 const compare = @import("compare.zig");
 const cursor = @import("cursor.zig");
 const ink = @import("ink.zig");
@@ -46,7 +46,7 @@ const have_gpu = caps.path_gpu;
 const max_zoom = View.max_zoom;
 
 /// The benchmark driver and its workloads, or `noreturn` in a build that
-/// has none -- the reason is on `LibraryIfStored`, in `read.zig`.
+/// has none -- the reason is on `Session.LibraryIfStored`.
 pub const BenchKind = if (caps.bench) Bench.Kind else noreturn;
 const BenchDriver = if (caps.bench) Bench else noreturn;
 
@@ -715,7 +715,8 @@ pub fn open(s: *Session, settings: Settings) !void {
             continue;
         }
 
-        s.tabs.arrange(windowRect(s, 
+        s.tabs.arrange(windowRect(
+            s,
             @floatFromInt(swapchain.extent.width),
             @floatFromInt(swapchain.extent.height),
         ));

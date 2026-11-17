@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const fenrir = @import("fenrir");
 
 const Library = @import("../library.zig").Library;
-const Session = @import("../read.zig").Session;
+const Session = @import("Session.zig");
 
 const galdr = fenrir.galdr;
 const gelgja = fenrir.gelgja;
