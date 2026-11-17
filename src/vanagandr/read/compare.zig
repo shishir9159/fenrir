@@ -12,8 +12,9 @@ const Io = std.Io;
 const fenrir = @import("fenrir");
 
 const diff_mod = @import("../diff.zig");
-const Job = @import("../read.zig").Job;
+const Job = render.Job;
 const Session = @import("../read.zig").Session;
+const render = @import("render.zig");
 const windows = @import("windows.zig");
 
 const content = fenrir.content;
@@ -310,7 +311,7 @@ pub fn collectRerun(s: *Session) void {
 /// should grow for this.
 ///
 /// **Runs on the rasterising thread**, which owns both documents.
-pub fn rasteriseOverlay(s: *Session, job: Job) !Session.Image {
+pub fn rasteriseOverlay(s: *Session, job: Job) !render.Image {
     const cmp = s.diff.?;
     const gpa = s.gpa;
     const pair = cmp.pairs[cmp.pair_of[0][job.page]];
@@ -322,7 +323,7 @@ pub fn rasteriseOverlay(s: *Session, job: Job) !Session.Image {
         const b = s.buffer(@intCast(side));
         var result = try content.page(gpa, b.doc, b.pages[page], .{});
         defer result.deinit(gpa);
-        canvases[side] = try s.drawCanvas(@intCast(side), page, result.list, job.zoom, if (side == 1) job.shift else .{ 0, 0 }, b);
+        canvases[side] = try render.drawCanvas(s, @intCast(side), page, result.list, job.zoom, if (side == 1) job.shift else .{ 0, 0 }, b);
     }
 
     const a = canvases[0].?.fb;
@@ -677,12 +678,12 @@ const comparison_tests = struct {
         try testing.expectEqual(Showing.overlay, s.diff_showing);
         try testing.expectEqual(@as(u32, 1), s.layout().count());
         try testing.expectEqual(@as(u32, 0), s.view().buffer);
-        try testing.expectEqual(Job.Want.overlay, s.firstMissing().?.want);
+        try testing.expectEqual(Job.Want.overlay, render.firstMissing(&s).?.want);
         try testing.expectEqual(scroll, s.view().scroll);
 
         // Each alone, and the blink between them keeps the place.
         _ = s.apply(.{ .diff_view = 1 });
-        try testing.expectEqual(Job.Want.page, s.firstMissing().?.want);
+        try testing.expectEqual(Job.Want.page, render.firstMissing(&s).?.want);
         _ = s.apply(.{ .diff_view = 1 });
         try testing.expectEqual(Showing.second, s.diff_showing);
         try testing.expectEqual(@as(u32, 1), s.view().buffer);
@@ -732,18 +733,18 @@ const comparison_tests = struct {
         arrangeComparison(&s);
         showComparison(&s, .overlay);
 
-        const before = s.firstMissing().?;
+        const before = render.firstMissing(&s).?;
         _ = s.apply(.{ .nudge = .{ 1, 0 } });
         _ = s.apply(.{ .nudge = .{ 1, 0 } });
         _ = s.apply(.{ .nudge = .{ 0, -1 } });
         try testing.expectEqual([2]f32{ 2, -1 }, s.diff_offset);
         try testing.expectEqualStrings("comparing again, the second document 2pt right, 1pt up", s.status);
 
-        const after = s.firstMissing().?;
+        const after = render.firstMissing(&s).?;
         try testing.expectEqual([2]f32{ 2, -1 }, after.shift);
         try testing.expect(!before.eql(after));
-        try testing.expect(!s.wantedNow(before));
-        try testing.expect(s.wantedNow(after));
+        try testing.expect(!render.wantedNow(&s, before));
+        try testing.expect(render.wantedNow(&s, after));
 
         // The regions stay the ones they were found at until the comparison
         // made again comes back.

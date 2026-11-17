@@ -9,8 +9,9 @@ const std = @import("std");
 const fenrir = @import("fenrir");
 
 const find_mod = @import("../find.zig");
-const Job = @import("../read.zig").Job;
+const Job = render.Job;
 const Session = @import("../read.zig").Session;
+const render = @import("render.zig");
 
 const gelgja = fenrir.gelgja;
 const hlidskjalf = fenrir.hlidskjalf;

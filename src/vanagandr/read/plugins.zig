@@ -13,8 +13,9 @@ const fenrir = @import("fenrir");
 const library = @import("../library.zig");
 const Library = library.Library;
 const marks = @import("marks.zig");
-const Job = @import("../read.zig").Job;
+const Job = render.Job;
 const Session = @import("../read.zig").Session;
+const render = @import("render.zig");
 const cursor = @import("cursor.zig");
 
 const galdr = fenrir.galdr;

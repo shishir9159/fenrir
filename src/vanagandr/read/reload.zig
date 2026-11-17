@@ -14,10 +14,11 @@ const fenrir = @import("fenrir");
 
 const read = @import("../read.zig");
 const watch = @import("../watch.zig");
-const Job = read.Job;
+const Job = render.Job;
 const Lap = read.Lap;
 const Session = read.Session;
-const Slot = read.Slot;
+const render = @import("render.zig");
+const Slot = render.Slot;
 const msOf = read.msOf;
 const compare = @import("compare.zig");
 const marks = @import("marks.zig");
@@ -111,7 +112,7 @@ fn reloadJob(s: *Session) ?Job {
 /// with nothing else posted the worker is parked when the reload comes
 /// back -- which is what lets `install` free it on this thread.
 pub fn jobToPost(s: *Session) ?Job {
-    return reloadJob(s) orelse s.nextJob();
+    return reloadJob(s) orelse render.nextJob(s);
 }
 
 /// Puts what a reload read in place of what the buffer had: the
@@ -387,8 +388,8 @@ test "a reload leaves its buffer's pages stale, drawn until they come again" {
 
     // Still drawn, and asked for again.
     const v = s.view();
-    try testing.expect(s.slotFor(0, 0, 1, false) != null);
-    try testing.expect(!s.cached(v, 0));
+    try testing.expect(render.slotFor(&s, 0, 0, 1, false) != null);
+    try testing.expect(!render.cached(&s, v, 0));
     try testing.expectEqual(@as(usize, 2), v.pages.len);
     try testing.expectEqual(@as(u32, 2), s.disks.items[0].generation);
     try testing.expect(s.disks.items[0].held.eql(.{ .size = 1, .mtime = 1 }));
