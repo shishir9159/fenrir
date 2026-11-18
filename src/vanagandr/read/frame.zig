@@ -293,7 +293,7 @@ fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
     try compare.drawChanges(s, v, range, over);
     try marks.drawMarks(s, v, b, range, over);
     try ink.drawInk(s, v, b, range, over);
-    try search_mod.drawSearchHits(s, v, range, over);
+    if (caps.search) try search_mod.drawSearchHits(s, v, range, over);
 
     v.marks_seen = b.marks.revision;
     try cursor.drawSelection(s, v, over);
@@ -808,7 +808,7 @@ pub fn open(s: *Session, settings: Settings) !void {
                 if (try c.leftRail(interface.modeRail(s))) |wanted| interface.applyRail(s, wanted);
                 try interface.drawPanel(s, c);
             }
-            const asked_find = try find_mod.bar(
+            const asked_find: ?find_mod.Action = if (caps.search) try find_mod.bar(
                 &c.ui,
                 c.face,
                 c.theme,
@@ -816,7 +816,7 @@ pub fn open(s: *Session, settings: Settings) !void {
                 &s.find,
                 search_mod.searchCount(s),
                 c.top,
-            );
+            ) else null;
             // After the bar, the rails and the panel, so it is over all
             // of them: a popup is on top by being built last, and nothing
             // here sorts.

@@ -35,6 +35,7 @@ const Buffer = hlidskjalf.Buffer;
 const View = hlidskjalf.View;
 const text = hlidskjalf.text;
 
+const caps = fenrir.build_options;
 const min_zoom = View.min_zoom;
 
 pub const Backend = enum { cpu, gpu };
@@ -583,7 +584,7 @@ pub fn nextJob(s: *Session) ?Job {
     // runs must not wait behind a page they cannot see. The scan gets
     // whatever is left over, one page at a time, and stops the instant
     // something on screen is missing.
-    return search_mod.searchJob(s);
+    return if (caps.search) search_mod.searchJob(s) else null;
 }
 
 /// Whether the cache has a slot the windows are not already using.
@@ -695,7 +696,7 @@ pub fn collectPage(
         return null;
     }
 
-    if (finished.job.want == .text) {
+    if (caps.search and finished.job.want == .text) {
         // The scan's own page, and it is not cached: the buffer keeps
         // eight maps for the cursor to walk through, and a search that
         // put six hundred of them through that cache would evict the
@@ -911,7 +912,6 @@ pub fn placeVisible(s: *Session) !void {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
-const caps = fenrir.build_options;
 const fixtures = @import("fixtures.zig");
 const windows = @import("windows.zig");
 const closeSession = fixtures.closeSession;

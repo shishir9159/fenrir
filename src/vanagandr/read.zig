@@ -314,9 +314,16 @@ const normal_mode =
     \\    page up / page down  a screen at a time
     \\    home / end           the first and last page
     \\    space / p            the next and previous page
+    \\
+++ (if (caps.search)
     \\    /                    search the document; escape ends it
     \\    n / N                the next and previous match, or the next and
     \\                         previous page when nothing is being searched for
+    \\
+else
+    \\    n / N                the next and previous page
+    \\
+) ++
     \\    drag over text       select it; a click puts the selection away
     \\
 ++ (if (caps.marks)

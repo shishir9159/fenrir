@@ -97,7 +97,7 @@ pub fn closeSession(s: *Session) void {
         s.rows.deinit(s.gpa);
     }
     s.doc_handles.deinit(s.gpa);
-    s.search.deinit(s.gpa);
+    if (caps.search) s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
     if (caps.splits) {

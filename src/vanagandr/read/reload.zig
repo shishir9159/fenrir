@@ -193,7 +193,7 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
     if (loaded.annots_arena) |*a| a.deinit();
 
     if (loaded.first) |page| showChange(s, index, page, loaded.down);
-    if (s.view().buffer == index and s.find.query().len != 0) search_mod.requery(s);
+    if (caps.search and s.view().buffer == index and s.find.query().len != 0) search_mod.requery(s);
 
     var count_buf: [32]u8 = undefined;
     const counted = if (b.pages.len == before) "" else std.fmt.bufPrint(&count_buf, ", {d} pages", .{b.pages.len}) catch "";

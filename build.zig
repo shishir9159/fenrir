@@ -92,6 +92,7 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "config", caps.config);
     opts.addOption(bool, "splits", caps.splits);
     opts.addOption(bool, "marks", caps.marks);
+    opts.addOption(bool, "search", caps.search);
     opts.addOption(bool, "panels", caps.panels);
     opts.addOption(bool, "compare", caps.compare);
     opts.addOption(bool, "diagnostics", caps.diagnostics);
@@ -353,6 +354,10 @@ const Caps = struct {
     splits: bool,
     /// Highlights, notes and ink.
     marks: bool,
+    /// `/`: the bar, the scan of every page's text behind it, and the
+    /// matches drawn over the page. Not in `light`, which then never builds
+    /// a page's text unless something else asks for it.
+    search: bool,
     /// The rails down either side of the page, the panel they open, the
     /// command palette and the settings page: the interface beyond the
     /// status bar. Not in `light`, whose window is the page and the bar
@@ -508,6 +513,7 @@ fn resolve(b: *std.Build) Caps {
         .config = !light,
         .splits = !light,
         .marks = !light,
+        .search = !light,
         .panels = !light,
         .compare = !light,
         .diagnostics = profile == .debug,

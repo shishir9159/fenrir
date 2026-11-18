@@ -192,8 +192,8 @@ palette_text: If(caps.panels, std.heap.ArenaAllocator),
 /// bar is a widget that is open or shut, and the search is a query, a
 /// frontier and a list of hits that the worker thread fills in. `/`
 /// starts both and escape ends both; nothing else touches the pair.
-find: find_mod.State = .{},
-search: hlidskjalf.search.State = .{},
+find: If(caps.search, find_mod.State) = if (caps.search) .{} else {},
+search: If(caps.search, hlidskjalf.search.State) = if (caps.search) .{} else {},
 
 /// The panel docked to the right rail, and the rows in it.
 ///
@@ -423,7 +423,7 @@ pub fn deinit(s: *Session) void {
     if (s.plugins) |p| p.destroy();
     if (s.config_dir) |d| s.gpa.free(d);
     s.cmdline.deinit(s.gpa);
-    s.search.deinit(s.gpa);
+    if (caps.search) s.search.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.comment_order.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
@@ -1076,7 +1076,7 @@ pub fn interfaceHasInput(s: *const Session) bool {
     // stays on screen. So the question is whether the field has it, not
     // whether the bar is open -- and the answer is last frame's, for the
     // same reason the rest of this function's answers are.
-    if (s.find.typing or (caps.panels and s.panel.typing)) return true;
+    if ((caps.search and s.find.typing) or (caps.panels and s.panel.typing)) return true;
     const c = s.chrome orelse return false;
     return c.grabbing();
 }
@@ -1140,7 +1140,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
             // so leaving is never the same key as leaving cursor mode.
             if (s.drag != null) {
                 s.drag = null;
-            } else if (s.find.open) {
+            } else if (caps.search and s.find.open) {
                 // The search bar hands the keyboard back on enter, so
                 // this is the escape that ends a search somebody has
                 // stopped typing into. Before the caret, because the
@@ -1245,11 +1245,12 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         },
         .show_commands => if (caps.panels) interface.showPalette(s),
 
-        .enter_search => search_mod.beginSearch(s),
+        .enter_search => if (caps.search) search_mod.beginSearch(s),
         .search_step => |back| {
-            // `n` is the next page until a search is live. See the note
-            // on `keys.Command.search_step`.
-            if (s.search.isEmpty()) {
+            // `n` is the next page until a search is live, and in a build
+            // with no search it is the next page. See the note on
+            // `keys.Command.search_step`.
+            if (!caps.search or s.search.isEmpty()) {
                 v.scrollToPage(if (back)
                     v.currentPage() -| 1
                 else
@@ -1294,7 +1295,7 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
     // document, so the press that lands in it has to be kept off the text
     // underneath -- and `rect` is last frame's, which is the rectangle
     // that was there when the button went down.
-    if ((caps.panels and s.panel.holds(in.mouse)) or s.find.holds(in.mouse.x, in.mouse.y)) {
+    if ((caps.panels and s.panel.holds(in.mouse)) or (caps.search and s.find.holds(in.mouse.x, in.mouse.y))) {
         s.view().was_down = down;
         return;
     }
@@ -1503,7 +1504,7 @@ test {
     _ = plugins_mod;
     _ = reload;
     _ = render;
-    _ = search_mod;
+    if (caps.search) _ = search_mod;
     if (caps.splits) _ = windows;
 }
 
