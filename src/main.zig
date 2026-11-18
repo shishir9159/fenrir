@@ -288,6 +288,7 @@ test "the help text offers no flag this build would reject" {
     try std.testing.expectEqual(caps.splits, mentions(u, "--split "));
     try std.testing.expectEqual(caps.splits, mentions(u, ":bn"));
     try std.testing.expectEqual(caps.splits, mentions(u, "<file>..."));
+    try std.testing.expectEqual(caps.panels, mentions(u, ":settings"));
     try std.testing.expectEqual(caps.sqlite, mentions(u, "--db"));
     try std.testing.expectEqual(caps.lua, mentions(u, "--clean"));
     try std.testing.expectEqual(caps.config, mentions(u, "fenrir.toml"));

@@ -30,6 +30,8 @@ const hlidskjalf = fenrir.hlidskjalf;
 const View = hlidskjalf.View;
 const keys = hlidskjalf.keys;
 
+const caps = fenrir.build_options;
+
 /// What the `watch` setting says: on, or anything else, which is off.
 pub fn rememberedWatch(s: *Session) bool {
     const lib = s.library orelse return false;
@@ -181,7 +183,7 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
         if (drag.buffer == index and !kept) s.drag = null;
     }
     if (loaded.first) |page| placeStale(s, index, page);
-    s.rows_for = .{};
+    if (caps.panels) s.rows_for = .{};
 
     // The file's own annotations, read again: those the library holds
     // stay, as they do at open.

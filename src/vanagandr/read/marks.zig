@@ -32,6 +32,8 @@ const View = hlidskjalf.View;
 const keys = hlidskjalf.keys;
 const text = hlidskjalf.text;
 
+const caps = fenrir.build_options;
+
 /// How wide a stroke is, in PDF points, when nothing says otherwise: a row
 /// stored with no width, and the pen the reader starts with. About the weight
 /// of a fineliner against ten-point type, which is what somebody underlining
@@ -62,6 +64,9 @@ pub fn paletteColor(s: *const Session, index: ?u8) Color {
 /// is asked for -- on a key, or when the rows are rebuilt -- and never
 /// held, so it cannot outlive the text its words point into.
 pub fn markFilter(s: *Session) Marks.Filter {
+    // Typed into the panel and kept there, so a build with no panel has no
+    // filter, and every mark is let through.
+    if (!caps.panels) return .{};
     var swatches: [palette_names.len + 1]Marks.Swatch = undefined;
     swatches[0] = .{ .name = "default", .color = s.highlight };
     for (palette_names, swatches[1..]) |name, *sw| sw.* = .{ .name = name, .color = Library.parseColor(name).? };
@@ -1015,7 +1020,6 @@ pub fn squiggle(over: *DrawList, box: Bounds, color: Color) !void {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
-const caps = fenrir.build_options;
 const fixtures = @import("fixtures.zig");
 const windows = @import("windows.zig");
 const interface = @import("interface.zig");
@@ -1292,11 +1296,13 @@ test "a selection's lines are one anchor, and marking them again keeps its comme
     try commentOn(marks, gpa, 0, "one claim");
 
     // The comment on the first line, and the other two under it.
-    const rows = interface.panelRows(&s, .annotations);
-    try testing.expectEqual(@as(usize, 3), rows.len);
-    try testing.expectEqualStrings("one claim", rows[0].label);
-    try testing.expectEqual(@as(u8, 0), rows[0].depth);
-    try testing.expectEqual(@as(u8, 1), rows[2].depth);
+    if (caps.panels) {
+        const rows = interface.panelRows(&s, .annotations);
+        try testing.expectEqual(@as(usize, 3), rows.len);
+        try testing.expectEqualStrings("one claim", rows[0].label);
+        try testing.expectEqual(@as(u8, 0), rows[0].depth);
+        try testing.expectEqual(@as(u8, 1), rows[2].depth);
+    }
 
     // Underlined over the same words: new marks, a new anchor, and the
     // comment moved onto it rather than lost with the old marks.
@@ -1575,6 +1581,7 @@ test "]a and ]c walk the marks from where the reader is, and come round again" {
 }
 
 test "]a walks what :filter lets the panel show, and the rows are those" {
+    if (!caps.panels) return error.SkipZigTest;
     const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
@@ -1608,6 +1615,7 @@ test "]a walks what :filter lets the panel show, and the rows are those" {
 // The author asked for edit mode to walk the filter as `]a` does. `n` and `N`
 // stepping every mark while the panel shows a few is what this pins.
 test "edit mode's i, n, N and d walk what the filter lets through" {
+    if (!caps.panels) return error.SkipZigTest;
     const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);

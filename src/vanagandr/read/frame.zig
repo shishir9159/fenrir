@@ -342,14 +342,17 @@ fn drawScrollbar(s: *Session, v: *View, list: *DrawList) !void {
 /// of the two a click belonged to: a pointer over a rail is never also
 /// over a page, so there is nothing to arbitrate. The panels are the ones
 /// that overlay, and they are asked about separately.
+///
+/// A build with no rails reserves nothing for them, and its pages have the
+/// width.
 pub fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
     if (s.chrome == null) return .fromRect(0, 0, width, @max(height, 1));
-    const left = rails_mod.width;
+    const rail: f32 = if (caps.panels) rails_mod.width else 0;
     const top = if (caps.splits) windows.tabInset(s) else 0;
     return .fromRect(
-        left,
+        rail,
         top,
-        @max(width - rails_mod.width, left + 1),
+        @max(width - rail, rail + 1),
         @max(height - chrome_mod.status_height, top + 1),
     );
 }
@@ -799,10 +802,12 @@ pub fn open(s: *Session, settings: Settings) !void {
             if (caps.splits) {
                 if (try c.tabBar(windows.tabLabels(s), s.tabs.active)) |asked_tabs| windows.applyTabs(s, asked_tabs);
             }
-            const asked = try c.rightRail(interface.railLine(s));
-            if (asked) |wanted| interface.applyRail(s, wanted);
-            if (try c.leftRail(interface.modeRail(s))) |wanted| interface.applyRail(s, wanted);
-            try interface.drawPanel(s, c);
+            if (caps.panels) {
+                const asked = try c.rightRail(interface.railLine(s));
+                if (asked) |wanted| interface.applyRail(s, wanted);
+                if (try c.leftRail(interface.modeRail(s))) |wanted| interface.applyRail(s, wanted);
+                try interface.drawPanel(s, c);
+            }
             const asked_find = try find_mod.bar(
                 &c.ui,
                 c.face,
@@ -820,17 +825,21 @@ pub fn open(s: *Session, settings: Settings) !void {
             // while the page was open. Nothing is read from the library
             // unless Galdr's revision moved, so an open page costs one
             // comparison a frame.
-            if (s.settings.open and interface.pluginSettingsStale(s)) interface.readSettings(s);
-            const changed = try settings_page.page(&c.ui, c.face, c.theme, &s.settings);
-            const chosen = try palette_mod.palette(
+            if (caps.panels and s.settings.open and interface.pluginSettingsStale(s)) interface.readSettings(s);
+            const changed: ?settings_page.Change = if (caps.panels)
+                try settings_page.page(&c.ui, c.face, c.theme, &s.settings)
+            else
+                null;
+            const chosen: ?palette_mod.Chosen = if (caps.panels) try palette_mod.palette(
                 &c.ui,
                 c.face,
                 c.theme,
                 &c.icons,
                 s.palette_rows.items,
                 &s.palette,
-            );
-            try c.tips();
+            ) else null;
+            // The rails' tooltips: nothing else in the chrome has one.
+            if (caps.panels) try c.tips();
             c.end();
             if (want) |wanted| s.applyZoom(wanted);
             if (changed) |c2| interface.changeSetting(s, c2);

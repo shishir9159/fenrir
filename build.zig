@@ -92,6 +92,7 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "config", caps.config);
     opts.addOption(bool, "splits", caps.splits);
     opts.addOption(bool, "marks", caps.marks);
+    opts.addOption(bool, "panels", caps.panels);
     opts.addOption(bool, "compare", caps.compare);
     opts.addOption(bool, "diagnostics", caps.diagnostics);
     opts.addOption(bool, "bench", caps.bench);
@@ -352,6 +353,11 @@ const Caps = struct {
     splits: bool,
     /// Highlights, notes and ink.
     marks: bool,
+    /// The rails down either side of the page, the panel they open, the
+    /// command palette and the settings page: the interface beyond the
+    /// status bar. Not in `light`, whose window is the page and the bar
+    /// under it, and whose pages have the width the rails would take.
+    panels: bool,
     /// `fenrir diff` and the reader's comparison overlay.
     compare: bool,
     /// The commands that answer questions about fenrir rather than about a
@@ -502,6 +508,7 @@ fn resolve(b: *std.Build) Caps {
         .config = !light,
         .splits = !light,
         .marks = !light,
+        .panels = !light,
         .compare = !light,
         .diagnostics = profile == .debug,
         .bench = profile == .debug,

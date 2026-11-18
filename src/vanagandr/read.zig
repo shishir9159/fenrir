@@ -248,7 +248,11 @@ const colon_commands =
     \\    :page +2, :page -1   pages forward and back
     \\    :zoom 150, :fit page a zoom, or the width, the height or a page
     \\    :set theme=light     the colours the interface is drawn in
+    \\
+++ (if (caps.panels)
     \\    :settings            all of them, as a page over the document
+    \\
+else "") ++
     \\    :reload, :e!         read the document again from its file
     \\
 ++ (if (caps.splits)
@@ -631,7 +635,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Session.Co
         .samples = samples,
         .backend = backend,
         .io = ctx.io,
-        .palette_text = .init(gpa),
+        .palette_text = if (caps.panels) .init(gpa) else {},
     };
     defer session.deinit();
 

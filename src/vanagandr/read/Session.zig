@@ -100,6 +100,16 @@ fn If(comptime on: bool, comptime T: type) type {
 const Windows = if (caps.splits) Tabs else OneWindow;
 const Arrangement = if (caps.splits) Layout else OneWindow;
 
+/// What the panel's rows were built from; see `rows`.
+const RowsFor = struct {
+    which: rails_mod.Panel = .none,
+    buffer: u32 = 0,
+    revision: u64 = 0,
+    contributions: u32 = 0,
+    compared: usize = 0,
+    filtered: u32 = 0,
+};
+
 ctx: *Context,
 /// The reader's heap, not the CLI's arena, and safe to call from the
 /// rasterising thread.
@@ -156,7 +166,7 @@ theme: Theme = .dark,
 
 /// The settings page, and the values it is showing. Filled when it opens
 /// and after every change, never per frame: see `settings.zig`.
-settings: settings_page.State = .{},
+settings: If(caps.panels, settings_page.State) = if (caps.panels) .{} else {},
 
 /// The command palette, and the rows it is filtering.
 ///
@@ -164,8 +174,8 @@ settings: settings_page.State = .{},
 /// built-in half is a table in the binary and the plugin half changes
 /// when a plugin registers something, which is while Lua runs and never
 /// during a frame. `palette.zig` re-ranks on the same rule.
-palette: palette_mod.State = .{},
-palette_rows: std.ArrayList(palette_mod.Row) = .empty,
+palette: If(caps.panels, palette_mod.State) = if (caps.panels) .{} else {},
+palette_rows: If(caps.panels, std.ArrayList(palette_mod.Row)) = if (caps.panels) .empty else {},
 /// The bytes a plugin's rows point into, copied out of Galdr.
 ///
 /// The built-in half of the palette is a table in the binary and needs
@@ -174,7 +184,7 @@ palette_rows: std.ArrayList(palette_mod.Row) = .empty,
 /// immediately before the chrome is built, so this is one frame and not
 /// a race. The rows own what they draw and the arena is reset the next
 /// time the palette opens.
-palette_text: std.heap.ArenaAllocator,
+palette_text: If(caps.panels, std.heap.ArenaAllocator),
 
 /// The search bar, and what it has found.
 ///
@@ -192,28 +202,21 @@ search: hlidskjalf.search.State = .{},
 /// buffer's marks were at the time, and a highlight added or removed is
 /// what makes them stale. The labels are the marks' own note bytes,
 /// which live on the buffer, so nothing here owns a string.
-panel: panels.State = .{},
-rows: std.ArrayList(panels.Row) = .empty,
+panel: If(caps.panels, panels.State) = if (caps.panels) .{} else {},
+rows: If(caps.panels, std.ArrayList(panels.Row)) = if (caps.panels) .empty else {},
 
 /// The plugins' rail buttons, sorted by side. Filled from Galdr when its
 /// revision changes and never per frame: see `fillRailButtons`.
-rail_left: std.ArrayList(rails_mod.Extra) = .empty,
-rail_right: std.ArrayList(rails_mod.Extra) = .empty,
-rail_panels: std.ArrayList(rails_mod.PanelToggle) = .empty,
-rails_for: u32 = std.math.maxInt(u32),
+rail_left: If(caps.panels, std.ArrayList(rails_mod.Extra)) = if (caps.panels) .empty else {},
+rail_right: If(caps.panels, std.ArrayList(rails_mod.Extra)) = if (caps.panels) .empty else {},
+rail_panels: If(caps.panels, std.ArrayList(rails_mod.PanelToggle)) = if (caps.panels) .empty else {},
+rails_for: If(caps.panels, u32) = if (caps.panels) std.math.maxInt(u32) else {},
 
 /// The plugins' settings as the page wants them. Same rule: filled when
 /// Galdr's revision changes, and never on a frame path.
-plugin_settings: std.ArrayList(settings_page.Option) = .empty,
-settings_for: u32 = std.math.maxInt(u32),
-rows_for: struct {
-    which: rails_mod.Panel = .none,
-    buffer: u32 = 0,
-    revision: u64 = 0,
-    contributions: u32 = 0,
-    compared: usize = 0,
-    filtered: u32 = 0,
-} = .{},
+plugin_settings: If(caps.panels, std.ArrayList(settings_page.Option)) = if (caps.panels) .empty else {},
+settings_for: If(caps.panels, u32) = if (caps.panels) std.math.maxInt(u32) else {},
+rows_for: If(caps.panels, RowsFor) = if (caps.panels) .{} else {},
 
 /// What is written on the tabs, and the bytes those names point into.
 ///
@@ -229,7 +232,7 @@ tab_ends: If(caps.splits, std.ArrayList(u32)) = if (caps.splits) .empty else {},
 tabs_for: If(caps.splits, u64) = if (caps.splits) 0 else {},
 
 /// The left rail's colours, filled when the highlight colour changes.
-swatches: [keys.palette_size]rails_mod.Swatch = @splat(.{ .name = "", .color = .gray(0) }),
+swatches: If(caps.panels, [keys.palette_size]rails_mod.Swatch) = if (caps.panels) @splat(.{ .name = "", .color = .gray(0) }) else {},
 
 /// The accent a person configured, or null for the theme's own.
 ///
@@ -444,14 +447,16 @@ pub fn deinit(s: *Session) void {
     }
     s.boxes.deinit(s.gpa);
     s.stroking.deinit(s.gpa);
-    s.rows.deinit(s.gpa);
-    s.palette_rows.deinit(s.gpa);
-    s.palette_text.deinit();
+    if (caps.panels) {
+        s.rows.deinit(s.gpa);
+        s.palette_rows.deinit(s.gpa);
+        s.palette_text.deinit();
+        s.rail_left.deinit(s.gpa);
+        s.rail_right.deinit(s.gpa);
+        s.plugin_settings.deinit(s.gpa);
+        s.rail_panels.deinit(s.gpa);
+    }
     s.doc_handles.deinit(s.gpa);
-    s.rail_left.deinit(s.gpa);
-    s.rail_right.deinit(s.gpa);
-    s.plugin_settings.deinit(s.gpa);
-    s.rail_panels.deinit(s.gpa);
     for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
 }
 
@@ -788,10 +793,11 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
         },
         .set => return s.setOption(args),
         .settings => {
+            if (!caps.panels) return s.absent(name);
             s.settings.toggle();
             if (s.settings.open) interface.readSettings(s);
         },
-        .palette => interface.showPalette(s),
+        .palette => if (caps.panels) interface.showPalette(s) else return s.absent(name),
         .undo => marks.undoMarks(s, false),
         .redo => marks.undoMarks(s, true),
         .marks => {
@@ -814,6 +820,9 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
         .cnext => marks.jumpMark(s, .{ .forwards = true, .comments = true }),
         .cprevious => marks.jumpMark(s, .{ .forwards = false, .comments = true }),
         .filter => {
+            // The filter is typed into the panel, and kept there: with no
+            // panel there is nothing to type it into.
+            if (!caps.panels) return s.absent(name);
             s.panel.setFilter(args);
             if (s.chrome) |c| c.rails.show(.annotations);
             const filter = marks.markFilter(s);
@@ -976,9 +985,19 @@ fn setOption(s: *Session, args: []const u8) bool {
             s.say("watch is on or off, not {s}", .{value[0..@min(value.len, 48)]});
             return false;
         }
-        for (settings_page.builtin, 0..) |opt, i| {
-            if (std.mem.eql(u8, opt.key, name)) interface.changeSetting(s, .{ .key = opt.key, .value = value, .index = i });
+        if (caps.panels) {
+            for (settings_page.builtin, 0..) |opt, i| {
+                if (std.mem.eql(u8, opt.key, name)) interface.changeSetting(s, .{ .key = opt.key, .value = value, .index = i });
+            }
+            return true;
         }
+        // No page to go through: applied as the page would, and written
+        // down where there is somewhere to write it.
+        if (name[0] == 'c') {
+            s.comment_style = marks.commentStyleNamed(value).?;
+        } else reload.setWatching(s, std.mem.eql(u8, value, "on"));
+        if (s.library) |l| l.set(name, value) catch {};
+        s.say("{s} = {s}", .{ name, value });
         return true;
     }
     if (!std.mem.eql(u8, name, "theme")) {
@@ -1051,13 +1070,13 @@ pub fn handle(s: *Session, in: lyngvi.Input) bool {
 /// of a box tree that does not exist yet -- which is why that state is
 /// the caller's in both files rather than living in the tree.
 pub fn interfaceHasInput(s: *const Session) bool {
-    if (s.settings.open or s.palette.open) return true;
+    if (caps.panels and (s.settings.open or s.palette.open)) return true;
     // The search bar is the one of these that gives the keyboard *back*:
     // enter drops focus so `n` and `N` step the matches while the count
     // stays on screen. So the question is whether the field has it, not
     // whether the bar is open -- and the answer is last frame's, for the
     // same reason the rest of this function's answers are.
-    if (s.find.typing or s.panel.typing) return true;
+    if (s.find.typing or (caps.panels and s.panel.typing)) return true;
     const c = s.chrome orelse return false;
     return c.grabbing();
 }
@@ -1224,7 +1243,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
             _ = s.exec(copy[0..len]);
             return s.quit;
         },
-        .show_commands => interface.showPalette(s),
+        .show_commands => if (caps.panels) interface.showPalette(s),
 
         .enter_search => search_mod.beginSearch(s),
         .search_step => |back| {
@@ -1275,7 +1294,7 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
     // document, so the press that lands in it has to be kept off the text
     // underneath -- and `rect` is last frame's, which is the rectangle
     // that was there when the button went down.
-    if (s.panel.holds(in.mouse) or s.find.holds(in.mouse.x, in.mouse.y)) {
+    if ((caps.panels and s.panel.holds(in.mouse)) or s.find.holds(in.mouse.x, in.mouse.y)) {
         s.view().was_down = down;
         return;
     }
@@ -1479,7 +1498,7 @@ test {
     _ = cursor;
     _ = frame;
     _ = ink;
-    _ = interface;
+    if (caps.panels) _ = interface;
     _ = marks;
     _ = plugins_mod;
     _ = reload;

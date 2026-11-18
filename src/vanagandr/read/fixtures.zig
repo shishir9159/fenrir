@@ -62,7 +62,12 @@ pub fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
 /// A session with one buffer of `n` blank pages and one window on it. No
 /// document: everything tested here reads `pages` and the caches.
 pub fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !Session {
-    var s: Session = .{ .ctx = undefined, .gpa = gpa, .samples = .four, .palette_text = .init(gpa) };
+    var s: Session = .{
+        .ctx = undefined,
+        .gpa = gpa,
+        .samples = .four,
+        .palette_text = if (caps.panels) .init(gpa) else {},
+    };
     errdefer s.deinit();
     try s.buffers.append(gpa, .{
         .path = try gpa.dupe(u8, "/docs/a.pdf"),
@@ -82,14 +87,16 @@ pub fn closeSession(s: *Session) void {
     s.stroking.deinit(s.gpa);
     s.note.deinit(s.gpa);
     s.comment_order.deinit(s.gpa);
-    s.palette_rows.deinit(s.gpa);
-    s.palette_text.deinit();
+    if (caps.panels) {
+        s.palette_rows.deinit(s.gpa);
+        s.palette_text.deinit();
+        s.rail_left.deinit(s.gpa);
+        s.rail_right.deinit(s.gpa);
+        s.plugin_settings.deinit(s.gpa);
+        s.rail_panels.deinit(s.gpa);
+        s.rows.deinit(s.gpa);
+    }
     s.doc_handles.deinit(s.gpa);
-    s.rail_left.deinit(s.gpa);
-    s.rail_right.deinit(s.gpa);
-    s.plugin_settings.deinit(s.gpa);
-    s.rail_panels.deinit(s.gpa);
-    s.rows.deinit(s.gpa);
     s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
