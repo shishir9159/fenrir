@@ -12,7 +12,9 @@
 //! document can be in four windows at once; each has its own scroll, zoom and
 //! cursor, and all four share the document's highlights, because the
 //! highlights belong to the buffer. `<C-w>v` splits, `<C-w>c` closes,
-//! `<C-w>hjkl` moves between them, as in Vim.
+//! `<C-w>hjkl` moves between them, as in Vim. A build with no splits has one
+//! window on one document, `hlidskjalf.OneWindow`, and refuses a second file
+//! rather than opening it into a buffer nothing could show.
 //!
 //! Everything about *where* a window is looking lives in `hlidskjalf.View`
 //! and is tested there without a device. What lives in `read/` is the part
@@ -130,21 +132,22 @@ pub const usage = synopsis ++ view_flags ++
     (if (caps.marks) mark_modes else "") ++
     closing;
 
-const synopsis =
+const synopsis = if (caps.splits)
     \\fenrir <file>... [options]       -- `fenrir read <file>...` is the same
     \\
     \\    Opens the documents in a window and scrolls through them. More than
     \\    one file opens them as buffers; the first is shown and the rest are
-    \\
-++ (if (caps.splits)
     \\    reachable with <C-w>n.
     \\
     \\
 else
-    \\    reachable with :bn.
+    \\fenrir <file> [options]          -- `fenrir read <file>` is the same
+    \\
+    \\    Opens the document in a window and scrolls through it. One document:
+    \\    this build has one window, and no buffers to hold a second file in.
     \\
     \\
-);
+;
 
 const view_flags =
     \\    --page N     Start at this page, numbered from 1. Without it, the
@@ -255,10 +258,7 @@ const colon_commands =
     \\    :tabonly             close every other tabpage
     \\    :tabn, :tabp         next / previous tabpage; with N, that one
     \\
-else
-    \\    :bn, :bp             next / previous document
-    \\
-) ++
+else "") ++
     \\    :q, :qa              close the window, close the reader
     \\
 ++ (if (caps.marks)
@@ -590,6 +590,11 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Session.Co
     from_file = null;
 
     if (files.items.len == 0) return ctx.fail("read needs a file", .{});
+    // Said, rather than the second opened into a buffer that nothing in this
+    // build can show.
+    if (!caps.splits and files.items.len > 1) {
+        return ctx.fail("this build reads one document at a time, and {s} is a second", .{files.items[1]});
+    }
     if (comparison != null and files.items.len != 2) return ctx.fail("a comparison is of two documents", .{});
     // `Rerun` reads both documents' bytes on a thread of its own, and a
     // reload frees them.

@@ -911,6 +911,7 @@ pub fn placeVisible(s: *Session) !void {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+const caps = fenrir.build_options;
 const fixtures = @import("fixtures.zig");
 const windows = @import("windows.zig");
 const closeSession = fixtures.closeSession;
@@ -918,6 +919,7 @@ const fakePages = fixtures.fakePages;
 const sessionOf = fixtures.sessionOf;
 
 test "every window's visible pages are asked for, focused window first" {
+    if (!caps.splits) return error.SkipZigTest;
     const gpa = testing.allocator;
     var buf: [64]fenrir.Page = undefined;
     // Half scale, so two pages fit at once.
@@ -941,6 +943,7 @@ test "two windows at different zooms need two rasters and one recording" {
     // The difference between the backends, as a test: the CPU cache is keyed
     // by zoom because its contents are pixels, and the GPU cache is not
     // because its contents are curves.
+    if (!caps.splits) return error.SkipZigTest;
     const gpa = testing.allocator;
     var buf: [8]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 6), 1, 1000, 800);

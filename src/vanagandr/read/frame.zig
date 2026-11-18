@@ -208,6 +208,19 @@ fn compose(s: *Session, list: *DrawList, over: *DrawList) !void {
     s.stamp += 1;
     s.recorded.stamp = s.stamp;
 
+    if (!caps.splits) {
+        // One window: no order to draw windows in, no lines between them
+        // and no focus ring to say which one is meant. Still clipped, so
+        // that a page's shadow stays off the status bar as it would in a
+        // split.
+        const v = s.view();
+        list.pushClip(v.rect);
+        over.pushClip(v.rect);
+        defer list.popClip();
+        defer over.popClip();
+        return composeView(s, v, list, over);
+    }
+
     s.order.clearRetainingCapacity();
     try s.layout().leaves(&s.order, s.gpa);
 
@@ -332,7 +345,7 @@ fn drawScrollbar(s: *Session, v: *View, list: *DrawList) !void {
 pub fn windowRect(s: *const Session, width: f32, height: f32) Bounds {
     if (s.chrome == null) return .fromRect(0, 0, width, @max(height, 1));
     const left = rails_mod.width;
-    const top = windows.tabInset(s);
+    const top = if (caps.splits) windows.tabInset(s) else 0;
     return .fromRect(
         left,
         top,
@@ -396,7 +409,7 @@ pub fn shoot(s: *Session, dest: []const u8, width: u32, height: u32, start_page:
     s.backend = .cpu;
 
     s.tabs.arrange(.fromRect(0, 0, @floatFromInt(width), @floatFromInt(height)));
-    windows.applySplits(s, splits);
+    if (caps.splits) windows.applySplits(s, splits);
 
     var it = s.layout().iterator();
     while (it.next()) |v| {
@@ -530,7 +543,7 @@ pub fn open(s: *Session, settings: Settings) !void {
         v.dpi_scale = scale;
         if (v.fit_on_open) v.fitTo(.width);
     }
-    windows.applySplits(s, settings.splits);
+    if (caps.splits) windows.applySplits(s, settings.splits);
     {
         // After the splits, because a split refits the zoom and a zoom
         // moves where every page starts: scrolling to `--page` first
@@ -781,9 +794,11 @@ pub fn open(s: *Session, settings: Settings) !void {
             // Before anything that starts below the bar: the rails and
             // the panel are floated against the top of the window and
             // have to be told how much of it is already spoken for.
-            c.top = windows.tabInset(s);
+            if (caps.splits) c.top = windows.tabInset(s);
             const want = try c.status(s.statusLine());
-            if (try c.tabBar(windows.tabLabels(s), s.tabs.active)) |asked_tabs| windows.applyTabs(s, asked_tabs);
+            if (caps.splits) {
+                if (try c.tabBar(windows.tabLabels(s), s.tabs.active)) |asked_tabs| windows.applyTabs(s, asked_tabs);
+            }
             const asked = try c.rightRail(interface.railLine(s));
             if (asked) |wanted| interface.applyRail(s, wanted);
             if (try c.leftRail(interface.modeRail(s))) |wanted| interface.applyRail(s, wanted);

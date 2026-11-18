@@ -25,7 +25,8 @@
 //!
 //! `Layout` arranges the views as Vim arranges windows: a tree of rows and
 //! columns, split and closed with `<C-w>`, with the space a closed window
-//! leaves going back to the one it was taken from.
+//! leaves going back to the one it was taken from. `OneWindow` is the same
+//! questions answered for a build that has no splits.
 //!
 //! Nothing here opens a file, draws anything, or talks to a device. It is the
 //! model `vanagandr/read.zig` drives, which is what lets every rule in it --
@@ -38,6 +39,7 @@ const std = @import("std");
 pub const Buffer = @import("hlidskjalf/Buffer.zig");
 pub const Layout = @import("hlidskjalf/Layout.zig");
 pub const Marks = @import("hlidskjalf/Marks.zig");
+pub const OneWindow = @import("hlidskjalf/OneWindow.zig");
 pub const Tabs = @import("hlidskjalf/Tabs.zig");
 pub const View = @import("hlidskjalf/View.zig");
 pub const commands = @import("hlidskjalf/commands.zig");
@@ -53,6 +55,7 @@ test {
     _ = Buffer;
     _ = Layout;
     _ = Marks;
+    _ = OneWindow;
     _ = Tabs;
     _ = View;
     _ = commands;

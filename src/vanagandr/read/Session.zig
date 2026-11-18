@@ -53,6 +53,7 @@ const Point = gelgja.Point;
 const Buffer = hlidskjalf.Buffer;
 const Layout = hlidskjalf.Layout;
 const Marks = hlidskjalf.Marks;
+const OneWindow = hlidskjalf.OneWindow;
 const Tabs = hlidskjalf.Tabs;
 const View = hlidskjalf.View;
 const commands = hlidskjalf.commands;
@@ -77,6 +78,27 @@ const max_zoom = View.max_zoom;
 const LibraryIfStored = if (caps.sqlite) Library else noreturn;
 pub const ComparisonIfCompared = if (caps.compare) *diff_mod.Comparison else noreturn;
 const RuntimeIfScripted = if (caps.lua) *galdr.Runtime else noreturn;
+
+/// A field of a feature this build may leave out: its own type when the
+/// feature is in, and `void` when it is not.
+///
+/// `void` rather than a value nothing reads, for the reason `library` is
+/// `?noreturn`: a field that is there is a field a line can still touch,
+/// and that line is then in the binary. Gone, every line that touches it
+/// fails to compile unless a comptime-false gate above it means it is never
+/// analysed -- so the gates in `handle`, `apply`, `execFrom`, `pointer` and
+/// the frame loop are not a convention that can be forgotten. A build that
+/// forgets one does not build.
+fn If(comptime on: bool, comptime T: type) type {
+    return if (on) T else void;
+}
+
+/// The windows: tabpages of split trees, or in a build with no splits the
+/// one window there is. `layout()` is the arrangement on screen, a `Layout`
+/// or that same one window, and both answer `current`, `count`, `iterator`
+/// and `arrange` alike -- which is nearly all the reader asks of either.
+const Windows = if (caps.splits) Tabs else OneWindow;
+const Arrangement = if (caps.splits) Layout else OneWindow;
 
 ctx: *Context,
 /// The reader's heap, not the CLI's arena, and safe to call from the
@@ -108,8 +130,9 @@ timing: bool = false,
 /// The tabpages, and the tree of windows in each. The one on screen is
 /// `layout()`, which is what almost everything here means by "the
 /// windows": a tab nobody is looking at is drawn by nothing and
-/// rasterised for nobody.
-tabs: Tabs = .{},
+/// rasterised for nobody. In a build with no splits, the one window, under
+/// the same name so that it is started and arranged the same way.
+tabs: Windows = .{},
 keymap: keys.State = .{},
 
 /// The interface drawn over the page: Þviti, a face off this machine, and
@@ -200,10 +223,10 @@ rows_for: struct {
 /// name stops in `tab_text`, kept because appending to the text moves it
 /// and a slice taken before the last name was written would be aimed at
 /// freed bytes.
-tab_names: std.ArrayList([]const u8) = .empty,
-tab_text: std.ArrayList(u8) = .empty,
-tab_ends: std.ArrayList(u32) = .empty,
-tabs_for: u64 = 0,
+tab_names: If(caps.splits, std.ArrayList([]const u8)) = if (caps.splits) .empty else {},
+tab_text: If(caps.splits, std.ArrayList(u8)) = if (caps.splits) .empty else {},
+tab_ends: If(caps.splits, std.ArrayList(u32)) = if (caps.splits) .empty else {},
+tabs_for: If(caps.splits, u64) = if (caps.splits) 0 else {},
 
 /// The left rail's colours, filled when the highlight colour changes.
 swatches: [keys.palette_size]rails_mod.Swatch = @splat(.{ .name = "", .color = .gray(0) }),
@@ -261,7 +284,7 @@ pen: ink.Pen = .{},
 stroking: std.ArrayList(Point) = .empty,
 
 /// The line between two windows, while it is being dragged.
-split_drag: ?Layout.Divider = null,
+split_drag: If(caps.splits, ?Layout.Divider) = if (caps.splits) null else {},
 
 /// The highlight in hand in edit mode, by its session key.
 focus_mark: ?u64 = null,
@@ -384,9 +407,10 @@ failure_next: usize = 0,
 /// draw order, the lines between them, and the boxes a selection covers
 /// -- and a reader scrolling at the refresh rate would otherwise ask the
 /// allocator for them sixty times a second forever. Kept here they are a
-/// few allocations for the life of the session.
-order: std.ArrayList(u32) = .empty,
-borders: std.ArrayList(Bounds) = .empty,
+/// few allocations for the life of the session. One window has no order to
+/// be drawn in and no line between it and another.
+order: If(caps.splits, std.ArrayList(u32)) = if (caps.splits) .empty else {},
+borders: If(caps.splits, std.ArrayList(Bounds)) = if (caps.splits) .empty else {},
 boxes: std.ArrayList(cursor.PageBox) = .empty,
 
 pub fn deinit(s: *Session) void {
@@ -411,8 +435,13 @@ pub fn deinit(s: *Session) void {
         b.deinit(s.gpa);
     }
     s.buffers.deinit(s.gpa);
-    s.order.deinit(s.gpa);
-    s.borders.deinit(s.gpa);
+    if (caps.splits) {
+        s.order.deinit(s.gpa);
+        s.borders.deinit(s.gpa);
+        s.tab_names.deinit(s.gpa);
+        s.tab_text.deinit(s.gpa);
+        s.tab_ends.deinit(s.gpa);
+    }
     s.boxes.deinit(s.gpa);
     s.stroking.deinit(s.gpa);
     s.rows.deinit(s.gpa);
@@ -423,9 +452,6 @@ pub fn deinit(s: *Session) void {
     s.rail_right.deinit(s.gpa);
     s.plugin_settings.deinit(s.gpa);
     s.rail_panels.deinit(s.gpa);
-    s.tab_names.deinit(s.gpa);
-    s.tab_text.deinit(s.gpa);
-    s.tab_ends.deinit(s.gpa);
     for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
 }
 
@@ -534,8 +560,8 @@ pub fn buffer(s: *Session, index: u32) *Buffer {
 }
 
 /// The tabpage on screen. Every window command means this one.
-pub fn layout(s: *Session) *Layout {
-    return s.tabs.current();
+pub fn layout(s: *Session) *Arrangement {
+    return if (caps.splits) s.tabs.current() else &s.tabs;
 }
 
 pub fn view(s: *Session) *View {
@@ -681,28 +707,33 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
         if (s.plugins) |rt| {
             if (rt.runCommand(name, args)) |ran| return ran;
         }
-        s.say("not a command: {s}", .{name[0..@min(name.len, 64)]});
-        return false;
+        return s.absent(name);
     };
 
     switch (entry.id) {
         .quit => {
-            if (!windows.closeWindow(s)) s.quit = true;
+            if (!caps.splits or !windows.closeWindow(s)) s.quit = true;
         },
         .quit_all => s.quit = true,
-        .split => windows.splitWindow(s, .horizontal),
-        .vsplit => windows.splitWindow(s, .vertical),
-        .close => _ = windows.closeWindow(s),
-        .only => s.layout().only(s.gpa),
-        .tabnew => windows.newTab(s),
-        .tabclose => if (!windows.closeTab(s)) {
-            s.say("this is the only tabpage; :q leaves the reader", .{});
-            return false;
+        .split => if (caps.splits) windows.splitWindow(s, .horizontal) else return s.absent(name),
+        .vsplit => if (caps.splits) windows.splitWindow(s, .vertical) else return s.absent(name),
+        .close => if (caps.splits) {
+            _ = windows.closeWindow(s);
+        } else return s.absent(name),
+        .only => if (caps.splits) s.layout().only(s.gpa) else return s.absent(name),
+        .tabnew => if (caps.splits) windows.newTab(s) else return s.absent(name),
+        .tabclose => {
+            if (!caps.splits) return s.absent(name);
+            if (!windows.closeTab(s)) {
+                s.say("this is the only tabpage; :q leaves the reader", .{});
+                return false;
+            }
         },
-        .tabonly => s.tabs.only(s.gpa),
+        .tabonly => if (caps.splits) s.tabs.only(s.gpa) else return s.absent(name),
         // `:tabnext` alone is the next one; with a number it is that one,
         // counted from 1 as a person counts the bar.
         .tabnext, .tabprevious => {
+            if (!caps.splits) return s.absent(name);
             const back = entry.id == .tabprevious;
             if (args.len == 0) {
                 windows.goTab(s, if (back) -1 else 1);
@@ -717,8 +748,8 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
                 return false;
             }
         },
-        .bnext => windows.showBuffer(s, 1),
-        .bprevious => windows.showBuffer(s, -1),
+        .bnext => if (caps.splits) windows.showBuffer(s, 1) else return s.absent(name),
+        .bprevious => if (caps.splits) windows.showBuffer(s, -1) else return s.absent(name),
         .reload => {
             if (s.diff != null) {
                 s.say("a comparison does not reload", .{});
@@ -891,6 +922,14 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
     return true;
 }
 
+/// What a `:` line naming nothing gets, and so does one naming a command
+/// this build left out: `:sp` in a reader with one window is not refused,
+/// there being nothing to refuse. It is simply not there.
+fn absent(s: *Session, name: []const u8) bool {
+    s.say("not a command: {s}", .{name[0..@min(name.len, 64)]});
+    return false;
+}
+
 /// `:set theme=light`, and `:set theme` to be told what it is.
 ///
 /// Vim's spelling, and Vim's division: a setting is a name and a value,
@@ -1031,26 +1070,34 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
     const v = s.view();
     switch (cmd) {
         .none => {},
-        .quit => if (!windows.closeWindow(s)) return true,
+        .quit => if (!caps.splits or !windows.closeWindow(s)) return true,
         .quit_all => return true,
 
-        .split => |dir| windows.splitWindow(s, dir),
-        .close_window => _ = windows.closeWindow(s),
-        .only_window => s.layout().only(s.gpa),
-        .focus_side => |side| _ = s.layout().focusSide(side),
-        .cycle_window => |back| s.layout().cycle(s.gpa, back),
-        .equalise => s.layout().equalise(),
+        // The window keys do nothing in a build with one window, as
+        // `<C-w>j` does nothing in Vim with no window below.
+        .split => |dir| if (caps.splits) windows.splitWindow(s, dir),
+        .close_window => if (caps.splits) {
+            _ = windows.closeWindow(s);
+        },
+        .only_window => if (caps.splits) s.layout().only(s.gpa),
+        .focus_side => |side| if (caps.splits) {
+            _ = s.layout().focusSide(side);
+        },
+        .cycle_window => |back| if (caps.splits) s.layout().cycle(s.gpa, back),
+        .equalise => if (caps.splits) s.layout().equalise(),
 
-        .new_tab => windows.newTab(s),
-        .close_tab => _ = windows.closeTab(s),
-        .go_tab => |delta| windows.goTab(s, delta),
-        .window_to_tab => windows.windowToTab(s),
+        .new_tab => if (caps.splits) windows.newTab(s),
+        .close_tab => if (caps.splits) {
+            _ = windows.closeTab(s);
+        },
+        .go_tab => |delta| if (caps.splits) windows.goTab(s, delta),
+        .window_to_tab => if (caps.splits) windows.windowToTab(s),
 
         .diff_view => |delta| compare.turnComparison(s, delta),
         .nudge => |by| compare.nudge(s, by),
 
-        .next_buffer => windows.showBuffer(s, 1),
-        .previous_buffer => windows.showBuffer(s, -1),
+        .next_buffer => if (caps.splits) windows.showBuffer(s, 1),
+        .previous_buffer => if (caps.splits) windows.showBuffer(s, -1),
 
         // Straight through. The wheel already arrives in document pixels:
         // the platform layer multiplied the notch by the system's line
@@ -1235,7 +1282,7 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
 
     // Before anything else: a gesture that began on the line between two
     // windows belongs to that line until it is let go.
-    if (windows.dragSplit(s, in, down, pressed)) return;
+    if (caps.splits and windows.dragSplit(s, in, down, pressed)) return;
 
     // Then the pen, which claims the whole gesture the way a divider
     // does -- a stroke that stopped because the pointer crossed a mark or
@@ -1251,7 +1298,7 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
     // `s.drag` and take the last gesture's selection for this one's.
     if (pressed) {
         s.drag = null;
-        _ = s.layout().focusAt(in.mouse);
+        if (caps.splits) _ = s.layout().focusAt(in.mouse);
     }
 
     // Every window's scrollbar is live, not only the focused one's: a
@@ -1438,7 +1485,7 @@ test {
     _ = reload;
     _ = render;
     _ = search_mod;
-    _ = windows;
+    if (caps.splits) _ = windows;
 }
 
 test "the status line carries the mode and what the mode has to show" {
@@ -1539,11 +1586,17 @@ test "command lines: page numbers, relative pages, zoom, and unknown names" {
     try testing.expect(s.exec("zoom 200%"));
     try testing.expectApproxEqAbs(@as(f32, 200), s.view().percent(), 0.5);
 
-    try testing.expect(s.exec("vsplit"));
-    try testing.expectEqual(@as(u32, 2), s.layout().count());
-    try testing.expect(s.exec("q"));
-    try testing.expectEqual(@as(u32, 1), s.layout().count());
-    try testing.expect(!s.quit);
+    if (caps.splits) {
+        try testing.expect(s.exec("vsplit"));
+        try testing.expectEqual(@as(u32, 2), s.layout().count());
+        try testing.expect(s.exec("q"));
+        try testing.expectEqual(@as(u32, 1), s.layout().count());
+        try testing.expect(!s.quit);
+    } else {
+        // Not refused: absent, in the words a name nobody registered gets.
+        try testing.expect(!s.exec("vsplit"));
+        try testing.expect(std.mem.indexOf(u8, s.status, "not a command") != null);
+    }
     try testing.expect(s.exec("q"));
     try testing.expect(s.quit);
 

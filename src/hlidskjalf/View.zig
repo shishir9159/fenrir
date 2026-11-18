@@ -54,8 +54,9 @@ buffer: u32 = 0,
 /// The buffer's pages, borrowed. Valid for as long as the buffer is open.
 pages: []const fenrir.Page = &.{},
 
-/// Where this view sits in the window, in device pixels. Assigned by
-/// `Layout.arrange`; a view never decides its own rectangle.
+/// Where this view sits in the window, in device pixels. Given by
+/// `arrange`, from `Layout` or `OneWindow`; a view never decides its own
+/// rectangle.
 rect: Bounds = .fromRect(0, 0, 1, 1),
 
 /// The top of the viewport, in view-space pixels at the current zoom.
@@ -336,8 +337,8 @@ pub fn fitTo(v: *View, want: Fit) void {
     if (want == .page) v.scrollToPage(page);
 }
 
-/// Re-applies the fit to the view's current rectangle. Called by `Layout`
-/// whenever it gives this view a new one.
+/// Re-applies the fit to the view's current rectangle. Called by `arrange`
+/// whenever the view is given a new one.
 pub fn refit(v: *View) void {
     if (v.fit == .free or v.pages.len == 0) return;
     const p = v.pages[v.currentPage()];
@@ -358,6 +359,19 @@ pub fn refit(v: *View) void {
     // a pan held from before the fit would slide it off centre. Fit-height
     // keeps its pan, because the page may still be wider than the window.
     if (v.fit != .height) v.pan = 0;
+}
+
+/// Gives the view its rectangle: what `Layout` does for each of its leaves,
+/// and `OneWindow` for its one.
+pub fn arrange(v: *View, rect: Bounds) void {
+    const resized = v.rect.width() != rect.width() or v.rect.height() != rect.height();
+    v.rect = rect;
+    // Only on a change of size: `arrange` runs every frame, and a refit is
+    // a zoom about the middle of the view, which with a scroll in flight
+    // would nudge the page a sub-pixel per frame. The height counts as well
+    // as the width now that a page can be fitted down the window.
+    if (resized) v.refit();
+    v.clampScroll();
 }
 
 /// The `zoom` at which the page is its true physical size. A PDF point is

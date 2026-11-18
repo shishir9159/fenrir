@@ -795,8 +795,8 @@ test "a row chosen in the palette runs the command it names" {
     defer closeSession(&s);
 
     showPalette(&s);
-    runChosen(&s, .{ .row = .{ .name = "split" } });
-    try testing.expectEqual(@as(usize, 2), s.layout().count());
+    runChosen(&s, .{ .row = .{ .name = "fit" } });
+    try testing.expectEqual(hlidskjalf.View.Fit.width, s.view().fit);
 
     // And a line nothing matched goes down the same path a typed one does.
     runChosen(&s, .{ .line = "page 3" });

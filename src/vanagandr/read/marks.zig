@@ -1015,6 +1015,7 @@ pub fn squiggle(over: *DrawList, box: Bounds, color: Color) !void {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+const caps = fenrir.build_options;
 const fixtures = @import("fixtures.zig");
 const windows = @import("windows.zig");
 const interface = @import("interface.zig");
@@ -1027,6 +1028,7 @@ const sessionOf = fixtures.sessionOf;
 test "a highlight made in one window is in the other" {
     // The requirement in one test: two views, one underlying document, and a
     // change made through one visible through the other with nothing copied.
+    if (!caps.splits) return error.SkipZigTest;
     const gpa = testing.allocator;
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);

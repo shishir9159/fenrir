@@ -210,12 +210,12 @@ fn writeUsage(ctx: *Context) !void {
     try w.print(
         \\fenrir -- a PDF reader written from scratch in Zig ({s} build)
         \\
-        \\usage: fenrir <file>... [options]
+        \\usage: fenrir <file>{s} [options]
         \\       fenrir <command> [arguments]
         \\
         \\commands:
         \\
-    , .{caps.profile});
+    , .{ caps.profile, if (caps.splits) "..." else "" });
     for (commands) |cmd| {
         try w.print("  {s: <9} {s}\n", .{ cmd.name, cmd.summary });
     }
@@ -286,6 +286,8 @@ test "the help text offers no flag this build would reject" {
     try std.testing.expectEqual(caps.bench, mentions(u, "--time"));
     try std.testing.expectEqual(caps.diagnostics, mentions(u, "--shot"));
     try std.testing.expectEqual(caps.splits, mentions(u, "--split "));
+    try std.testing.expectEqual(caps.splits, mentions(u, ":bn"));
+    try std.testing.expectEqual(caps.splits, mentions(u, "<file>..."));
     try std.testing.expectEqual(caps.sqlite, mentions(u, "--db"));
     try std.testing.expectEqual(caps.lua, mentions(u, "--clean"));
     try std.testing.expectEqual(caps.config, mentions(u, "fenrir.toml"));

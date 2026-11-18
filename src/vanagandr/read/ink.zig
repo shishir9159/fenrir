@@ -24,6 +24,8 @@ const Marks = hlidskjalf.Marks;
 const View = hlidskjalf.View;
 const keys = hlidskjalf.keys;
 
+const caps = fenrir.build_options;
+
 /// What `[` and `]` may take the pen to. A stroke under the thin end would
 /// disappear at a fitted zoom and one over the thick end is a redaction.
 const min_pen_width: f32 = 0.4;
@@ -154,7 +156,9 @@ pub fn drawPointer(s: *Session, in: lyngvi.Input, down: bool, pressed: bool) voi
 
     const v = s.view();
     if (pressed) {
-        _ = s.layout().focusAt(in.mouse);
+        // The window under the pen first. One window is the focused one
+        // already.
+        if (caps.splits) _ = s.layout().focusAt(in.mouse);
         const focused = s.view();
         const page = focused.pageAt(in.mouse) orelse return;
         const at = focused.userSpaceAt(page, in.mouse) orelse return;

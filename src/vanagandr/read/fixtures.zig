@@ -93,9 +93,11 @@ pub fn closeSession(s: *Session) void {
     s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
-    s.tab_names.deinit(s.gpa);
-    s.tab_text.deinit(s.gpa);
-    s.tab_ends.deinit(s.gpa);
+    if (caps.splits) {
+        s.tab_names.deinit(s.gpa);
+        s.tab_text.deinit(s.gpa);
+        s.tab_ends.deinit(s.gpa);
+    }
     for (s.disks.items) |*d| d.deinit(s.gpa, null);
     s.disks.deinit(s.gpa);
     for (s.buffers.items) |*b| {

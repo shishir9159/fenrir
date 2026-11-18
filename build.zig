@@ -344,9 +344,11 @@ const Caps = struct {
     /// start. Not in `light`, which reads nothing it was not handed on its
     /// command line: a viewer that opens now has no file to look for first.
     config: bool,
-    /// The split tree's commands and the tab bar. The tree itself is the
-    /// reader's spine and is in every build; what goes is `:sp`, `:tabnew`
-    /// and the bar.
+    /// The split tree, the tabpages and their bar, and more than one
+    /// document open at once. Without them the reader is one window on one
+    /// document -- `hlidskjalf.OneWindow` where `Tabs` would be -- and a
+    /// second file is refused by name rather than opened into a buffer that
+    /// nothing could show.
     splits: bool,
     /// Highlights, notes and ink.
     marks: bool,

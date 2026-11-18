@@ -511,18 +511,7 @@ fn place(l: *Layout, node: u32, rect: Bounds) void {
 
     switch (n.kind) {
         .free => {},
-        .leaf => {
-            const v = &l.views.items[n.pane.view().?];
-            const resized = v.rect.width() != rect.width() or v.rect.height() != rect.height();
-            v.rect = rect;
-            // Only on a change of size: `arrange` runs every frame, and a
-            // refit is a zoom about the middle of the view, which with a
-            // scroll in flight would nudge the page a sub-pixel per frame.
-            // The height counts as well as the width now that a page can be
-            // fitted down the window.
-            if (resized) v.refit();
-            v.clampScroll();
-        },
+        .leaf => l.views.items[n.pane.view().?].arrange(rect),
         .row, .column => {
             const vertical = n.kind == .column;
             const total = if (vertical) rect.height() else rect.width();
