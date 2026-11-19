@@ -162,7 +162,10 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
     stalePages(s, index, @intCast(b.pages.len));
     b.dropMaps(s.gpa);
     if (loaded.map) |*m| {
-        if (loaded.first) |page| b.putMap(s.gpa, page, m.*) else m.deinit(s.gpa);
+        // Kept for the caret, and a build with no marks has no caret.
+        if (!caps.marks) {
+            m.deinit(s.gpa);
+        } else if (loaded.first) |page| b.putMap(s.gpa, page, m.*) else m.deinit(s.gpa);
     }
     // Keyed by the old document's object numbers.
     if (index < s.faces.items.len) {
@@ -184,7 +187,9 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
             if (drag.buffer == index and !kept) s.drag = null;
         }
     }
-    if (loaded.first) |page| placeStale(s, index, page);
+    if (caps.marks) {
+        if (loaded.first) |page| placeStale(s, index, page);
+    }
     if (caps.panels) s.rows_for = .{};
 
     // The file's own annotations, read again: those the library holds

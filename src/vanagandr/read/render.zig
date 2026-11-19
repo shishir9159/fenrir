@@ -375,8 +375,13 @@ pub fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
 
     // The text map first, and separately failable: a page whose pixels
     // will not come out should still be one the cursor can move through,
-    // and vice versa.
-    out.map = text.build(gpa, result.list) catch null;
+    // and vice versa. Built only where something reads it: the caret, a
+    // selection and a mark read a page's text, and a search reads it from
+    // pages nobody is looking at. A build with none of them never pays
+    // for one.
+    if (caps.marks or (caps.search and job.want == .text)) {
+        out.map = text.build(gpa, result.list) catch null;
+    }
     errdefer if (out.map) |*m| m.deinit(gpa);
 
     // A search wants the words and not the picture.
@@ -656,6 +661,9 @@ fn missingIn(s: *Session, v: *View) ?Job {
         if (failed(s, job)) continue;
         if (!cached(s, v, i)) return job;
     }
+    // Neither the caret nor a selection is in a build with no marks, and
+    // nothing else asks for a page's text.
+    if (!caps.marks) return null;
     // The cursor needs a text map even for a page whose pixels are
     // already cached -- a window that has not moved since the map was
     // evicted would otherwise have a cursor that cannot cross a page.
@@ -719,7 +727,7 @@ pub fn collectPage(
     if (finished.map) |map| {
         s.buffer(finished.job.buffer).putMap(gpa, finished.job.page, map);
         finished.map = null;
-        reload.placeStale(s, finished.job.buffer, finished.job.page);
+        if (caps.marks) reload.placeStale(s, finished.job.buffer, finished.job.page);
     }
 
     const result = finished.result orelse {

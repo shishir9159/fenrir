@@ -447,7 +447,9 @@ pub fn shoot(s: *Session, dest: []const u8, width: u32, height: u32, start_page:
             var result = content.page(gpa, b.doc, b.pages[job.page], render.page_options) catch break;
             defer result.deinit(gpa);
 
-            if (text.build(gpa, result.list) catch null) |map| b.putMap(gpa, job.page, map);
+            if (caps.marks) {
+                if (text.build(gpa, result.list) catch null) |map| b.putMap(gpa, job.page, map);
+            }
 
             break :page render.rasterise(s, job, result.list, b) catch {
                 render.noteFailure(s, job);
