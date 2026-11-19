@@ -261,11 +261,12 @@ else "") ++
     \\    :tabnew, :tabclose   a tabpage of this window, close this tabpage
     \\    :tabonly             close every other tabpage
     \\    :tabn, :tabp         next / previous tabpage; with N, that one
-    \\
-else "") ++
     \\    :q, :qa              close the window, close the reader
     \\
-++ (if (caps.marks)
+else
+    \\    :q, :qa              close the reader
+    \\
+) ++ (if (caps.marks)
     \\    :undo, :redo         the history of the marks
     \\    :marks, :marks clear how many marks, or remove them all
     \\    :filter WORDS        only the marks that match, in the panel and to
@@ -307,10 +308,17 @@ const normal_mode =
     \\normal mode (reading):
     \\    drag the scrollbar   scroll; a press on the track moves a screen
     \\    wheel, ctrl+wheel    scroll, zoom
+    \\
+++ (if (caps.marks)
     \\    arrows, h j k l      move the cursor; the page follows it
     \\    w / b / e            the next word, the word before, the word's end
     \\    ^ / $                the start and end of the line
     \\    escape               put the cursor away
+    \\
+else
+    \\    up / down, j / k     scroll a tenth of a screen
+    \\
+) ++
     \\    page up / page down  a screen at a time
     \\    home / end           the first and last page
     \\    space / p            the next and previous page
@@ -323,10 +331,8 @@ const normal_mode =
 else
     \\    n / N                the next and previous page
     \\
-) ++
+) ++ (if (caps.marks)
     \\    drag over text       select it; a click puts the selection away
-    \\
-++ (if (caps.marks)
     \\    m                    highlight the selection, or the cursor's line,
     \\                         or remove the highlight under the cursor
     \\    click on a mark      remove it: a highlight, or a line of ink
@@ -338,37 +344,35 @@ else
 else "") ++
     \\    + / -                zoom in and out
     \\    0 / 1                fit the width / one hundred per cent
+    \\
+++ (if (caps.splits)
     \\    q                    close this window, then the reader
     \\    Q                    close the reader
     \\
-++ (if (caps.marks)
+else
+    \\    q, Q                 close the reader
+    \\
+) ++ (if (caps.marks)
     \\    v / V / i / d        visual, visual line, edit and draw mode
     \\
-else
-    \\    v / V                visual and visual line mode
-    \\
-) ++
+else "") ++
     \\    :                    the command line
+    \\
+++ (if (caps.marks) visual_mode else "");
+
+const visual_mode =
     \\
     \\visual mode (selecting), from v or V:
     \\    any motion           extend the selection
     \\    o                    go to the other end of the selection
-    \\
-++ (if (caps.marks)
     \\    m, enter             highlight it in the default colour
     \\    _ / - / ~            underline it, strike it through, squiggle it
     \\    c                    highlight it and write a comment on it
-    \\
-else "") ++
     \\    y                    put it away; there is no clipboard yet, and a
     \\                         selection is never stored
-    \\
-++ (if (caps.marks)
     \\    1 .. 8               highlight it in that colour: default, yellow,
     \\                         green, blue, pink, orange, purple, red
     \\    d, x                 remove the highlights it touches
-    \\
-else "") ++
     \\    v / V                leave, or switch between the two
     \\    escape               leave without doing anything
     \\
@@ -683,7 +687,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Session.Co
     // After the accent, because the theme carries it: `useTheme` puts the
     // chosen colour back on top of whichever theme was named.
     session.useTheme(written_theme orelse session.rememberedTheme());
-    session.comment_style = marks.rememberedCommentStyle(&session);
+    if (caps.marks) session.comment_style = marks.rememberedCommentStyle(&session);
     // Before the documents open: a document not watched is held from the
     // moment it is read.
     session.watching = comparison == null and (watch_flag or reload.rememberedWatch(&session));

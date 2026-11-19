@@ -352,7 +352,12 @@ const Caps = struct {
     /// second file is refused by name rather than opened into a buffer that
     /// nothing could show.
     splits: bool,
-    /// Highlights, notes and ink.
+    /// Highlights, notes and ink, and the caret and visual mode that select
+    /// what a highlight is made on. One capability and not two because a
+    /// selection has nowhere else to go: there is no clipboard, and the
+    /// author asked that a selection never be stored. Without them the
+    /// reader has normal mode and the command line, `j` and `k` scroll, and
+    /// a file's own annotations are drawn in the page as `raster` draws them.
     marks: bool,
     /// `/`: the bar, the scan of every page's text behind it, and the
     /// matches drawn over the page. Not in `light`, which then never builds

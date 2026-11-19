@@ -84,8 +84,10 @@ pub fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32
 /// `Session.deinit` frees documents, and a test session has none.
 pub fn closeSession(s: *Session) void {
     s.cmdline.deinit(s.gpa);
-    s.stroking.deinit(s.gpa);
-    s.note.deinit(s.gpa);
+    if (caps.marks) {
+        s.stroking.deinit(s.gpa);
+        s.note.deinit(s.gpa);
+    }
     s.comment_order.deinit(s.gpa);
     if (caps.panels) {
         s.palette_rows.deinit(s.gpa);

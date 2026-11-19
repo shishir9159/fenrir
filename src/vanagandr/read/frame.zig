@@ -291,13 +291,17 @@ fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
     }
 
     try compare.drawChanges(s, v, range, over);
-    try marks.drawMarks(s, v, b, range, over);
-    try ink.drawInk(s, v, b, range, over);
+    if (caps.marks) {
+        try marks.drawMarks(s, v, b, range, over);
+        try ink.drawInk(s, v, b, range, over);
+    }
     if (caps.search) try search_mod.drawSearchHits(s, v, range, over);
 
-    v.marks_seen = b.marks.revision;
-    try cursor.drawSelection(s, v, over);
-    try cursor.drawCaret(s, v, over);
+    if (caps.marks) {
+        v.marks_seen = b.marks.revision;
+        try cursor.drawSelection(s, v, over);
+        try cursor.drawCaret(s, v, over);
+    }
     try drawScrollbar(s, v, over);
 }
 

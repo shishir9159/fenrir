@@ -6,6 +6,19 @@
 //! table of function pointers between them. Besides that dispatch, what is
 //! here is what every build has: the documents, the windows onto them, the
 //! command line, and where the reader was left.
+//!
+//! A feature's fields are typed `if (caps.feature) T else void`. `void`
+//! rather than a value nothing reads, for the reason `library` is
+//! `?noreturn`: a field that is there is a field a line can still touch,
+//! and that line is then in the binary. Gone, a line that touches it does
+//! not compile unless a comptime-false gate above it keeps it from being
+//! analysed -- so the gates in `handle`, `apply`, `execFrom`, `pointer` and
+//! the frame loop are not a convention that can be forgotten: a build that
+//! forgets one does not build. Spelled as an `if` at each field and not
+//! through a helper function, because a helper's arguments are evaluated
+//! whether the feature is in or not, and naming a type from a feature's
+//! file is enough to pull that file, and every test in it, into a build
+//! that left the feature out.
 
 const Session = @This();
 
@@ -78,20 +91,6 @@ const max_zoom = View.max_zoom;
 const LibraryIfStored = if (caps.sqlite) Library else noreturn;
 pub const ComparisonIfCompared = if (caps.compare) *diff_mod.Comparison else noreturn;
 const RuntimeIfScripted = if (caps.lua) *galdr.Runtime else noreturn;
-
-/// A field of a feature this build may leave out: its own type when the
-/// feature is in, and `void` when it is not.
-///
-/// `void` rather than a value nothing reads, for the reason `library` is
-/// `?noreturn`: a field that is there is a field a line can still touch,
-/// and that line is then in the binary. Gone, every line that touches it
-/// fails to compile unless a comptime-false gate above it means it is never
-/// analysed -- so the gates in `handle`, `apply`, `execFrom`, `pointer` and
-/// the frame loop are not a convention that can be forgotten. A build that
-/// forgets one does not build.
-fn If(comptime on: bool, comptime T: type) type {
-    return if (on) T else void;
-}
 
 /// The windows: tabpages of split trees, or in a build with no splits the
 /// one window there is. `layout()` is the arrangement on screen, a `Layout`
@@ -166,7 +165,7 @@ theme: Theme = .dark,
 
 /// The settings page, and the values it is showing. Filled when it opens
 /// and after every change, never per frame: see `settings.zig`.
-settings: If(caps.panels, settings_page.State) = if (caps.panels) .{} else {},
+settings: if (caps.panels) settings_page.State else void = if (caps.panels) .{} else {},
 
 /// The command palette, and the rows it is filtering.
 ///
@@ -174,8 +173,8 @@ settings: If(caps.panels, settings_page.State) = if (caps.panels) .{} else {},
 /// built-in half is a table in the binary and the plugin half changes
 /// when a plugin registers something, which is while Lua runs and never
 /// during a frame. `palette.zig` re-ranks on the same rule.
-palette: If(caps.panels, palette_mod.State) = if (caps.panels) .{} else {},
-palette_rows: If(caps.panels, std.ArrayList(palette_mod.Row)) = if (caps.panels) .empty else {},
+palette: if (caps.panels) palette_mod.State else void = if (caps.panels) .{} else {},
+palette_rows: if (caps.panels) std.ArrayList(palette_mod.Row) else void = if (caps.panels) .empty else {},
 /// The bytes a plugin's rows point into, copied out of Galdr.
 ///
 /// The built-in half of the palette is a table in the binary and needs
@@ -184,7 +183,7 @@ palette_rows: If(caps.panels, std.ArrayList(palette_mod.Row)) = if (caps.panels)
 /// immediately before the chrome is built, so this is one frame and not
 /// a race. The rows own what they draw and the arena is reset the next
 /// time the palette opens.
-palette_text: If(caps.panels, std.heap.ArenaAllocator),
+palette_text: if (caps.panels) std.heap.ArenaAllocator else void,
 
 /// The search bar, and what it has found.
 ///
@@ -192,8 +191,8 @@ palette_text: If(caps.panels, std.heap.ArenaAllocator),
 /// bar is a widget that is open or shut, and the search is a query, a
 /// frontier and a list of hits that the worker thread fills in. `/`
 /// starts both and escape ends both; nothing else touches the pair.
-find: If(caps.search, find_mod.State) = if (caps.search) .{} else {},
-search: If(caps.search, hlidskjalf.search.State) = if (caps.search) .{} else {},
+find: if (caps.search) find_mod.State else void = if (caps.search) .{} else {},
+search: if (caps.search) hlidskjalf.search.State else void = if (caps.search) .{} else {},
 
 /// The panel docked to the right rail, and the rows in it.
 ///
@@ -202,21 +201,21 @@ search: If(caps.search, hlidskjalf.search.State) = if (caps.search) .{} else {},
 /// buffer's marks were at the time, and a highlight added or removed is
 /// what makes them stale. The labels are the marks' own note bytes,
 /// which live on the buffer, so nothing here owns a string.
-panel: If(caps.panels, panels.State) = if (caps.panels) .{} else {},
-rows: If(caps.panels, std.ArrayList(panels.Row)) = if (caps.panels) .empty else {},
+panel: if (caps.panels) panels.State else void = if (caps.panels) .{} else {},
+rows: if (caps.panels) std.ArrayList(panels.Row) else void = if (caps.panels) .empty else {},
 
 /// The plugins' rail buttons, sorted by side. Filled from Galdr when its
 /// revision changes and never per frame: see `fillRailButtons`.
-rail_left: If(caps.panels, std.ArrayList(rails_mod.Extra)) = if (caps.panels) .empty else {},
-rail_right: If(caps.panels, std.ArrayList(rails_mod.Extra)) = if (caps.panels) .empty else {},
-rail_panels: If(caps.panels, std.ArrayList(rails_mod.PanelToggle)) = if (caps.panels) .empty else {},
-rails_for: If(caps.panels, u32) = if (caps.panels) std.math.maxInt(u32) else {},
+rail_left: if (caps.panels) std.ArrayList(rails_mod.Extra) else void = if (caps.panels) .empty else {},
+rail_right: if (caps.panels) std.ArrayList(rails_mod.Extra) else void = if (caps.panels) .empty else {},
+rail_panels: if (caps.panels) std.ArrayList(rails_mod.PanelToggle) else void = if (caps.panels) .empty else {},
+rails_for: if (caps.panels) u32 else void = if (caps.panels) std.math.maxInt(u32) else {},
 
 /// The plugins' settings as the page wants them. Same rule: filled when
 /// Galdr's revision changes, and never on a frame path.
-plugin_settings: If(caps.panels, std.ArrayList(settings_page.Option)) = if (caps.panels) .empty else {},
-settings_for: If(caps.panels, u32) = if (caps.panels) std.math.maxInt(u32) else {},
-rows_for: If(caps.panels, RowsFor) = if (caps.panels) .{} else {},
+plugin_settings: if (caps.panels) std.ArrayList(settings_page.Option) else void = if (caps.panels) .empty else {},
+settings_for: if (caps.panels) u32 else void = if (caps.panels) std.math.maxInt(u32) else {},
+rows_for: if (caps.panels) RowsFor else void = if (caps.panels) .{} else {},
 
 /// What is written on the tabs, and the bytes those names point into.
 ///
@@ -226,13 +225,13 @@ rows_for: If(caps.panels, RowsFor) = if (caps.panels) .{} else {},
 /// name stops in `tab_text`, kept because appending to the text moves it
 /// and a slice taken before the last name was written would be aimed at
 /// freed bytes.
-tab_names: If(caps.splits, std.ArrayList([]const u8)) = if (caps.splits) .empty else {},
-tab_text: If(caps.splits, std.ArrayList(u8)) = if (caps.splits) .empty else {},
-tab_ends: If(caps.splits, std.ArrayList(u32)) = if (caps.splits) .empty else {},
-tabs_for: If(caps.splits, u64) = if (caps.splits) 0 else {},
+tab_names: if (caps.splits) std.ArrayList([]const u8) else void = if (caps.splits) .empty else {},
+tab_text: if (caps.splits) std.ArrayList(u8) else void = if (caps.splits) .empty else {},
+tab_ends: if (caps.splits) std.ArrayList(u32) else void = if (caps.splits) .empty else {},
+tabs_for: if (caps.splits) u64 else void = if (caps.splits) 0 else {},
 
 /// The left rail's colours, filled when the highlight colour changes.
-swatches: If(caps.panels, [keys.palette_size]rails_mod.Swatch) = if (caps.panels) @splat(.{ .name = "", .color = .gray(0) }) else {},
+swatches: if (caps.panels) [keys.palette_size]rails_mod.Swatch else void = if (caps.panels) @splat(.{ .name = "", .color = .gray(0) }) else {},
 
 /// The accent a person configured, or null for the theme's own.
 ///
@@ -256,7 +255,7 @@ accent: Color = Theme.dark.accent,
 /// fifths and leaves the type near black -- which is the block a
 /// highlighter actually makes. Setting `accent` replaces this too, so a
 /// reader who chose a colour still gets it.
-highlight: Color = .gray(0.42),
+highlight: if (caps.marks) Color else void = if (caps.marks) .gray(0.42) else {},
 
 /// Mímir, if this build has a database.
 ///
@@ -276,35 +275,35 @@ remembers_place: bool = true,
 quit: bool = false,
 
 /// The selection made with the mouse, or null when there is none.
-drag: ?cursor.Drag = null,
+drag: if (caps.marks) ?cursor.Drag else void = if (caps.marks) null else {},
 
 /// The pen, and the stroke it is in the middle of.
-pen: ink.Pen = .{},
+pen: if (caps.marks) ink.Pen else void = if (caps.marks) .{} else {},
 /// Where the pen has been since the button went down, in the user space
 /// of `pen.page`. Held on the session and cleared rather than freed: a
 /// reader drawing on a page makes a stroke a second and the buffer it
 /// needs is the same buffer every time.
-stroking: std.ArrayList(Point) = .empty,
+stroking: if (caps.marks) std.ArrayList(Point) else void = if (caps.marks) .empty else {},
 
 /// The line between two windows, while it is being dragged.
-split_drag: If(caps.splits, ?Layout.Divider) = if (caps.splits) null else {},
+split_drag: if (caps.splits) ?Layout.Divider else void = if (caps.splits) null else {},
 
 /// The highlight in hand in edit mode, by its session key.
-focus_mark: ?u64 = null,
+focus_mark: if (caps.marks) ?u64 else void = if (caps.marks) null else {},
 /// The comment in hand with it: the first on its anchor when the mark is
 /// taken up, the one `]c` landed on after that. Asked through
 /// `focusedComment`, which mends it when an undo has taken it away.
-focus_comment: ?u64 = null,
+focus_comment: if (caps.marks) ?u64 else void = if (caps.marks) null else {},
 /// What `c` leaves on the words it comments on: a highlight, or an arrow
 /// for a reader who wants no colour on the text. The `comment_anchor`
 /// setting, read when the reader starts and when it is changed.
-comment_style: Marks.Style = .highlight,
+comment_style: if (caps.marks) Marks.Style else void = if (caps.marks) .highlight else {},
 /// What note mode will write on enter. Set as it begins, because the
 /// keys that begin it mean different things: `a` the comment in hand,
 /// `c` a new one.
-typing: ?marks.Typing = null,
+typing: if (caps.marks) ?marks.Typing else void = if (caps.marks) null else {},
 /// The mark `]a` or `]c` last landed on, and the caret that left.
-last_jump: ?marks.Jumped = null,
+last_jump: if (caps.marks) ?marks.Jumped else void = if (caps.marks) null else {},
 
 /// `fenrir diff`'s comparison, when this reader is showing one. Buffer 0
 /// is the first document and buffer 1 the second; see
@@ -330,10 +329,10 @@ rerun: compare.Rerun = .{},
 /// zoom they were worked out at.
 diff_ticks: [2]struct { zoom: f32 = 0, at: std.ArrayList(f32) = .empty } = @splat(.{}),
 /// The note being typed in note mode. Written to the highlight on enter.
-note: std.ArrayList(u8) = .empty,
+note: if (caps.marks) std.ArrayList(u8) else void = if (caps.marks) .empty else {},
 /// Whether the last visual mode entered was `V`. Read after the key that
 /// ends visual mode has already set the mode back to normal.
-last_visual_line: bool = false,
+last_visual_line: if (caps.marks) bool else void = if (caps.marks) false else {},
 /// A sentence for the title bar about what just happened -- "no
 /// highlights to edit", "already at oldest change". Cleared by the next
 /// key. The title bar is the only text this window draws.
@@ -412,9 +411,9 @@ failure_next: usize = 0,
 /// allocator for them sixty times a second forever. Kept here they are a
 /// few allocations for the life of the session. One window has no order to
 /// be drawn in and no line between it and another.
-order: If(caps.splits, std.ArrayList(u32)) = if (caps.splits) .empty else {},
-borders: If(caps.splits, std.ArrayList(Bounds)) = if (caps.splits) .empty else {},
-boxes: std.ArrayList(cursor.PageBox) = .empty,
+order: if (caps.splits) std.ArrayList(u32) else void = if (caps.splits) .empty else {},
+borders: if (caps.splits) std.ArrayList(Bounds) else void = if (caps.splits) .empty else {},
+boxes: if (caps.marks) std.ArrayList(cursor.PageBox) else void = if (caps.marks) .empty else {},
 
 pub fn deinit(s: *Session) void {
     s.rerun.finish();
@@ -424,7 +423,7 @@ pub fn deinit(s: *Session) void {
     if (s.config_dir) |d| s.gpa.free(d);
     s.cmdline.deinit(s.gpa);
     if (caps.search) s.search.deinit(s.gpa);
-    s.note.deinit(s.gpa);
+    if (caps.marks) s.note.deinit(s.gpa);
     s.comment_order.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
@@ -445,8 +444,10 @@ pub fn deinit(s: *Session) void {
         s.tab_text.deinit(s.gpa);
         s.tab_ends.deinit(s.gpa);
     }
-    s.boxes.deinit(s.gpa);
-    s.stroking.deinit(s.gpa);
+    if (caps.marks) {
+        s.boxes.deinit(s.gpa);
+        s.stroking.deinit(s.gpa);
+    }
     if (caps.panels) {
         s.rows.deinit(s.gpa);
         s.palette_rows.deinit(s.gpa);
@@ -525,11 +526,15 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
     try s.doc_handles.append(gpa, s.next_doc_handle);
 
     const id: u32 = @intCast(s.buffers.items.len - 1);
-    marks.loadMarks(s, id);
+    if (caps.marks) marks.loadMarks(s, id);
     s.rememberFileId(path, doc);
     if (s.stage) |g| g.mark("document");
-    marks.readAnnots(s, id, null);
-    if (s.stage) |g| g.mark("annotations");
+    // With no marks to take them as, a file's annotations stay in its
+    // pages and are drawn there; see `render.page_options`.
+    if (caps.marks) {
+        marks.readAnnots(s, id, null);
+        if (s.stage) |g| g.mark("annotations");
+    }
     return id;
 }
 
@@ -798,9 +803,10 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
             if (s.settings.open) interface.readSettings(s);
         },
         .palette => if (caps.panels) interface.showPalette(s) else return s.absent(name),
-        .undo => marks.undoMarks(s, false),
-        .redo => marks.undoMarks(s, true),
+        .undo => if (caps.marks) marks.undoMarks(s, false) else return s.absent(name),
+        .redo => if (caps.marks) marks.undoMarks(s, true) else return s.absent(name),
         .marks => {
+            if (!caps.marks) return s.absent(name);
             if (std.mem.eql(u8, args, "clear")) {
                 marks.clearMarks(s);
             } else {
@@ -815,14 +821,14 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
                 s.say("{d} highlights and {d} lines of ink in this document", .{ all - strokes, strokes });
             }
         },
-        .mnext => marks.jumpMark(s, .{ .forwards = true }),
-        .mprevious => marks.jumpMark(s, .{ .forwards = false }),
-        .cnext => marks.jumpMark(s, .{ .forwards = true, .comments = true }),
-        .cprevious => marks.jumpMark(s, .{ .forwards = false, .comments = true }),
+        .mnext => if (caps.marks) marks.jumpMark(s, .{ .forwards = true }) else return s.absent(name),
+        .mprevious => if (caps.marks) marks.jumpMark(s, .{ .forwards = false }) else return s.absent(name),
+        .cnext => if (caps.marks) marks.jumpMark(s, .{ .forwards = true, .comments = true }) else return s.absent(name),
+        .cprevious => if (caps.marks) marks.jumpMark(s, .{ .forwards = false, .comments = true }) else return s.absent(name),
         .filter => {
             // The filter is typed into the panel, and kept there: with no
             // panel there is nothing to type it into.
-            if (!caps.panels) return s.absent(name);
+            if (!caps.marks or !caps.panels) return s.absent(name);
             s.panel.setFilter(args);
             if (s.chrome) |c| c.rails.show(.annotations);
             const filter = marks.markFilter(s);
@@ -956,7 +962,7 @@ fn setOption(s: *Session, args: []const u8) bool {
     }
 
     const eq = std.mem.indexOfScalar(u8, args, '=') orelse {
-        if (std.mem.eql(u8, args, "comment_anchor")) {
+        if (caps.marks and std.mem.eql(u8, args, "comment_anchor")) {
             s.say("comment_anchor = {s}", .{@tagName(s.comment_style)});
             return true;
         }
@@ -976,8 +982,8 @@ fn setOption(s: *Session, args: []const u8) bool {
     const value = std.mem.trim(u8, args[eq + 1 ..], " \t");
     // Through the settings page's door, which checks it, applies it and
     // writes it down, so `:set` and a click cannot disagree.
-    if (std.mem.eql(u8, name, "comment_anchor") or std.mem.eql(u8, name, "watch")) {
-        if (name[0] == 'c' and marks.commentStyleNamed(value) == null) {
+    if ((caps.marks and std.mem.eql(u8, name, "comment_anchor")) or std.mem.eql(u8, name, "watch")) {
+        if (caps.marks and name[0] == 'c' and marks.commentStyleNamed(value) == null) {
             s.say("comment_anchor is highlight or arrow, not {s}", .{value[0..@min(value.len, 48)]});
             return false;
         }
@@ -993,7 +999,7 @@ fn setOption(s: *Session, args: []const u8) bool {
         }
         // No page to go through: applied as the page would, and written
         // down where there is somewhere to write it.
-        if (name[0] == 'c') {
+        if (caps.marks and name[0] == 'c') {
             s.comment_style = marks.commentStyleNamed(value).?;
         } else reload.setWatching(s, std.mem.eql(u8, value, "on"));
         if (s.library) |l| l.set(name, value) catch {};
@@ -1054,7 +1060,7 @@ pub fn handle(s: *Session, in: lyngvi.Input) bool {
     for (result.items()) |cmd| {
         if (s.apply(cmd)) return true;
     }
-    marks.applyEffects(s);
+    if (caps.marks) marks.applyEffects(s);
     compare.lockComparison(s);
 
     var it = s.layout().iterator();
@@ -1133,12 +1139,18 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         .zoom_to => |f| v.setZoom(v.hundredPercent() * f),
         .fit => |want| v.fitTo(want),
 
-        .move_cursor => |step| cursor.moveCursor(s, step),
+        // With no caret to move, the motions that go down and up the text
+        // move the page instead, a tenth of a screen a press.
+        .move_cursor => |step| if (caps.marks) cursor.moveCursor(s, step) else switch (step) {
+            .down => v.scroll += v.height() * 0.1,
+            .up => v.scroll -= v.height() * 0.1,
+            else => {},
+        },
         .hide_cursor => {
             // Escape puts the selection away, then the caret, and closes
             // last -- each step is something the reader can see undone,
             // so leaving is never the same key as leaving cursor mode.
-            if (s.drag != null) {
+            if (caps.marks and s.drag != null) {
                 s.drag = null;
             } else if (caps.search and s.find.open) {
                 // The search bar hands the keyboard back on enter, so
@@ -1146,75 +1158,94 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
                 // stopped typing into. Before the caret, because the
                 // highlights are the louder thing on the page.
                 search_mod.endSearch(s);
-            } else if (v.cursor.visible) {
+            } else if (caps.marks and v.cursor.visible) {
                 v.cursor.visible = false;
             } else return true;
         },
 
-        .enter_visual, .enter_visual_line => {
+        // A build with no marks has normal mode and the command line and
+        // nothing between them: visual, edit, draw and note mode are each a
+        // way of making or changing a mark. The keymap enters a mode as it
+        // reads the key, so a mode is refused here, the way edit mode is on
+        // a document with no highlights.
+        .enter_visual, .enter_visual_line => if (caps.marks) {
             s.last_visual_line = cmd == .enter_visual_line;
             _ = cursor.ensureCursor(s);
             if (v.anchor == null) v.beginSelection();
+        } else {
+            s.keymap.mode = .normal;
         },
-        .enter_edit => marks.enterEdit(s),
-        .enter_draw => {
+        .enter_edit => if (caps.marks) marks.enterEdit(s) else {
+            s.keymap.mode = .normal;
+        },
+        .enter_draw => if (caps.marks) {
             // Whatever was selected is not selected any more: the next
             // drag is a stroke, so a selection left on screen would be a
             // thing the mouse could no longer change.
             cursor.clearSelection(s);
             s.say("pen {d:.1}pt -- drag to draw, d or escape to stop", .{s.pen.width});
+        } else {
+            s.keymap.mode = .normal;
         },
-        .enter_note => marks.beginNote(s),
-        .add_comment => marks.beginComment(s),
+        .enter_note => if (caps.marks) marks.beginNote(s) else {
+            s.keymap.mode = .normal;
+        },
+        .add_comment => if (caps.marks) marks.beginComment(s) else {
+            s.keymap.mode = .normal;
+        },
         .leave_mode => {
-            cursor.clearSelection(s);
-            ink.penCancel(s);
-            s.note.clearRetainingCapacity();
             s.cmdline.clearRetainingCapacity();
-            s.typing = null;
-            if (s.keymap.mode == .normal) {
-                s.focus_mark = null;
-                s.focus_comment = null;
+            if (caps.marks) {
+                cursor.clearSelection(s);
+                ink.penCancel(s);
+                s.note.clearRetainingCapacity();
+                s.typing = null;
+                if (s.keymap.mode == .normal) {
+                    s.focus_mark = null;
+                    s.focus_comment = null;
+                }
             }
         },
 
-        .swap_selection_ends => {
+        .swap_selection_ends => if (caps.marks) {
             const other = v.swapSelectionEnds() orelse return false;
             if (s.buffer(v.buffer).textMap(other.page)) |map| v.cursorTo(other, map);
             v.scrollToCursor();
         },
-        .highlight_selection => |colour| marks.highlightSelection(s, colour, .highlight),
-        .style_selection => |style| marks.highlightSelection(s, null, style),
-        .yank_selection => {
+        .highlight_selection => |colour| if (caps.marks) marks.highlightSelection(s, colour, .highlight),
+        .style_selection => |style| if (caps.marks) marks.highlightSelection(s, null, style),
+        .yank_selection => if (caps.marks) {
             // The selection goes and nothing is written: a selection is
             // the interface's, never a mark, whichever key ends it.
             cursor.clearSelection(s);
             s.status = "nothing copied -- there is no clipboard yet; m highlights";
         },
-        .unhighlight_selection => marks.unhighlightSelection(s),
-        .comment_selection => marks.commentSelection(s),
+        .unhighlight_selection => if (caps.marks) marks.unhighlightSelection(s),
+        .comment_selection => if (caps.marks) marks.commentSelection(s) else {
+            s.keymap.mode = .normal;
+        },
 
-        .toggle_highlight => marks.toggleMark(s),
-        .clear_highlights => marks.clearMarks(s),
+        .toggle_highlight => if (caps.marks) marks.toggleMark(s),
+        .clear_highlights => if (caps.marks) marks.clearMarks(s),
 
         // Edit mode's `n` and `N` are `]a` and `[a`: they walk what the
         // filter lets through. The author asked for this -- don't give
         // them a walk of their own over every mark again, or the panel
         // shows one set and `n` steps through another.
-        .next_mark => marks.jumpMark(s, .{ .forwards = true }),
-        .previous_mark => marks.jumpMark(s, .{ .forwards = false }),
-        .jump_mark => |j| marks.jumpMark(s, j),
+        .next_mark => if (caps.marks) marks.jumpMark(s, .{ .forwards = true }),
+        .previous_mark => if (caps.marks) marks.jumpMark(s, .{ .forwards = false }),
+        .jump_mark => |j| if (caps.marks) marks.jumpMark(s, j),
         .jump_change => |forwards| compare.jumpChange(s, forwards),
-        .recolour_mark => |colour| marks.recolourMark(s, colour),
-        .restyle_mark => |style| marks.restyleMark(s, style),
-        .delete_mark => marks.deleteMark(s),
+        .recolour_mark => |colour| if (caps.marks) marks.recolourMark(s, colour),
+        .restyle_mark => |style| if (caps.marks) marks.restyleMark(s, style),
+        .delete_mark => if (caps.marks) marks.deleteMark(s),
 
-        .pen_colour => |colour| ink.setPenColour(s, colour),
-        .pen_width => |factor| ink.setPenWidth(s, factor),
+        .pen_colour => |colour| if (caps.marks) ink.setPenColour(s, colour),
+        .pen_width => |factor| if (caps.marks) ink.setPenWidth(s, factor),
 
-        .note_char => |c| marks.noteChar(s, c),
-        .note_backspace => marks.noteBackspace(s),
-        .note_commit => marks.commitNote(s),
+        .note_char => |c| if (caps.marks) marks.noteChar(s, c),
+        .note_backspace => if (caps.marks) marks.noteBackspace(s),
+        .note_commit => if (caps.marks) marks.commitNote(s),
 
         .enter_command => s.cmdline.clearRetainingCapacity(),
         .command_char => |c| {
@@ -1259,8 +1290,8 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         },
         .plugin_key => |id| if (s.plugins) |rt| rt.runKeymap(id),
 
-        .undo => marks.undoMarks(s, false),
-        .redo => marks.undoMarks(s, true),
+        .undo => if (caps.marks) marks.undoMarks(s, false),
+        .redo => if (caps.marks) marks.undoMarks(s, true),
     }
     return false;
 }
@@ -1307,7 +1338,7 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
     // Then the pen, which claims the whole gesture the way a divider
     // does -- a stroke that stopped because the pointer crossed a mark or
     // ran off the page would be a line with a hole in it.
-    if (s.keymap.mode == .draw or s.pen.down) {
+    if (caps.marks and (s.keymap.mode == .draw or s.pen.down)) {
         ink.drawPointer(s, in, down, pressed);
         s.view().was_down = down;
         return;
@@ -1317,7 +1348,7 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
     // selected -- and it happens here, before anything below can read
     // `s.drag` and take the last gesture's selection for this one's.
     if (pressed) {
-        s.drag = null;
+        if (caps.marks) s.drag = null;
         if (caps.splits) _ = s.layout().focusAt(in.mouse);
     }
 
@@ -1332,9 +1363,12 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
         }
     }
     if (handled) {
-        s.drag = null;
+        if (caps.marks) s.drag = null;
         return;
     }
+    // The rest is selecting and marking, and a build with no marks has
+    // neither: the pointer is for the scrollbars.
+    if (!caps.marks) return;
 
     const v = s.view();
     if (!down) {
@@ -1411,7 +1445,9 @@ pub fn statusLine(s: *Session) chrome_mod.Status {
     };
 
     switch (mode) {
-        .note => st.typing = s.note.items,
+        .note => if (caps.marks) {
+            st.typing = s.note.items;
+        },
         // The colon belongs to the line being typed and not beside it:
         // `:zoom 150` is one thing a person is writing, and a gap in the
         // middle of it would read as two.
@@ -1427,7 +1463,7 @@ pub fn statusLine(s: *Session) chrome_mod.Status {
     // Edit and note mode say which highlight is in hand, in the order `n`
     // walks them, and edit mode shows what is written on it -- note mode
     // does not, because what is being typed is about to replace it.
-    if ((mode == .edit or mode == .note) and marks.focusedMarkIndex(s) != null) {
+    if (caps.marks and (mode == .edit or mode == .note) and marks.focusedMarkIndex(s) != null) {
         const held = b.marks.items()[marks.focusedMarkIndex(s).?];
         // Among what the filter lets through, which is what `n` walks;
         // among them all when the one in hand is not one of those -- a
@@ -1496,11 +1532,11 @@ test {
     // whichever of them this build's session reaches. A file whose tests
     // need a capability gates them itself: see `compare.comparison_tests`.
     _ = compare;
-    _ = cursor;
+    if (caps.marks) _ = cursor;
     _ = frame;
-    _ = ink;
+    if (caps.marks) _ = ink;
     if (caps.panels) _ = interface;
-    _ = marks;
+    if (caps.marks) _ = marks;
     _ = plugins_mod;
     _ = reload;
     _ = render;
@@ -1519,14 +1555,16 @@ test "the status line carries the mode and what the mode has to show" {
     s.keymap.mode = .visual;
     try testing.expectEqualStrings("-- VISUAL --", s.statusLine().mode);
 
-    marks.highlightBoxes(&s, 0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
-    s.keymap.mode = .note;
-    s.focus_mark = s.buffer(0).marks.items()[0].key;
-    for ("hello") |c| marks.noteChar(&s, c);
+    if (caps.marks) {
+        marks.highlightBoxes(&s, 0, &.{.{ .page = 0, .box = .fromRect(100, 700, 200, 712) }}, s.accent);
+        s.keymap.mode = .note;
+        s.focus_mark = s.buffer(0).marks.items()[0].key;
+        for ("hello") |c| marks.noteChar(&s, c);
 
-    const noting = s.statusLine();
-    try testing.expectEqualStrings("-- NOTE -- 1/1", noting.mode);
-    try testing.expectEqualStrings("hello", noting.typing.?);
+        const noting = s.statusLine();
+        try testing.expectEqualStrings("-- NOTE -- 1/1", noting.mode);
+        try testing.expectEqualStrings("hello", noting.typing.?);
+    }
 
     // A `:` line belongs to the colon, not beside it.
     s.keymap.mode = .command;

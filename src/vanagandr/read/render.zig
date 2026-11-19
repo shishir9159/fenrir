@@ -54,7 +54,11 @@ pub const max_page_pixels: u64 = 64 << 20;
 /// it took as marks at open (`readAnnots`). It draws those itself, where they
 /// can be recoloured and stepped through, and with their appearances in the
 /// pixels too every one would be on screen twice.
-pub const page_options: content.Options = .{ .taken = fenrir.annots.taken };
+///
+/// A build with no marks takes none, and leaves every annotation in the
+/// page: a highlight made in Acrobat is still on the page, drawn as `raster`
+/// draws it, rather than taken out and drawn by nothing.
+pub const page_options: content.Options = .{ .taken = if (caps.marks) fenrir.annots.taken else null };
 
 /// One rendered page, on the device and in the display list's numbering.
 ///

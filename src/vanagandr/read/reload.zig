@@ -175,21 +175,26 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
         if (v.buffer != index) continue;
         v.pages = b.pages;
         v.refit();
-        keepCursor(s, v, old, d.digests);
+        if (caps.marks) keepCursor(s, v, old, d.digests);
         v.clampScroll();
     }
-    if (s.drag) |drag| {
-        const kept = watch.unchanged(old, d.digests, drag.from.page) and watch.unchanged(old, d.digests, drag.to.page);
-        if (drag.buffer == index and !kept) s.drag = null;
+    if (caps.marks) {
+        if (s.drag) |drag| {
+            const kept = watch.unchanged(old, d.digests, drag.from.page) and watch.unchanged(old, d.digests, drag.to.page);
+            if (drag.buffer == index and !kept) s.drag = null;
+        }
     }
     if (loaded.first) |page| placeStale(s, index, page);
     if (caps.panels) s.rows_for = .{};
 
     // The file's own annotations, read again: those the library holds
-    // stay, as they do at open.
-    _ = b.marks.forget(s.gpa, &d.taken) catch 0;
-    d.taken.clearRetainingCapacity();
-    marks.readAnnots(s, index, loaded.annots);
+    // stay, as they do at open. A build with no marks has them in the
+    // pages, which are read again already.
+    if (caps.marks) {
+        _ = b.marks.forget(s.gpa, &d.taken) catch 0;
+        d.taken.clearRetainingCapacity();
+        marks.readAnnots(s, index, loaded.annots);
+    }
     if (loaded.annots_arena) |*a| a.deinit();
 
     if (loaded.first) |page| showChange(s, index, page, loaded.down);
@@ -430,6 +435,7 @@ fn reloadDigests(gpa: Allocator, digests: []const u64, first: ?u32) !watch.Outco
 }
 
 test "a reload keeps the caret where the page did not change, and finds it where it did" {
+    if (!caps.marks) return error.SkipZigTest;
     // The author asked for this: a reload first sent every caret to the top
     // of its page, wherever the change was.
     const gpa = testing.allocator;
@@ -468,6 +474,7 @@ test "a reload keeps the caret where the page did not change, and finds it where
 }
 
 test "a selection is kept through a reload only where neither end's page changed" {
+    if (!caps.marks) return error.SkipZigTest;
     const gpa = testing.allocator;
     var s = try watchedSession(gpa, 3);
     defer closeWatched(&s);
