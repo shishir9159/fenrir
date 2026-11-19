@@ -365,7 +365,7 @@ pub fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
 
     // Two pages and no text map: the cursor's map is a `.page` job's,
     // asked for separately when the cursor wants it.
-    if (job.want == .overlay) {
+    if (caps.compare and job.want == .overlay) {
         out.result = .{ .cpu = try compare.rasteriseOverlay(s, job) };
         return;
     }
@@ -528,7 +528,7 @@ fn recordPage(s: *Session, job: Job, list: gelgja.DisplayList, b: *Buffer) !Scen
 /// and two windows at two zooms need two CPU entries and one GPU entry.
 pub fn cached(s: *const Session, v: *const View, page: u32) bool {
     // An overlay is pixels on either backend: see `rasteriseOverlay`.
-    if (compare.overlaid(s, v)) return cachedSlot(s, v.buffer, page, v.zoom, true) != null;
+    if (caps.compare and compare.overlaid(s, v)) return cachedSlot(s, v.buffer, page, v.zoom, true) != null;
     return switch (s.backend) {
         .cpu => cachedSlot(s, v.buffer, page, v.zoom, false) != null,
         .gpu => s.recorded.has(v.buffer, page),
@@ -638,7 +638,7 @@ fn aheadIn(s: *Session, v: *View) ?Job {
 
     var after = range.end;
     while (after < @min(range.end + read_ahead, v.pages.len)) : (after += 1) {
-        const job: Job = .{ .buffer = v.buffer, .page = after, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
+        const job = pageJob(s, v, after);
         if (failed(s, job)) continue;
         if (!cached(s, v, after)) return job;
     }
@@ -646,18 +646,26 @@ fn aheadIn(s: *Session, v: *View) ?Job {
     var back: u32 = 0;
     while (back < read_ahead and back < range.first) : (back += 1) {
         const page = range.first - 1 - back;
-        const job: Job = .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
+        const job = pageJob(s, v, page);
         if (failed(s, job)) continue;
         if (!cached(s, v, page)) return job;
     }
     return null;
 }
 
+/// The job that draws `page` as window `v` shows it: the page, or in a
+/// comparison laid over its partner, the pair -- which only a build with a
+/// comparison has to ask.
+fn pageJob(s: *const Session, v: *const View, page: u32) Job {
+    if (!caps.compare) return .{ .buffer = v.buffer, .page = page, .zoom = v.zoom };
+    return .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
+}
+
 fn missingIn(s: *Session, v: *View) ?Job {
     const range = v.visiblePages();
     var i = range.first;
     while (i < range.end) : (i += 1) {
-        const job: Job = .{ .buffer = v.buffer, .page = i, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
+        const job = pageJob(s, v, i);
         if (failed(s, job)) continue;
         if (!cached(s, v, i)) return job;
     }
@@ -796,7 +804,7 @@ pub fn collectPage(
 /// another one still wants the page.
 pub fn wantedNow(s: *Session, job: Job) bool {
     // An overlay drawn before the last nudge shows the old offset.
-    if (job.want == .overlay and !std.meta.eql(job.shift, s.diff_offset)) return false;
+    if (caps.compare and job.want == .overlay and !std.meta.eql(job.shift, s.diff_offset)) return false;
     var it = s.layout().iterator();
     while (it.next()) |v| {
         if (v.buffer == job.buffer and v.zoom == job.zoom) return true;
@@ -877,7 +885,7 @@ pub fn placementKey(s: *Session) u64 {
     var it = s.layout().iterator();
     while (it.next()) |v| {
         mix(&h, v.buffer);
-        mix(&h, @intFromBool(compare.overlaid(s, v)));
+        mix(&h, @intFromBool(caps.compare and compare.overlaid(s, v)));
         mix(&h, v.scroll);
         mix(&h, v.pan);
         mix(&h, v.zoom);
@@ -901,7 +909,7 @@ pub fn placeVisible(s: *Session) !void {
     var it = s.layout().iterator();
     while (it.next()) |v| {
         // An overlaid window shows a picture, not the recorded outlines.
-        if (compare.overlaid(s, v)) continue;
+        if (caps.compare and compare.overlaid(s, v)) continue;
         const box: [4]f32 = .{ v.rect.min_x, v.rect.min_y, v.rect.max_x, v.rect.max_y };
         const range = v.visiblePages();
         var i = range.first;

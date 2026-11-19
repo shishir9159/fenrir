@@ -315,19 +315,19 @@ last_jump: if (caps.marks) ?marks.Jumped else void = if (caps.marks) null else {
 diff: ?ComparisonIfCompared = null,
 /// Where each document's window was when the two were last held
 /// together, to tell which one has moved. See `lockComparison`.
-diff_seen: [2]compare.Seen = @splat(.{}),
+diff_seen: if (caps.compare) [2]compare.Seen else void = if (caps.compare) @splat(.{}) else {},
 /// The change `]d` last landed on, and where that left its window.
-diff_at: ?struct { change: u32, side: u1, scroll: f32 } = null,
+diff_at: if (caps.compare) ?struct { change: u32, side: u1, scroll: f32 } else void = if (caps.compare) null else {},
 /// How the comparison is on screen. `gd` turns it.
-diff_showing: compare.Showing = .side_by_side,
+diff_showing: if (caps.compare) compare.Showing else void = if (caps.compare) .side_by_side else {},
 /// How far the second document is moved against the first, as last
 /// nudged. The comparison's own offset is the one its regions were
 /// found with, and catches up when `rerun` comes back.
-diff_offset: [2]f32 = .{ 0, 0 },
-rerun: compare.Rerun = .{},
+diff_offset: if (caps.compare) [2]f32 else void = if (caps.compare) .{ 0, 0 } else {},
+rerun: if (caps.compare) compare.Rerun else void = if (caps.compare) .{} else {},
 /// Each document's scrollbar ticks, as fractions of its height, and the
 /// zoom they were worked out at.
-diff_ticks: [2]struct { zoom: f32 = 0, at: std.ArrayList(f32) = .empty } = @splat(.{}),
+diff_ticks: if (caps.compare) [2]struct { zoom: f32 = 0, at: std.ArrayList(f32) = .empty } else void = if (caps.compare) @splat(.{}) else {},
 /// The note being typed in note mode. Written to the highlight on enter.
 note: if (caps.marks) std.ArrayList(u8) else void = if (caps.marks) .empty else {},
 /// Whether the last visual mode entered was `V`. Read after the key that
@@ -347,7 +347,7 @@ stage: ?*frame.Stage = null,
 /// `?noreturn` when it has no plugin host at all; see `library`.
 plugins: ?RuntimeIfScripted = null,
 /// Where `init.lua` and `plugins/` are read from. Owned.
-config_dir: ?[]u8 = null,
+config_dir: if (caps.lua) ?[]u8 else void = if (caps.lua) null else {},
 /// The `:` line being typed.
 cmdline: std.ArrayList(u8) = .empty,
 /// Where `status` points when the message is not a literal: a plugin's
@@ -356,15 +356,15 @@ status_buf: [512]u8 = undefined,
 /// The mode and the count beside it, for the frame being built.
 mode_buf: [96]u8 = undefined,
 /// A highlight's colour as text, for the one `markAt` being answered.
-hex_buf: [7]u8 = undefined,
+hex_buf: if (caps.lua) [7]u8 else void = if (caps.lua) undefined else {},
 /// Names as text, for the one highlight or comment being answered: an
 /// anchor's, and a comment's own.
-name_bufs: [2][Library.name_len]u8 = undefined,
+name_bufs: if (caps.lua) [2][Library.name_len]u8 else void = if (caps.lua) undefined else {},
 /// The comments of one buffer in the order `]c` reads them, by index,
 /// for `fenrir.comments()`; kept until the marks change, so a plugin
 /// listing them asks for one sort and not one a row.
-comment_order: std.ArrayList(usize) = .empty,
-comment_order_for: struct { buffer: u32 = 0, revision: u64 = 0 } = .{},
+comment_order: if (caps.lua) std.ArrayList(usize) else void = if (caps.lua) .empty else {},
+comment_order_for: if (caps.lua) struct { buffer: u32 = 0, revision: u64 = 0 } else void = if (caps.lua) .{} else {},
 /// What events were last reported with, so that the ones that are a
 /// difference fire on a change and not on every frame.
 ///
@@ -374,11 +374,11 @@ comment_order_for: struct { buffer: u32 = 0, revision: u64 = 0 } = .{},
 /// have changed. `reported_window` is the same question for a window,
 /// because two windows on one document are at two scrolls and the
 /// baseline is the focused one's.
-reported_doc: galdr.Host.Handle = galdr.Host.focused,
-reported_window: u32 = std.math.maxInt(u32),
-reported_page: u32 = std.math.maxInt(u32),
-reported_mode: keys.Mode = .normal,
-reported_selection: ?[2]galdr.Host.Position = null,
+reported_doc: if (caps.lua) galdr.Host.Handle else void = if (caps.lua) galdr.Host.focused else {},
+reported_window: if (caps.lua) u32 else void = if (caps.lua) std.math.maxInt(u32) else {},
+reported_page: if (caps.lua) u32 else void = if (caps.lua) std.math.maxInt(u32) else {},
+reported_mode: if (caps.lua) keys.Mode else void = if (caps.lua) .normal else {},
+reported_selection: if (caps.lua) ?[2]galdr.Host.Position else void = if (caps.lua) null else {},
 
 /// What each open document is called from Lua, in `buffers`' order.
 ///
@@ -386,8 +386,8 @@ reported_selection: ?[2]galdr.Host.Position = null,
 /// API needs and a buffer is Hlidskjalf's, which knows nothing about
 /// plugins. Handed out once each and never reused, so a handle a
 /// handler kept over a yield names its own document or names nothing.
-doc_handles: std.ArrayList(galdr.Host.Handle) = .empty,
-next_doc_handle: galdr.Host.Handle = 0,
+doc_handles: if (caps.lua) std.ArrayList(galdr.Host.Handle) else void = if (caps.lua) .empty else {},
+next_doc_handle: if (caps.lua) galdr.Host.Handle else void = if (caps.lua) 0 else {},
 
 slots: [render.cache_slots]render.Slot = @splat(.{}),
 stamp: u64 = 0,
@@ -416,15 +416,18 @@ borders: if (caps.splits) std.ArrayList(Bounds) else void = if (caps.splits) .em
 boxes: if (caps.marks) std.ArrayList(cursor.PageBox) else void = if (caps.marks) .empty else {},
 
 pub fn deinit(s: *Session) void {
-    s.rerun.finish();
+    if (caps.compare) s.rerun.finish();
     if (s.chrome) |c| c.destroy();
     // Before the buffers: a plugin's last handlers may still read them.
     if (s.plugins) |p| p.destroy();
-    if (s.config_dir) |d| s.gpa.free(d);
+    if (caps.lua) {
+        if (s.config_dir) |d| s.gpa.free(d);
+        s.comment_order.deinit(s.gpa);
+        s.doc_handles.deinit(s.gpa);
+    }
     s.cmdline.deinit(s.gpa);
     if (caps.search) s.search.deinit(s.gpa);
     if (caps.marks) s.note.deinit(s.gpa);
-    s.comment_order.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
     for (s.faces.items) |*c| c.deinit();
@@ -457,8 +460,9 @@ pub fn deinit(s: *Session) void {
         s.plugin_settings.deinit(s.gpa);
         s.rail_panels.deinit(s.gpa);
     }
-    s.doc_handles.deinit(s.gpa);
-    for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
+    if (caps.compare) {
+        for (&s.diff_ticks) |*t| t.at.deinit(s.gpa);
+    }
 }
 
 // -- buffers -----------------------------------------------------------------
@@ -522,8 +526,11 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
         .outline = fenrir.outline.all(doc, pages) catch &.{},
     });
 
-    s.next_doc_handle += 1;
-    try s.doc_handles.append(gpa, s.next_doc_handle);
+    // What Lua will call it, in a build that has Lua.
+    if (caps.lua) {
+        s.next_doc_handle += 1;
+        try s.doc_handles.append(gpa, s.next_doc_handle);
+    }
 
     const id: u32 = @intCast(s.buffers.items.len - 1);
     if (caps.marks) marks.loadMarks(s, id);
@@ -841,9 +848,10 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
                 s.say("{d} of {d} marks match", .{ n, b.marks.count() });
             }
         },
-        .dnext => compare.jumpChange(s, true),
-        .dprevious => compare.jumpChange(s, false),
+        .dnext => if (caps.compare) compare.jumpChange(s, true) else return s.absent(name),
+        .dprevious => if (caps.compare) compare.jumpChange(s, false) else return s.absent(name),
         .diff => {
+            if (!caps.compare) return s.absent(name);
             if (args.len == 0) {
                 if (s.diff == null) {
                     s.status = "nothing is being compared -- fenrir diff A B";
@@ -1043,7 +1051,7 @@ pub fn goToPage(s: *Session, page: u32) bool {
 /// the chrome keeps for exactly this reason, and not of a box tree that
 /// does not exist yet.
 pub fn handle(s: *Session, in: lyngvi.Input) bool {
-    compare.collectRerun(s);
+    if (caps.compare) compare.collectRerun(s);
     if (s.interfaceHasInput()) {
         var it = s.layout().iterator();
         while (it.next()) |v| v.clampScroll();
@@ -1061,7 +1069,7 @@ pub fn handle(s: *Session, in: lyngvi.Input) bool {
         if (s.apply(cmd)) return true;
     }
     if (caps.marks) marks.applyEffects(s);
-    compare.lockComparison(s);
+    if (caps.compare) compare.lockComparison(s);
 
     var it = s.layout().iterator();
     while (it.next()) |v| v.clampScroll();
@@ -1118,8 +1126,8 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         .go_tab => |delta| if (caps.splits) windows.goTab(s, delta),
         .window_to_tab => if (caps.splits) windows.windowToTab(s),
 
-        .diff_view => |delta| compare.turnComparison(s, delta),
-        .nudge => |by| compare.nudge(s, by),
+        .diff_view => |delta| if (caps.compare) compare.turnComparison(s, delta),
+        .nudge => |by| if (caps.compare) compare.nudge(s, by),
 
         .next_buffer => if (caps.splits) windows.showBuffer(s, 1),
         .previous_buffer => if (caps.splits) windows.showBuffer(s, -1),
@@ -1235,7 +1243,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         .next_mark => if (caps.marks) marks.jumpMark(s, .{ .forwards = true }),
         .previous_mark => if (caps.marks) marks.jumpMark(s, .{ .forwards = false }),
         .jump_mark => |j| if (caps.marks) marks.jumpMark(s, j),
-        .jump_change => |forwards| compare.jumpChange(s, forwards),
+        .jump_change => |forwards| if (caps.compare) compare.jumpChange(s, forwards),
         .recolour_mark => |colour| if (caps.marks) marks.recolourMark(s, colour),
         .restyle_mark => |style| if (caps.marks) marks.restyleMark(s, style),
         .delete_mark => if (caps.marks) marks.deleteMark(s),

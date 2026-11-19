@@ -74,8 +74,10 @@ pub fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32
         .title = "a.pdf",
         .pages = pages,
     });
-    s.next_doc_handle += 1;
-    try s.doc_handles.append(gpa, s.next_doc_handle);
+    if (caps.lua) {
+        s.next_doc_handle += 1;
+        try s.doc_handles.append(gpa, s.next_doc_handle);
+    }
     try s.tabs.init(gpa, .{ .buffer = 0, .pages = pages, .zoom = zoom });
     s.tabs.arrange(.fromRect(0, 0, w, h));
     return s;
@@ -88,7 +90,10 @@ pub fn closeSession(s: *Session) void {
         s.stroking.deinit(s.gpa);
         s.note.deinit(s.gpa);
     }
-    s.comment_order.deinit(s.gpa);
+    if (caps.lua) {
+        s.comment_order.deinit(s.gpa);
+        s.doc_handles.deinit(s.gpa);
+    }
     if (caps.panels) {
         s.palette_rows.deinit(s.gpa);
         s.palette_text.deinit();
@@ -98,7 +103,6 @@ pub fn closeSession(s: *Session) void {
         s.rail_panels.deinit(s.gpa);
         s.rows.deinit(s.gpa);
     }
-    s.doc_handles.deinit(s.gpa);
     if (caps.search) s.search.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);

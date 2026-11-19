@@ -256,7 +256,7 @@ fn compose(s: *Session, list: *DrawList, over: *DrawList) !void {
 fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
     const b = s.buffer(v.buffer);
     const range = v.visiblePages();
-    const overlay = compare.overlaid(s, v);
+    const overlay = caps.compare and compare.overlaid(s, v);
 
     var i = range.first;
     while (i < range.end) : (i += 1) {
@@ -437,7 +437,7 @@ pub fn shoot(s: *Session, dest: []const u8, width: u32, height: u32, start_page:
     while (render.firstMissing(s)) |job| {
         if (slot >= render.cache_slots) break;
 
-        const image = if (job.want == .overlay)
+        const image = if (caps.compare and job.want == .overlay)
             compare.rasteriseOverlay(s, job) catch {
                 render.noteFailure(s, job);
                 continue;
