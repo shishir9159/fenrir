@@ -313,6 +313,7 @@ const normal_mode =
     \\    ^ / $                the start and end of the line
     \\    escape               put the cursor away
     \\    page up / page down  a screen at a time
+    \\    <C-d> / <C-u>        a fifth of a screen, and the cursor with it
     \\    home / end           the first and last page
     \\    space / p            the next and previous page
     \\

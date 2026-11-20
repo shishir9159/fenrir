@@ -13,6 +13,7 @@ const Session = @import("Session.zig");
 const hlidskjalf = fenrir.hlidskjalf;
 
 const DrawList = fenrir.gleipnir.DrawList;
+const Point = fenrir.gelgja.Point;
 
 const View = hlidskjalf.View;
 
@@ -88,6 +89,51 @@ pub fn ensureCursor(s: *Session) bool {
     return true;
 }
 
+/// `<C-d>` and `<C-u>`: the window `by` of its own height down, or up for
+/// a negative `by`, and the caret as far, so that it keeps its place on
+/// screen -- on whichever line is there now, at the same x. Vim's, which
+/// moves the cursor by the lines it scrolls.
+///
+/// The caret goes the whole distance even where the window cannot: at the
+/// end of the document the window stops and the caret carries on to the
+/// last line, as Vim's does. A caret not shown, or off the screen, has no
+/// place on it to keep, and only the window moves.
+pub fn scrollWithCursor(s: *Session, by: f32) void {
+    const v = s.view();
+    const dy = by * v.height();
+    const before = v.scroll;
+    // The caret's leading edge, halfway up it, as a point in the window.
+    const was: ?Point = if (v.cursor.visible and !v.cursor.caret.isEmpty() and v.cursor.page < v.pages.len) at: {
+        const box = v.windowBox(v.cursor.page, v.cursor.caret);
+        break :at .{ .x = box.min_x, .y = (box.min_y + box.max_y) * 0.5 };
+    } else null;
+
+    v.scroll += dy;
+    v.clampScroll();
+
+    const at = was orelse return;
+    if (at.y < v.rect.min_y or at.y > v.rect.max_y) return;
+    // Where it was on screen, and further by what the window could not move.
+    const to: Point = .{ .x = at.x, .y = at.y + dy - (v.scroll - before) };
+
+    // The page at that height, looking the way the window went: a point in
+    // the gap between two pages goes to the page it was moving towards.
+    var page = v.cursor.page;
+    if (dy > 0) {
+        while (page + 1 < v.pages.len and v.pageRect(page).max_y < to.y) page += 1;
+    } else {
+        while (page > 0 and v.pageRect(page).min_y > to.y) page -= 1;
+    }
+
+    // Kept as a place on the page and put on the nearest glyph, now or when
+    // the page's text comes: the reload's way, see `placeStale`.
+    const user = v.pageSpaceAt(page, to);
+    v.cursor.page = page;
+    v.cursor.caret = .fromRect(user.x, user.y, user.x, user.y);
+    v.cursor.stale = true;
+    if (s.buffer(v.buffer).textMap(page)) |map| v.cursorNear(map);
+}
+
 /// The text of `page` has come: a caret waiting on it is put on the glyph
 /// nearest where it was. One a reload left stale keeps its place on the
 /// page; one shown before the text was read goes to the first line, and
@@ -122,6 +168,7 @@ pub fn drawCaret(s: *Session, v: *View, over: *DrawList) !void {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+const keys = hlidskjalf.keys;
 const fixtures = @import("fixtures.zig");
 const closeSession = fixtures.closeSession;
 const fakePages = fixtures.fakePages;
@@ -184,4 +231,47 @@ test "a caret shown before its page's text is read goes on the page when the tex
     // And on from there, a line a press.
     _ = s.apply(.{ .move_cursor = .down });
     try testing.expectEqual(@as(u32, 1), v.cursor.line);
+}
+
+test "<C-d> and <C-u> move the window a fifth of itself, and the caret with it" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    // Thirty lines twenty points apart, at a point a pixel: a fifth of the
+    // window is eight of them.
+    try putText(&s, 0, 30, 6);
+    const v = s.view();
+    _ = s.apply(.{ .move_cursor = .down });
+    _ = s.apply(.{ .move_cursor = .down });
+    try testing.expectEqual(@as(u32, 1), v.cursor.line);
+    const scroll = v.scroll;
+    const on_screen = v.windowBox(0, v.cursor.caret).min_y;
+
+    _ = s.apply(.{ .scroll_with_cursor = keys.scroll_step });
+    try testing.expectApproxEqAbs(scroll + v.height() * keys.scroll_step, v.scroll, 0.01);
+    try testing.expectEqual(@as(u32, 9), v.cursor.line);
+    try testing.expectApproxEqAbs(on_screen, v.windowBox(0, v.cursor.caret).min_y, 10);
+    try testing.expect(!v.cursor.stale);
+
+    _ = s.apply(.{ .scroll_with_cursor = -keys.scroll_step });
+    try testing.expectApproxEqAbs(scroll, v.scroll, 0.01);
+    try testing.expectEqual(@as(u32, 1), v.cursor.line);
+
+    // At the end of the document the window stops and the caret goes on.
+    try putText(&s, 2, 30, 6);
+    v.scroll = v.maxScroll();
+    v.cursorTo(.{ .page = 2, .line = 20, .column = 0 }, s.buffer(0).textMap(2).?);
+    _ = s.apply(.{ .scroll_with_cursor = keys.scroll_step });
+    try testing.expectEqual(v.maxScroll(), v.scroll);
+    try testing.expectEqual(@as(u32, 2), v.cursor.page);
+    try testing.expectEqual(@as(u32, 28), v.cursor.line);
+
+    // A caret put away stays put away, and only the window moves.
+    _ = s.apply(.hide_cursor);
+    v.scroll = 0;
+    _ = s.apply(.{ .scroll_with_cursor = keys.scroll_step });
+    try testing.expect(v.scroll > 0);
+    try testing.expect(!v.cursor.visible);
+    try testing.expectEqual(@as(u32, 28), v.cursor.line);
 }

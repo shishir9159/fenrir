@@ -1185,6 +1185,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         // "line" of sixty was what made one notch jump most of a page.
         .scroll_pixels => |n| v.scroll += n,
         .scroll_screens => |n| v.scroll += n * v.height() * 0.9,
+        .scroll_with_cursor => |by| cursor.scrollWithCursor(s, by),
         .to_start => v.scroll = 0,
         .to_end => v.scroll = v.maxScroll(),
         .next_page => v.scrollToPage(@min(v.currentPage() + 1, v.pages.len - 1)),

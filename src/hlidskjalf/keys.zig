@@ -158,6 +158,10 @@ pub const Command = union(enum) {
     /// decided in the platform layer and arrives here already converted.
     scroll_pixels: f32,
     scroll_screens: f32,
+    /// `<C-d>` and `<C-u>`: the window this many of its own heights down,
+    /// or up for a negative number, and the cursor as far, so that it
+    /// keeps its place on screen. Vim's, at `scroll_step`.
+    scroll_with_cursor: f32,
     to_start,
     to_end,
     next_page,
@@ -413,6 +417,8 @@ pub fn commandWith(state: *State, in: Input, plugins: ?Lookup) Result {
     }
     if (!claimed_ctrl_r and in.chorded(.ctrlKey('r'))) out.push(.redo);
     if (!claimed_ctrl_p and in.chorded(.ctrlKey('p'))) out.push(.show_commands);
+    // Where the cursor moves: normal and visual mode.
+    if (state.mode == .normal or state.mode.isVisual()) scrollKeys(state.mode, in, plugins, &out);
 
     // The wheel scrolls in every mode: reading on while a selection is held
     // is how a selection longer than a screen gets made.
@@ -643,6 +649,30 @@ fn normalKey(state: *State, c: u21, out: *Result) void {
         else => return,
     };
     out.push(cmd);
+}
+
+/// How far `<C-d>` and `<C-u>` move, in window heights.
+///
+/// A fifth, because the author asked for a fifth; Vim's default is half.
+/// Do not "correct" it to half to match Vim.
+pub const scroll_step: f32 = 1.0 / 5.0;
+
+/// `<C-d>` down and `<C-u>` up, once a press and again on every repeat, as
+/// in Vim: a key held down keeps the page coming. Not where a plugin has
+/// bound the chord -- asked of the plugin's table for each event, because
+/// a repeat arrives in a frame of its own, after the press it repeats
+/// was claimed.
+fn scrollKeys(mode: Mode, in: Input, plugins: ?Lookup, out: *Result) void {
+    for (in.events) |e| switch (e) {
+        .key_down => |k| {
+            if (k.char == 0 or !k.modifiers.ctrl or k.modifiers.alt) continue;
+            const c = lowerAscii(k.char);
+            if (c != 'd' and c != 'u') continue;
+            if (Lookup.get(plugins, mode, .{ .char = c, .ctrl = true }) != null) continue;
+            out.push(.{ .scroll_with_cursor = if (c == 'd') scroll_step else -scroll_step });
+        },
+        else => {},
+    };
 }
 
 /// The arrow keys as cursor moves, which is what they are everywhere but
@@ -1272,13 +1302,63 @@ test "enter in edit mode starts a note and does not also commit it" {
     try testing.expectEqual(Mode.note, state.mode);
 }
 
+test "<C-d> and <C-u> are a fifth of a window, and come again while held" {
+    // A fifth because the author asked for a fifth; Vim's is half.
+    try testing.expectEqual(@as(f32, 0.2), scroll_step);
+    for ([_]Mode{ .normal, .visual, .visual_line }) |mode| {
+        var state: State = .{ .mode = mode };
+        const down = command(&state, frame(&.{press('d', true)}));
+        try testing.expectEqual(@as(usize, 1), down.items().len);
+        try testing.expectEqual(scroll_step, down.items()[0].scroll_with_cursor);
+        const up = command(&state, frame(&.{press('u', true)}));
+        try testing.expectEqual(-scroll_step, up.items()[0].scroll_with_cursor);
+        // A chord, not the letter: no draw mode, and no undo.
+        try testing.expectEqual(mode, state.mode);
+        try testing.expectEqual(@as(usize, 1), up.items().len);
+    }
+
+    var state: State = .{};
+    var held = press('d', true);
+    held.key_down.repeat = true;
+    try testing.expectEqual(scroll_step, command(&state, frame(&.{held})).items()[0].scroll_with_cursor);
+
+    // Not where the motions are not the cursor's.
+    for ([_]Mode{ .edit, .draw }) |mode| {
+        var other: State = .{ .mode = mode };
+        for (command(&other, frame(&.{press('d', true)})).items()) |c| {
+            try testing.expect(std.meta.activeTag(c) != .scroll_with_cursor);
+        }
+    }
+}
+
 const TestBindings = struct {
     fn find(_: *anyopaque, mode: Mode, k: Key) ?u32 {
         if (mode == .normal and k.char == 'j' and !k.ctrl) return 7;
         if (mode == .normal and k.char == 'w' and k.ctrl) return 9;
+        if (mode == .normal and k.char == 'd' and k.ctrl) return 11;
         return null;
     }
 };
+
+test "a plugin's <C-d> is the plugin's, held down as well" {
+    var dummy: u8 = 0;
+    const lookup: Lookup = .{ .ptr = &dummy, .find = TestBindings.find };
+    var state: State = .{};
+
+    const pressed = commandWith(&state, frame(&.{press('d', true)}), lookup);
+    try testing.expectEqual(@as(usize, 1), pressed.items().len);
+    try testing.expectEqual(@as(u32, 11), pressed.items()[0].plugin_key);
+
+    // A repeat comes in a later frame than the press it repeats, and is
+    // still not a scroll.
+    var held = press('d', true);
+    held.key_down.repeat = true;
+    try testing.expectEqual(@as(usize, 0), commandWith(&state, frame(&.{held}), lookup).items().len);
+
+    // `<C-u>`, which it did not bind, is still the built-in.
+    const up = commandWith(&state, frame(&.{press('u', true)}), lookup);
+    try testing.expectEqual(-scroll_step, up.items()[0].scroll_with_cursor);
+}
 
 test "a plugin binding takes a key before the built-in one" {
     var dummy: u8 = 0;
