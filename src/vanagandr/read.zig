@@ -700,7 +700,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Session.Co
     }
 
     // The first window, looking at the first document.
-    const first = &session.buffers.items[0];
+    const first = session.buffer(0);
     if (start_page > first.pages.len) {
         return ctx.fail("page {d}: {s} has {d} pages", .{ start_page, first.title, first.pages.len });
     }

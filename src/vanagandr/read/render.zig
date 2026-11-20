@@ -357,7 +357,7 @@ pub fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
     // thread owns. `reload` was written before the job was posted, and
     // the post's lock orders the two.
     if (job.want == .reload) {
-        const d = &s.disks.items[job.buffer];
+        const d = s.disk(job.buffer);
         const old: watch.Old = .{ .doc = b.doc, .pages = b.pages, .digests = d.digests };
         out.reload = watch.load(gpa, s.ctx.io, b.path, old, d.reload == .forced, page_options);
         return;
@@ -467,7 +467,7 @@ pub fn drawCanvas(
     errdefer canvas.deinit(gpa);
     canvas.fb.clear(.white);
 
-    var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, &s.faces.items[buffer_index]);
+    var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, s.facesOf(buffer_index));
     defer glyphs.deinit();
 
     var images: Images = .init(gpa, b.doc, b.pages[page].resources);
@@ -501,7 +501,7 @@ fn recordPage(s: *Session, job: Job, list: gelgja.DisplayList, b: *Buffer) !Scen
     const size = replay.canvasSize(list.page, 1.0);
     scene.reset(.{ @floatFromInt(size[0]), @floatFromInt(size[1]) });
 
-    var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, &s.faces.items[job.buffer]);
+    var glyphs: Glyphs = try .init(gpa, b.doc, list, s.ctx.io, s.facesOf(job.buffer));
     defer glyphs.deinit();
 
     var images: Images = .init(gpa, b.doc, b.pages[job.page].resources);

@@ -116,7 +116,14 @@ gpa: Allocator,
 samples: gleipnir.raster.Samples,
 
 /// The open documents, and the tree of windows onto them.
-buffers: std.ArrayList(Buffer) = .empty,
+///
+/// In a build with no splits, the one document and no list: null until it
+/// is open, and never a second. The author asked for this -- a reader of
+/// one file needs to know which file, not to keep a list of one -- so do
+/// not put an `ArrayList` back here for light's sake. Every line reaches
+/// the three through `buffer`, `disk`, `facesOf` and `bufferCount`, and
+/// `adopt` is the one place a document is put into them.
+buffers: if (caps.splits) std.ArrayList(Buffer) else ?Buffer = if (caps.splits) .empty else null,
 /// One font cache per open buffer, same index. Every page of a document
 /// draws in the same few faces, and parsing each font program again for
 /// every page was a tenth of the time a page took to appear.
@@ -125,10 +132,10 @@ buffers: std.ArrayList(Buffer) = .empty,
 /// binding of a PDF font to a Týr face is Vánagandr's, and the
 /// dependencies run one way. Touched only from `produce`, which is to say
 /// only on the rasterising thread, for the same reason `Document` is.
-faces: std.ArrayList(glyphmod.Cache) = .empty,
+faces: if (caps.splits) std.ArrayList(glyphmod.Cache) else ?glyphmod.Cache = if (caps.splits) .empty else null,
 /// One a buffer, beside `faces` and under the same rule: the file each
 /// document was read from, and whether it is held shut. See `watch.zig`.
-disks: std.ArrayList(watch.Disk) = .empty,
+disks: if (caps.splits) std.ArrayList(watch.Disk) else ?watch.Disk = if (caps.splits) .empty else null,
 /// Whether files are followed when another program rewrites them, or
 /// held so that none can: `--watch`, else the `watch` setting, off
 /// unless asked for. Never in a comparison, whose `Rerun` reads the
@@ -430,17 +437,19 @@ pub fn deinit(s: *Session) void {
     if (caps.marks) s.note.deinit(s.gpa);
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
-    for (s.faces.items) |*c| c.deinit();
-    s.faces.deinit(s.gpa);
-    for (s.disks.items) |*d| d.deinit(s.gpa, s.io);
-    s.disks.deinit(s.gpa);
-    for (s.buffers.items) |*b| {
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) {
+        s.facesOf(i).deinit();
+        s.disk(i).deinit(s.gpa, s.io);
+        const b = s.buffer(i);
         b.doc.deinit();
         s.gpa.destroy(b.doc);
         b.deinit(s.gpa);
     }
-    s.buffers.deinit(s.gpa);
     if (caps.splits) {
+        s.faces.deinit(s.gpa);
+        s.disks.deinit(s.gpa);
+        s.buffers.deinit(s.gpa);
         s.order.deinit(s.gpa);
         s.borders.deinit(s.gpa);
         s.tab_names.deinit(s.gpa);
@@ -478,19 +487,19 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
     // that a write during the read is noticed. Watched, it is never held
     // open at all, see `watch.load`, and is listened to from before the
     // stamp, so that no write falls between the two.
-    var disk: watch.Disk = .{};
-    errdefer disk.deinit(gpa, s.io);
+    var on_disk: watch.Disk = .{};
+    errdefer on_disk.deinit(gpa, s.io);
     if (s.io) |io| {
         if (s.watching) {
-            disk.notice = reload.noticeOf(s, file);
+            on_disk.notice = reload.noticeOf(s, file);
         } else {
-            disk.hold = watch.Hold.take(io, file) catch |err| blk: {
+            on_disk.hold = watch.Hold.take(io, file) catch |err| blk: {
                 s.ctx.note("{s} is not held ({t}): another program may change it", .{ file, err });
                 break :blk null;
             };
         }
-        disk.held = watch.stat(io, file) orelse .{};
-        disk.seen = disk.held;
+        on_disk.held = watch.stat(io, file) orelse .{};
+        on_disk.seen = on_disk.held;
     }
 
     // With `gpa` and not `ctx.gpa`: `Document` owns these bytes and frees
@@ -508,15 +517,7 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
     const path = absolutePath(s.ctx, gpa, file) orelse return error.OutOfMemory;
     errdefer gpa.free(path);
 
-    // Appended together and in this order, because `faces` is indexed by
-    // buffer id and a buffer with no cache beside it would be looked up
-    // out of bounds on its first page.
-    try s.faces.append(gpa, .init(gpa));
-    errdefer _ = s.faces.pop();
-    try s.disks.append(gpa, disk);
-    errdefer _ = s.disks.pop();
-
-    try s.buffers.append(gpa, .{
+    const id = try s.adopt(.{
         .path = path,
         .title = std.fs.path.basename(path),
         .doc = doc,
@@ -524,7 +525,7 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
         // A table of contents that will not parse is no table of
         // contents, and never a document that will not open.
         .outline = fenrir.outline.all(doc, pages) catch &.{},
-    });
+    }, on_disk);
 
     // What Lua will call it, in a build that has Lua.
     if (caps.lua) {
@@ -532,7 +533,6 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
         try s.doc_handles.append(gpa, s.next_doc_handle);
     }
 
-    const id: u32 = @intCast(s.buffers.items.len - 1);
     if (caps.marks) marks.loadMarks(s, id);
     s.rememberFileId(path, doc);
     if (s.stage) |g| g.mark("document");
@@ -572,8 +572,54 @@ fn rememberFileId(s: *Session, path: []const u8, doc: *const fenrir.Document) vo
     lib.setFileId(path, Library.hexId(&hex, doc.fileId() orelse "")) catch {};
 }
 
+/// Puts a buffer in the session with its file beside it and a font cache
+/// of its own, and returns its id. The three go in together and in this
+/// order, because `faces` and `disks` are indexed by buffer id and a
+/// buffer with no cache beside it would be looked up out of bounds on its
+/// first page. Takes ownership of `b` only when it succeeds.
+pub fn adopt(s: *Session, b: Buffer, file: watch.Disk) Allocator.Error!u32 {
+    if (!caps.splits) {
+        // `read` refuses a second file before anything opens, and a
+        // second would leave nothing to show the first.
+        std.debug.assert(s.buffers == null);
+        s.faces = .init(s.gpa);
+        s.disks = file;
+        s.buffers = b;
+        return 0;
+    }
+    const gpa = s.gpa;
+    try s.faces.append(gpa, .init(gpa));
+    errdefer _ = s.faces.pop();
+    try s.disks.append(gpa, file);
+    errdefer _ = s.disks.pop();
+    try s.buffers.append(gpa, b);
+    return @intCast(s.buffers.items.len - 1);
+}
+
+/// How many documents are open: in a build with no splits, none until the
+/// one opens.
+pub fn bufferCount(s: *const Session) u32 {
+    return if (caps.splits) @intCast(s.buffers.items.len) else @intFromBool(s.buffers != null);
+}
+
 pub fn buffer(s: *Session, index: u32) *Buffer {
-    return &s.buffers.items[index];
+    if (caps.splits) return &s.buffers.items[index];
+    std.debug.assert(index == 0);
+    return &s.buffers.?;
+}
+
+/// The file buffer `index` was read from. See `disks`.
+pub fn disk(s: *Session, index: u32) *watch.Disk {
+    if (caps.splits) return &s.disks.items[index];
+    std.debug.assert(index == 0);
+    return &s.disks.?;
+}
+
+/// Buffer `index`'s fonts, bound to Týr's faces. See `faces`.
+pub fn facesOf(s: *Session, index: u32) *glyphmod.Cache {
+    if (caps.splits) return &s.faces.items[index];
+    std.debug.assert(index == 0);
+    return &s.faces.?;
 }
 
 /// The tabpage on screen. Every window command means this one.
@@ -772,8 +818,8 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
                 s.say("a comparison does not reload", .{});
                 return false;
             }
-            if (v.buffer >= s.disks.items.len) return false;
-            s.disks.items[v.buffer].reload = .forced;
+            if (v.buffer >= s.bufferCount()) return false;
+            s.disk(v.buffer).reload = .forced;
         },
         .page => {
             // `:page 12`, `:page +2`, `:page -1`.

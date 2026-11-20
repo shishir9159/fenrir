@@ -348,8 +348,9 @@ const Caps = struct {
     config: bool,
     /// The split tree, the tabpages and their bar, and more than one
     /// document open at once. Without them the reader is one window on one
-    /// document -- `hlidskjalf.OneWindow` where `Tabs` would be -- and a
-    /// second file is refused by name rather than opened into a buffer that
+    /// document -- `hlidskjalf.OneWindow` where `Tabs` would be, and the
+    /// document itself where the list of buffers would be -- and a second
+    /// file is refused by name rather than opened into a buffer that
     /// nothing could show.
     splits: bool,
     /// Highlights, notes and ink, and the caret and visual mode that select

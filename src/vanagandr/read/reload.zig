@@ -47,7 +47,10 @@ pub fn setWatching(s: *Session, on: bool) void {
     if (s.diff != null or s.watching == on) return;
     s.watching = on;
     const io = s.io orelse return;
-    for (s.disks.items, s.buffers.items) |*d, b| {
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) {
+        const d = s.disk(i);
+        const b = s.buffer(i);
         if (on) {
             if (d.hold) |*h| h.release(io);
             d.hold = null;
@@ -80,7 +83,10 @@ pub fn noticeOf(s: *Session, path: []const u8) ?*watch.Notice {
 pub fn poll(s: *Session, dt: f32) void {
     if (!s.watching) return;
     const io = s.io orelse return;
-    for (s.disks.items, s.buffers.items) |*d, b| {
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) {
+        const d = s.disk(i);
+        const b = s.buffer(i);
         var said: ?watch.Notice.Said = null;
         if (d.notice) |n| {
             said = n.take(dt);
@@ -101,8 +107,9 @@ pub fn poll(s: *Session, dt: f32) void {
 
 /// A file waiting to be read again, as a job.
 fn reloadJob(s: *Session) ?Job {
-    for (s.disks.items, 0..) |d, i| {
-        if (d.reload != .none) return .{ .buffer = @intCast(i), .page = 0, .zoom = 0, .want = .reload };
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) {
+        if (s.disk(i).reload != .none) return .{ .buffer = i, .page = 0, .zoom = 0, .want = .reload };
     }
     return null;
 }
@@ -122,7 +129,7 @@ pub fn jobToPost(s: *Session) ?Job {
 /// Only from `collectPage`, with the worker parked; see `jobToPost`.
 pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
     var lap: ?Lap = if (s.io) |io| .start(io) else null;
-    const d = &s.disks.items[index];
+    const d = s.disk(index);
     const b = s.buffer(index);
     const forced = d.reload == .forced;
     d.reload = .none;
@@ -168,10 +175,9 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
         } else if (loaded.first) |page| b.putMap(s.gpa, page, m.*) else m.deinit(s.gpa);
     }
     // Keyed by the old document's object numbers.
-    if (index < s.faces.items.len) {
-        s.faces.items[index].deinit();
-        s.faces.items[index] = .init(s.gpa);
-    }
+    const faces = s.facesOf(index);
+    faces.deinit();
+    faces.* = .init(s.gpa);
 
     var it = s.tabs.iterator();
     while (it.next()) |v| {
@@ -354,13 +360,12 @@ fn watchedSession(gpa: Allocator, n: usize) !Session {
         gpa.destroy(doc);
     }
     var s = try sessionOf(gpa, @constCast(try fenrir.pages.all(doc)), 1, 600, 900);
-    s.buffers.items[0].doc = doc;
-    try s.disks.append(gpa, .{});
+    s.buffer(0).doc = doc;
     return s;
 }
 
 fn closeWatched(s: *Session) void {
-    const doc = s.buffers.items[0].doc;
+    const doc = s.buffer(0).doc;
     doc.deinit();
     s.gpa.destroy(doc);
     closeSession(s);
@@ -403,8 +408,8 @@ test "a reload leaves its buffer's pages stale, drawn until they come again" {
     try testing.expect(render.slotFor(&s, 0, 0, 1, false) != null);
     try testing.expect(!render.cached(&s, v, 0));
     try testing.expectEqual(@as(usize, 2), v.pages.len);
-    try testing.expectEqual(@as(u32, 2), s.disks.items[0].generation);
-    try testing.expect(s.disks.items[0].held.eql(.{ .size = 1, .mtime = 1 }));
+    try testing.expectEqual(@as(u32, 2), s.disk(0).generation);
+    try testing.expect(s.disk(0).held.eql(.{ .size = 1, .mtime = 1 }));
     try testing.expectEqualStrings("gen 2: no page changed, 2 pages", s.status);
 }
 
@@ -449,7 +454,7 @@ test "a reload keeps the caret where the page did not change, and finds it where
     const v = s.view();
 
     // On the third line of the first page, which will not change.
-    s.disks.items[0].digests = try gpa.dupe(u64, &.{ 1, 2, 3 });
+    s.disk(0).digests = try gpa.dupe(u64, &.{ 1, 2, 3 });
     try putText(&s, 0, 4, 6);
     v.cursorTo(.{ .page = 0, .line = 2, .column = 3 }, s.buffer(0).textMap(0).?);
     const caret = v.cursor.caret;
@@ -484,7 +489,7 @@ test "a selection is kept through a reload only where neither end's page changed
     var s = try watchedSession(gpa, 3);
     defer closeWatched(&s);
     const v = s.view();
-    s.disks.items[0].digests = try gpa.dupe(u64, &.{ 1, 2, 3 });
+    s.disk(0).digests = try gpa.dupe(u64, &.{ 1, 2, 3 });
     try putText(&s, 0, 4, 6);
 
     s.keymap.mode = .visual;
@@ -505,11 +510,11 @@ test "a file caught halfway is not shown, and is not tried again" {
     const gpa = testing.allocator;
     var s = try watchedSession(gpa, 2);
     defer closeWatched(&s);
-    s.disks.items[0].reload = .auto;
+    s.disk(0).reload = .auto;
     install(&s, 0, .{ .refused = .{ .stamp = .{ .size = 7 }, .why = error.Incomplete } });
     try testing.expectEqualStrings("a.pdf is incomplete; showing gen 1", s.status);
-    try testing.expect(s.disks.items[0].refused.eql(.{ .size = 7 }));
-    try testing.expectEqual(watch.Disk.Reload.none, s.disks.items[0].reload);
+    try testing.expect(s.disk(0).refused.eql(.{ .size = 7 }));
+    try testing.expectEqual(watch.Disk.Reload.none, s.disk(0).reload);
     try testing.expectEqual(@as(usize, 2), s.view().pages.len);
 }
 
@@ -518,11 +523,10 @@ test "while a reload is pending, nothing else is asked of the worker" {
     var buf: [4]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 4), 1, 600, 900);
     defer closeSession(&s);
-    try s.disks.append(gpa, .{});
 
     // Pages are missing, and would be asked for.
     try testing.expectEqual(Job.Want.page, jobToPost(&s).?.want);
-    s.disks.items[0].reload = .auto;
+    s.disk(0).reload = .auto;
     try testing.expectEqual(Job.Want.reload, jobToPost(&s).?.want);
 }
 
@@ -531,10 +535,9 @@ test ":reload reads the document again, and :set watch follows the file or holds
     var buf: [2]fenrir.Page = undefined;
     var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 600, 900);
     defer closeSession(&s);
-    try s.disks.append(gpa, .{});
 
     try testing.expect(s.exec("e!"));
-    try testing.expectEqual(watch.Disk.Reload.forced, s.disks.items[0].reload);
+    try testing.expectEqual(watch.Disk.Reload.forced, s.disk(0).reload);
 
     // Off unless asked for.
     try testing.expect(!s.watching);

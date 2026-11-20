@@ -60,7 +60,8 @@ pub fn fakePages(buf: []fenrir.Page, n: usize) []fenrir.Page {
 }
 
 /// A session with one buffer of `n` blank pages and one window on it. No
-/// document: everything tested here reads `pages` and the caches.
+/// document: everything tested here reads `pages` and the caches. The
+/// buffer has its file and its fonts beside it, as an opened one has.
 pub fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32) !Session {
     var s: Session = .{
         .ctx = undefined,
@@ -68,12 +69,12 @@ pub fn sessionOf(gpa: Allocator, pages: []fenrir.Page, zoom: f32, w: f32, h: f32
         .samples = .four,
         .palette_text = if (caps.panels) .init(gpa) else {},
     };
-    errdefer s.deinit();
-    try s.buffers.append(gpa, .{
-        .path = try gpa.dupe(u8, "/docs/a.pdf"),
-        .title = "a.pdf",
-        .pages = pages,
-    });
+    errdefer closeSession(&s);
+    const path = try gpa.dupe(u8, "/docs/a.pdf");
+    _ = s.adopt(.{ .path = path, .title = "a.pdf", .pages = pages }, .{}) catch |err| {
+        gpa.free(path);
+        return err;
+    };
     if (caps.lua) {
         s.next_doc_handle += 1;
         try s.doc_handles.append(gpa, s.next_doc_handle);
@@ -111,14 +112,24 @@ pub fn closeSession(s: *Session) void {
         s.tab_text.deinit(s.gpa);
         s.tab_ends.deinit(s.gpa);
     }
-    for (s.disks.items) |*d| d.deinit(s.gpa, null);
-    s.disks.deinit(s.gpa);
-    for (s.buffers.items) |*b| {
+    // A test may add a buffer of its own, without a file or fonts beside it.
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) {
+        const b = s.buffer(i);
         b.marks.deinit(s.gpa);
         for (&b.maps) |*m| m.map.deinit(s.gpa);
         s.gpa.free(b.path);
     }
-    s.buffers.deinit(s.gpa);
+    if (caps.splits) {
+        for (s.disks.items) |*d| d.deinit(s.gpa, null);
+        for (s.faces.items) |*c| c.deinit();
+        s.disks.deinit(s.gpa);
+        s.faces.deinit(s.gpa);
+        s.buffers.deinit(s.gpa);
+    } else if (s.buffers != null) {
+        s.disk(0).deinit(s.gpa, null);
+        s.facesOf(0).deinit();
+    }
 }
 
 /// `rows` lines of `cols` glyphs each, twenty points apart, as page `page`'s
