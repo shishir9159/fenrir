@@ -21,6 +21,7 @@ const render = @import("render.zig");
 const Slot = render.Slot;
 const msOf = frame.msOf;
 const compare = @import("compare.zig");
+const cursor = @import("cursor.zig");
 const marks = @import("marks.zig");
 const plugins_mod = @import("plugins.zig");
 const search_mod = @import("search.zig");
@@ -169,10 +170,8 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
     stalePages(s, index, @intCast(b.pages.len));
     b.dropMaps(s.gpa);
     if (loaded.map) |*m| {
-        // Kept for the caret, and a build with no marks has no caret.
-        if (!caps.marks) {
-            m.deinit(s.gpa);
-        } else if (loaded.first) |page| b.putMap(s.gpa, page, m.*) else m.deinit(s.gpa);
+        // Kept for the caret, which every build has.
+        if (loaded.first) |page| b.putMap(s.gpa, page, m.*) else m.deinit(s.gpa);
     }
     // Keyed by the old document's object numbers.
     const faces = s.facesOf(index);
@@ -184,7 +183,7 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
         if (v.buffer != index) continue;
         v.pages = b.pages;
         v.refit();
-        if (caps.marks) keepCursor(s, v, old, d.digests);
+        keepCursor(s, v, old, d.digests);
         v.clampScroll();
     }
     if (caps.marks) {
@@ -193,9 +192,7 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
             if (drag.buffer == index and !kept) s.drag = null;
         }
     }
-    if (caps.marks) {
-        if (loaded.first) |page| placeStale(s, index, page);
-    }
+    if (loaded.first) |page| cursor.placeStale(s, index, page);
     if (caps.panels) s.rows_for = .{};
 
     // The file's own annotations, read again: those the library holds
@@ -245,9 +242,9 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
 /// On a page that reads as it did, where it was: its line and column
 /// count the same text. On one that changed, it keeps its place on the
 /// page and is put on the nearest glyph when the page's text comes
-/// (`placeStale`). A page that is gone sends it to the top of the last.
-/// A selection with an end on a changed page goes, and visual mode with
-/// it.
+/// (`cursor.placeStale`). A page that is gone sends it to the top of the
+/// last. A selection with an end on a changed page goes, and visual mode
+/// with it.
 ///
 /// The author asked that a reload keep the caret; it first went to the
 /// top of its page on every one. Do not go back to resetting it.
@@ -267,16 +264,6 @@ fn keepCursor(s: *Session, v: *View, old: []const u64, new: []const u64) void {
     if (kept and watch.unchanged(old, new, anchor.page)) return;
     v.anchor = null;
     if (v == s.layout().current() and s.keymap.mode.isVisual()) s.keymap.mode = .normal;
-}
-
-/// The text of `page` has come: a caret a reload left stale on it is put
-/// on the glyph nearest where it was.
-pub fn placeStale(s: *Session, index: u32, page: u32) void {
-    const map = s.buffer(index).textMap(page) orelse return;
-    var it = s.tabs.iterator();
-    while (it.next()) |v| {
-        if (v.buffer == index and v.cursor.stale and v.cursor.page == page) v.cursorNear(map);
-    }
 }
 
 /// Every cached picture of a buffer's pages is stale, and drawn until
@@ -445,7 +432,6 @@ fn reloadDigests(gpa: Allocator, digests: []const u64, first: ?u32) !watch.Outco
 }
 
 test "a reload keeps the caret where the page did not change, and finds it where it did" {
-    if (!caps.marks) return error.SkipZigTest;
     // The author asked for this: a reload first sent every caret to the top
     // of its page, wherever the change was.
     const gpa = testing.allocator;
@@ -471,7 +457,7 @@ test "a reload keeps the caret where the page did not change, and finds it where
     try testing.expect(v.cursor.stale);
     try testing.expectEqual(@as(u32, 1), v.cursor.page);
     try putText(&s, 1, 4, 6);
-    placeStale(&s, 0, 1);
+    cursor.placeStale(&s, 0, 1);
     try testing.expect(!v.cursor.stale);
     try testing.expectEqual(View.Position{ .page = 1, .line = 3, .column = 1 }, v.cursor.position());
 

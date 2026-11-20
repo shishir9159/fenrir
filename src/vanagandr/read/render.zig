@@ -16,6 +16,7 @@ const Images = @import("../images.zig").Images;
 const watch = @import("../watch.zig");
 const Session = @import("Session.zig");
 const compare = @import("compare.zig");
+const cursor = @import("cursor.zig");
 const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
 const search_mod = @import("search.zig");
@@ -375,11 +376,11 @@ pub fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
 
     // The text map first, and separately failable: a page whose pixels
     // will not come out should still be one the cursor can move through,
-    // and vice versa. Built only where something reads it: the caret, a
-    // selection and a mark read a page's text, and a search reads it from
-    // pages nobody is looking at. A build with none of them never pays
-    // for one.
-    if (caps.marks or (caps.search and job.want == .text)) {
+    // and vice versa. With every page where a selection and a mark read
+    // the text under the pointer; otherwise only when it is asked for by
+    // itself, as the caret and a search ask -- so a build with no marks
+    // reads no page's text until the caret is shown on it.
+    if (caps.marks or job.want == .text) {
         out.map = text.build(gpa, result.list) catch null;
     }
     errdefer if (out.map) |*m| m.deinit(gpa);
@@ -576,6 +577,10 @@ pub fn firstMissing(s: *Session) ?Job {
 /// is never going to photograph.
 pub fn nextJob(s: *Session) ?Job {
     if (firstMissing(s)) |job| return job;
+    // Text and no picture, so before the slots are counted: it takes none.
+    if (!caps.marks) {
+        if (caretAhead(s)) |job| return job;
+    }
     if (!hasSpareSlot(s)) return null;
 
     // Only once nothing on screen is outstanding: a page just off the
@@ -661,6 +666,34 @@ fn pageJob(s: *const Session, v: *const View, page: u32) Job {
     return .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = compare.pixelsFor(s, v), .shift = compare.shiftFor(s, v) };
 }
 
+/// What the caret asks for when it needs `page`'s text.
+///
+/// The page, in a build with marks: every page job there builds its text,
+/// and `.text` is the search's, whose scan takes whatever text comes back.
+/// In a build with none, the text alone -- a page already drawn is not
+/// drawn again for it, and there is no search to take it.
+fn caretJob(v: *const View, page: u32) Job {
+    return .{ .buffer = v.buffer, .page = page, .zoom = v.zoom, .want = if (caps.marks) .page else .text };
+}
+
+/// The text either side of the caret, in a build that reads a page's text
+/// only for the caret, so that `j` on a page's last line goes straight on
+/// to the next page. With marks, the pages on screen and just past it
+/// already have theirs.
+fn caretAhead(s: *Session) ?Job {
+    const v = s.view();
+    if (!v.cursor.visible) return null;
+    const b = s.buffer(v.buffer);
+    // Below first, as for read-ahead; above the first page wraps past the
+    // last and is skipped.
+    for ([_]u32{ v.cursor.page +% 1, v.cursor.page -% 1 }) |page| {
+        if (page >= v.pages.len or b.hasMap(page)) continue;
+        const job = caretJob(v, page);
+        if (!failed(s, job)) return job;
+    }
+    return null;
+}
+
 fn missingIn(s: *Session, v: *View) ?Job {
     const range = v.visiblePages();
     var i = range.first;
@@ -669,19 +702,17 @@ fn missingIn(s: *Session, v: *View) ?Job {
         if (failed(s, job)) continue;
         if (!cached(s, v, i)) return job;
     }
-    // Neither the caret nor a selection is in a build with no marks, and
-    // nothing else asks for a page's text.
-    if (!caps.marks) return null;
     // The cursor needs a text map even for a page whose pixels are
     // already cached -- a window that has not moved since the map was
     // evicted would otherwise have a cursor that cannot cross a page.
     if (v.cursor.visible and !s.buffer(v.buffer).hasMap(v.cursor.page)) {
-        const job: Job = .{ .buffer = v.buffer, .page = v.cursor.page, .zoom = v.zoom };
+        const job = caretJob(v, v.cursor.page);
         if (!failed(s, job)) return job;
     }
     // A selection's text on every page it spans, so a selection extended
     // off the screen still draws -- a few pages each way, not a whole
     // chapter's worth of interpretation for one held key.
+    if (!caps.marks) return null;
     if (v.selection()) |sel| {
         const last = @min(sel[1].page, sel[0].page + 8);
         var page = sel[0].page;
@@ -732,11 +763,18 @@ pub fn collectPage(
         return null;
     }
 
+    // The caret's text alone, in a build with no search to take it: there
+    // is no picture to put away. Text that would not come is asked for
+    // once, as a page that would not draw is.
+    const text_only = finished.job.want == .text;
+    if (text_only and finished.map == null) noteFailure(s, finished.job);
+
     if (finished.map) |map| {
         s.buffer(finished.job.buffer).putMap(gpa, finished.job.page, map);
         finished.map = null;
-        if (caps.marks) reload.placeStale(s, finished.job.buffer, finished.job.page);
+        cursor.placeStale(s, finished.job.buffer, finished.job.page);
     }
+    if (text_only) return null;
 
     const result = finished.result orelse {
         // A page that will not interpret is a blank page, not a dead
@@ -1111,4 +1149,37 @@ test "a page that will not rasterise is asked for once, not every frame" {
     // memory at one scale may well fit at another.
     s.view().zoom = 0.25;
     try testing.expectEqual(@as(u32, 0), firstMissing(&s).?.page);
+}
+
+test "the caret's page is read for its text, and where nothing else reads text, the pages either side" {
+    const gpa = testing.allocator;
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    const v = s.view();
+    v.scrollToPage(1);
+
+    // Every page on screen drawn already, so what is left to ask for is
+    // text, and only once the caret is shown.
+    const range = v.visiblePages();
+    for (range.first..range.end, 0..) |page, i| {
+        s.slots[i] = .{ .buffer = 0, .page = @intCast(page), .zoom = v.zoom, .gpu = @intCast(i + 1) };
+    }
+    try testing.expect(firstMissing(&s) == null);
+
+    _ = s.apply(.{ .move_cursor = .down });
+    const own = firstMissing(&s).?;
+    try testing.expectEqual(@as(u32, 1), own.page);
+    // With marks every page job reads its text; without, a page already
+    // drawn is not drawn again for it.
+    try testing.expectEqual(if (caps.marks) Job.Want.page else .text, own.want);
+    try fixtures.putText(&s, 1, 4, 6);
+    if (caps.marks) return;
+
+    // Below first, then above.
+    try testing.expectEqual(Job{ .buffer = 0, .page = 2, .zoom = v.zoom, .want = .text }, nextJob(&s).?);
+    try fixtures.putText(&s, 2, 4, 6);
+    try testing.expectEqual(@as(u32, 0), nextJob(&s).?.page);
+    try fixtures.putText(&s, 0, 4, 6);
+    try testing.expect(nextJob(&s) == null or nextJob(&s).?.want != .text);
 }

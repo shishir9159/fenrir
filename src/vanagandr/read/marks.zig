@@ -14,7 +14,7 @@ const library = @import("../library.zig");
 const Library = library.Library;
 const Session = @import("Session.zig");
 const frame = @import("frame.zig");
-const cursor = @import("cursor.zig");
+const selection = @import("selection.zig");
 const plugins_mod = @import("plugins.zig");
 
 const gelgja = fenrir.gelgja;
@@ -86,7 +86,7 @@ pub fn paletteName(index: u8) []const u8 {
 /// A box laid mostly over an existing highlight replaces it rather than
 /// stacking on it, so selecting highlighted words and pressing `3`
 /// recolours them instead of darkening them.
-pub fn highlightBoxes(s: *Session, buffer_index: u32, boxes: []const cursor.PageBox, color: Color) void {
+pub fn highlightBoxes(s: *Session, buffer_index: u32, boxes: []const selection.PageBox, color: Color) void {
     _ = markBoxes(s, buffer_index, boxes, color, .highlight);
 }
 
@@ -97,7 +97,7 @@ pub fn highlightBoxes(s: *Session, buffer_index: u32, boxes: []const cursor.Page
 /// was the last line of its anchor hands its comments to the new one
 /// first, so marking commented words again keeps what was said about
 /// them.
-pub fn markBoxes(s: *Session, buffer_index: u32, boxes: []const cursor.PageBox, color: Color, style: Marks.Style) u64 {
+pub fn markBoxes(s: *Session, buffer_index: u32, boxes: []const selection.PageBox, color: Color, style: Marks.Style) u64 {
     const b = s.buffer(buffer_index);
     b.marks.beginGroup();
     defer b.marks.beginGroup();
@@ -172,25 +172,25 @@ pub fn clearMarks(s: *Session) void {
 /// go of one does not, and `y` does not.
 pub fn highlightSelection(s: *Session, colour: ?u8, style: Marks.Style) void {
     const v = s.view();
-    const sel = cursor.activeSelection(s, v) orelse return;
-    defer cursor.clearSelection(s);
+    const sel = selection.activeSelection(s, v) orelse return;
+    defer selection.clearSelection(s);
 
-    var boxes: std.ArrayList(cursor.PageBox) = .empty;
+    var boxes: std.ArrayList(selection.PageBox) = .empty;
     defer boxes.deinit(s.gpa);
-    cursor.selectionBoxes(s, v.buffer, sel[0], sel[1], cursor.lineSelection(s), &boxes) catch return;
+    selection.selectionBoxes(s, v.buffer, sel[0], sel[1], selection.lineSelection(s), &boxes) catch return;
     _ = markBoxes(s, v.buffer, boxes.items, paletteColor(s, colour), style);
 }
 
 /// Visual mode's `d`: every highlight the selection touches goes.
 pub fn unhighlightSelection(s: *Session) void {
     const v = s.view();
-    const sel = cursor.activeSelection(s, v) orelse return;
-    defer cursor.clearSelection(s);
+    const sel = selection.activeSelection(s, v) orelse return;
+    defer selection.clearSelection(s);
     const b = s.buffer(v.buffer);
 
-    var boxes: std.ArrayList(cursor.PageBox) = .empty;
+    var boxes: std.ArrayList(selection.PageBox) = .empty;
     defer boxes.deinit(s.gpa);
-    cursor.selectionBoxes(s, v.buffer, sel[0], sel[1], cursor.lineSelection(s), &boxes) catch return;
+    selection.selectionBoxes(s, v.buffer, sel[0], sel[1], selection.lineSelection(s), &boxes) catch return;
 
     b.marks.beginGroup();
     defer b.marks.beginGroup();
@@ -482,11 +482,11 @@ pub fn beginComment(s: *Session) void {
 /// keeps the highlight, which `u` takes back like any other.
 pub fn commentSelection(s: *Session) void {
     const v = s.view();
-    const sel = cursor.activeSelection(s, v) orelse return noAnchor(s);
-    defer cursor.clearSelection(s);
-    var boxes: std.ArrayList(cursor.PageBox) = .empty;
+    const sel = selection.activeSelection(s, v) orelse return noAnchor(s);
+    defer selection.clearSelection(s);
+    var boxes: std.ArrayList(selection.PageBox) = .empty;
     defer boxes.deinit(s.gpa);
-    cursor.selectionBoxes(s, v.buffer, sel[0], sel[1], cursor.lineSelection(s), &boxes) catch return noAnchor(s);
+    selection.selectionBoxes(s, v.buffer, sel[0], sel[1], selection.lineSelection(s), &boxes) catch return noAnchor(s);
     if (boxes.items.len == 0) return noAnchor(s);
 
     const b = s.buffer(v.buffer);
@@ -1285,7 +1285,7 @@ test "a selection's lines are one anchor, and marking them again keeps its comme
     var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
     defer closeSession(&s);
 
-    const lines = [_]cursor.PageBox{
+    const lines = [_]selection.PageBox{
         .{ .page = 0, .box = .fromRect(100, 700, 300, 712) },
         .{ .page = 0, .box = .fromRect(100, 686, 300, 698) },
         .{ .page = 0, .box = .fromRect(100, 672, 200, 684) },
@@ -1324,7 +1324,7 @@ test "highlighting over a highlight replaces it rather than stacking" {
     var s = try sessionOf(gpa, fakePages(&buf, 2), 1, 1000, 800);
     defer closeSession(&s);
 
-    const line: cursor.PageBox = .{ .page = 0, .box = .fromRect(100, 695, 160, 710) };
+    const line: selection.PageBox = .{ .page = 0, .box = .fromRect(100, 695, 160, 710) };
     highlightBoxes(&s, 0, &.{line}, Library.parseColor("yellow").?);
     highlightBoxes(&s, 0, &.{line}, Library.parseColor("blue").?);
     try testing.expectEqual(@as(usize, 1), s.buffer(0).marks.count());

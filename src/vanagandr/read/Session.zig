@@ -50,6 +50,7 @@ const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
 const render = @import("render.zig");
 const search_mod = @import("search.zig");
+const selection = @import("selection.zig");
 const windows = @import("windows.zig");
 
 const gelgja = fenrir.gelgja;
@@ -282,7 +283,7 @@ remembers_place: bool = true,
 quit: bool = false,
 
 /// The selection made with the mouse, or null when there is none.
-drag: if (caps.marks) ?cursor.Drag else void = if (caps.marks) null else {},
+drag: if (caps.marks) ?selection.Drag else void = if (caps.marks) null else {},
 
 /// The pen, and the stroke it is in the middle of.
 pen: if (caps.marks) ink.Pen else void = if (caps.marks) .{} else {},
@@ -420,7 +421,7 @@ failure_next: usize = 0,
 /// be drawn in and no line between it and another.
 order: if (caps.splits) std.ArrayList(u32) else void = if (caps.splits) .empty else {},
 borders: if (caps.splits) std.ArrayList(Bounds) else void = if (caps.splits) .empty else {},
-boxes: if (caps.marks) std.ArrayList(cursor.PageBox) else void = if (caps.marks) .empty else {},
+boxes: if (caps.marks) std.ArrayList(selection.PageBox) else void = if (caps.marks) .empty else {},
 
 pub fn deinit(s: *Session) void {
     if (caps.compare) s.rerun.finish();
@@ -1193,13 +1194,10 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         .zoom_to => |f| v.setZoom(v.hundredPercent() * f),
         .fit => |want| v.fitTo(want),
 
-        // With no caret to move, the motions that go down and up the text
-        // move the page instead, a tenth of a screen a press.
-        .move_cursor => |step| if (caps.marks) cursor.moveCursor(s, step) else switch (step) {
-            .down => v.scroll += v.height() * 0.1,
-            .up => v.scroll -= v.height() * 0.1,
-            else => {},
-        },
+        // The caret, in every build: `j` and `k` are a line, as in Vim. The
+        // author asked for this over light's old tenth of a screen a press;
+        // see `cursor.moveCursor` before making a motion scroll anywhere.
+        .move_cursor => |step| cursor.moveCursor(s, step),
         .hide_cursor => {
             // Escape puts the selection away, then the caret, and closes
             // last -- each step is something the reader can see undone,
@@ -1212,7 +1210,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
                 // stopped typing into. Before the caret, because the
                 // highlights are the louder thing on the page.
                 search_mod.endSearch(s);
-            } else if (caps.marks and v.cursor.visible) {
+            } else if (v.cursor.visible) {
                 v.cursor.visible = false;
             } else return true;
         },
@@ -1236,7 +1234,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
             // Whatever was selected is not selected any more: the next
             // drag is a stroke, so a selection left on screen would be a
             // thing the mouse could no longer change.
-            cursor.clearSelection(s);
+            selection.clearSelection(s);
             s.say("pen {d:.1}pt -- drag to draw, d or escape to stop", .{s.pen.width});
         } else {
             s.keymap.mode = .normal;
@@ -1250,7 +1248,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         .leave_mode => {
             s.cmdline.clearRetainingCapacity();
             if (caps.marks) {
-                cursor.clearSelection(s);
+                selection.clearSelection(s);
                 ink.penCancel(s);
                 s.note.clearRetainingCapacity();
                 s.typing = null;
@@ -1271,7 +1269,7 @@ pub fn apply(s: *Session, cmd: keys.Command) bool {
         .yank_selection => if (caps.marks) {
             // The selection goes and nothing is written: a selection is
             // the interface's, never a mark, whichever key ends it.
-            cursor.clearSelection(s);
+            selection.clearSelection(s);
             s.status = "nothing copied -- there is no clipboard yet; m highlights";
         },
         .unhighlight_selection => if (caps.marks) marks.unhighlightSelection(s),
@@ -1441,9 +1439,9 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
 
     if (s.drag) |*d| {
         if (d.buffer == v.buffer) {
-            if (cursor.positionAt(s, v, in.mouse)) |p| {
+            if (selection.positionAt(s, v, in.mouse)) |p| {
                 d.to = p;
-                cursor.carryCursor(s, v, p);
+                selection.carryCursor(s, v, p);
             }
         }
         return;
@@ -1469,9 +1467,9 @@ pub fn pointer(s: *Session, in: lyngvi.Input) void {
         return;
     }
 
-    const p = cursor.positionAt(s, v, in.mouse) orelse return;
+    const p = selection.positionAt(s, v, in.mouse) orelse return;
     s.drag = .{ .buffer = v.buffer, .from = p, .to = p };
-    cursor.carryCursor(s, v, p);
+    selection.carryCursor(s, v, p);
 }
 
 /// What the mode line says, gathered from wherever the reader keeps it.
@@ -1586,7 +1584,7 @@ test {
     // whichever of them this build's session reaches. A file whose tests
     // need a capability gates them itself: see `compare.comparison_tests`.
     _ = compare;
-    if (caps.marks) _ = cursor;
+    _ = cursor;
     _ = frame;
     if (caps.marks) _ = ink;
     if (caps.panels) _ = interface;
@@ -1595,6 +1593,7 @@ test {
     _ = reload;
     _ = render;
     if (caps.search) _ = search_mod;
+    if (caps.marks) _ = selection;
     if (caps.splits) _ = windows;
 }
 

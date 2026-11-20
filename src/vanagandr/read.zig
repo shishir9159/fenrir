@@ -308,17 +308,10 @@ const normal_mode =
     \\normal mode (reading):
     \\    drag the scrollbar   scroll; a press on the track moves a screen
     \\    wheel, ctrl+wheel    scroll, zoom
-    \\
-++ (if (caps.marks)
     \\    arrows, h j k l      move the cursor; the page follows it
     \\    w / b / e            the next word, the word before, the word's end
     \\    ^ / $                the start and end of the line
     \\    escape               put the cursor away
-    \\
-else
-    \\    up / down, j / k     scroll a tenth of a screen
-    \\
-) ++
     \\    page up / page down  a screen at a time
     \\    home / end           the first and last page
     \\    space / p            the next and previous page

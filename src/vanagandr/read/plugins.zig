@@ -16,7 +16,7 @@ const marks = @import("marks.zig");
 const Job = render.Job;
 const Session = @import("Session.zig");
 const render = @import("render.zig");
-const cursor = @import("cursor.zig");
+const selection_mod = @import("selection.zig");
 
 const galdr = fenrir.galdr;
 const hlidskjalf = fenrir.hlidskjalf;
@@ -426,7 +426,7 @@ fn hostSelection(ptr: *anyopaque, doc: galdr.Host.Handle) ?[2]galdr.Host.Positio
 /// `SelectionChanged` compares two of these rather than watching the
 /// three places a selection can move from.
 fn hostSelectionOf(s: *Session, v: *View) ?[2]galdr.Host.Position {
-    const sel = cursor.activeSelection(s, v) orelse return null;
+    const sel = selection_mod.activeSelection(s, v) orelse return null;
     return .{ fromOne(sel[0]), fromOne(sel[1]) };
 }
 

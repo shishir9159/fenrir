@@ -353,16 +353,21 @@ const Caps = struct {
     /// file is refused by name rather than opened into a buffer that
     /// nothing could show.
     splits: bool,
-    /// Highlights, notes and ink, and the caret and visual mode that select
-    /// what a highlight is made on. One capability and not two because a
-    /// selection has nowhere else to go: there is no clipboard, and the
-    /// author asked that a selection never be stored. Without them the
-    /// reader has normal mode and the command line, `j` and `k` scroll, and
-    /// a file's own annotations are drawn in the page as `raster` draws them.
+    /// Highlights, notes and ink, and the selection -- visual mode and a
+    /// drag -- that a highlight is made on. One capability and not two
+    /// because a selection has nowhere else to go: there is no clipboard,
+    /// and the author asked that a selection never be stored. Without them
+    /// the reader has normal mode, the caret and the command line, and a
+    /// file's own annotations are drawn in the page as `raster` draws them.
+    /// The caret is in every build, because the author asked that `j` and
+    /// `k` move it a line at a time everywhere, as in Vim.
     marks: bool,
     /// `/`: the bar, the scan of every page's text behind it, and the
-    /// matches drawn over the page. Not in `light`, which then never builds
-    /// a page's text unless something else asks for it.
+    /// matches drawn over the page. Not in `light`, which then builds a
+    /// page's text only for the caret. The author agreed to leave search,
+    /// selection and copy out of `light` because a reload needs none of
+    /// them: it finds its change by reading the two versions' text itself,
+    /// in `watch.locate`.
     search: bool,
     /// The rails down either side of the page, the panel they open, the
     /// command palette and the settings page: the interface beyond the

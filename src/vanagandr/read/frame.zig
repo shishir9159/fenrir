@@ -26,6 +26,7 @@ const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
 const render = @import("render.zig");
 const search_mod = @import("search.zig");
+const selection = @import("selection.zig");
 const windows = @import("windows.zig");
 
 const content = fenrir.content;
@@ -299,9 +300,9 @@ fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
 
     if (caps.marks) {
         v.marks_seen = b.marks.revision;
-        try cursor.drawSelection(s, v, over);
-        try cursor.drawCaret(s, v, over);
+        try selection.drawSelection(s, v, over);
     }
+    try cursor.drawCaret(s, v, over);
     try drawScrollbar(s, v, over);
 }
 

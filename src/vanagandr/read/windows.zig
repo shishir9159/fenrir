@@ -11,7 +11,7 @@ const fenrir = @import("fenrir");
 
 const chrome_mod = @import("../chrome.zig");
 const Session = @import("Session.zig");
-const cursor = @import("cursor.zig");
+const selection = @import("selection.zig");
 
 const hlidskjalf = fenrir.hlidskjalf;
 const lyngvi = fenrir.lyngvi;
@@ -78,7 +78,7 @@ pub fn dragSplit(s: *Session, in: lyngvi.Input, down: bool, pressed: bool) bool 
 pub fn splitWindow(s: *Session, dir: Layout.Direction) void {
     // A split copies the window, and a copied selection would be two
     // windows each claiming to be selecting.
-    cursor.clearSelection(s);
+    selection.clearSelection(s);
     if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
 
     const made = s.layout().split(s.gpa, dir) catch null;
@@ -137,7 +137,7 @@ pub fn closeTab(s: *Session) bool {
     var it = s.layout().iterator();
     while (it.next()) |v| s.rememberPlace(v);
 
-    cursor.clearSelection(s);
+    selection.clearSelection(s);
     if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
     _ = s.tabs.close(s.gpa);
     enteredTab(s);
@@ -183,7 +183,7 @@ pub fn windowToTab(s: *Session) void {
 /// the way a split's does and for the same reason.
 fn leavingTab(s: *Session) View {
     const copy = s.view().*;
-    cursor.clearSelection(s);
+    selection.clearSelection(s);
     if (s.keymap.mode.isVisual()) s.keymap.mode = .normal;
     s.rememberPlace(s.view());
     return copy;
