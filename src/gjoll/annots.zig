@@ -103,6 +103,36 @@ pub const Annot = struct {
     text: []const u8 = "",
 };
 
+/// What an annotation looks like, as a number: its kind, its lines or its
+/// paths to a hundredth of a point, which is what `write` keeps, and its
+/// text. The identity of one with no `/NM`, or one its page repeats, by
+/// which a name the reader gives it is found again.
+///
+/// Not its object number: a program that rewrites the file renumbers every
+/// object and leaves the drawing where it was. Two annotations of one
+/// shape on one page are one, which is what they look like.
+pub fn shapeOf(a: Annot) u64 {
+    var h: std.hash.Wyhash = .init(0);
+    h.update(&.{@intFromEnum(a.kind)});
+    for (a.lines) |box| {
+        for ([_]f32{ box.min_x, box.min_y, box.max_x, box.max_y }) |v| hashHundredths(&h, v);
+    }
+    for (a.paths) |path| {
+        h.update(&.{0xff});
+        for (path) |p| {
+            hashHundredths(&h, p.x);
+            hashHundredths(&h, p.y);
+        }
+    }
+    h.update(a.text);
+    return h.final();
+}
+
+fn hashHundredths(h: *std.hash.Wyhash, v: f32) void {
+    const n: i64 = @intFromFloat(std.math.clamp(@round(@as(f64, v) * 100), -1e15, 1e15));
+    h.update(std.mem.asBytes(&n));
+}
+
 /// More than any page holds, and few enough that a hostile file cannot
 /// make one page cost seconds.
 const max_quads = 1 << 12;
@@ -1372,6 +1402,17 @@ test "a later save names the forms the file has, and only fenrir's" {
     try testing.expectEqual(@as(u32, 5), forms[0]);
     try testing.expect(forms[1] != 5);
     try testing.expectEqual(forms[1], forms[2]);
+}
+
+test "a shape is what is drawn, to a hundredth, and not where the object is" {
+    const line = [_]Bounds{.fromRect(100, 500, 220, 512)};
+    const nudged = [_]Bounds{.fromRect(100.001, 500, 220, 512)};
+    const moved = [_]Bounds{.fromRect(100.5, 500, 220, 512)};
+    const a: Annot = .{ .kind = .highlight, .lines = &line };
+    try testing.expectEqual(shapeOf(a), shapeOf(.{ .kind = .highlight, .lines = &nudged, .name = "anything" }));
+    try testing.expect(shapeOf(a) != shapeOf(.{ .kind = .highlight, .lines = &moved }));
+    try testing.expect(shapeOf(a) != shapeOf(.{ .kind = .underline, .lines = &line }));
+    try testing.expect(shapeOf(a) != shapeOf(.{ .kind = .highlight, .lines = &line, .text = "why" }));
 }
 
 test "an annotation with nothing to draw is refused" {

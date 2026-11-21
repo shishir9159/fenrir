@@ -65,6 +65,16 @@
 //! fenrir's own never reach. Everything here goes on comparing `u64`s, and
 //! only what writes a name down asks how it is spelled (`spelling`).
 //!
+//! **A name is never handed out twice.** The next is one past the highest
+//! ever handed out in the document -- which the library carries, and which
+//! `reserve` is told -- and not one past the highest still in use, so that
+//! a link to a deleted name cannot attach to whatever is made next.
+//! Another program's name is its page's (§12.5.2) and is resolved with the
+//! page. An annotation with no name, or one its page repeats, has none to
+//! resolve: it is given a number from the top half that spells as nothing
+//! (`unnamedName`), and a name of fenrir's only once something is written
+//! about it, which then renames it everywhere (`rename`).
+//!
 //! ## Coordinates
 //!
 //! A mark's box is in **PDF user space** -- points, y upwards, origin at the
@@ -332,11 +342,19 @@ comments: std.ArrayList(Comment) = .empty,
 /// The next anchor or comment number to hand out.
 next_name: u64 = 1,
 
-/// Names another program wrote, and the number each stands for here; the
-/// number is `foreign_base` and its place in `spelled`. Both hold the one
-/// copy, in `owned`.
+/// The highest name the library has been told was handed out; see
+/// `reserve`. What a pass that wrote something tells it past.
+told: u64 = 0,
+
+/// Names another program wrote, keyed by the page then the name, and the
+/// number each stands for here; the number is `foreign_base` and its place
+/// in `spelled`, which holds the name alone. Both in `owned`.
 foreign: std.StringHashMapUnmanaged(u64) = .empty,
 spelled: std.ArrayList([]const u8) = .empty,
+
+/// The anchors read from a file with no usable name, and what each looks
+/// like there: what a name given one later is written down against.
+unnamed: std.AutoHashMapUnmanaged(u64, Unnamed) = .empty,
 
 /// For each anchor, the index of its first line in reading order: the mark
 /// a comment is shown on, and an arrow drawn from. Worked out again when
@@ -394,6 +412,7 @@ pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.comments.deinit(gpa);
     m.foreign.deinit(gpa);
     m.spelled.deinit(gpa);
+    m.unnamed.deinit(gpa);
     m.led.deinit(gpa);
     m.lines.deinit(gpa);
     m.effects.deinit(gpa);
@@ -511,30 +530,116 @@ fn claim(m: *Marks, n: u64) void {
     m.next_name = @max(m.next_name, n +| 1);
 }
 
+/// Every name up to `n` has been handed out already -- in the library, or
+/// in the file -- and none of them is handed out again.
+pub fn reserve(m: *Marks, n: u64) void {
+    m.claim(n);
+}
+
 /// Where the numbers for other programs' names begin. Fenrir's own count up
 /// from one and would take a document of 2^63 annotations to get here.
 pub const foreign_base: u64 = 1 << 63;
 
-/// The number a name another program wrote stands for, the same one every
-/// time it is asked.
-pub fn foreignName(m: *Marks, gpa: Allocator, nm: []const u8) Allocator.Error!u64 {
+/// The number a name another program wrote on `page` stands for, the same
+/// one every time it is asked. The same name on another page is another
+/// number: §12.5.2 makes `/NM` unique on its page and nowhere else.
+pub fn foreignName(m: *Marks, gpa: Allocator, page: u32, nm: []const u8) Allocator.Error!u64 {
     std.debug.assert(nm.len != 0);
-    const got = try m.foreign.getOrPut(gpa, nm);
+    var key_buf: [4 + 256]u8 = undefined;
+    const kept_key = nm.len > key_buf.len - 4;
+    std.mem.writeInt(u32, key_buf[0..4], page, .little);
+    const key: []const u8 = if (kept_key) try m.ownKey(page, nm) else blk: {
+        @memcpy(key_buf[4..][0..nm.len], nm);
+        break :blk key_buf[0 .. 4 + nm.len];
+    };
+    const got = try m.foreign.getOrPut(gpa, key);
     if (got.found_existing) return got.value_ptr.*;
-    errdefer _ = m.foreign.remove(nm);
-    const kept = try m.own(nm);
-    try m.spelled.append(gpa, kept);
-    got.key_ptr.* = kept;
+    errdefer _ = m.foreign.remove(key);
+    got.key_ptr.* = if (kept_key) key else try m.own(key);
+    // The key's tail is the name, so the spelling costs nothing more.
+    try m.spelled.append(gpa, got.key_ptr.*[4..]);
     got.value_ptr.* = foreign_base + m.spelled.items.len - 1;
     return got.value_ptr.*;
 }
 
+fn ownKey(m: *Marks, page: u32, nm: []const u8) Allocator.Error![]const u8 {
+    const key = try m.owned.allocator().alloc(u8, 4 + nm.len);
+    std.mem.writeInt(u32, key[0..4], page, .little);
+    @memcpy(key[4..], nm);
+    return key;
+}
+
+/// A number for an annotation with no name to hold it by: from the top
+/// half, so fenrir's own count is not spent on it, and spelled as nothing,
+/// so nothing writes it down. Something written about it is given a name
+/// of fenrir's first; see `rename`.
+pub fn unnamedName(m: *Marks, gpa: Allocator, where: Unnamed) Allocator.Error!u64 {
+    try m.spelled.append(gpa, "");
+    const n = foreign_base + m.spelled.items.len - 1;
+    try m.unnamed.put(gpa, n, where);
+    return n;
+}
+
+/// Where an annotation that came with no usable name is, and a hash of how
+/// it looks (`annots.shapeOf`): enough to find it again in the file.
+pub const Unnamed = struct { page: u32, shape: u64 };
+
 /// How a name another program wrote is spelled, or null for one of
-/// fenrir's numbers, which the caller writes as its own.
+/// fenrir's numbers, which the caller writes as its own. Empty for an
+/// annotation that came with none.
 pub fn spelling(m: Marks, n: u64) ?[]const u8 {
     if (n < foreign_base) return null;
     const i = n - foreign_base;
     return if (i < m.spelled.items.len) m.spelled.items[i] else null;
+}
+
+/// The first number another program's name stands for, on whichever page:
+/// what a plugin naming an anchor by its `/NM` means.
+pub fn spelledAs(m: Marks, nm: []const u8) ?u64 {
+    if (nm.len == 0) return null;
+    for (m.spelled.items, 0..) |name, i| {
+        if (std.mem.eql(u8, name, nm)) return foreign_base + i;
+    }
+    return null;
+}
+
+/// Gives everything called `from` the name `to`: the lines of an anchor,
+/// the comments on it and the one named as it is, and every step of the
+/// history that says it, so that an undo does not bring the old name back.
+///
+/// Not a change anybody made, so nothing is queued: the library is told
+/// by whoever asked. What an unnamed anchor becomes when something is
+/// first written about it, and what a name the reader made becomes when a
+/// newer copy of the file holds the same one for something else.
+pub fn rename(m: *Marks, from: u64, to: u64) void {
+    if (from == to) return;
+    m.claim(to);
+    for (m.list.items) |*mark| {
+        if (mark.anchor == from) mark.anchor = to;
+    }
+    for (m.comments.items) |*c| renamed(c, from, to);
+    std.mem.sort(Comment, m.comments.items, {}, commentOrder);
+    for ([_]*std.ArrayList(Change){ &m.undo_stack, &m.redo_stack }) |stack| {
+        for (stack.items) |*change| {
+            for ([_]*Change.Item{ &change.before, &change.after }) |item| switch (item.*) {
+                .mark => |*mark| if (mark.anchor == from) {
+                    mark.anchor = to;
+                },
+                .comment => |*c| renamed(c, from, to),
+            };
+        }
+    }
+    _ = m.unnamed.remove(from);
+    m.revision +%= 1;
+}
+
+fn renamed(c: *Comment, from: u64, to: u64) void {
+    if (c.anchor == from) c.anchor = to;
+    if (c.name == from) c.name = to;
+}
+
+fn commentOrder(_: void, a: Comment, b: Comment) bool {
+    return a.anchor < b.anchor or (a.anchor == b.anchor and a.key < b.key);
 }
 
 /// Removes the mark at `index`, returning it.
@@ -629,6 +734,9 @@ pub fn forget(m: *Marks, gpa: Allocator, gone: *const std.AutoHashMapUnmanaged(u
 
     if (keys.count() == 0) return 0;
     m.revision +%= 1;
+    // Read again, they are given numbers again.
+    var it = gone.keyIterator();
+    while (it.next()) |n| _ = m.unnamed.remove(n.*);
     for ([_]*std.ArrayList(Change){ &m.undo_stack, &m.redo_stack }) |stack| {
         var left: usize = 0;
         for (stack.items) |c| {
@@ -1369,11 +1477,20 @@ test "another program's name is held as a number fenrir never hands out" {
     var m: Marks = .{};
     defer m.deinit(gpa);
 
-    const a = try m.foreignName(gpa, "305e35fa-f306-438a");
-    try testing.expectEqual(a, try m.foreignName(gpa, "305e35fa-f306-438a"));
-    try testing.expect(a != try m.foreignName(gpa, "ccbe0138"));
+    const a = try m.foreignName(gpa, 0, "305e35fa-f306-438a");
+    try testing.expectEqual(a, try m.foreignName(gpa, 0, "305e35fa-f306-438a"));
+    try testing.expect(a != try m.foreignName(gpa, 0, "ccbe0138"));
     try testing.expectEqualStrings("305e35fa-f306-438a", m.spelling(a).?);
     try testing.expect(m.spelling(7) == null);
+    // The same name on another page is another annotation (§12.5.2).
+    const b = try m.foreignName(gpa, 3, "305e35fa-f306-438a");
+    try testing.expect(a != b);
+    try testing.expectEqualStrings("305e35fa-f306-438a", m.spelling(b).?);
+    try testing.expectEqual(a, m.spelledAs("305e35fa-f306-438a").?);
+    // A name too long for the key on the stack is still found again.
+    const long: [300]u8 = @splat('x');
+    const c = try m.foreignName(gpa, 1, &long);
+    try testing.expectEqual(c, try m.foreignName(gpa, 1, &long));
 
     // Lines and a comment on it are an anchor like any other, and the next
     // name fenrir gives is still its own.
@@ -1381,6 +1498,40 @@ test "another program's name is held as a number fenrir never hands out" {
     _ = try m.addComment(gpa, .{ .anchor = a, .text = "read" }, true);
     try testing.expectEqual(a, m.said(a)[0].name);
     try testing.expectEqual(@as(u64, 1), m.newName());
+}
+
+test "an unnamed annotation spells as nothing until it is renamed, and the history follows" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    const where: Unnamed = .{ .page = 2, .shape = 0xabc };
+    const loose = try m.unnamedName(gpa, where);
+    try testing.expect(loose >= foreign_base);
+    try testing.expectEqualStrings("", m.spelling(loose).?);
+    try testing.expectEqual(where, m.unnamed.get(loose).?);
+    // Not one of fenrir's: the count is not spent on it.
+    try testing.expectEqual(@as(u64, 1), m.next_name);
+
+    _ = try m.add(gpa, .{ .page = 2, .box = box(0, 0, 9, 9), .anchor = loose }, true);
+    _ = try m.addComment(gpa, .{ .anchor = loose, .name = loose, .text = "note" }, true);
+    m.beginGroup();
+    _ = try m.addComment(gpa, .{ .anchor = loose, .text = "reply" }, false);
+    const reply = m.said(loose)[1].name;
+
+    const given = m.newName();
+    m.rename(loose, given);
+    try testing.expectEqual(given, m.items()[0].anchor);
+    try testing.expectEqual(@as(usize, 2), m.said(given).len);
+    try testing.expectEqual(given, m.said(given)[0].name);
+    try testing.expectEqual(reply, m.said(given)[1].name);
+    try testing.expectEqual(@as(usize, 0), m.said(loose).len);
+    try testing.expect(m.unnamed.get(loose) == null);
+
+    // Undone and redone under the name it has now, not the one it had.
+    _ = try m.undo(gpa);
+    _ = try m.redo(gpa);
+    try testing.expectEqual(@as(usize, 2), m.said(given).len);
 }
 
 test "a comment changed twice in one group redoes to the last of them" {

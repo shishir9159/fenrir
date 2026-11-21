@@ -544,7 +544,7 @@ fn hostAddComment(ptr: *anyopaque, doc: galdr.Host.Handle, c: galdr.Host.Comment
     const anchor = if (c.on != 0)
         (b.marks.byKey(c.on) orelse return null).anchor
     else
-        Library.nameNumber(c.anchor) orelse b.marks.foreign.get(c.anchor) orelse return null;
+        Library.nameNumber(c.anchor) orelse b.marks.spelledAs(c.anchor) orelse return null;
     if (anchor == 0 or b.marks.lineCount(anchor) == 0) return null;
 
     b.marks.beginGroup();

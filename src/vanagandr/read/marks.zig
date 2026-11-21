@@ -638,7 +638,19 @@ fn writeEffects(s: *Session, retry: bool) void {
             plugins_mod.announceEffect(s, at, b, e);
         }
         if (was != 0 and b.marks.owed() == 0) s.say("{s}: the library has every change now", .{b.title});
+        noteNames(s, b);
     }
+}
+
+/// Tells the library how far this document's names have been handed out,
+/// when that has moved: the rows alone would give a deleted mark's name
+/// to the next one made. Once a pass, not once a name.
+fn noteNames(s: *Session, b: *Buffer) void {
+    const lib = s.library orelse return;
+    const high = b.marks.next_name - 1;
+    if (high <= b.marks.told) return;
+    lib.noteName(b.path, high) catch return;
+    b.marks.told = high;
 }
 
 /// One queued change, written.
@@ -698,13 +710,18 @@ fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) Library.Error!void {
             }
         },
         .comment_insert => |key| {
-            const c = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
-            if (c.saved()) return;
+            const was = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
+            if (was.saved()) return;
+            try nameUnnamed(s, b, was.anchor);
+            // Asked again: a name given just now has moved it in the list.
+            const c = b.marks.comments.items[b.marks.commentIndex(key).?];
             var anchor: [Library.name_len]u8 = undefined;
             var own: [Library.name_len]u8 = undefined;
+            const first = b.marks.firstLine(s.gpa, c.anchor);
             const id = try lib.addComment(b.path, .{
                 .anchor = @constCast(spell(b, c.anchor, &anchor)),
                 .nm = @constCast(spell(b, c.name, &own)),
+                .page = if (first) |i| b.marks.items()[i].page else 0,
                 .text = @constCast(c.text),
             }, now(s));
             b.marks.setCommentId(key, id);
@@ -731,11 +748,42 @@ fn now(s: *const Session) i64 {
     return library.now(io);
 }
 
+/// An anchor read from the file with no name of its own, or one its page
+/// repeats, is given one of fenrir's the first time something about it is
+/// written down, and the library notes which annotation that is by its
+/// shape; the save that next writes the file puts the name in it, once.
+/// Until then it has a number that spells as nothing, and a comment row
+/// naming it would name nothing on the next open.
+fn nameUnnamed(s: *Session, b: *Buffer, anchor: u64) Library.Error!void {
+    const at = b.marks.unnamed.get(anchor) orelse return;
+    const lib = s.library orelse return;
+    const named = b.marks.newName();
+    var buf: [Library.name_len]u8 = undefined;
+    try lib.nameAnnotation(b.path, at.page, at.shape, Library.makeName(&buf, named));
+    b.marks.rename(anchor, named);
+    // Still the file's, under its new name: a reload forgets it by that.
+    if (takenOf(s, b)) |t| {
+        if (t.remove(anchor)) t.put(s.gpa, named, {}) catch {};
+    }
+}
+
+/// The names read out of `b`'s file rather than its library.
+fn takenOf(s: *Session, b: *Buffer) ?*std.AutoHashMapUnmanaged(u64, void) {
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) {
+        if (s.buffer(i) == b) return &s.disk(i).taken;
+    }
+    return null;
+}
+
 /// Reads this document's marks, and the comments on them, into its
 /// buffer. A row with no name becomes an anchor of its own.
 pub fn loadMarks(s: *Session, index: u32) void {
     const lib = s.library orelse return;
     const b = s.buffer(index);
+    // Past every name this document has handed out, still in use or not.
+    b.marks.told = lib.highestName(b.path) catch 0;
+    b.marks.reserve(b.marks.told);
 
     const list = lib.marks(b.path) catch return;
     defer lib.freeMarks(list, list.len);
@@ -748,7 +796,7 @@ pub fn loadMarks(s: *Session, index: u32) void {
             .box = .fromRect(h.x0, h.y0, h.x1, h.y1),
             .color = color,
             .style = std.meta.stringToEnum(Marks.Style, h.style) orelse .highlight,
-            .anchor = (nameOf(s, b, h.anchor) catch return) orelse 0,
+            .anchor = (nameOf(s, b, h.page, h.anchor) catch return) orelse 0,
         }, true) catch return;
     }
 
@@ -766,7 +814,7 @@ pub fn loadMarks(s: *Session, index: u32) void {
             .points = k.points,
             .width = if (k.width > 0) k.width else default_pen_width,
             .color = Library.parseColor(k.color) orelse ink_colour,
-            .anchor = (nameOf(s, b, k.anchor) catch return) orelse 0,
+            .anchor = (nameOf(s, b, k.page, k.anchor) catch return) orelse 0,
         }, true) catch return;
     }
 
@@ -774,25 +822,29 @@ pub fn loadMarks(s: *Session, index: u32) void {
     defer lib.freeComments(said, said.len);
 
     for (said) |c| {
-        const anchor = (nameOf(s, b, c.anchor) catch return) orelse continue;
+        const anchor = (nameOf(s, b, c.page, c.anchor) catch return) orelse continue;
         _ = b.marks.addComment(s.gpa, .{
             .id = c.id,
             .anchor = anchor,
-            .name = (nameOf(s, b, c.nm) catch return) orelse 0,
+            .name = (nameOf(s, b, c.page, c.nm) catch return) orelse 0,
             .text = c.text,
         }, true) catch return;
     }
 }
 
 /// The number a written name stands for in this buffer: one of fenrir's
-/// read as the number it spells, anybody else's held as it was written
-/// (`Marks.foreignName`). Null for no name.
-fn nameOf(s: *Session, b: *Buffer, nm: []const u8) Allocator.Error!?u64 {
+/// read as the number it spells, which is the document's; anybody else's
+/// held as it was written, which is its page's (`Marks.foreignName`).
+/// Null for no name.
+fn nameOf(s: *Session, b: *Buffer, page: u32, nm: []const u8) Allocator.Error!?u64 {
     if (nm.len == 0) return null;
-    if (Library.nameNumber(nm)) |n| {
-        if (n < Marks.foreign_base) return n;
-    }
-    return try b.marks.foreignName(s.gpa, nm);
+    if (fenrirName(nm)) |n| return n;
+    return try b.marks.foreignName(s.gpa, page, nm);
+}
+
+fn fenrirName(nm: []const u8) ?u64 {
+    const n = Library.nameNumber(nm) orelse return null;
+    return if (n < Marks.foreign_base) n else null;
 }
 
 /// How a name is written down: the other half of `nameOf`.
@@ -825,19 +877,168 @@ pub fn readAnnots(s: *Session, index: u32, already: ?[]const []const fenrir.anno
     defer arena.deinit();
     const a = arena.allocator();
 
+    const lists = a.alloc([]const fenrir.annots.Annot, b.pages.len) catch return;
+    for (b.pages, lists, 0..) |p, *list, page| {
+        list.* = if (already) |read| (if (page < read.len) read[page] else &.{}) else fenrir.annots.read(a, b.doc, p) catch &.{};
+    }
+
+    // Every name of fenrir's the file holds is spent before any is handed
+    // out: a page read late would otherwise find its `f12` given already,
+    // to an annotation on an earlier page that came with no name.
+    for (lists) |list| {
+        for (list) |annot| {
+            if (fenrirName(annot.name)) |n| b.marks.reserve(n);
+        }
+    }
+
     // What the library put there, asked once rather than once per
     // annotation: `lineCount` walks every mark.
-    var held: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    for (b.marks.items()) |m| held.put(a, m.anchor, {}) catch return;
-    for (b.marks.comments.items) |c| held.put(a, c.name, {}) catch return;
+    var held: Held = .{};
+    for (b.marks.items()) |m| held.anchors.put(a, m.anchor, {}) catch return;
+    for (b.marks.comments.items) |c| held.comments.put(a, c.name, {}) catch return;
+    renumberClashes(s, b, lists, &held, a) catch return;
+
+    // The names given before to annotations that came with none.
+    var named: Named = .empty;
+    if (s.library) |lib| {
+        const given: []Library.Naming = lib.namings(b.path) catch &.{};
+        defer lib.freeNamings(given, given.len);
+        for (given) |g| {
+            const n = fenrirName(g.nm) orelse continue;
+            named.put(a, .{ g.page, g.shape }, n) catch return;
+        }
+    }
 
     // What a reload takes away and reads again.
     const taken: ?*std.AutoHashMapUnmanaged(u64, void) = if (index < s.disks.items.len) &s.disks.items[index].taken else null;
-    for (b.pages, 0..) |p, page| {
-        const list = if (already) |read| (if (page < read.len) read[page] else &.{}) else fenrir.annots.read(a, b.doc, p) catch continue;
+    for (lists, 0..) |list, page| {
         if (list.len == 0) continue;
-        takeAnnots(s, a, b, @intCast(page), list, &held, taken) catch return;
+        takeAnnots(s, a, b, @intCast(page), list, &held, taken, &named) catch return;
     }
+}
+
+/// Names given to annotations that came with none, by page and shape.
+const Named = std.AutoHashMapUnmanaged(struct { u32, u64 }, u64);
+
+/// What the library holds, which the file does not get to say again: an
+/// anchor's lines, and a comment, apart. The first comment on an anchor has
+/// the anchor's name, so one set would let a comment written on another
+/// program's highlight hide the highlight it was written on.
+const Held = struct {
+    anchors: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    comments: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn contains(h: Held, n: u64) bool {
+        return h.anchors.contains(n) or h.comments.contains(n);
+    }
+};
+
+/// A name the library holds for something the reader made, which the file
+/// now holds for something else: a newer copy, annotated by another
+/// fenrir before this one's rows were written into it. The library's is
+/// given a new name, everywhere, and the file's is read as it is.
+///
+/// **Only a name with nothing in common.** A row the reader wrote over
+/// one of the file's -- recoloured, a line taken off, a comment changed
+/// -- is the same thing under the same name, and the library wins it, as
+/// it does at open; so is a row a save wrote in and did not live to clear.
+/// Each of those keeps a line where the file's is, or answers the same
+/// anchor. Asked once a name over the whole file, since one of fenrir's
+/// anchors may be on several pages and changed on only some of them.
+fn renumberClashes(
+    s: *Session,
+    b: *Buffer,
+    lists: []const []const fenrir.annots.Annot,
+    held: *Held,
+    a: Allocator,
+) Allocator.Error!void {
+    var shared: std.AutoArrayHashMapUnmanaged(u64, bool) = .empty;
+    for (lists, 0..) |list, page| {
+        for (list) |annot| {
+            const n = fenrirName(annot.name) orelse continue;
+            if (!held.contains(n)) continue;
+            const got = try shared.getOrPut(a, n);
+            if (!got.found_existing) got.value_ptr.* = false;
+            if (try sameThing(s, b, @intCast(page), list, n, annot)) got.value_ptr.* = true;
+        }
+    }
+    for (shared.keys(), shared.values()) |n, same| {
+        if (same) continue;
+        const fresh = b.marks.newName();
+        b.marks.rename(n, fresh);
+        if (held.anchors.remove(n)) try held.anchors.put(a, fresh, {});
+        if (held.comments.remove(n)) try held.comments.put(a, fresh, {});
+        var from: [Library.name_len]u8 = undefined;
+        var to: [Library.name_len]u8 = undefined;
+        if (s.library) |lib| lib.renumber(b.path, Library.makeName(&from, n), Library.makeName(&to, fresh)) catch {};
+        s.say("{s}: the file has another {s}; what this reader made under that name is {s} now", .{
+            b.title,
+            Library.makeName(&from, n),
+            Library.makeName(&to, fresh),
+        });
+    }
+}
+
+/// Whether what the reader holds as `n` and what the file draws as `annot`
+/// on `page` are one thing: a line or a stroke of it where one of the
+/// file's is, to the hundredth of a point a save keeps; for a reply, the
+/// same anchor answered. When the file does not say what a reply answers
+/// by a name, it is taken as the same: the library winning is what was
+/// done before there was a question, and a wrong renaming is worse.
+fn sameThing(s: *Session, b: *Buffer, page: u32, list: []const fenrir.annots.Annot, n: u64, annot: fenrir.annots.Annot) Allocator.Error!bool {
+    if (annot.kind == .reply) {
+        const thread = list[annot.thread orelse return true];
+        if (thread.name.len == 0) return true;
+        const answers = (try nameOf(s, b, page, thread.name)).?;
+        for (b.marks.comments.items) |c| {
+            if (c.name == n) return c.anchor == answers;
+        }
+        return false;
+    }
+    for (b.marks.items()) |m| {
+        if (m.anchor != n or m.page != page) continue;
+        if (m.kind == .ink) {
+            for (annot.paths) |path| {
+                if (samePath(m.points, path)) return true;
+            }
+        } else for (annot.lines) |box| {
+            if (sameBox(m.box, box)) return true;
+        }
+    }
+    return false;
+}
+
+fn sameBox(x: gelgja.Bounds, y: gelgja.Bounds) bool {
+    return near(x.min_x, y.min_x) and near(x.min_y, y.min_y) and near(x.max_x, y.max_x) and near(x.max_y, y.max_y);
+}
+
+fn samePath(x: []const Point, y: []const Point) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| {
+        if (!near(p.x, q.x) or !near(p.y, q.y)) return false;
+    }
+    return true;
+}
+
+fn near(x: f32, y: f32) bool {
+    return @abs(x - y) <= 0.006;
+}
+
+/// The number an annotation is held by: its name, unless it has none or
+/// its page repeats it, and then the name given it before by its shape,
+/// or a number that spells as nothing until one is (`nameUnnamed`).
+fn nameAt(
+    s: *Session,
+    b: *Buffer,
+    page: u32,
+    annot: fenrir.annots.Annot,
+    repeated: *const std.StringHashMapUnmanaged(u32),
+    named: *const Named,
+) Allocator.Error!u64 {
+    if (annot.name.len != 0 and (repeated.get(annot.name) orelse 0) < 2) return (try nameOf(s, b, page, annot.name)).?;
+    const shape = fenrir.annots.shapeOf(annot);
+    if (named.get(.{ page, shape })) |n| return n;
+    return b.marks.unnamedName(s.gpa, .{ .page = page, .shape = shape });
 }
 
 fn takeAnnots(
@@ -846,18 +1047,32 @@ fn takeAnnots(
     b: *Buffer,
     page: u32,
     list: []const fenrir.annots.Annot,
-    held: *const std.AutoHashMapUnmanaged(u64, void),
+    held: *const Held,
     taken: ?*std.AutoHashMapUnmanaged(u64, void),
+    named: *const Named,
 ) Allocator.Error!void {
+    // A name the page gives twice names neither: §12.5.2 makes `/NM` the
+    // page's own, and two annotations under one are two things it cannot
+    // tell apart. Both are taken as having none.
+    var repeated: std.StringHashMapUnmanaged(u32) = .empty;
+    for (list) |annot| {
+        if (annot.name.len == 0) continue;
+        const got = try repeated.getOrPut(a, annot.name);
+        got.value_ptr.* = if (got.found_existing) got.value_ptr.* + 1 else 1;
+    }
+
     // The anchor each was taken as, so a reply finds its thread's.
     const anchors = try a.alloc(u64, list.len);
     for (list, anchors) |annot, *anchor| {
         if (annot.kind == .reply) continue;
-        anchor.* = try nameOf(s, b, annot.name) orelse b.marks.newName();
-        if (held.contains(anchor.*)) continue;
+        anchor.* = try nameAt(s, b, page, annot, &repeated, named);
+        // The lines and the note apart: either may be the library's.
+        const lines = !held.anchors.contains(anchor.*);
+        const note = annot.text.len != 0 and !held.comments.contains(anchor.*);
+        if (!lines and !note) continue;
         if (taken) |t| try t.put(s.gpa, anchor.*, {});
 
-        switch (annot.kind) {
+        if (lines) switch (annot.kind) {
             .ink => for (annot.paths) |path| {
                 _ = try b.marks.add(s.gpa, .{
                     .kind = .ink,
@@ -877,9 +1092,9 @@ fn takeAnnots(
                     .anchor = anchor.*,
                 }, true);
             },
-        }
+        };
         // The markup's own note is the first comment, and has its name.
-        if (annot.text.len != 0) {
+        if (note) {
             _ = try b.marks.addComment(s.gpa, .{ .anchor = anchor.*, .name = anchor.*, .text = annot.text }, true);
         }
     }
@@ -887,10 +1102,10 @@ fn takeAnnots(
     for (list) |annot| {
         if (annot.kind != .reply or annot.text.len == 0) continue;
         const thread = annot.thread orelse continue;
-        // A reply with no name of its own gets a new one rather than
-        // the anchor's, which would make it the note on the markup.
-        const name = try nameOf(s, b, annot.name) orelse b.marks.newName();
-        if (held.contains(name)) continue;
+        // A reply with no name of its own gets a number rather than the
+        // anchor's, which would make it the note on the markup.
+        const name = try nameAt(s, b, page, annot, &repeated, named);
+        if (held.comments.contains(name)) continue;
         if (taken) |t| try t.put(s.gpa, name, {});
         _ = try b.marks.addComment(s.gpa, .{ .anchor = anchors[thread], .name = name, .text = annot.text }, true);
     }
@@ -1211,8 +1426,10 @@ test "the file's annotations are marks and comments, and the library's names win
     b.doc = &doc;
 
     // The library already holds the stroke, as a journal row newer than
-    // the file: it is not read a second time.
-    _ = try b.marks.add(gpa, .{ .kind = .ink, .points = &.{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } }, .anchor = 7 }, true);
+    // the file -- recoloured, where the file has it -- and it is not read
+    // a second time.
+    const red = Library.parseColor("red").?;
+    _ = try b.marks.add(gpa, .{ .kind = .ink, .points = &.{ .{ .x = 10, .y = 10 }, .{ .x = 40, .y = 40 } }, .color = red, .anchor = 7 }, true);
     readAnnots(&s, 0, null);
 
     const marks = &b.marks;
@@ -1235,6 +1452,141 @@ test "the file's annotations are marks and comments, and the library's names win
     // None of it is a change, and fenrir's next name is past the stroke's.
     try testing.expect(!marks.dirty);
     try testing.expect(marks.newName() > 7);
+}
+
+test "a name the reader made, which the file holds for something else, is given another" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+    var s = try sessionOf(gpa, &buf, 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    const b = s.buffer(0);
+    b.doc = &doc;
+
+    // A highlight this reader made as f7, not yet in the file, where a copy
+    // annotated elsewhere has a stroke under the same name.
+    _ = try lib.addMark("/docs/a.pdf", .{ .page = 0, .x0 = 300, .y0 = 100, .x1 = 400, .y1 = 112, .anchor = @constCast("f7") }, 1);
+    _ = try lib.addComment("/docs/a.pdf", .{ .anchor = @constCast("f7"), .nm = @constCast("f7"), .text = @constCast("mine") }, 1);
+    loadMarks(&s, 0);
+    readAnnots(&s, 0, null);
+
+    // Both are there: the file's stroke as f7, the highlight under a name
+    // past every one the file holds, its comment with it.
+    try testing.expectEqual(@as(usize, 4), b.marks.count());
+    const mine = b.marks.items()[0];
+    try testing.expect(mine.anchor > 7);
+    try testing.expectEqualStrings("mine", b.marks.said(mine.anchor)[0].text);
+    try testing.expectEqual(mine.anchor, b.marks.said(mine.anchor)[0].name);
+    for (b.marks.items()) |m| {
+        if (m.kind == .ink) try testing.expectEqual(@as(u64, 7), m.anchor);
+    }
+    var name: [Library.name_len]u8 = undefined;
+    const rows = try lib.marks("/docs/a.pdf");
+    defer lib.freeMarks(rows, rows.len);
+    try testing.expectEqualStrings(Library.makeName(&name, mine.anchor), rows[0].anchor);
+    const said = try lib.comments("/docs/a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqualStrings(rows[0].anchor, said[0].nm);
+}
+
+/// Two highlights under one name, which their page may not repeat, and an
+/// underline with none.
+const unnamed_pdf =
+    \\%PDF-1.7
+    \\1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+    \\2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+    \\3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Annots [30 0 R 31 0 R 32 0 R] >> endobj
+    \\30 0 obj << /Subtype /Highlight /Rect [100 700 300 712] /NM (dup) /QuadPoints [100 712 300 712 100 700 300 700] >> endobj
+    \\31 0 obj << /Subtype /Highlight /Rect [100 600 300 612] /NM (dup) /QuadPoints [100 612 300 612 100 600 300 600] >> endobj
+    \\32 0 obj << /Subtype /Underline /Rect [100 500 300 512] /QuadPoints [100 512 300 512 100 500 300 500] >> endobj
+    \\trailer << /Root 1 0 R /Size 40 >>
+    \\startxref 0
+    \\%%EOF
+    \\
+;
+
+test "an annotation with no name, or one its page repeats, is named when written about, and found by its shape" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, unnamed_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+    var s = try sessionOf(gpa, &buf, 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    const b = s.buffer(0);
+    b.doc = &doc;
+    loadMarks(&s, 0);
+    readAnnots(&s, 0, null);
+
+    // Three anchors, none of them spelled, and fenrir's count unspent.
+    try testing.expectEqual(@as(usize, 3), b.marks.count());
+    const items = b.marks.items();
+    try testing.expect(items[0].anchor != items[1].anchor);
+    var name: [Library.name_len]u8 = undefined;
+    for (items) |m| try testing.expectEqualStrings("", spell(b, m.anchor, &name));
+    try testing.expectEqual(@as(u64, 1), b.marks.next_name);
+
+    // A comment on the underline gives it fenrir's first name, written
+    // down by its shape, and the comment goes under that name.
+    const loose = items[2].anchor;
+    b.marks.beginGroup();
+    _ = try b.marks.addComment(gpa, .{ .anchor = loose, .text = "underlined" }, false);
+    applyEffects(&s);
+    const named = b.marks.items()[2].anchor;
+    try testing.expectEqual(@as(u64, 1), named);
+    try testing.expectEqualStrings("underlined", b.marks.said(named)[0].text);
+    try testing.expect(s.disk(0).taken.contains(named));
+    const given = try lib.namings("/docs/a.pdf");
+    defer lib.freeNamings(given, given.len);
+    try testing.expectEqual(@as(usize, 1), given.len);
+    try testing.expectEqualStrings("f1", given[0].nm);
+
+    // The next open finds the underline by its shape, and the comment on it.
+    var again = try sessionOf(gpa, &buf, 1, 1000, 800);
+    defer closeSession(&again);
+    try giveLibrary(&again, lib);
+    again.buffer(0).doc = &doc;
+    loadMarks(&again, 0);
+    readAnnots(&again, 0, null);
+    const back = again.buffer(0).marks.items();
+    try testing.expectEqual(@as(usize, 3), back.len);
+    try testing.expectEqual(@as(u64, 1), back[2].anchor);
+    try testing.expectEqualStrings("underlined", again.buffer(0).marks.said(1)[0].text);
+    // And the name stays spent: the next is past it.
+    try testing.expect(again.buffer(0).marks.newName() > 1);
+}
+
+test "a name handed out is not handed out again after its mark is gone" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var buf: [2]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 1), 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+
+    const made = markBoxes(&s, 0, &.{.{ .page = 0, .box = .fromRect(100, 700, 300, 712) }}, s.accent, .highlight);
+    applyEffects(&s);
+    s.buffer(0).marks.beginGroup();
+    _ = try s.buffer(0).marks.removeAt(gpa, 0);
+    applyEffects(&s);
+
+    // Counted from the rows, which are gone, the next open would give the
+    // same name to the next thing made, and a link to the old would land on it.
+    var again = try sessionOf(gpa, fakePages(&buf, 1), 1, 1000, 800);
+    defer closeSession(&again);
+    try giveLibrary(&again, lib);
+    loadMarks(&again, 0);
+    try testing.expect(again.buffer(0).marks.newName() > made);
 }
 
 test "a comment on another program's highlight is stored under that program's name" {

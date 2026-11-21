@@ -143,6 +143,12 @@ pub fn userVersion(lib: Library) Error!i64 {
 /// document was left, does not silently throw away what was written on it.
 /// `other` on a link is the other document's `/ID`, and empty when both
 /// comments are in this one. See "Anchors, comments and links" at the top.
+///
+/// `document.named` is the highest name ever handed out in the document,
+/// and `comment.page` the page of the anchor a comment is on, which is
+/// how another program's name is told apart from the same name on another
+/// page. `naming` gives a name to an annotation the file holds without a
+/// usable one of its own, by what it looks like; see `nameAnnotation`.
 fn create(lib: *Library) Error!void {
     try lib.db.exec(
         \\BEGIN;
@@ -188,7 +194,8 @@ fn create(lib: *Library) Error!void {
         \\CREATE TABLE IF NOT EXISTS document (
         \\    id      INTEGER PRIMARY KEY,
         \\    path    TEXT NOT NULL UNIQUE,
-        \\    file_id TEXT NOT NULL DEFAULT ''
+        \\    file_id TEXT NOT NULL DEFAULT '',
+        \\    named   INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE INDEX IF NOT EXISTS document_by_file ON document (file_id);
         \\CREATE TABLE IF NOT EXISTS comment (
@@ -196,6 +203,7 @@ fn create(lib: *Library) Error!void {
         \\    path        TEXT NOT NULL,
         \\    anchor      TEXT NOT NULL,
         \\    nm          TEXT NOT NULL,
+        \\    page        INTEGER NOT NULL DEFAULT 0,
         \\    text        TEXT NOT NULL DEFAULT '',
         \\    created_at  INTEGER NOT NULL DEFAULT 0,
         \\    modified_at INTEGER NOT NULL DEFAULT 0
@@ -211,6 +219,14 @@ fn create(lib: *Library) Error!void {
         \\    created_at INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE INDEX IF NOT EXISTS link_by_doc ON link (path);
+        \\CREATE TABLE IF NOT EXISTS naming (
+        \\    id    INTEGER PRIMARY KEY,
+        \\    path  TEXT NOT NULL,
+        \\    page  INTEGER NOT NULL,
+        \\    shape TEXT NOT NULL,
+        \\    nm    TEXT NOT NULL
+        \\);
+        \\CREATE INDEX IF NOT EXISTS naming_by_doc ON naming (path);
         \\PRAGMA user_version = 1;
         \\COMMIT;
     );
@@ -266,25 +282,125 @@ pub fn nameNumber(nm: []const u8) ?u64 {
 /// The highest name fenrir has given in a document, or 0 for none. The next
 /// is one more.
 ///
-/// Asked of every row because it is asked rarely -- once when a document is
-/// opened, and on each mark a command writes -- and a counter kept beside
-/// the rows is a second thing to be wrong.
+/// The rows, and `document.named` beside them. The rows alone would hand
+/// a deleted mark's name out again, and a link that named it -- in the
+/// library, or in a copy of the file sent before the delete -- would then
+/// attach to whatever was made next. **A name is never handed out twice**:
+/// do not go back to counting only what is still there.
 pub fn highestName(lib: Library, path: []const u8) Error!u64 {
     var s = try lib.db.prepare(
         \\SELECT anchor FROM mark WHERE path = ?1
         \\UNION SELECT anchor FROM ink WHERE path = ?1
         \\UNION SELECT nm FROM comment WHERE path = ?1
+        \\UNION SELECT nm FROM naming WHERE path = ?1
     );
     defer s.finalize();
     s.bindText(1, path);
     var high: u64 = 0;
     while (try s.step()) high = @max(high, nameNumber(s.columnText(0)) orelse 0);
+
+    var named = try lib.db.prepare("SELECT named FROM document WHERE path = ?1");
+    defer named.finalize();
+    named.bindText(1, path);
+    if (try named.step()) high = @max(high, @as(u64, @intCast(@max(0, named.columnInt(0)))));
     return high;
 }
 
-/// The name a new mark is given when its writer did not choose one.
+/// Records that names up to `n` have been handed out in a document, so
+/// that none of them is handed out again. Never lowers what is there.
+pub fn noteName(lib: Library, path: []const u8, n: u64) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare(
+        \\INSERT INTO document (path, named) VALUES (?1, ?2)
+        \\ON CONFLICT (path) DO UPDATE SET named = max(named, excluded.named)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindInt(2, @intCast(@min(n, std.math.maxInt(i64))));
+    try s.exec();
+}
+
+/// Moves every row that says `from` to `to`: a mark's anchor, a comment's
+/// anchor and its own name, either end of a link. What a name the reader
+/// made is changed to when a newer copy of the file turns out to hold the
+/// same one for something else. One transaction, so a document is never
+/// left half under each name.
+pub fn renumber(lib: Library, path: []const u8, from: []const u8, to: []const u8) Error!void {
+    if (lib.future) return;
+    try lib.db.exec("BEGIN");
+    errdefer lib.db.exec("ROLLBACK") catch {};
+    const steps = [_][]const u8{
+        "UPDATE mark SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
+        "UPDATE ink SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
+        "UPDATE comment SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
+        "UPDATE comment SET nm = ?3 WHERE path = ?1 AND nm = ?2",
+        "UPDATE link SET from_nm = ?3 WHERE path = ?1 AND from_nm = ?2",
+        "UPDATE link SET to_nm = ?3 WHERE path = ?1 AND to_nm = ?2 AND other = ''",
+        "UPDATE naming SET nm = ?3 WHERE path = ?1 AND nm = ?2",
+    };
+    for (steps) |sql| {
+        var s = try lib.db.prepare(sql);
+        defer s.finalize();
+        s.bindText(1, path);
+        s.bindText(2, from);
+        s.bindText(3, to);
+        try s.exec();
+    }
+    try lib.db.exec("COMMIT");
+}
+
+/// A name given to an annotation the file holds with none of its own, or
+/// with one its page repeats: by its page and by `shape`, a hash of what
+/// it looks like (`annots.shapeOf`), which is all that can find it again
+/// in a file whose objects another program may have renumbered.
+pub const Naming = struct {
+    page: u32,
+    shape: u64,
+    /// `f` and a number.
+    nm: []u8,
+};
+
+/// Records that the annotation on `page` with this shape is called `nm`
+/// from now on, until a save writes the name into the file itself.
+pub fn nameAnnotation(lib: Library, path: []const u8, page: u32, shape: u64, nm: []const u8) Error!void {
+    if (lib.future) return;
+    var hex: [16]u8 = undefined;
+    var s = try lib.db.prepare("INSERT INTO naming (path, page, shape, nm) VALUES (?1, ?2, ?3, ?4)");
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindInt(2, page);
+    s.bindText(3, std.fmt.bufPrint(&hex, "{x:0>16}", .{shape}) catch unreachable);
+    s.bindText(4, nm);
+    try s.exec();
+}
+
+/// Every name given to a document's unnamed annotations, oldest first.
+pub fn namings(lib: Library, path: []const u8) Error![]Naming {
+    var out: std.ArrayList(Naming) = .empty;
+    errdefer lib.freeNamings(out.items, out.items.len);
+    var s = try lib.db.prepare("SELECT page, shape, nm FROM naming WHERE path = ?1 ORDER BY id");
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const shape = std.fmt.parseInt(u64, s.columnText(1), 16) catch continue;
+        const nm = try lib.gpa.dupe(u8, s.columnText(2));
+        errdefer lib.gpa.free(nm);
+        try out.append(lib.gpa, .{ .page = @intCast(@max(0, s.columnInt(0))), .shape = shape, .nm = nm });
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freeNamings(lib: Library, list: []Naming, n: usize) void {
+    for (list[0..n]) |x| lib.gpa.free(x.nm);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
+/// The name a new mark is given when its writer did not choose one, noted
+/// as handed out before the row that carries it exists.
 fn nextName(lib: Library, path: []const u8, buf: *[name_len]u8) Error![]const u8 {
-    return makeName(buf, try lib.highestName(path) + 1);
+    const n = try lib.highestName(path) + 1;
+    try lib.noteName(path, n);
+    return makeName(buf, n);
 }
 
 // -- settings ----------------------------------------------------------------
@@ -895,6 +1011,11 @@ pub const Comment = struct {
     /// in a PDF it is the anchor's `/Contents` and has no annotation of its
     /// own to carry another.
     nm: []u8 = &.{},
+    /// The page of the anchor it is on, from 0. What tells two of another
+    /// program's annotations apart when they have one name on two pages,
+    /// which the standard allows (§12.5.2); fenrir's own names are the
+    /// document's and need no page.
+    page: u32 = 0,
     text: []u8 = &.{},
     /// Seconds since the epoch. `modified_at` is what a PDF's `/M` will say.
     created_at: i64 = 0,
@@ -907,8 +1028,8 @@ pub const Comment = struct {
 pub fn addComment(lib: Library, path: []const u8, c: Comment, now: i64) Error!i64 {
     if (lib.future) return 0;
     var s = try lib.db.prepare(
-        \\INSERT INTO comment (path, anchor, nm, text, created_at, modified_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+        \\INSERT INTO comment (path, anchor, nm, page, text, created_at, modified_at)
+        \\VALUES (?1, ?2, ?3, ?6, ?4, ?5, ?5)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -916,6 +1037,7 @@ pub fn addComment(lib: Library, path: []const u8, c: Comment, now: i64) Error!i6
     s.bindText(3, c.nm);
     s.bindText(4, c.text);
     s.bindInt(5, now);
+    s.bindInt(6, c.page);
     try s.exec();
     return lib.db.lastInsertRowId();
 }
@@ -955,7 +1077,7 @@ pub fn comments(lib: Library, path: []const u8) Error![]Comment {
     errdefer lib.freeComments(out.items, out.items.len);
 
     var s = try lib.db.prepare(
-        \\SELECT id, anchor, nm, text, created_at, modified_at FROM comment
+        \\SELECT id, anchor, nm, text, created_at, modified_at, page FROM comment
         \\WHERE path = ?1 ORDER BY id
     );
     defer s.finalize();
@@ -974,6 +1096,7 @@ pub fn comments(lib: Library, path: []const u8) Error![]Comment {
             .text = text,
             .created_at = s.columnInt(4),
             .modified_at = s.columnInt(5),
+            .page = @intCast(@max(0, s.columnInt(6))),
         });
     }
     return out.toOwnedSlice(lib.gpa);
@@ -1526,6 +1649,78 @@ test "a mark written without an anchor is the next name, and comments count" {
     // of one selection are one anchor.
     _ = try lib.addMark("a.pdf", .{ .page = 2, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("fa") }, 1);
     try testing.expectEqual(@as(u64, 10), try lib.highestName("a.pdf"));
+}
+
+test "a name handed out stays handed out when its row goes" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    const id = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4 }, 1);
+    try lib.removeMark(id);
+    // Counted from the rows alone this would be 0, and the next mark f1.
+    try testing.expectEqual(@as(u64, 1), try lib.highestName("a.pdf"));
+
+    // A reader that handed names out without writing rows says so, and is
+    // never taken down by a lower number.
+    try lib.noteName("a.pdf", 40);
+    try lib.noteName("a.pdf", 7);
+    try testing.expectEqual(@as(u64, 40), try lib.highestName("a.pdf"));
+    try testing.expectEqual(@as(u64, 0), try lib.highestName("b.pdf"));
+    // The `/ID` and the count share a row, and neither writes over the other.
+    try lib.setFileId("a.pdf", "00ff");
+    try testing.expectEqual(@as(u64, 40), try lib.highestName("a.pdf"));
+    const file = (try lib.fileId("a.pdf")).?;
+    defer testing.allocator.free(file);
+    try testing.expectEqualStrings("00ff", file);
+}
+
+test "a name moved is moved in every row that says it, and nowhere else" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("f3") }, 1);
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f3"), .nm = @constCast("f3"), .text = @constCast("why") }, 1);
+    _ = try lib.addLink("a.pdf", .{ .from = @constCast("f3"), .to = @constCast("f3"), .other = @constCast("abcd") }, 1);
+    _ = try lib.addMark("b.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("f3") }, 1);
+    try lib.renumber("a.pdf", "f3", "f9");
+
+    const list = try lib.marks("a.pdf");
+    defer lib.freeMarks(list, list.len);
+    try testing.expectEqualStrings("f9", list[0].anchor);
+    const said = try lib.comments("a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqualStrings("f9", said[0].anchor);
+    try testing.expectEqualStrings("f9", said[0].nm);
+    // The far end of a link names another document's f3, which is not this one.
+    const joined = try lib.links("a.pdf");
+    defer lib.freeLinks(joined, joined.len);
+    try testing.expectEqualStrings("f9", joined[0].from);
+    try testing.expectEqualStrings("f3", joined[0].to);
+    const other = try lib.marks("b.pdf");
+    defer lib.freeMarks(other, other.len);
+    try testing.expectEqualStrings("f3", other[0].anchor);
+}
+
+test "an unnamed annotation is named by its page and its shape, and the name counts" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    try lib.nameAnnotation("a.pdf", 4, 0xdead_beef_0000_0001, "f12");
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f12"), .nm = @constCast("f12"), .page = 4, .text = @constCast("seen") }, 1);
+    const named = try lib.namings("a.pdf");
+    defer lib.freeNamings(named, named.len);
+    try testing.expectEqual(@as(usize, 1), named.len);
+    try testing.expectEqual(@as(u32, 4), named[0].page);
+    try testing.expectEqual(@as(u64, 0xdead_beef_0000_0001), named[0].shape);
+    try testing.expectEqualStrings("f12", named[0].nm);
+    try testing.expectEqual(@as(u64, 38), try lib.highestName("a.pdf"));
+
+    const said = try lib.comments("a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqual(@as(u32, 4), said[0].page);
 }
 
 test "comments are many to an anchor, and change and go by row" {
