@@ -109,6 +109,8 @@ pub const Box = struct {
     /// whatever the character collection says it means, which on a page of
     /// Japanese is a letter.
     space: bool = false,
+    /// Which way the glyph's baseline runs, when it does not run across.
+    turn: Turn = .none,
 
     pub fn isSpace(b: Box) bool {
         return b.space;
@@ -118,6 +120,11 @@ pub const Box = struct {
         return (b.box.min_x + b.box.max_x) * 0.5;
     }
 };
+
+/// Which way a baseline runs up or down the page: a margin stamp, a rotated
+/// table head, a figure's y-axis label. `up` reads bottom to top, as text
+/// turned a quarter left does; `down` the other way.
+pub const Turn = enum(u8) { none, up, down };
 
 /// Glyphs sharing a baseline, in the order they are read along it.
 pub const Line = struct {
@@ -136,6 +143,8 @@ pub const Line = struct {
     column: u32 = 0,
     /// Which band of the page the line is in, counting down. See `group`.
     band: u32 = 0,
+    /// A line up or down the page rather than across it. See `group`.
+    turned: bool = false,
     /// The line as a span of `Page.text`, its inserted word spaces included
     /// and its newline not.
     at: u32 = 0,
@@ -228,8 +237,15 @@ pub const Page = struct {
     /// The band is chosen before either. A drag down the left column under a
     /// full-width figure must stay in that column, and the figure's own lines
     /// are as near its x as the column's are -- nearer, being wider.
+    ///
+    /// A turned line is found only by a point on it. It runs the height of
+    /// the margin, and as the nearest line to every height there it would
+    /// take the clicks meant for the body beside it.
     pub fn lineAt(p: Page, x: f32, y: f32) u32 {
         if (p.lines.len == 0) return 0;
+        for (p.lines, 0..) |l, i| {
+            if (l.turned and l.box.contains(.{ .x = x, .y = y })) return @intCast(i);
+        }
 
         const want = p.columnNear(p.bandNear(y), x);
         var best: u32 = 0;
@@ -251,6 +267,7 @@ pub const Page = struct {
         var best: u32 = 0;
         var best_d: f32 = std.math.floatMax(f32);
         for (p.lines) |l| {
+            if (l.turned) continue;
             const d = if (y < l.box.min_y)
                 l.box.min_y - y
             else if (y > l.box.max_y)
@@ -271,7 +288,7 @@ pub const Page = struct {
         var best: u32 = 0;
         var best_d: f32 = std.math.floatMax(f32);
         for (p.lines) |l| {
-            if (l.band != band) continue;
+            if (l.band != band or l.turned) continue;
             const d = if (x < l.box.min_x)
                 l.box.min_x - x
             else if (x > l.box.max_x)
@@ -360,6 +377,8 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
         };
         const glyphs = list.glyphsOf(run);
         if (glyphs.len == 0) continue;
+        const dir = run.transform.applyVector(.{ .x = 1, .y = 0 });
+        const turn: Turn = if (@abs(dir.y) <= @abs(dir.x)) .none else if (dir.y > 0) .up else .down;
 
         for (glyphs, 0..) |g, i| {
             // The advance the producer actually used, which is what puts a
@@ -402,6 +421,7 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
                 .box = box,
                 .base = pen.y,
                 .space = meaning.len == 1 and meaning[0] == ' ',
+                .turn = turn,
             });
         }
     }
@@ -486,7 +506,12 @@ fn flatten(
 /// A seventh of the glyph's height sits in the middle of that and scales
 /// with the type, so it means the same on a footnote as on a heading.
 fn gapIsSpace(prev: Box, next: Box) bool {
-    return next.box.min_x - prev.box.max_x > next.box.height() * 0.15;
+    // Measured along the baseline, against the glyph's height across it.
+    return switch (next.turn) {
+        .none => next.box.min_x - prev.box.max_x > next.box.height() * 0.15,
+        .up => next.box.min_y - prev.box.max_y > next.box.width() * 0.15,
+        .down => prev.box.min_y - next.box.max_y > next.box.width() * 0.15,
+    };
 }
 
 /// Sorts glyphs into reading order and cuts them into lines.
@@ -512,14 +537,22 @@ fn gapIsSpace(prev: Box, next: Box) bool {
 /// the right one too. The author reported that as a regression of the
 /// column work; `findBands` is the fix. Do not go back to one set of
 /// gutters for the page.
-fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
-    // Down the page, which is the order the gutter scan reads rows in.
-    std.mem.sort(Box, boxes, {}, struct {
+///
+/// Text turned up or down the page is read last, in its own direction: see
+/// `groupTurned`.
+fn group(gpa: Allocator, all: []Box) Allocator.Error![]Line {
+    // Down the page, which is the order the gutter scan reads rows in; the
+    // turned glyphs after every other.
+    std.mem.sort(Box, all, {}, struct {
         fn less(_: void, a: Box, b: Box) bool {
+            if ((a.turn == .none) != (b.turn == .none)) return a.turn == .none;
             if (a.box.min_y != b.box.min_y) return a.box.min_y > b.box.min_y;
             return a.box.min_x < b.box.min_x;
         }
     }.less);
+    var across: usize = 0;
+    while (across < all.len and all[across].turn == .none) across += 1;
+    const boxes = all[0..across];
 
     var bands_buf: [max_bands]Band = undefined;
     const bands = findBands(boxes, &bands_buf);
@@ -589,7 +622,70 @@ fn group(gpa: Allocator, boxes: []Box) Allocator.Error![]Line {
         column_base += @intCast(gutters.len + 1);
         band_start = band.end;
     }
+    try groupTurned(gpa, all, across, column_base, @intCast(bands.len), &lines);
     return lines.toOwnedSlice(gpa);
+}
+
+/// The lines of text turned up or down the page, after the page's others.
+///
+/// Read along their own baseline, so that a line of it is one stop for the
+/// caret: grouped across the page it was a line per letter, and `j` walked
+/// an arXiv stamp down the margin thirty presses long before reaching the
+/// title. The author asked that `j` and `k` move a line at a time in every
+/// build; do not put these back through the across-the-page grouping.
+///
+/// Marginal, so after the body in reading order, each a column of its own
+/// and in no band the body's lines are found in -- see `Page.lineAt`. Lines
+/// turned up read left to right and bottom to top, as the page turned a
+/// quarter right shows them; turned down, the other way.
+fn groupTurned(gpa: Allocator, boxes: []Box, from: usize, column_base: u32, band: u32, lines: *std.ArrayList(Line)) Allocator.Error!void {
+    const turned = boxes[from..];
+    std.mem.sort(Box, turned, {}, struct {
+        fn less(_: void, a: Box, b: Box) bool {
+            if (a.turn != b.turn) return @intFromEnum(a.turn) < @intFromEnum(b.turn);
+            if (a.box.min_x != b.box.min_x) return (a.box.min_x < b.box.min_x) == (a.turn == .up);
+            return alongTurn({}, a, b);
+        }
+    }.less);
+
+    var column = column_base;
+    var start: usize = 0;
+    var i: usize = 1;
+    while (i <= turned.len) : (i += 1) {
+        if (i < turned.len and turned[i].turn == turned[start].turn and sameTurnedLine(turned[start], turned[i])) continue;
+        const on_line = turned[start..i];
+        std.mem.sort(Box, on_line, {}, alongTurn);
+        var box: Bounds = .empty;
+        var baseline: f32 = 0;
+        for (on_line) |g| {
+            box = box.unionWith(g.box);
+            baseline += g.base;
+        }
+        try lines.append(gpa, .{
+            .first = @intCast(from + start),
+            .count = @intCast(on_line.len),
+            .baseline = baseline / @as(f32, @floatFromInt(on_line.len)),
+            .box = box,
+            .column = column,
+            .band = band,
+            .turned = true,
+        });
+        column += 1;
+        start = i;
+    }
+}
+
+/// Reading order along a turned baseline: up the page, or down it.
+fn alongTurn(_: void, a: Box, b: Box) bool {
+    return if (a.turn == .up) a.box.min_y < b.box.min_y else a.box.max_y > b.box.max_y;
+}
+
+/// `sameLine` turned a quarter: horizontal extents overlapping by more than
+/// half the narrower.
+fn sameTurnedLine(a: Box, b: Box) bool {
+    const overlap = @min(a.box.max_x, b.box.max_x) - @max(a.box.min_x, b.box.min_x);
+    const narrower = @min(a.box.width(), b.box.width());
+    return overlap > 0 and narrower > 0 and overlap > narrower * 0.5;
 }
 
 fn byX(_: void, a: Box, b: Box) bool {
