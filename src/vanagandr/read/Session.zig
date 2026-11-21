@@ -822,6 +822,16 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
             if (v.buffer >= s.bufferCount()) return false;
             s.disk(v.buffer).reload = .forced;
         },
+        .write => {
+            if (!caps.marks) return s.absent(name);
+            marks.retryEffects(s);
+            const left = marks.unsaved(s);
+            if (left != 0) {
+                s.say("{d} changes the library still will not take -- kept, and tried again on the next", .{left});
+                return false;
+            }
+            if (s.status.len == 0) s.say("every change is kept", .{});
+        },
         .page => {
             // `:page 12`, `:page +2`, `:page -1`.
             const relative = args.len > 0 and (args[0] == '+' or args[0] == '-');
@@ -1495,6 +1505,7 @@ pub fn statusLine(s: *Session) chrome_mod.Status {
         .percent = v.percent(),
         .fit = v.fit.label(),
         .windows = s.layout().count(),
+        .unsaved = if (caps.marks) @intCast(marks.unsaved(s)) else 0,
     };
 
     switch (mode) {

@@ -1,6 +1,7 @@
 *
 !*/
 !.gitignore
+!.plan
 !README.md
 !LICENSE
 !myths.md

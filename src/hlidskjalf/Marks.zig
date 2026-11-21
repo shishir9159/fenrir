@@ -30,6 +30,12 @@
 //! the mark back*, through the same path as adding it the first time, so the
 //! database cannot disagree with the screen about what was undone.
 //!
+//! An effect the library would not write is not dropped. It is kept
+//! (`keep`), and so is everything queued after it, because a later update
+//! or delete may need the row the refused insert would have made; the next
+//! pass the reader makes with something new, or `:w`, tries them again in
+//! order.
+//!
 //! A mark has two identities. `key` is this session's, handed out here and
 //! never reused, and it is what history refers to. `id` is the database row,
 //! which changes when an undone removal is written back as a new row. History
@@ -354,6 +360,11 @@ dirty: bool = false,
 /// Database work waiting for the reader to do it.
 effects: std.ArrayList(Effect) = .empty,
 
+/// Database work the library refused, oldest first, waiting to be tried
+/// again. Not `effects`: those are new, and a plugin is told of each once,
+/// where these were told of when they happened.
+unwritten: std.ArrayList(Effect) = .empty,
+
 undo_stack: std.ArrayList(Change) = .empty,
 redo_stack: std.ArrayList(Change) = .empty,
 
@@ -386,6 +397,7 @@ pub fn deinit(m: *Marks, gpa: Allocator) void {
     m.led.deinit(gpa);
     m.lines.deinit(gpa);
     m.effects.deinit(gpa);
+    m.unwritten.deinit(gpa);
     m.undo_stack.deinit(gpa);
     m.redo_stack.deinit(gpa);
     m.owned.deinit();
@@ -427,6 +439,27 @@ pub fn takeEffects(m: *Marks) []const Effect {
 
 pub fn clearEffects(m: *Marks) void {
     m.effects.clearRetainingCapacity();
+}
+
+/// Holds on to effects the library did not write, after any held already.
+/// A delete of a mark whose insert is held still waits behind the insert:
+/// written first, it would find no row, and the insert would then make
+/// one for a mark that is gone.
+pub fn keep(m: *Marks, gpa: Allocator, refused: []const Effect) Allocator.Error!void {
+    try m.unwritten.appendSlice(gpa, refused);
+}
+
+/// The first `n` held effects were written at last.
+pub fn wrote(m: *Marks, n: usize) void {
+    const left = m.unwritten.items.len - n;
+    std.mem.copyForwards(Effect, m.unwritten.items[0..left], m.unwritten.items[n..]);
+    m.unwritten.shrinkRetainingCapacity(left);
+}
+
+/// How many changes the library has not got yet: what the status line
+/// counts as unsaved.
+pub fn owed(m: Marks) usize {
+    return m.unwritten.items.len;
 }
 
 // -- changing it --------------------------------------------------------------
@@ -1471,6 +1504,34 @@ test "effects say exactly what the database must do, rows included" {
     // And the redo deletes the new row.
     _ = try m.redo(gpa);
     try testing.expectEqual(@as(i64, 42), m.takeEffects()[0].delete.id);
+}
+
+test "what the library refused is held in order until it is written" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    _ = try m.add(gpa, .{ .page = 0, .box = box(0, 0, 1, 1) }, false);
+    try m.recolour(gpa, 0, .{ .r = 0, .g = 0, .b = 1, .a = 1 });
+    const key = m.items()[0].key;
+    try m.keep(gpa, m.takeEffects());
+    m.clearEffects();
+    try testing.expectEqual(@as(usize, 2), m.owed());
+
+    // A later change waits behind them rather than overtaking them.
+    _ = try m.removeAt(gpa, 0);
+    try m.keep(gpa, m.takeEffects());
+    m.clearEffects();
+    try testing.expectEqual(Effect{ .insert = key }, m.unwritten.items[0]);
+    try testing.expectEqual(Effect{ .update = key }, m.unwritten.items[1]);
+    try testing.expectEqual(key, m.unwritten.items[2].delete.key);
+
+    // Two got through on the next try; the third is still owed.
+    m.wrote(2);
+    try testing.expectEqual(@as(usize, 1), m.owed());
+    try testing.expectEqual(key, m.unwritten.items[0].delete.key);
+    m.wrote(1);
+    try testing.expectEqual(@as(usize, 0), m.owed());
 }
 
 test "clearing everything is one step to undo" {

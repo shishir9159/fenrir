@@ -577,8 +577,48 @@ pub fn undoMarks(s: *Session, forwards: bool) void {
 /// after the commands, so that a burst of edits is written as it settles
 /// rather than one statement per keystroke inside the handler.
 pub fn applyEffects(s: *Session) void {
-    for (s.buffers.items, 0..) |*b, at| {
-        if (b.marks.takeEffects().len == 0) continue;
+    writeEffects(s, false);
+}
+
+/// `:w`'s pass: what the library refused before is tried again even when
+/// nothing new has come to carry it.
+pub fn retryEffects(s: *Session) void {
+    writeEffects(s, true);
+}
+
+/// The changes no library has yet, over every open document: what the
+/// status line counts.
+pub fn unsaved(s: *Session) usize {
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < s.bufferCount()) : (i += 1) n += s.buffer(i).marks.owed();
+    return n;
+}
+
+/// What the library refused is tried again first, in order, and on the
+/// next pass that brings something new rather than every frame: a disk
+/// that is full, or a library another process holds locked, is not going
+/// to change its mind in a sixtieth of a second, and asking every frame
+/// would be a failed statement a frame for as long as it lasts.
+///
+/// **Nothing refused is dropped.** This cleared the queue and swallowed
+/// every error once, so an insert that failed left its mark with no row
+/// for good, and its later recolours and its delete were skipped as being
+/// for a mark the library never had. Do not go back to clearing first.
+fn writeEffects(s: *Session, retry: bool) void {
+    var at: u32 = 0;
+    while (at < s.bufferCount()) : (at += 1) {
+        const b = s.buffer(at);
+        const fresh = b.marks.takeEffects().len != 0;
+        if (!fresh and !(retry and b.marks.owed() != 0)) continue;
+        const was = b.marks.owed();
+
+        var done: usize = 0;
+        for (b.marks.unwritten.items) |e| {
+            writeEffect(s, b, e) catch break;
+            done += 1;
+        }
+        b.marks.wrote(done);
 
         // Taken out of the buffer before anything is told about them: a
         // plugin handler for `highlight` may make another change, and
@@ -587,10 +627,17 @@ pub fn applyEffects(s: *Session) void {
         defer s.gpa.free(effects);
         b.marks.clearEffects();
 
-        for (effects) |e| {
-            writeEffect(s, b, e);
-            plugins_mod.announceEffect(s, @intCast(at), b, e);
+        for (effects, 0..) |e, i| {
+            // Behind what is still held, whether or not it would go now.
+            if (b.marks.owed() == 0) {
+                writeEffect(s, b, e) catch |err| {
+                    s.say("the library would not take that ({t}) -- kept, and tried again on the next change or :w", .{err});
+                    b.marks.keep(s.gpa, effects[i .. i + 1]) catch {};
+                };
+            } else b.marks.keep(s.gpa, effects[i .. i + 1]) catch {};
+            plugins_mod.announceEffect(s, at, b, e);
         }
+        if (was != 0 and b.marks.owed() == 0) s.say("{s}: the library has every change now", .{b.title});
     }
 }
 
@@ -600,16 +647,22 @@ pub fn applyEffects(s: *Session) void {
 /// `Effect` says *what happened* to a mark, and which table that is is a
 /// fact about the mark. A delete carries the whole mark for this reason,
 /// so a row can still be found after the mark has left the list.
-fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
+///
+/// A change to what is no longer there, or never got a row, has nothing
+/// left to write and is done: an insert of a mark deleted since, an
+/// update of one whose insert is held in front of it, which writes the
+/// mark as it is now.
+fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) Library.Error!void {
     const lib = s.library orelse return;
     switch (e) {
         .insert => |key| {
             const mark = b.marks.byKey(key) orelse return;
+            if (mark.saved()) return;
             var hex: [7]u8 = undefined;
             var name: [Library.name_len]u8 = undefined;
             const anchor = spell(b, mark.anchor, &name);
             const id = switch (mark.kind) {
-                .block => lib.addMark(b.path, .{
+                .block => try lib.addMark(b.path, .{
                     .page = mark.page,
                     .x0 = mark.box.min_x,
                     .y0 = mark.box.min_y,
@@ -618,45 +671,48 @@ fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) void {
                     .color = @constCast(hexOf(mark.color, &hex)),
                     .style = @constCast(@tagName(mark.style)),
                     .anchor = @constCast(anchor),
-                }, now(s)) catch return,
-                .ink => lib.addStroke(b.path, .{
+                }, now(s)),
+                .ink => try lib.addStroke(b.path, .{
                     .page = mark.page,
                     .color = @constCast(hexOf(mark.color, &hex)),
                     .width = mark.width,
                     .points = @constCast(mark.points),
                     .anchor = @constCast(anchor),
-                }, now(s)) catch return,
+                }, now(s)),
             };
             b.marks.setId(key, id);
         },
+        // A mark that went before its held insert was tried again never
+        // got a row: the insert found nothing to write.
         .delete => |mark| if (mark.saved()) switch (mark.kind) {
-            .block => lib.removeMark(mark.id) catch {},
-            .ink => lib.removeStroke(mark.id) catch {},
+            .block => try lib.removeMark(mark.id),
+            .ink => try lib.removeStroke(mark.id),
         },
         .update => |key| {
             const mark = b.marks.byKey(key) orelse return;
             if (!mark.saved()) return;
             var hex: [7]u8 = undefined;
             switch (mark.kind) {
-                .block => lib.updateMark(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)) catch {},
-                .ink => lib.updateStroke(mark.id, hexOf(mark.color, &hex)) catch {},
+                .block => try lib.updateMark(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)),
+                .ink => try lib.updateStroke(mark.id, hexOf(mark.color, &hex)),
             }
         },
         .comment_insert => |key| {
             const c = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
+            if (c.saved()) return;
             var anchor: [Library.name_len]u8 = undefined;
             var own: [Library.name_len]u8 = undefined;
-            const id = lib.addComment(b.path, .{
+            const id = try lib.addComment(b.path, .{
                 .anchor = @constCast(spell(b, c.anchor, &anchor)),
                 .nm = @constCast(spell(b, c.name, &own)),
                 .text = @constCast(c.text),
-            }, now(s)) catch return;
+            }, now(s));
             b.marks.setCommentId(key, id);
         },
-        .comment_delete => |c| if (c.saved()) lib.removeComment(c.id) catch {},
+        .comment_delete => |c| if (c.saved()) try lib.removeComment(c.id),
         .comment_update => |key| {
             const c = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
-            if (c.saved()) lib.updateComment(c.id, c.text, now(s)) catch {};
+            if (c.saved()) try lib.updateComment(c.id, c.text, now(s));
         },
     }
 }
@@ -1079,6 +1135,49 @@ test "visual mode: select with motions, highlight in a colour, undo it" {
     try testing.expectEqual(@as(usize, 0), marks.count());
     _ = s.apply(.redo);
     try testing.expectEqual(@as(usize, 2), marks.count());
+}
+
+test "a change the library refuses is kept, counted, and written once it will take it" {
+    // The open gap this closes: the queue was cleared before writing and
+    // every error swallowed, so the mark below would have had no row for
+    // good, and its recolour been skipped as a change to nothing stored.
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var buf: [2]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 1), 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    const b = s.buffer(0);
+
+    // A table that is not there is a write that fails, as a full disk's is.
+    try lib.db.exec("ALTER TABLE mark RENAME TO away");
+    highlightBoxes(&s, 0, &.{.{ .page = 0, .box = .fromRect(100, 700, 300, 712) }}, s.accent);
+    applyEffects(&s);
+    try testing.expectEqual(@as(usize, 1), b.marks.owed());
+    try testing.expectEqual(@as(u32, 1), s.statusLine().unsaved);
+    try testing.expect(std.mem.indexOf(u8, s.status, "kept") != null);
+
+    // Changed again while it is held: behind it, and not tried every frame.
+    b.marks.beginGroup();
+    try b.marks.recolour(gpa, 0, Library.parseColor("green").?);
+    applyEffects(&s);
+    try testing.expectEqual(@as(usize, 2), b.marks.owed());
+    applyEffects(&s);
+    try testing.expectEqual(@as(usize, 2), b.marks.owed());
+
+    // The library can take it again, and `:w` does not wait for a change.
+    try lib.db.exec("ALTER TABLE away RENAME TO mark");
+    try testing.expect(s.exec("w"));
+    try testing.expectEqual(@as(usize, 0), b.marks.owed());
+    try testing.expectEqual(@as(u32, 0), s.statusLine().unsaved);
+
+    const rows = try lib.marks("/docs/a.pdf");
+    defer lib.freeMarks(rows, rows.len);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("#3fa34d", rows[0].color);
+    try testing.expect(b.marks.items()[0].saved());
 }
 
 /// A page carrying what Acrobat leaves and what a save by fenrir would: a

@@ -342,6 +342,10 @@ pub const Status = struct {
     fit: []const u8 = "",
     /// Shown only when there is more than one.
     windows: u32 = 1,
+    /// Changes to the marks the library would not take, kept to be tried
+    /// again. Shown only when there are some: it is the one thing in the
+    /// bar that says something may be lost.
+    unsaved: u32 = 0,
 };
 
 /// What the zoom control was asked for.
@@ -537,6 +541,14 @@ fn modeLine(ui: *UI, t: Theme, st: Status, z: *Zoom) !void {
             try w.spacer(ui, .px(gutter));
         }
 
+        if (st.unsaved != 0) {
+            // In the foreground, as the mode is: drawn dim, it would read
+            // as a count of something that is fine.
+            ui.next(.{ .fg = t.text });
+            _ = try w.labelf(ui, "{d} unsaved###unsaved", .{st.unsaved});
+            try w.spacer(ui, .px(gutter));
+        }
+
         try zoomControl(ui, t, st, z);
         try w.spacer(ui, .px(gutter * 0.4));
 
@@ -665,6 +677,19 @@ test "a label that counts keeps its identity when only the number moves" {
     // The same box, so turning a page does not restart its animation.
     try testing.expectEqual(first, second);
     try testing.expectEqualStrings("8 / 48", second.text);
+}
+
+test "changes the library has not taken are counted on the right, and only then" {
+    var ui: UI = .init(testing.allocator, UI.fixed_metrics);
+    defer ui.deinit();
+
+    try solve(&ui, .{ .title = "a.pdf", .unsaved = 3 });
+    try testing.expectEqualStrings("3 unsaved", group(&ui, "right").first.?.text);
+
+    // Gone when the library has caught up, rather than drawn as a nought.
+    try solve(&ui, .{ .title = "a.pdf" });
+    var it = group(&ui, "right").children();
+    while (it.next()) |child| try testing.expect(std.mem.indexOf(u8, child.text, "unsaved") == null);
 }
 
 test "a message longer than the window cannot push the page number off it" {

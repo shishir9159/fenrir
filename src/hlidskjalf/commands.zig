@@ -82,6 +82,7 @@ pub const Id = enum {
     bnext,
     bprevious,
     reload,
+    write,
     page,
     zoom,
     fit,
@@ -164,6 +165,7 @@ pub const table = [_]Entry{
     .{ .id = .bnext, .name = "bnext", .aliases = &.{"bn"}, .icon = "fenrir.chevron_right", .binding = "<C-w>n", .about = "show the next open document in this window" },
     .{ .id = .bprevious, .name = "bprevious", .aliases = &.{"bp"}, .icon = "fenrir.chevron_left", .binding = "<C-w>b", .about = "show the previous open document in this window" },
     .{ .id = .reload, .name = "reload", .aliases = &.{"e!"}, .icon = "fenrir.page", .about = "read this document again from its file, whole or not" },
+    .{ .id = .write, .name = "write", .aliases = &.{"w"}, .icon = "fenrir.page", .about = "keep every change to the marks, trying again what the library refused" },
 
     .{ .id = .page, .name = "page", .args = "N | +N | -N", .needs_argument = true, .icon = "fenrir.page", .about = "go to a page, or so many pages along" },
     .{ .id = .zoom, .name = "zoom", .args = "PERCENT", .needs_argument = true, .icon = "fenrir.zoom_in", .binding = "+ -", .about = "set the zoom, as a percentage of the true size" },
