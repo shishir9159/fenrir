@@ -664,45 +664,44 @@ fn noteNames(s: *Session, b: *Buffer) void {
 /// left to write and is done: an insert of a mark deleted since, an
 /// update of one whose insert is held in front of it, which writes the
 /// mark as it is now.
+///
+/// **A change to something the file holds is journaled too.** The library
+/// wins by name on the next open, so a recolour, a restyle or a line taken
+/// off one of the file's anchors writes a row for every line it has left
+/// (`adopt`), and deleting the last of them, or one of the file's
+/// comments, writes a `gone` row. Without them a recolour of Acrobat's
+/// highlight came back in Acrobat's colour, and a deleted one came back.
 fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) Library.Error!void {
     const lib = s.library orelse return;
     switch (e) {
         .insert => |key| {
             const mark = b.marks.byKey(key) orelse return;
             if (mark.saved()) return;
-            var hex: [7]u8 = undefined;
-            var name: [Library.name_len]u8 = undefined;
-            const anchor = spell(b, mark.anchor, &name);
-            const id = switch (mark.kind) {
-                .block => try lib.addMark(b.path, .{
-                    .page = mark.page,
-                    .x0 = mark.box.min_x,
-                    .y0 = mark.box.min_y,
-                    .x1 = mark.box.max_x,
-                    .y1 = mark.box.max_y,
-                    .color = @constCast(hexOf(mark.color, &hex)),
-                    .style = @constCast(@tagName(mark.style)),
-                    .anchor = @constCast(anchor),
-                }, now(s)),
-                .ink => try lib.addStroke(b.path, .{
-                    .page = mark.page,
-                    .color = @constCast(hexOf(mark.color, &hex)),
-                    .width = mark.width,
-                    .points = @constCast(mark.points),
-                    .anchor = @constCast(anchor),
-                }, now(s)),
-            };
+            // The file's, put back by an undo: its anchor is the reader's
+            // version of the file's from here on.
+            if (inFile(s, b, mark.anchor)) return adopt(s, b, mark.anchor);
+            const id = try insertRow(s, b, mark.*, false);
             b.marks.setId(key, id);
         },
         // A mark that went before its held insert was tried again never
         // got a row: the insert found nothing to write.
-        .delete => |mark| if (mark.saved()) switch (mark.kind) {
-            .block => try lib.removeMark(mark.id),
-            .ink => try lib.removeStroke(mark.id),
+        .delete => |mark| {
+            if (mark.saved()) switch (mark.kind) {
+                .block => try lib.removeMark(mark.id),
+                .ink => try lib.removeStroke(mark.id),
+            };
+            if (!inFile(s, b, mark.anchor)) return;
+            if (b.marks.lineCount(mark.anchor) != 0) return adopt(s, b, mark.anchor);
+            const anchor = try nameUnnamed(s, b, mark.anchor);
+            var name: [Library.name_len]u8 = undefined;
+            try lib.addGone(b.path, .{ .nm = @constCast(spell(b, anchor, &name)), .page = mark.page });
         },
         .update => |key| {
             const mark = b.marks.byKey(key) orelse return;
-            if (!mark.saved()) return;
+            if (!mark.saved()) {
+                if (inFile(s, b, mark.anchor)) try adopt(s, b, mark.anchor);
+                return;
+            }
             var hex: [7]u8 = undefined;
             switch (mark.kind) {
                 .block => try lib.updateMark(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)),
@@ -712,26 +711,101 @@ fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) Library.Error!void {
         .comment_insert => |key| {
             const was = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
             if (was.saved()) return;
-            try nameUnnamed(s, b, was.anchor);
-            // Asked again: a name given just now has moved it in the list.
-            const c = b.marks.comments.items[b.marks.commentIndex(key).?];
-            var anchor: [Library.name_len]u8 = undefined;
-            var own: [Library.name_len]u8 = undefined;
-            const first = b.marks.firstLine(s.gpa, c.anchor);
-            const id = try lib.addComment(b.path, .{
-                .anchor = @constCast(spell(b, c.anchor, &anchor)),
-                .nm = @constCast(spell(b, c.name, &own)),
-                .page = if (first) |i| b.marks.items()[i].page else 0,
-                .text = @constCast(c.text),
-            }, now(s));
-            b.marks.setCommentId(key, id);
+            try insertComment(s, b, key);
         },
-        .comment_delete => |c| if (c.saved()) try lib.removeComment(c.id),
+        .comment_delete => |c| {
+            if (c.saved()) try lib.removeComment(c.id);
+            if (!inFile(s, b, c.name)) return;
+            // On an anchor that went with it: the anchor's `gone` row takes
+            // the annotation and its replies out together.
+            if (b.marks.lineCount(c.anchor) == 0 and inFile(s, b, c.anchor)) return;
+            const name = try nameUnnamed(s, b, c.name);
+            var buf: [Library.name_len]u8 = undefined;
+            try lib.addGone(b.path, .{ .nm = @constCast(spell(b, name, &buf)), .page = anchorPage(s, b, c.anchor), .comment = true });
+        },
         .comment_update => |key| {
             const c = b.marks.comments.items[b.marks.commentIndex(key) orelse return];
-            if (c.saved()) try lib.updateComment(c.id, c.text, now(s));
+            if (c.saved()) return lib.updateComment(c.id, c.text, now(s));
+            if (inFile(s, b, c.name)) try insertComment(s, b, key);
         },
     }
+}
+
+/// A row for a mark, as it is now. `edit` when it is the reader's version
+/// of one of the file's.
+fn insertRow(s: *Session, b: *Buffer, mark: Marks.Mark, edit: bool) Library.Error!i64 {
+    const lib = s.library.?;
+    var hex: [7]u8 = undefined;
+    var name: [Library.name_len]u8 = undefined;
+    const anchor = spell(b, mark.anchor, &name);
+    return switch (mark.kind) {
+        .block => lib.addMark(b.path, .{
+            .page = mark.page,
+            .x0 = mark.box.min_x,
+            .y0 = mark.box.min_y,
+            .x1 = mark.box.max_x,
+            .y1 = mark.box.max_y,
+            .color = @constCast(hexOf(mark.color, &hex)),
+            .style = @constCast(@tagName(mark.style)),
+            .anchor = @constCast(anchor),
+            .edit = edit,
+        }, now(s)),
+        .ink => lib.addStroke(b.path, .{
+            .page = mark.page,
+            .color = @constCast(hexOf(mark.color, &hex)),
+            .width = mark.width,
+            .points = @constCast(mark.points),
+            .anchor = @constCast(anchor),
+            .edit = edit,
+        }, now(s)),
+    };
+}
+
+/// A row for every line of one of the file's anchors that has none, so
+/// that the library holds the whole anchor as the reader has it: it wins
+/// by name, and an anchor it held half of would come back as that half.
+/// Asked again after a refusal it writes only what is still missing.
+fn adopt(s: *Session, b: *Buffer, was: u64) Library.Error!void {
+    const anchor = try nameUnnamed(s, b, was);
+    for (b.marks.items(), 0..) |m, i| {
+        if (m.anchor != anchor or m.saved()) continue;
+        b.marks.list.items[i].id = try insertRow(s, b, m, true);
+    }
+}
+
+/// A comment's row: one the reader wrote, or its version of one of the
+/// file's. Whatever came with no usable name is given one first, the
+/// anchor and the comment both, or the row would name nothing.
+fn insertComment(s: *Session, b: *Buffer, key: u64) Library.Error!void {
+    const lib = s.library.?;
+    const first = b.marks.comments.items[b.marks.commentIndex(key).?];
+    _ = try nameUnnamed(s, b, first.anchor);
+    _ = try nameUnnamed(s, b, b.marks.comments.items[b.marks.commentIndex(key).?].name);
+    // Asked again: a name given just now has moved it in the list.
+    const c = b.marks.comments.items[b.marks.commentIndex(key).?];
+    var anchor: [Library.name_len]u8 = undefined;
+    var own: [Library.name_len]u8 = undefined;
+    const id = try lib.addComment(b.path, .{
+        .anchor = @constCast(spell(b, c.anchor, &anchor)),
+        .nm = @constCast(spell(b, c.name, &own)),
+        .page = anchorPage(s, b, c.anchor),
+        .text = @constCast(c.text),
+        .edit = inFile(s, b, c.name),
+    }, now(s));
+    b.marks.setCommentId(key, id);
+}
+
+/// The page an anchor begins on, which is the page another program's name
+/// for it belongs to.
+fn anchorPage(s: *Session, b: *Buffer, anchor: u64) u32 {
+    const first = b.marks.firstLine(s.gpa, anchor) orelse return 0;
+    return b.marks.items()[first].page;
+}
+
+/// Whether the file holds something by this name, whoever's it is now.
+fn inFile(s: *Session, b: *Buffer, name: u64) bool {
+    const t = takenOf(s, b) orelse return false;
+    return t.contains(name);
 }
 
 pub fn hexOf(c: Color, buf: *[7]u8) []const u8 {
@@ -753,10 +827,11 @@ fn now(s: *const Session) i64 {
 /// written down, and the library notes which annotation that is by its
 /// shape; the save that next writes the file puts the name in it, once.
 /// Until then it has a number that spells as nothing, and a comment row
-/// naming it would name nothing on the next open.
-fn nameUnnamed(s: *Session, b: *Buffer, anchor: u64) Library.Error!void {
-    const at = b.marks.unnamed.get(anchor) orelse return;
-    const lib = s.library orelse return;
+/// naming it would name nothing on the next open. Returns the name it has
+/// now, which is the one it came with when it had one.
+fn nameUnnamed(s: *Session, b: *Buffer, anchor: u64) Library.Error!u64 {
+    const at = b.marks.unnamed.get(anchor) orelse return anchor;
+    const lib = s.library orelse return anchor;
     const named = b.marks.newName();
     var buf: [Library.name_len]u8 = undefined;
     try lib.nameAnnotation(b.path, at.page, at.shape, Library.makeName(&buf, named));
@@ -765,6 +840,7 @@ fn nameUnnamed(s: *Session, b: *Buffer, anchor: u64) Library.Error!void {
     if (takenOf(s, b)) |t| {
         if (t.remove(anchor)) t.put(s.gpa, named, {}) catch {};
     }
+    return named;
 }
 
 /// The names read out of `b`'s file rather than its library.
@@ -896,6 +972,7 @@ pub fn readAnnots(s: *Session, index: u32, already: ?[]const []const fenrir.anno
     var held: Held = .{};
     for (b.marks.items()) |m| held.anchors.put(a, m.anchor, {}) catch return;
     for (b.marks.comments.items) |c| held.comments.put(a, c.name, {}) catch return;
+    if (s.library) |lib| readJournal(s, b, lib, &held, a) catch return;
     renumberClashes(s, b, lists, &held, a) catch return;
 
     // The names given before to annotations that came with none.
@@ -920,6 +997,23 @@ pub fn readAnnots(s: *Session, index: u32, already: ?[]const []const fenrir.anno
 /// Names given to annotations that came with none, by page and shape.
 const Named = std.AutoHashMapUnmanaged(struct { u32, u64 }, u64);
 
+/// What the library says of the file beyond its rows: what the reader
+/// deleted that the file still holds, and which rows are its versions of
+/// the file's, which no newer copy can clash with.
+fn readJournal(s: *Session, b: *Buffer, lib: Library, held: *Held, a: Allocator) !void {
+    const gone = try lib.gones(b.path);
+    defer lib.freeGones(gone, gone.len);
+    for (gone) |g| {
+        const n = (try nameOf(s, b, g.page, g.nm)) orelse continue;
+        try (if (g.comment) &held.comments else &held.gone).put(a, n, {});
+    }
+    const changed = try lib.edits(b.path);
+    defer lib.freeNames(changed);
+    for (changed) |nm| {
+        if (fenrirName(nm)) |n| try held.edits.put(a, n, {});
+    }
+}
+
 /// What the library holds, which the file does not get to say again: an
 /// anchor's lines, and a comment, apart. The first comment on an anchor has
 /// the anchor's name, so one set would let a comment written on another
@@ -927,6 +1021,11 @@ const Named = std.AutoHashMapUnmanaged(struct { u32, u64 }, u64);
 const Held = struct {
     anchors: std.AutoHashMapUnmanaged(u64, void) = .empty,
     comments: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Anchors the reader deleted, which the file still holds, with their
+    /// replies: none of it is read.
+    gone: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Names whose rows are the reader's versions of the file's.
+    edits: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     fn contains(h: Held, n: u64) bool {
         return h.anchors.contains(n) or h.comments.contains(n);
@@ -956,7 +1055,7 @@ fn renumberClashes(
     for (lists, 0..) |list, page| {
         for (list) |annot| {
             const n = fenrirName(annot.name) orelse continue;
-            if (!held.contains(n)) continue;
+            if (!held.contains(n) or held.edits.contains(n)) continue;
             const got = try shared.getOrPut(a, n);
             if (!got.found_existing) got.value_ptr.* = false;
             if (try sameThing(s, b, @intCast(page), list, n, annot)) got.value_ptr.* = true;
@@ -1061,16 +1160,25 @@ fn takeAnnots(
         got.value_ptr.* = if (got.found_existing) got.value_ptr.* + 1 else 1;
     }
 
-    // The anchor each was taken as, so a reply finds its thread's.
-    const anchors = try a.alloc(u64, list.len);
+    // The anchor each was taken as, so a reply finds its thread's, or
+    // null for one the reader deleted, whose replies went with it.
+    const anchors = try a.alloc(?u64, list.len);
     for (list, anchors) |annot, *anchor| {
         if (annot.kind == .reply) continue;
-        anchor.* = try nameAt(s, b, page, annot, &repeated, named);
+        const n = try nameAt(s, b, page, annot, &repeated, named);
+        anchor.* = n;
+        // Whatever the library says of it, the file holds it: a change to
+        // it is a change to one of the file's.
+        if (taken) |t| try t.put(s.gpa, n, {});
+        // Deleted, unless an undo has put lines of it back since.
+        if (held.gone.contains(n) and !held.anchors.contains(n)) {
+            anchor.* = null;
+            continue;
+        }
         // The lines and the note apart: either may be the library's.
-        const lines = !held.anchors.contains(anchor.*);
-        const note = annot.text.len != 0 and !held.comments.contains(anchor.*);
+        const lines = !held.anchors.contains(n);
+        const note = annot.text.len != 0 and !held.comments.contains(n);
         if (!lines and !note) continue;
-        if (taken) |t| try t.put(s.gpa, anchor.*, {});
 
         if (lines) switch (annot.kind) {
             .ink => for (annot.paths) |path| {
@@ -1080,7 +1188,7 @@ fn takeAnnots(
                     .points = path,
                     .width = if (annot.width > 0) annot.width else default_pen_width,
                     .color = annot.color orelse ink_colour,
-                    .anchor = anchor.*,
+                    .anchor = n,
                 }, true);
             },
             else => for (annot.lines) |box| {
@@ -1089,13 +1197,13 @@ fn takeAnnots(
                     .box = box,
                     .color = annot.color orelse s.highlight,
                     .style = styleOfAnnot(annot.kind),
-                    .anchor = anchor.*,
+                    .anchor = n,
                 }, true);
             },
         };
         // The markup's own note is the first comment, and has its name.
         if (note) {
-            _ = try b.marks.addComment(s.gpa, .{ .anchor = anchor.*, .name = anchor.*, .text = annot.text }, true);
+            _ = try b.marks.addComment(s.gpa, .{ .anchor = n, .name = n, .text = annot.text }, true);
         }
     }
 
@@ -1104,10 +1212,11 @@ fn takeAnnots(
         const thread = annot.thread orelse continue;
         // A reply with no name of its own gets a number rather than the
         // anchor's, which would make it the note on the markup.
+        const on = anchors[thread] orelse continue;
         const name = try nameAt(s, b, page, annot, &repeated, named);
-        if (held.comments.contains(name)) continue;
         if (taken) |t| try t.put(s.gpa, name, {});
-        _ = try b.marks.addComment(s.gpa, .{ .anchor = anchors[thread], .name = name, .text = annot.text }, true);
+        if (held.comments.contains(name)) continue;
+        _ = try b.marks.addComment(s.gpa, .{ .anchor = on, .name = name, .text = annot.text }, true);
     }
 }
 
@@ -1587,6 +1696,175 @@ test "a name handed out is not handed out again after its mark is gone" {
     try giveLibrary(&again, lib);
     loadMarks(&again, 0);
     try testing.expect(again.buffer(0).marks.newName() > made);
+}
+
+/// A session on `annotated_pdf` with the library, its marks loaded and the
+/// file's read, as an open leaves it.
+fn openAnnotated(gpa: Allocator, lib: Library, doc: *fenrir.Document, buf: *[1]fenrir.Page) !Session {
+    var s = try sessionOf(gpa, buf, 1, 1000, 800);
+    errdefer closeSession(&s);
+    try giveLibrary(&s, lib);
+    s.buffer(0).doc = doc;
+    loadMarks(&s, 0);
+    readAnnots(&s, 0, null);
+    return s;
+}
+
+/// The marks of the file's highlight, by its name.
+fn linesOf(b: *Buffer, nm: []const u8) usize {
+    var n: usize = 0;
+    for (b.marks.items()) |m| {
+        if (std.mem.eql(u8, b.marks.spelling(m.anchor) orelse "", nm)) n += 1;
+    }
+    return n;
+}
+
+test "a change to the file's own mark is kept, and the next open shows it" {
+    // The two open gaps this closes: a recolour of a mark read from the
+    // file came back in the file's colour, and a deleted one came back.
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+
+    {
+        var s = try openAnnotated(gpa, lib, &doc, &buf);
+        defer closeSession(&s);
+        const b = s.buffer(0);
+        // The first line of Acrobat's highlight recoloured, and the stroke
+        // deleted.
+        b.marks.beginGroup();
+        try b.marks.recolour(gpa, 0, Library.parseColor("blue").?);
+        const stroke = for (b.marks.items(), 0..) |m, i| {
+            if (m.kind == .ink) break i;
+        } else unreachable;
+        _ = try b.marks.removeAt(gpa, stroke);
+        applyEffects(&s);
+        // Both lines are the library's now, and only one changed colour.
+        const rows = try lib.marks("/docs/a.pdf");
+        defer lib.freeMarks(rows, rows.len);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        try testing.expectEqualStrings("305e35fa", rows[0].anchor);
+        try testing.expect(!std.mem.eql(u8, rows[0].color, rows[1].color));
+    }
+
+    var s = try openAnnotated(gpa, lib, &doc, &buf);
+    defer closeSession(&s);
+    const b = s.buffer(0);
+    try testing.expectEqual(@as(usize, 2), b.marks.count());
+    try testing.expectEqual(@as(usize, 2), linesOf(b, "305e35fa"));
+    try testing.expectEqual(Library.parseColor("blue").?, b.marks.items()[0].color);
+    for (b.marks.items()) |m| try testing.expect(m.kind != .ink);
+    // The note and the reply are still the file's, on the library's lines.
+    const said = b.marks.said(b.marks.items()[0].anchor);
+    try testing.expectEqual(@as(usize, 2), said.len);
+    try testing.expectEqualStrings("why", said[0].text);
+}
+
+test "the file's comments changed or cleared stay so, and a deleted anchor takes its replies" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+
+    {
+        var s = try openAnnotated(gpa, lib, &doc, &buf);
+        defer closeSession(&s);
+        const b = s.buffer(0);
+        const anchor = b.marks.items()[0].anchor;
+        b.marks.beginGroup();
+        // The reply said again, the note on the highlight cleared.
+        try b.marks.setText(gpa, b.marks.saidRange(anchor)[0] + 1, "because so");
+        _ = try b.marks.removeComment(gpa, b.marks.saidRange(anchor)[0]);
+        applyEffects(&s);
+    }
+    {
+        var s = try openAnnotated(gpa, lib, &doc, &buf);
+        defer closeSession(&s);
+        const b = s.buffer(0);
+        // Clearing the note left the highlight, as the design says.
+        try testing.expectEqual(@as(usize, 2), linesOf(b, "305e35fa"));
+        const said = b.marks.said(b.marks.items()[0].anchor);
+        try testing.expectEqual(@as(usize, 1), said.len);
+        try testing.expectEqualStrings("because so", said[0].text);
+
+        // Now the highlight goes, both lines in one step, and its reply
+        // with it.
+        b.marks.beginGroup();
+        var i = b.marks.count();
+        while (i > 0) {
+            i -= 1;
+            if (b.marks.items()[i].kind != .ink) _ = try b.marks.removeAt(gpa, i);
+        }
+        applyEffects(&s);
+    }
+
+    var s = try openAnnotated(gpa, lib, &doc, &buf);
+    defer closeSession(&s);
+    const b = s.buffer(0);
+    try testing.expectEqual(@as(usize, 1), b.marks.count());
+    try testing.expectEqual(Marks.Kind.ink, b.marks.items()[0].kind);
+    try testing.expectEqual(@as(usize, 0), b.marks.comments.items.len);
+}
+
+test "an undone deletion of the file's mark is the library's, and wins over its own deletion" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+
+    {
+        var s = try openAnnotated(gpa, lib, &doc, &buf);
+        defer closeSession(&s);
+        const b = s.buffer(0);
+        const stroke = for (b.marks.items(), 0..) |m, i| {
+            if (m.kind == .ink) break i;
+        } else unreachable;
+        b.marks.beginGroup();
+        _ = try b.marks.removeAt(gpa, stroke);
+        applyEffects(&s);
+        _ = try b.marks.undo(gpa);
+        applyEffects(&s);
+    }
+
+    var s = try openAnnotated(gpa, lib, &doc, &buf);
+    defer closeSession(&s);
+    var strokes: usize = 0;
+    for (s.buffer(0).marks.items()) |m| strokes += @intFromBool(m.kind == .ink);
+    try testing.expectEqual(@as(usize, 1), strokes);
+}
+
+test "the reader's version of the file's mark is never taken for a clash, wherever the file has moved it" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    var doc = try fenrir.open(gpa, try gpa.dupe(u8, annotated_pdf));
+    defer doc.deinit();
+    var buf: [1]fenrir.Page = .{(try fenrir.pages.all(&doc))[0]};
+
+    // f7 recoloured by this reader where it once was; another program has
+    // since moved the stroke. Still one thing under one name.
+    var points = [_]Point{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } };
+    _ = try lib.addStroke("/docs/a.pdf", .{ .points = &points, .anchor = @constCast("f7"), .edit = true }, 1);
+    var s = try openAnnotated(gpa, lib, &doc, &buf);
+    defer closeSession(&s);
+    var strokes: usize = 0;
+    for (s.buffer(0).marks.items()) |m| {
+        if (m.kind != .ink) continue;
+        strokes += 1;
+        try testing.expectEqual(@as(u64, 7), m.anchor);
+    }
+    try testing.expectEqual(@as(usize, 1), strokes);
 }
 
 test "a comment on another program's highlight is stored under that program's name" {

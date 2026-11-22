@@ -50,6 +50,17 @@
 //! a file is moved or sent and the `/ID` does not, so a link to a comment in
 //! another document names that document by its `/ID`.
 //!
+//! ## The journal
+//!
+//! The rows are also what the reader changed since its file was last
+//! written, and a reopen takes them over the file by name: an anchor's
+//! lines, a comment's text. A change to something the file holds -- a
+//! highlight made in Acrobat, recoloured; a line taken off one of
+//! fenrir's own -- is a row of the whole anchor, marked `edit`, and a
+//! deletion of one is a `gone` row, because a deletion leaves no row to
+//! win with. Without the two, a recolour of the file's highlight came
+//! back in the file's colour and a deleted one came back at all.
+//!
 //! Settings are key and value, both text, because every one of them is
 //! either a name, a colour or a number that a person may want to read in the
 //! file. `author` is who annotations will be signed by; `accent` is the
@@ -149,6 +160,12 @@ pub fn userVersion(lib: Library) Error!i64 {
 /// how another program's name is told apart from the same name on another
 /// page. `naming` gives a name to an annotation the file holds without a
 /// usable one of its own, by what it looks like; see `nameAnnotation`.
+///
+/// `edit` on a mark, a stroke or a comment says the row is the reader's
+/// version of something the file has, rather than something the reader
+/// made; `gone` names what the reader deleted that the file still holds.
+/// Those and the rest are the journal: what the next save writes into the
+/// file. See "The journal" at the top.
 fn create(lib: *Library) Error!void {
     try lib.db.exec(
         \\BEGIN;
@@ -177,6 +194,7 @@ fn create(lib: *Library) Error!void {
         \\    color      TEXT NOT NULL DEFAULT '',
         \\    style      TEXT NOT NULL DEFAULT 'highlight',
         \\    anchor     TEXT NOT NULL DEFAULT '',
+        \\    edit       INTEGER NOT NULL DEFAULT 0,
         \\    created_at INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE INDEX IF NOT EXISTS mark_by_doc ON mark (path, page);
@@ -188,6 +206,7 @@ fn create(lib: *Library) Error!void {
         \\    width      REAL NOT NULL DEFAULT 0,
         \\    points     TEXT NOT NULL DEFAULT '',
         \\    anchor     TEXT NOT NULL DEFAULT '',
+        \\    edit       INTEGER NOT NULL DEFAULT 0,
         \\    created_at INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE INDEX IF NOT EXISTS ink_by_doc ON ink (path, page);
@@ -205,6 +224,7 @@ fn create(lib: *Library) Error!void {
         \\    nm          TEXT NOT NULL,
         \\    page        INTEGER NOT NULL DEFAULT 0,
         \\    text        TEXT NOT NULL DEFAULT '',
+        \\    edit        INTEGER NOT NULL DEFAULT 0,
         \\    created_at  INTEGER NOT NULL DEFAULT 0,
         \\    modified_at INTEGER NOT NULL DEFAULT 0
         \\);
@@ -227,6 +247,14 @@ fn create(lib: *Library) Error!void {
         \\    nm    TEXT NOT NULL
         \\);
         \\CREATE INDEX IF NOT EXISTS naming_by_doc ON naming (path);
+        \\CREATE TABLE IF NOT EXISTS gone (
+        \\    id      INTEGER PRIMARY KEY,
+        \\    path    TEXT NOT NULL,
+        \\    nm      TEXT NOT NULL,
+        \\    page    INTEGER NOT NULL DEFAULT 0,
+        \\    comment INTEGER NOT NULL DEFAULT 0,
+        \\    UNIQUE (path, nm, page, comment)
+        \\);
         \\PRAGMA user_version = 1;
         \\COMMIT;
     );
@@ -690,6 +718,9 @@ pub const Mark = struct {
     /// The name of the anchor this line is part of; see `makeName`. Empty is
     /// written as the document's next name, an anchor of one line.
     anchor: []u8 = &.{},
+    /// The reader's version of one of the file's, not a mark it made.
+    /// Written, never read back: what asks is `edits`.
+    edit: bool = false,
 };
 
 fn styleOf(style: []const u8) []const u8 {
@@ -703,8 +734,8 @@ pub fn addMark(lib: Library, path: []const u8, h: Mark, now: i64) Error!i64 {
     var buf: [name_len]u8 = undefined;
     const anchor = if (h.anchor.len != 0) h.anchor else try lib.nextName(path, &buf);
     var s = try lib.db.prepare(
-        \\INSERT INTO mark (path, page, x0, y0, x1, y1, color, style, anchor, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        \\INSERT INTO mark (path, page, x0, y0, x1, y1, color, style, anchor, created_at, edit)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -717,6 +748,7 @@ pub fn addMark(lib: Library, path: []const u8, h: Mark, now: i64) Error!i64 {
     s.bindText(8, styleOf(h.style));
     s.bindText(9, anchor);
     s.bindInt(10, now);
+    s.bindInt(11, @intFromBool(h.edit));
     try s.exec();
     return lib.db.lastInsertRowId();
 }
@@ -819,6 +851,8 @@ pub const Stroke = struct {
     /// The anchor it is, as for a mark. A stroke is always an anchor of
     /// its own.
     anchor: []u8 = &.{},
+    /// As for a mark.
+    edit: bool = false,
 };
 
 /// How many characters a point takes at the precision `writePoints` uses,
@@ -846,8 +880,8 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     const anchor = if (k.anchor.len != 0) k.anchor else try lib.nextName(path, &buf);
 
     var s = try lib.db.prepare(
-        \\INSERT INTO ink (path, page, color, width, points, anchor, created_at)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\INSERT INTO ink (path, page, color, width, points, anchor, created_at, edit)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -857,6 +891,7 @@ pub fn addStroke(lib: Library, path: []const u8, k: Stroke, now: i64) Error!i64 
     s.bindText(5, encoded);
     s.bindText(6, anchor);
     s.bindInt(7, now);
+    s.bindInt(8, @intFromBool(k.edit));
     try s.exec();
     return lib.db.lastInsertRowId();
 }
@@ -1017,6 +1052,8 @@ pub const Comment = struct {
     /// document's and need no page.
     page: u32 = 0,
     text: []u8 = &.{},
+    /// As for a mark: the file's comment, changed, rather than a new one.
+    edit: bool = false,
     /// Seconds since the epoch. `modified_at` is what a PDF's `/M` will say.
     created_at: i64 = 0,
     modified_at: i64 = 0,
@@ -1028,8 +1065,8 @@ pub const Comment = struct {
 pub fn addComment(lib: Library, path: []const u8, c: Comment, now: i64) Error!i64 {
     if (lib.future) return 0;
     var s = try lib.db.prepare(
-        \\INSERT INTO comment (path, anchor, nm, page, text, created_at, modified_at)
-        \\VALUES (?1, ?2, ?3, ?6, ?4, ?5, ?5)
+        \\INSERT INTO comment (path, anchor, nm, page, text, created_at, modified_at, edit)
+        \\VALUES (?1, ?2, ?3, ?6, ?4, ?5, ?5, ?7)
     );
     defer s.finalize();
     s.bindText(1, path);
@@ -1038,6 +1075,7 @@ pub fn addComment(lib: Library, path: []const u8, c: Comment, now: i64) Error!i6
     s.bindText(4, c.text);
     s.bindInt(5, now);
     s.bindInt(6, c.page);
+    s.bindInt(7, @intFromBool(c.edit));
     try s.exec();
     return lib.db.lastInsertRowId();
 }
@@ -1206,6 +1244,90 @@ pub fn freeLink(lib: Library, l: Link) void {
 
 pub fn freeLinks(lib: Library, list: []Link, n: usize) void {
     for (list[0..n]) |l| lib.freeLink(l);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
+// -- what the file still holds ----------------------------------------------
+
+/// Something the reader deleted that the file it was read from holds: an
+/// anchor, by its annotation's name, or a comment. A deletion leaves no
+/// row of its own to win with, so without this one the file would put it
+/// back on the next open.
+pub const Gone = struct {
+    nm: []u8,
+    /// The page of the annotation, for a name of another program's, which
+    /// is its page's; see `Comment.page`.
+    page: u32 = 0,
+    /// A comment rather than an anchor. The first comment on an anchor has
+    /// the anchor's name, and clearing it empties `/Contents` and leaves
+    /// the highlight, so the two are told apart here and not by name.
+    comment: bool = false,
+};
+
+/// Records a deletion. Said twice it is one row.
+pub fn addGone(lib: Library, path: []const u8, g: Gone) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare(
+        \\INSERT OR IGNORE INTO gone (path, nm, page, comment) VALUES (?1, ?2, ?3, ?4)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindText(2, g.nm);
+    s.bindInt(3, g.page);
+    s.bindInt(4, @intFromBool(g.comment));
+    try s.exec();
+}
+
+/// Every deletion recorded on a document, oldest first.
+pub fn gones(lib: Library, path: []const u8) Error![]Gone {
+    var out: std.ArrayList(Gone) = .empty;
+    errdefer lib.freeGones(out.items, out.items.len);
+    var s = try lib.db.prepare("SELECT nm, page, comment FROM gone WHERE path = ?1 ORDER BY id");
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const nm = try lib.gpa.dupe(u8, s.columnText(0));
+        errdefer lib.gpa.free(nm);
+        try out.append(lib.gpa, .{
+            .nm = nm,
+            .page = @intCast(@max(0, s.columnInt(1))),
+            .comment = s.columnInt(2) != 0,
+        });
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freeGones(lib: Library, list: []Gone, n: usize) void {
+    for (list[0..n]) |g| lib.gpa.free(g.nm);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
+/// The names whose rows are the reader's versions of the file's, and so
+/// never another fenrir's under the same name: a mark's or a stroke's
+/// anchor, a comment's own. The caller owns them.
+pub fn edits(lib: Library, path: []const u8) Error![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |nm| lib.gpa.free(nm);
+        out.deinit(lib.gpa);
+    }
+    var s = try lib.db.prepare(
+        \\SELECT anchor FROM mark WHERE path = ?1 AND edit = 1
+        \\UNION SELECT anchor FROM ink WHERE path = ?1 AND edit = 1
+        \\UNION SELECT nm FROM comment WHERE path = ?1 AND edit = 1
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const nm = try lib.gpa.dupe(u8, s.columnText(0));
+        errdefer lib.gpa.free(nm);
+        try out.append(lib.gpa, nm);
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freeNames(lib: Library, list: [][]u8) void {
+    for (list) |nm| lib.gpa.free(nm);
     if (list.len != 0) lib.gpa.free(list);
 }
 
@@ -1721,6 +1843,32 @@ test "an unnamed annotation is named by its page and its shape, and the name cou
     const said = try lib.comments("a.pdf");
     defer lib.freeComments(said, said.len);
     try testing.expectEqual(@as(u32, 4), said[0].page);
+}
+
+test "a deletion of the file's is a row of its own, and an edit is told from a new mark" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    // The anchor gone and, apart from it, the note cleared on another.
+    try lib.addGone("a.pdf", .{ .nm = @constCast("305e35fa"), .page = 2 });
+    try lib.addGone("a.pdf", .{ .nm = @constCast("305e35fa"), .page = 2 });
+    try lib.addGone("a.pdf", .{ .nm = @constCast("f4"), .comment = true });
+    const gone = try lib.gones("a.pdf");
+    defer lib.freeGones(gone, gone.len);
+    try testing.expectEqual(@as(usize, 2), gone.len);
+    try testing.expectEqualStrings("305e35fa", gone[0].nm);
+    try testing.expectEqual(@as(u32, 2), gone[0].page);
+    try testing.expect(!gone[0].comment);
+    try testing.expect(gone[1].comment);
+
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("f1") }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("f2"), .edit = true }, 1);
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f2"), .nm = @constCast("f5"), .text = @constCast("x"), .edit = true }, 1);
+    const changed = try lib.edits("a.pdf");
+    defer lib.freeNames(changed);
+    try testing.expectEqual(@as(usize, 2), changed.len);
+    for (changed) |nm| try testing.expect(std.mem.eql(u8, nm, "f2") or std.mem.eql(u8, nm, "f5"));
 }
 
 test "comments are many to an anchor, and change and go by row" {
