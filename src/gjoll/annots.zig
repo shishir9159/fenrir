@@ -101,6 +101,9 @@ pub const Annot = struct {
     width: f32 = 1,
     /// `/Contents`, as UTF-8.
     text: []const u8 = "",
+    /// The object it is, or null for one written straight into `/Annots`.
+    /// What a save writes over to change it, keeping what answers it.
+    ref: ?Ref = null,
 };
 
 /// What an annotation looks like, as a number: its kind, its lines or its
@@ -163,7 +166,7 @@ pub fn read(arena: Allocator, doc: *Document, p: Page) Error![]const Annot {
             else => continue,
         } orelse continue;
 
-        var a: Annot = .{ .kind = kind };
+        var a: Annot = .{ .kind = kind, .ref = raw.asRef() };
         a.name = try arena.dupe(u8, stringOf(doc, dict, "NM"));
         a.color = colorOf(doc, dict);
         if (stringOf(doc, dict, "Contents").len != 0) {
@@ -367,6 +370,14 @@ pub const Written = struct {
     when: i64 = 0,
     /// `/IRT`: for a reply, the annotation it answers.
     answers: ?Ref = null,
+    /// The object to write it as: one the file has, changed in place so
+    /// that its replies' `/IRT` and its page's `/Annots` still name it.
+    /// Null for a new one.
+    into: ?Ref = null,
+    /// For an arrow, where the words of its first line begin, in the same
+    /// space: the arrow stops short of them rather than of the mark, which
+    /// may begin mid-line. Null where the words are not known.
+    start: ?f32 = null,
 };
 
 pub const WriteError = Writer.Error || error{
@@ -747,7 +758,7 @@ fn colorObjects(a: Allocator, rgb: Rgb) Allocator.Error![]Object {
 }
 
 /// `/M` (§7.9.4): the moment in UTC, to the second.
-fn dateOf(a: Allocator, seconds: i64) Allocator.Error![]const u8 {
+pub fn dateOf(a: Allocator, seconds: i64) Allocator.Error![]const u8 {
     const at: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
     const year = at.getEpochDay().calculateYearDay();
     const day = year.calculateMonthDay();
@@ -761,9 +772,9 @@ fn dateOf(a: Allocator, seconds: i64) Allocator.Error![]const u8 {
 /// The reader's arrow at the first line of what it points at: a quarter of
 /// the line's height short of the words, as long as 1.7 heights and as tall
 /// as 0.6 of one. See `drawShared`.
-fn arrowBox(first: Bounds) Bounds {
+fn arrowBox(first: Bounds, start: ?f32) Bounds {
     const h = @max(first.height(), 1);
-    const tip = first.min_x - h * 0.25;
+    const tip = @min(start orelse first.min_x, first.min_x) - h * 0.25;
     const mid = (first.min_y + first.max_y) * 0.5;
     return .fromRect(tip - h * 1.7, mid - h * 0.3, tip, mid + h * 0.3);
 }
@@ -912,7 +923,7 @@ pub fn write(w: *Writer, ap: *Appearances, p: Page, a: Annot, written: Written) 
         .arrow => blk: {
             if (a.lines.len == 0) return error.NothingToDraw;
             try d.put(arena, "QuadPoints", .{ .array = try quadsOf(arena, back, a.lines) });
-            const box = arrowBox(a.lines[0]);
+            const box = arrowBox(a.lines[0], written.start);
             const mid = (box.min_y + box.max_y) * 0.5;
             const line = try arena.alloc(Object, 4);
             for ([2]f32{ box.min_x, box.max_x }, 0..) |x, i| {
@@ -965,30 +976,39 @@ pub fn write(w: *Writer, ap: *Appearances, p: Page, a: Annot, written: Written) 
     try appearance.put(arena, "N", .{ .ref = drawn.form });
     try d.put(arena, "AP", .{ .dict = appearance });
 
-    const ref: Ref = .{ .num = w.fresh(), .gen = 0 };
+    const ref: Ref = written.into orelse .{ .num = w.fresh(), .gen = 0 };
     try w.put(ref.num, .{ .dict = d });
     return ref;
 }
 
-/// Puts `refs` on `p`'s `/Annots`, after what is there. Once a page a save:
-/// a second call reads the list as the file has it, not as the first left it.
+/// Puts `refs` on `p`'s `/Annots`, after what is there, and takes `drop`
+/// off it. Once a page a save: a second call reads the list as the file
+/// has it, not as the first left it.
 ///
 /// The first time, the list becomes an object of its own and the page names
 /// it, so that every later save rewrites a list a few bytes an annotation
 /// long and not the page, whose dictionary can be long.
-pub fn attach(w: *Writer, p: Page, refs: []const Ref) Writer.Error!void {
-    if (refs.len == 0) return;
+pub fn attach(w: *Writer, p: Page, refs: []const Ref, drop: []const Ref) Writer.Error!void {
+    if (refs.len == 0 and drop.len == 0) return;
     const a = w.allocator();
     const old = try p.annotations(w.doc);
-    const list = try a.alloc(Object, old.len + refs.len);
-    @memcpy(list[0..old.len], old);
-    for (list[old.len..], refs) |*slot, r| slot.* = .{ .ref = r };
+    var list: std.ArrayList(Object) = try .initCapacity(a, old.len + refs.len);
+    for (old) |o| {
+        const r = o.asRef() orelse {
+            list.appendAssumeCapacity(o);
+            continue;
+        };
+        for (drop) |d| {
+            if (d.num == r.num) break;
+        } else list.appendAssumeCapacity(o);
+    }
+    for (refs) |r| list.appendAssumeCapacity(.{ .ref = r });
 
     if (p.dict.get("Annots")) |held| {
-        if (held.asRef()) |own| return w.put(own.num, .{ .array = list });
+        if (held.asRef()) |own| return w.put(own.num, .{ .array = list.items });
     }
     const num = w.fresh();
-    try w.put(num, .{ .array = list });
+    try w.put(num, .{ .array = list.items });
     var page = try p.dict.clone(a);
     try page.put(a, "Annots", .{ .ref = .{ .num = num, .gen = 0 } });
     try w.put(p.ref.num, .{ .dict = page });
@@ -1238,7 +1258,7 @@ test "a line of one colour shares a form, and several lines draw their own" {
         try write(&w, &ap, page, .{ .kind = .highlight, .lines = &two, .color = yellow }, .{}),
         try write(&w, &ap, page, .{ .kind = .underline, .lines = &one, .color = yellow }, .{}),
     };
-    try attach(&w, page, &refs);
+    try attach(&w, page, &refs, &.{});
     const update = try w.finish(.{});
     defer testing.allocator.free(update);
 
@@ -1278,7 +1298,7 @@ test "what is written is drawn under its words, the right way up on a turned pag
     // Twelve points tall, so the underline is one.
     const line = [_]Bounds{.fromRect(20, 300, 140, 312)};
     const ref = try write(&w, &ap, page, .{ .kind = .underline, .lines = &line }, .{});
-    try attach(&w, page, &.{ref});
+    try attach(&w, page, &.{ref}, &.{});
     const update = try w.finish(.{});
     defer testing.allocator.free(update);
 
@@ -1325,7 +1345,7 @@ test "ink, an arrow and a reply come back as they went, with who and when" {
         try write(&w, &ap, page, .{ .kind = .ink, .paths = &paths, .width = 2.5, .color = green }, said),
         try write(&w, &ap, page, .{ .kind = .reply, .lines = &words, .name = "fa", .text = "na\u{ef}ve \u{2192} yes" }, .{ .answers = anchor }),
     };
-    try attach(&w, page, &refs);
+    try attach(&w, page, &refs, &.{});
     const update = try w.finish(.{});
     defer testing.allocator.free(update);
 
@@ -1373,7 +1393,7 @@ test "a later save names the forms the file has, and only fenrir's" {
     try ap.adopt(testing.allocator, &doc, page);
     try testing.expectEqual(@as(u32, 0), ap.forms.count());
     const first = try write(&w, &ap, page, .{ .kind = .highlight, .lines = &line, .color = yellow }, .{});
-    try attach(&w, page, &.{first});
+    try attach(&w, page, &.{first}, &.{});
     const one = try w.finish(.{});
     defer testing.allocator.free(one);
     try testing.expect(std.mem.indexOf(u8, one, "/Subtype/Form") != null);
@@ -1389,7 +1409,7 @@ test "a later save names the forms the file has, and only fenrir's" {
     try testing.expectEqual(@as(u32, 1), later.forms.count());
     try testing.expect(later.resources != null);
     const second = try write(&again, &later, same, .{ .kind = .highlight, .lines = &line, .color = yellow }, .{});
-    try attach(&again, same, &.{second});
+    try attach(&again, same, &.{second}, &.{});
     const two = try again.finish(.{});
     defer testing.allocator.free(two);
     // Nothing drawn again: the second save carries no form at all.

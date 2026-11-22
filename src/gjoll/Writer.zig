@@ -86,6 +86,31 @@ pub fn init(gpa: Allocator, doc: *Document) Error!Writer {
     return .{ .gpa = gpa, .doc = doc, .arena_state = .init(gpa), .size = past, .next = past };
 }
 
+/// What a certification signature permits after it (§12.8.2.2, DocMDP):
+/// 1 no change at all, 2 filling in forms and signing, 3 those and
+/// annotations. Null for a file nobody certified, which permits anything.
+///
+/// Asked by whoever appends, not refused here: an update of 3 may hold
+/// annotations and must not hold anything else, which is a question about
+/// what is in it, and this file only writes what it is given.
+pub fn certified(doc: *Document) Document.Error!?u8 {
+    const root = try doc.catalog();
+    const perms = (try doc.get(root, "Perms") orelse return null).asDict() orelse return null;
+    const sig = (try doc.get(perms, "DocMDP") orelse return null).asDict() orelse return null;
+    // The standard's default, for a certification that does not say.
+    const unsaid: u8 = 2;
+    const refs = (try doc.get(sig, "Reference") orelse return unsaid).asArray() orelse return unsaid;
+    for (refs) |raw| {
+        const r = (try doc.resolve(raw)).asDict() orelse continue;
+        const method = try doc.get(r, "TransformMethod") orelse continue;
+        if (!method.isName("DocMDP")) continue;
+        const params = (try doc.get(r, "TransformParams") orelse return unsaid).asDict() orelse return unsaid;
+        const p = (try doc.get(params, "P") orelse return unsaid).asInt() orelse return unsaid;
+        return @intCast(std.math.clamp(p, 1, 3));
+    }
+    return unsaid;
+}
+
 pub fn deinit(w: *Writer) void {
     w.pending.deinit(w.gpa);
     w.arena_state.deinit();

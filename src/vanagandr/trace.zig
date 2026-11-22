@@ -46,6 +46,10 @@ pub const usage =
     \\    --no-rotate  Ignore /Rotate, so coordinates match the file's own
     \\                 numbers rather than what a reader would display.
     \\    --no-type3   Do not run Type 3 glyph procedures.
+    \\    --no-annots  Leave out the annotations' appearances: what a save
+    \\                 that adds annotations must leave unchanged, so
+    \\                 `--all --hash --no-annots` before and after is the
+    \\                 check that it changed no page.
     \\
     \\    Nothing here can fail a page: an unknown operator, a missing
     \\    resource, or a truncated stream is counted and reported at the end.
@@ -93,6 +97,8 @@ pub fn run(ctx: *Context, argv: []const []const u8) !void {
             options.rotate = false;
         } else if (std.mem.eql(u8, arg, "--no-type3")) {
             options.type3 = false;
+        } else if (std.mem.eql(u8, arg, "--no-annots")) {
+            options.annotations = false;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ctx.fail("unknown option {s}", .{arg});
         } else if (path == null) {

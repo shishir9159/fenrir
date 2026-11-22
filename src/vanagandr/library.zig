@@ -11,6 +11,7 @@ const fenrir = @import("fenrir");
 const Io = std.Io;
 
 const Context = @import("Context.zig");
+const save = @import("save.zig");
 const mimir = fenrir.mimir;
 
 const Marks = fenrir.hlidskjalf.Marks;
@@ -172,13 +173,14 @@ pub const marks_usage =
     \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
     \\                    [--style STYLE] [--ink PAGE X Y X Y ... [COLOUR]]
     \\                    [--comment ANCHOR TEXT] [--link FROM TO [LABEL]]
-    \\                    [--db FILE]
+    \\                    [--store pdf] [--db FILE]
     \\
-    \\    The marks made on a document, which `fenrir read` draws and keeps
-    \\    here rather than writing into the PDF: the highlights made with m
-    \\    or a palette colour, the ink drawn in draw mode, the comments on
-    \\    them and the links between those. A selection is not a mark and is
-    \\    never stored.
+    \\    The marks made on a document that the library holds and its file
+    \\    does not yet: the highlights made with m or a palette colour, the
+    \\    ink drawn in draw mode, the comments on them and the links between
+    \\    those, and what was deleted of the file's own. `fenrir read` writes
+    \\    them into the PDF on :w and when it closes; until then they are
+    \\    here. A selection is not a mark and is never stored.
     \\
     \\    fenrir marks paper.pdf              list them
     \\    fenrir marks paper.pdf --clear      remove every one, ink, comments
@@ -194,6 +196,9 @@ pub const marks_usage =
     \\                                        comment on the mark named f3
     \\    fenrir marks paper.pdf --link f3 f7 supports
     \\                                        link two comments, by name
+    \\    fenrir marks paper.pdf --store pdf  write them into the file, as
+    \\                                        the reader does on :w, and
+    \\                                        keep this document's there
     \\
     \\    Pages are numbered from 1. Boxes and strokes alike are in PDF points
     \\    on the page as it is displayed, measured from its bottom-left corner
@@ -216,6 +221,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
     defer ink.deinit(ctx.gpa);
     var comment: ?struct { anchor: []const u8, text: []const u8 } = null;
+    var store: ?[]const u8 = null;
     var link: ?struct { from: []const u8, to: []const u8, label: []const u8 = "" } = null;
 
     var i: usize = 0;
@@ -286,6 +292,11 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
                     return ctx.fail("{s} is not a colour: try a name or #rrggbb", .{colour});
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--store")) {
+            i += 1;
+            if (i == argv.len) return ctx.fail("--store needs pdf", .{});
+            if (!std.mem.eql(u8, argv[i], "pdf")) return ctx.fail("--store takes pdf, not {s}", .{argv[i]});
+            store = argv[i];
         } else if (std.mem.eql(u8, arg, "--comment")) {
             if (i + 2 >= argv.len) return ctx.fail("--comment needs ANCHOR TEXT", .{});
             comment = .{ .anchor = argv[i + 1], .text = argv[i + 2] };
@@ -337,6 +348,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         return;
     }
 
+    if (store != null) return storeInFile(ctx, &lib, key, name);
     if (comment) |c| return addComment(ctx, &lib, key, c.anchor, c.text);
     if (link) |l| return addLink(ctx, &lib, key, l.from, l.to, l.label);
 
@@ -442,10 +454,63 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     }
 }
 
-/// The name the next thing written into a document gets.
+/// The name the next thing written into a document gets, noted as handed
+/// out so that no later one is given it again.
 fn nextName(ctx: *Context, lib: *Library, key: []const u8, buf: *[Library.name_len]u8) ![]const u8 {
     const high = lib.highestName(key) catch |err| return ctx.fail("cannot read the names: {t}", .{err});
+    lib.noteName(key, high + 1) catch |err| return ctx.fail("cannot note the name: {t}", .{err});
     return Library.makeName(buf, high + 1);
+}
+
+/// `--store pdf`: the document's journal written into its file, as one
+/// incremental update, and the document's marks kept there from now on.
+///
+/// What a save that did not finish left is put right first, so this never
+/// appends to bytes another save was in the middle of.
+fn storeInFile(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) !void {
+    const gpa = ctx.gpa;
+    var bytes = ctx.readFileWith(gpa, file) catch |err| return ctx.fail("cannot read {s}: {t}", .{ file, err });
+    const verdict = save.repair(gpa, ctx.io, lib.*, key, file, bytes) catch |err| {
+        gpa.free(bytes);
+        return ctx.fail("cannot put the last save right: {t}", .{err});
+    };
+    if (verdict) |v| switch (v) {
+        .finished => ctx.note("the last save into {s} had finished; its journal is cleared", .{file}),
+        .torn => {
+            ctx.note("the last save into {s} was cut short; it is cut back, and written again", .{file});
+            gpa.free(bytes);
+            bytes = ctx.readFileWith(gpa, file) catch |err| return ctx.fail("cannot read {s}: {t}", .{ file, err });
+        },
+        .foreign => ctx.note("{s} has changed since the last save began; that save is forgotten", .{file}),
+    };
+    // The document frees the bytes, opened or not.
+    var doc = fenrir.open(gpa, bytes) catch |err| return ctx.fail("cannot open {s}: {t}", .{ file, err });
+    defer doc.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var plan = save.planOf(arena.allocator(), lib.*, key) catch |err| return ctx.fail("cannot read the journal: {t}", .{err});
+    if (plan.isEmpty()) {
+        lib.setStore(key, "pdf") catch {};
+        ctx.out.print("nothing to write: {s} holds every change\n", .{file}) catch {};
+        return;
+    }
+    const author = lib.author() catch null;
+    defer if (author) |name| gpa.free(name);
+    plan.author = author orelse "";
+    plan.when = now(ctx.io);
+
+    var seed: [64]u8 = undefined;
+    const update = save.write(gpa, ctx.io, lib.*, key, file, &doc, plan, std.fmt.bufPrint(&seed, "{d}", .{plan.when}) catch "") catch |err|
+        return ctx.fail("{s} is not written, and its marks stay in the library: {s}", .{ file, save.whyNot(err) });
+    defer gpa.free(update);
+    lib.setStore(key, "pdf") catch {};
+    ctx.out.print("wrote {d} anchor{s}, {d} repl{s} and {d} deletion{s} into {s}: {d} bytes\n", .{
+        plan.anchors.len + plan.notes.len, if (plan.anchors.len + plan.notes.len == 1) "" else "s",
+        plan.replies.len,                  if (plan.replies.len == 1) "y" else "ies",
+        plan.drops.len,                    if (plan.drops.len == 1) "" else "s",
+        file,                              update.len,
+    }) catch {};
 }
 
 /// `--comment`: a comment on an anchor that exists. The first on it takes

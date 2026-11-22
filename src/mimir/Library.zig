@@ -165,7 +165,9 @@ pub fn userVersion(lib: Library) Error!i64 {
 /// version of something the file has, rather than something the reader
 /// made; `gone` names what the reader deleted that the file still holds.
 /// Those and the rest are the journal: what the next save writes into the
-/// file. See "The journal" at the top.
+/// file. See "The journal" at the top. `appending` is a save on its way
+/// into a file, and `document.store` where a document's marks are kept,
+/// when it is not where the `store` setting says.
 fn create(lib: *Library) Error!void {
     try lib.db.exec(
         \\BEGIN;
@@ -214,7 +216,8 @@ fn create(lib: *Library) Error!void {
         \\    id      INTEGER PRIMARY KEY,
         \\    path    TEXT NOT NULL UNIQUE,
         \\    file_id TEXT NOT NULL DEFAULT '',
-        \\    named   INTEGER NOT NULL DEFAULT 0
+        \\    named   INTEGER NOT NULL DEFAULT 0,
+        \\    store   TEXT NOT NULL DEFAULT ''
         \\);
         \\CREATE INDEX IF NOT EXISTS document_by_file ON document (file_id);
         \\CREATE TABLE IF NOT EXISTS comment (
@@ -255,6 +258,12 @@ fn create(lib: *Library) Error!void {
         \\    comment INTEGER NOT NULL DEFAULT 0,
         \\    UNIQUE (path, nm, page, comment)
         \\);
+        \\CREATE TABLE IF NOT EXISTS appending (
+        \\    path   TEXT PRIMARY KEY,
+        \\    held   INTEGER NOT NULL,
+        \\    tail   TEXT NOT NULL,
+        \\    bytes  BLOB NOT NULL
+        \\) WITHOUT ROWID;
         \\PRAGMA user_version = 1;
         \\COMMIT;
     );
@@ -1331,6 +1340,86 @@ pub fn freeNames(lib: Library, list: [][]u8) void {
     if (list.len != 0) lib.gpa.free(list);
 }
 
+/// Empties a document's journal: every row the save just wrote into its
+/// file, and the record of that save. Its links stay, being nothing a PDF
+/// holds yet.
+pub fn clearJournal(lib: Library, path: []const u8) Error!void {
+    if (lib.future) return;
+    for ([_][]const u8{
+        "DELETE FROM mark WHERE path = ?1",
+        "DELETE FROM ink WHERE path = ?1",
+        "DELETE FROM comment WHERE path = ?1",
+        "DELETE FROM gone WHERE path = ?1",
+        "DELETE FROM naming WHERE path = ?1",
+        "DELETE FROM appending WHERE path = ?1",
+    }) |sql| {
+        var s = try lib.db.prepare(sql);
+        defer s.finalize();
+        s.bindText(1, path);
+        try s.exec();
+    }
+}
+
+/// Whether a document has anything in its journal: what a save would
+/// write, and what closing an unchanged document finds none of.
+pub fn journaled(lib: Library, path: []const u8) Error!bool {
+    var s = try lib.db.prepare(
+        \\SELECT EXISTS (SELECT 1 FROM mark WHERE path = ?1)
+        \\OR EXISTS (SELECT 1 FROM ink WHERE path = ?1)
+        \\OR EXISTS (SELECT 1 FROM comment WHERE path = ?1)
+        \\OR EXISTS (SELECT 1 FROM gone WHERE path = ?1)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    return try s.step() and s.columnInt(0) != 0;
+}
+
+// -- a save on its way --------------------------------------------------------
+
+/// What is about to be appended to a document's file, written before it is:
+/// what tells the next open whether the writer died halfway.
+pub const Appending = struct {
+    /// The file's length before.
+    held: u64,
+    /// A hash of the bytes before it.
+    tail: u64,
+    /// The update, owned by the caller.
+    bytes: []u8,
+};
+
+pub fn recordAppend(lib: Library, path: []const u8, a: struct { held: u64, tail: u64, bytes: []const u8 }) Error!void {
+    if (lib.future) return;
+    var hex: [16]u8 = undefined;
+    var s = try lib.db.prepare("INSERT OR REPLACE INTO appending (path, held, tail, bytes) VALUES (?1, ?2, ?3, ?4)");
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindInt(2, @intCast(a.held));
+    s.bindText(3, std.fmt.bufPrint(&hex, "{x:0>16}", .{a.tail}) catch unreachable);
+    s.bindBlob(4, a.bytes);
+    try s.exec();
+}
+
+/// The save a document's file was last left in the middle of, or null.
+pub fn appending(lib: Library, path: []const u8) Error!?Appending {
+    var s = try lib.db.prepare("SELECT held, tail, bytes FROM appending WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    if (!try s.step()) return null;
+    return .{
+        .held = @intCast(@max(0, s.columnInt(0))),
+        .tail = std.fmt.parseInt(u64, s.columnText(1), 16) catch 0,
+        .bytes = try lib.gpa.dupe(u8, s.columnBlob(2)),
+    };
+}
+
+pub fn clearAppend(lib: Library, path: []const u8) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("DELETE FROM appending WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    try s.exec();
+}
+
 // -- documents ----------------------------------------------------------------
 
 /// The most of an `/ID` kept, as hex. The standard's are sixteen bytes; a
@@ -1374,6 +1463,31 @@ pub fn fileId(lib: Library, path: []const u8) Error!?[]u8 {
     const text = s.columnText(0);
     if (text.len == 0) return null;
     return try lib.gpa.dupe(u8, text);
+}
+
+/// Where a document's marks are kept when it says for itself -- `pdf` or
+/// `library`, as `fenrir marks --store` left it -- or null, for wherever
+/// the `store` setting says. The caller owns it.
+pub fn storeOf(lib: Library, path: []const u8) Error!?[]u8 {
+    var s = try lib.db.prepare("SELECT store FROM document WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    if (!try s.step()) return null;
+    const text = s.columnText(0);
+    if (text.len == 0) return null;
+    return try lib.gpa.dupe(u8, text);
+}
+
+pub fn setStore(lib: Library, path: []const u8, store: []const u8) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare(
+        \\INSERT INTO document (path, store) VALUES (?1, ?2)
+        \\ON CONFLICT (path) DO UPDATE SET store = excluded.store
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindText(2, store);
+    try s.exec();
 }
 
 /// Where the document with this `/ID` was seen, which is the first place a
@@ -1869,6 +1983,39 @@ test "a deletion of the file's is a row of its own, and an edit is told from a n
     defer lib.freeNames(changed);
     try testing.expectEqual(@as(usize, 2), changed.len);
     for (changed) |nm| try testing.expect(std.mem.eql(u8, nm, "f2") or std.mem.eql(u8, nm, "f5"));
+}
+
+test "a save on its way is recorded as bytes, and the journal goes once it is in" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    // Binary, noughts and all: an update is not text.
+    const update = "1 0 obj\x00\xff<<>>endobj";
+    try lib.recordAppend("a.pdf", .{ .held = 1234, .tail = 0xfeed, .bytes = update });
+    const got = (try lib.appending("a.pdf")).?;
+    defer testing.allocator.free(got.bytes);
+    try testing.expectEqual(@as(u64, 1234), got.held);
+    try testing.expectEqual(@as(u64, 0xfeed), got.tail);
+    try testing.expectEqualSlices(u8, update, got.bytes);
+
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .anchor = @constCast("f1") }, 1);
+    _ = try lib.addLink("a.pdf", .{ .from = @constCast("f1"), .to = @constCast("f1") }, 1);
+    try lib.addGone("a.pdf", .{ .nm = @constCast("f9") });
+    try testing.expect(try lib.journaled("a.pdf"));
+    try lib.clearJournal("a.pdf");
+    try testing.expect(!try lib.journaled("a.pdf"));
+    try testing.expect(try lib.appending("a.pdf") == null);
+    // A link is nothing a file holds yet, and stays.
+    const joined = try lib.links("a.pdf");
+    defer lib.freeLinks(joined, joined.len);
+    try testing.expectEqual(@as(usize, 1), joined.len);
+
+    try testing.expect(try lib.storeOf("a.pdf") == null);
+    try lib.setStore("a.pdf", "library");
+    const store = (try lib.storeOf("a.pdf")).?;
+    defer testing.allocator.free(store);
+    try testing.expectEqualStrings("library", store);
 }
 
 test "comments are many to an anchor, and change and go by row" {

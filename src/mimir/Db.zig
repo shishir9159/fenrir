@@ -75,6 +75,14 @@ extern fn sqlite3_bind_text(
     n_bytes: c_int,
     destructor: ?*const anyopaque,
 ) c_int;
+extern fn sqlite3_bind_blob(
+    stmt: ?*Statement,
+    index: c_int,
+    data: ?*const anyopaque,
+    len: c_int,
+    destructor: ?*const anyopaque,
+) c_int;
+extern fn sqlite3_column_blob(stmt: ?*Statement, col: c_int) ?*const anyopaque;
 extern fn sqlite3_column_count(stmt: ?*Statement) c_int;
 extern fn sqlite3_column_int64(stmt: ?*Statement, col: c_int) i64;
 extern fn sqlite3_column_double(stmt: ?*Statement, col: c_int) f64;
@@ -182,6 +190,13 @@ pub const Stmt = struct {
         _ = sqlite3_bind_text(s.stmt, index, value.ptr, @intCast(value.len), transient);
     }
 
+    /// Bytes as they are, where `bindText` says they are text: an update a
+    /// save is about to append is binary, and text is read up to a nought.
+    pub fn bindBlob(s: Stmt, index: c_int, value: []const u8) void {
+        if (!available) return;
+        _ = sqlite3_bind_blob(s.stmt, index, value.ptr, @intCast(value.len), transient);
+    }
+
     pub fn bindInt(s: Stmt, index: c_int, value: i64) void {
         if (!available) return;
         _ = sqlite3_bind_int64(s.stmt, index, value);
@@ -224,6 +239,15 @@ pub const Stmt = struct {
     pub fn columnText(s: Stmt, col: c_int) []const u8 {
         if (!available) return "";
         const ptr = sqlite3_column_text(s.stmt, col) orelse return "";
+        const n = sqlite3_column_bytes(s.stmt, col);
+        if (n <= 0) return "";
+        return ptr[0..@intCast(n)];
+    }
+
+    /// As `columnText`, for a column bound with `bindBlob`.
+    pub fn columnBlob(s: Stmt, col: c_int) []const u8 {
+        if (!available) return "";
+        const ptr: [*]const u8 = @ptrCast(sqlite3_column_blob(s.stmt, col) orelse return "");
         const n = sqlite3_column_bytes(s.stmt, col);
         if (n <= 0) return "";
         return ptr[0..@intCast(n)];
