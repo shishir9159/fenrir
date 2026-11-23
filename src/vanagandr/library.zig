@@ -173,7 +173,7 @@ pub const marks_usage =
     \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
     \\                    [--style STYLE] [--ink PAGE X Y X Y ... [COLOUR]]
     \\                    [--comment ANCHOR TEXT] [--link FROM TO [LABEL]]
-    \\                    [--store pdf] [--db FILE]
+    \\                    [--store pdf|library] [--bytes] [--db FILE]
     \\
     \\    The marks made on a document that the library holds and its file
     \\    does not yet: the highlights made with m or a palette colour, the
@@ -199,6 +199,12 @@ pub const marks_usage =
     \\    fenrir marks paper.pdf --store pdf  write them into the file, as
     \\                                        the reader does on :w, and
     \\                                        keep this document's there
+    \\    fenrir marks paper.pdf --store library
+    \\                                        take the file's out of it, into
+    \\                                        the library, and keep them there:
+    \\                                        the reader writes it no more
+    \\    fenrir marks paper.pdf --bytes      each revision of the file, its
+    \\                                        size, and what is in it
     \\
     \\    Pages are numbered from 1. Boxes and strokes alike are in PDF points
     \\    on the page as it is displayed, measured from its bottom-left corner
@@ -221,7 +227,8 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
     defer ink.deinit(ctx.gpa);
     var comment: ?struct { anchor: []const u8, text: []const u8 } = null;
-    var store: ?[]const u8 = null;
+    var store: ?enum { pdf, library } = null;
+    var bytes = false;
     var link: ?struct { from: []const u8, to: []const u8, label: []const u8 = "" } = null;
 
     var i: usize = 0;
@@ -294,9 +301,15 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
             }
         } else if (std.mem.eql(u8, arg, "--store")) {
             i += 1;
-            if (i == argv.len) return ctx.fail("--store needs pdf", .{});
-            if (!std.mem.eql(u8, argv[i], "pdf")) return ctx.fail("--store takes pdf, not {s}", .{argv[i]});
-            store = argv[i];
+            if (i == argv.len) return ctx.fail("--store needs pdf or library", .{});
+            store = if (std.mem.eql(u8, argv[i], "pdf"))
+                .pdf
+            else if (std.mem.eql(u8, argv[i], "library"))
+                .library
+            else
+                return ctx.fail("--store is pdf or library, not {s}", .{argv[i]});
+        } else if (std.mem.eql(u8, arg, "--bytes")) {
+            bytes = true;
         } else if (std.mem.eql(u8, arg, "--comment")) {
             if (i + 2 >= argv.len) return ctx.fail("--comment needs ANCHOR TEXT", .{});
             comment = .{ .anchor = argv[i + 1], .text = argv[i + 2] };
@@ -319,6 +332,8 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     }
 
     const name = file orelse return ctx.fail("marks needs a file", .{});
+    // The file's own history, which needs no library.
+    if (bytes) return revisions(ctx, name);
     var lib = open(ctx, db_path) orelse return ctx.fail(
         "this build has no library: rebuild without -Dsqlite=false",
         .{},
@@ -348,7 +363,10 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         return;
     }
 
-    if (store != null) return storeInFile(ctx, &lib, key, name);
+    if (store) |where| return switch (where) {
+        .pdf => storeInFile(ctx, &lib, key, name),
+        .library => storeInLibrary(ctx, &lib, key, name),
+    };
     if (comment) |c| return addComment(ctx, &lib, key, c.anchor, c.text);
     if (link) |l| return addLink(ctx, &lib, key, l.from, l.to, l.label);
 
@@ -462,12 +480,10 @@ fn nextName(ctx: *Context, lib: *Library, key: []const u8, buf: *[Library.name_l
     return Library.makeName(buf, high + 1);
 }
 
-/// `--store pdf`: the document's journal written into its file, as one
-/// incremental update, and the document's marks kept there from now on.
-///
-/// What a save that did not finish left is put right first, so this never
-/// appends to bytes another save was in the middle of.
-fn storeInFile(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) !void {
+/// The file's bytes as they are, with what a save that did not finish left
+/// put right first, so that nothing is appended to bytes another save was
+/// in the middle of.
+fn readRepaired(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) ![]u8 {
     const gpa = ctx.gpa;
     var bytes = ctx.readFileWith(gpa, file) catch |err| return ctx.fail("cannot read {s}: {t}", .{ file, err });
     const verdict = save.repair(gpa, ctx.io, lib.*, key, file, bytes) catch |err| {
@@ -483,6 +499,14 @@ fn storeInFile(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) 
         },
         .foreign => ctx.note("{s} has changed since the last save began; that save is forgotten", .{file}),
     };
+    return bytes;
+}
+
+/// `--store pdf`: the document's journal written into its file, as one
+/// incremental update, and the document's marks kept there from now on.
+fn storeInFile(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) !void {
+    const gpa = ctx.gpa;
+    const bytes = try readRepaired(ctx, lib, key, file);
     // The document frees the bytes, opened or not.
     var doc = fenrir.open(gpa, bytes) catch |err| return ctx.fail("cannot open {s}: {t}", .{ file, err });
     defer doc.deinit();
@@ -501,7 +525,7 @@ fn storeInFile(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) 
     plan.when = now(ctx.io);
 
     var seed: [64]u8 = undefined;
-    const update = save.write(gpa, ctx.io, lib.*, key, file, &doc, plan, std.fmt.bufPrint(&seed, "{d}", .{plan.when}) catch "") catch |err|
+    const update = save.write(gpa, ctx.io, lib.*, key, file, &doc, plan, std.fmt.bufPrint(&seed, "{d}", .{plan.when}) catch "", .in) catch |err|
         return ctx.fail("{s} is not written, and its marks stay in the library: {s}", .{ file, save.whyNot(err) });
     defer gpa.free(update);
     lib.setStore(key, "pdf") catch {};
@@ -580,6 +604,45 @@ pub fn absolute(ctx: *Context, file: []const u8) std.mem.Allocator.Error![]u8 {
         return ctx.gpa.dupe(u8, real);
     } else |_| {}
     return ctx.gpa.dupe(u8, file);
+}
+
+/// `--store library`: the marks the file holds taken out of it, into the
+/// library (`save.takeOut`), by one update that drops them from `/Annots`,
+/// and the document kept in the library from now on. `--store pdf` puts
+/// them back under the same names.
+fn storeInLibrary(ctx: *Context, lib: *Library, key: []const u8, file: []const u8) !void {
+    const gpa = ctx.gpa;
+    const bytes = try readRepaired(ctx, lib, key, file);
+    var doc = fenrir.open(gpa, bytes) catch |err| return ctx.fail("cannot open {s}: {t}", .{ file, err });
+    defer doc.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const when = now(ctx.io);
+    const taken = save.takeOut(arena.allocator(), lib.*, key, &doc, when) catch |err|
+        return ctx.fail("cannot take the marks out of {s}: {t}", .{ file, err });
+    // Kept there whatever the file says next: the reader writes it no more.
+    lib.setStore(key, "library") catch {};
+    if (taken.plan.isEmpty()) {
+        ctx.out.print("{s} holds no marks; its marks are kept in the library from now on\n", .{file}) catch {};
+        return;
+    }
+    var seed: [64]u8 = undefined;
+    const update = save.write(gpa, ctx.io, lib.*, key, file, &doc, taken.plan, std.fmt.bufPrint(&seed, "{d}", .{when}) catch "", .out) catch |err|
+        return ctx.fail("{s} still holds its marks, and the library has them too: {s}", .{ file, save.whyNot(err) });
+    defer gpa.free(update);
+    ctx.out.print("took {d} anchor{s} and {d} comment{s} out of {s}, into the library: {d} bytes\n", .{
+        taken.anchors,  if (taken.anchors == 1) "" else "s",
+        taken.comments, if (taken.comments == 1) "" else "s",
+        file,           update.len,
+    }) catch {};
+}
+
+/// `--bytes`: each revision of the file, its size, and what is in it.
+fn revisions(ctx: *Context, file: []const u8) !void {
+    const bytes = ctx.readFileWith(ctx.gpa, file) catch |err| return ctx.fail("cannot read {s}: {t}", .{ file, err });
+    defer ctx.gpa.free(bytes);
+    save.describeRevisions(ctx.gpa, bytes, ctx.out) catch |err| return ctx.fail("cannot read {s}'s revisions: {t}", .{ file, err });
 }
 
 // -- fenrir config -----------------------------------------------------------

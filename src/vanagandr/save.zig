@@ -43,6 +43,7 @@ const Writer = fenrir.Writer;
 const Bounds = fenrir.gelgja.Bounds;
 const Color = fenrir.gelgja.Color;
 const Point = fenrir.gelgja.Point;
+const Object = fenrir.Object;
 const Ref = fenrir.Ref;
 
 /// How wide a stroke stored with no width is drawn: the reader's pen.
@@ -558,21 +559,38 @@ pub fn cut(io: Io, path: []const u8, at: u64) (Io.File.OpenError || Io.File.SetL
 
 // -- one save, start to end ------------------------------------------------
 
+/// Which way a save moves a document's marks, which decides what of the
+/// journal it leaves once it is in.
+pub const Way = enum {
+    /// Into the file: the rows are the file's now, and go.
+    in,
+    /// Out of it (`takeOut`): the rows are the marks now, and stay; what
+    /// the journal said about the file's annotations goes.
+    out,
+};
+
 /// Makes, records and appends one save of `plan` onto the file at `path`,
-/// whose bytes as they are now `doc` was opened from, and empties `key`'s
-/// journal once the update is in. Returns the update, which the caller owns
-/// and which is empty when there was nothing to write.
+/// whose bytes as they are now `doc` was opened from, and settles `key`'s
+/// journal the `way` it went once the update is in. Returns the update,
+/// which the caller owns and which is empty when there was nothing to write.
 ///
 /// A failure keeps the journal, and the record too: the next open judges
 /// what reached the file.
-pub fn write(gpa: Allocator, io: Io, lib: Library, key: []const u8, path: []const u8, doc: *Document, plan: Plan, seed: []const u8) ![]u8 {
+pub fn write(gpa: Allocator, io: Io, lib: Library, key: []const u8, path: []const u8, doc: *Document, plan: Plan, seed: []const u8, way: Way) ![]u8 {
     const bytes = try update(gpa, doc, plan, seed);
     errdefer gpa.free(bytes);
     if (bytes.len == 0) return bytes;
-    try lib.recordAppend(key, .{ .held = doc.bytes.len, .tail = tailHash(doc.bytes), .bytes = bytes });
+    try lib.recordAppend(key, .{ .held = doc.bytes.len, .tail = tailHash(doc.bytes), .bytes = bytes, .out = way == .out });
     try append(io, path, doc.bytes.len, bytes);
-    try lib.clearJournal(key);
+    try settle(lib, key, way);
     return bytes;
+}
+
+fn settle(lib: Library, key: []const u8, way: Way) Library.Error!void {
+    switch (way) {
+        .in => try lib.clearJournal(key),
+        .out => try lib.forgetFile(key),
+    }
 }
 
 /// Puts right what a save that did not finish left, given the file's bytes
@@ -584,7 +602,7 @@ pub fn repair(gpa: Allocator, io: Io, lib: Library, key: []const u8, path: []con
     defer gpa.free(r.bytes);
     const verdict = judge(file, .{ .held = r.held, .tail = r.tail, .update = r.bytes });
     switch (verdict) {
-        .finished => try lib.clearJournal(key),
+        .finished => try settle(lib, key, if (r.out) .out else .in),
         .torn => {
             if (file.len != r.held) try cut(io, path, r.held);
             try lib.clearAppend(key);
@@ -606,6 +624,267 @@ pub fn whyNot(err: anyerror) []const u8 {
         error.FileNotFound => "it is not there any more",
         else => @errorName(err),
     };
+}
+
+// -- out of the file --------------------------------------------------------
+
+/// What `takeOut` moved.
+pub const TakenOut = struct {
+    /// The update that drops them from the file.
+    plan: Plan,
+    anchors: usize = 0,
+    comments: usize = 0,
+};
+
+/// The marks `doc` holds put into the library under `key` as rows of the
+/// reader's own, and the plan of an update that drops them from the file:
+/// `fenrir marks --store library`. What the journal holds already wins,
+/// as it does in the reader: an anchor or a comment with rows keeps them,
+/// and one the reader deleted is dropped and not copied.
+///
+/// **Rows first, the update after.** A file that will not take the update
+/// still has the marks, and the library has them under the same names, so
+/// the next open shows each once. One that came with no usable name is
+/// named here and noted by its shape (`nameAnnotation`), for that same
+/// reason; the notes go once the update is in (`Way.out`).
+///
+/// A markup with no line the reader could read, or ink with no path, is
+/// left in the file: dropped, it would be gone from both.
+pub fn takeOut(a: Allocator, lib: Library, key: []const u8, doc: *Document, now: i64) !TakenOut {
+    const list = try fenrir.pages.all(doc);
+
+    var held: std.StringHashMapUnmanaged(void) = .empty;
+    var said: std.StringHashMapUnmanaged(void) = .empty;
+    var gone: std.StringHashMapUnmanaged(void) = .empty;
+    var unsaid: std.StringHashMapUnmanaged(void) = .empty;
+    {
+        const rows = try lib.marks(key);
+        defer lib.freeMarks(rows, rows.len);
+        for (rows) |r| try held.put(a, try a.dupe(u8, r.anchor), {});
+        const ink = try lib.strokes(key);
+        defer lib.freeStrokes(ink, ink.len);
+        for (ink) |k| try held.put(a, try a.dupe(u8, k.anchor), {});
+        const comments = try lib.comments(key);
+        defer lib.freeComments(comments, comments.len);
+        for (comments) |c| try said.put(a, try a.dupe(u8, c.nm), {});
+        const deleted = try lib.gones(key);
+        defer lib.freeGones(deleted, deleted.len);
+        for (deleted) |g| try (if (g.comment) &unsaid else &gone).put(a, try a.dupe(u8, g.nm), {});
+    }
+
+    var drops: std.ArrayList(Drop) = .empty;
+    var out: TakenOut = .{ .plan = .{} };
+    for (list, 0..) |p, at| {
+        const page: u32 = @intCast(at);
+        const read = try annots.read(a, doc, p);
+        if (read.len == 0) continue;
+        const names = try a.alloc([]const u8, read.len);
+        for (read, names) |x, *name| {
+            if (unique(read, x.name)) {
+                name.* = x.name;
+            } else {
+                var buf: [Library.name_len]u8 = undefined;
+                const n = try lib.highestName(key) + 1;
+                try lib.noteName(key, n);
+                name.* = try a.dupe(u8, Library.makeName(&buf, n));
+                try lib.nameAnnotation(key, page, annots.shapeOf(x), name.*);
+            }
+        }
+
+        for (read, names) |x, name| {
+            if (x.kind == .reply) continue;
+            if (x.kind == .ink and x.paths.len == 0) continue;
+            if (x.kind != .ink and x.lines.len == 0) continue;
+            const where: Where = if (unique(read, x.name))
+                .{ .name = name, .page = page, .paged = Library.nameNumber(name) == null }
+            else
+                .{ .name = name, .page = page, .shape = annots.shapeOf(x) };
+            // Its replies go with it, in the file and out of it.
+            try drops.append(a, .{ .where = where, .anchor = true });
+            if (gone.contains(name)) continue;
+
+            if (!held.contains(name)) {
+                var hex: [7]u8 = undefined;
+                const color: []u8 = if (x.color) |c| @constCast(hexOf(c, &hex)) else &.{};
+                if (x.kind == .ink) {
+                    for (x.paths) |path| {
+                        if (path.len < 2) continue;
+                        _ = try lib.addStroke(key, .{
+                            .page = page,
+                            .color = color,
+                            .width = x.width,
+                            .points = @constCast(path),
+                            .anchor = @constCast(name),
+                        }, now);
+                    }
+                } else for (x.lines) |box| {
+                    _ = try lib.addMark(key, .{
+                        .page = page,
+                        .x0 = box.min_x,
+                        .y0 = box.min_y,
+                        .x1 = box.max_x,
+                        .y1 = box.max_y,
+                        .color = color,
+                        .style = @constCast(@tagName(x.kind)),
+                        .anchor = @constCast(name),
+                    }, now);
+                }
+                out.anchors += 1;
+            }
+            if (x.text.len != 0 and !said.contains(name) and !unsaid.contains(name)) {
+                _ = try lib.addComment(key, .{ .anchor = @constCast(name), .nm = @constCast(name), .page = page, .text = @constCast(x.text) }, now);
+                out.comments += 1;
+            }
+        }
+
+        for (read, names) |x, name| {
+            if (x.kind != .reply or x.text.len == 0) continue;
+            const thread = x.thread orelse continue;
+            if (gone.contains(names[thread]) or said.contains(name) or unsaid.contains(name)) continue;
+            _ = try lib.addComment(key, .{ .anchor = @constCast(names[thread]), .nm = @constCast(name), .page = page, .text = @constCast(x.text) }, now);
+            out.comments += 1;
+        }
+    }
+    out.plan = .{ .drops = drops.items };
+    return out;
+}
+
+/// Whether `name` names one annotation on its page and no other.
+fn unique(read: []const annots.Annot, name: []const u8) bool {
+    if (name.len == 0) return false;
+    var seen: usize = 0;
+    for (read) |y| seen += @intFromBool(std.mem.eql(u8, name, y.name));
+    return seen == 1;
+}
+
+fn hexOf(c: Color, buf: *[7]u8) []const u8 {
+    const byte = struct {
+        fn of(v: f32) u8 {
+            return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
+        }
+    }.of;
+    return std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ byte(c.r), byte(c.g), byte(c.b) }) catch unreachable;
+}
+
+// -- what each save cost ----------------------------------------------------
+
+/// Each revision of a file, its size and what is in it: `fenrir marks F
+/// --bytes`, which is the check on what a save costs.
+///
+/// A revision ends at each `%%EOF`. What is in one is what its
+/// cross-reference data says moved: the tables of the file up to its end
+/// and up to the last one's are read, and the objects whose entries differ
+/// are counted by what they are. One that names an annotation `f` and a
+/// number is fenrir's. A prefix that does not open as a file of its own --
+/// the first part of a linearized file -- is counted with the next.
+pub fn describeRevisions(gpa: Allocator, bytes: []const u8, w: *Io.Writer) !void {
+    var prev: ?Document = null;
+    defer if (prev) |*p| p.deinit();
+    var prev_end: usize = 0;
+    var number: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, at, "%%EOF")) |i| {
+        var end = i + "%%EOF".len;
+        while (end < bytes.len and (bytes[end] == '\r' or bytes[end] == '\n')) end += 1;
+        at = end;
+        var doc = Document.openBorrowed(gpa, bytes[0..end]) catch continue;
+        if (doc.recovered or doc.table.recovered) {
+            doc.deinit();
+            continue;
+        }
+        number += 1;
+        if (prev) |*p| {
+            try w.print("revision {d}  {d} bytes  ", .{ number, end - prev_end });
+            try describeOne(gpa, p, &doc, w);
+            p.deinit();
+        } else try w.print("revision {d}  {d} bytes  the file as it was made\n", .{ number, end });
+        prev = doc;
+        prev_end = end;
+    }
+    if (number == 0) return error.NoRevision;
+}
+
+fn describeOne(gpa: Allocator, was: *Document, now: *Document, w: *Io.Writer) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var kinds: std.StringArrayHashMapUnmanaged(usize) = .empty;
+    var forms: usize = 0;
+    var lists: usize = 0;
+    var pages: usize = 0;
+    var freed: usize = 0;
+    var other: usize = 0;
+    var fenrirs = false;
+
+    var it = now.table.entries.iterator();
+    while (it.next()) |e| {
+        const num = e.key_ptr.*;
+        if (was.table.get(num)) |before| {
+            if (std.meta.eql(before, e.value_ptr.*)) continue;
+        }
+        if (e.value_ptr.* == .free) {
+            freed += 1;
+            continue;
+        }
+        const obj = now.fetch(.{ .num = num, .gen = 0 }) catch {
+            other += 1;
+            continue;
+        };
+        switch (obj) {
+            .array => lists += 1,
+            .stream => |st| {
+                if (st.dict.get("Subtype")) |sub| {
+                    if (sub.isName("Form")) {
+                        forms += 1;
+                        continue;
+                    }
+                }
+                const t = st.dict.get("Type") orelse Object.null_object;
+                if (!t.isName("ObjStm") and !t.isName("XRef")) other += 1;
+            },
+            .dict => |d| {
+                if (d.get("Type")) |t| {
+                    if (t.isName("Page")) {
+                        pages += 1;
+                        continue;
+                    }
+                }
+                const sub = (d.get("Subtype") orelse {
+                    other += 1;
+                    continue;
+                }).asName() orelse {
+                    other += 1;
+                    continue;
+                };
+                if (d.get("NM")) |nm| {
+                    if (Library.nameNumber(nm.asString() orelse "") != null) fenrirs = true;
+                }
+                const got = try kinds.getOrPut(a, sub);
+                if (!got.found_existing) got.value_ptr.* = 0;
+                got.value_ptr.* += 1;
+            },
+            else => other += 1,
+        }
+    }
+
+    // Whose it is, where an annotation in it says: one that only drops
+    // some, as `--store library`'s does, names nobody.
+    if (kinds.count() != 0) try w.writeAll(if (fenrirs) "fenrir's: " else "another program's: ");
+    var any = false;
+    for (kinds.keys(), kinds.values()) |k, n| {
+        try w.print("{s}{d} {s}", .{ if (any) ", " else "", n, k });
+        any = true;
+    }
+    const tail = [_]struct { usize, []const u8 }{
+        .{ forms, "form" }, .{ lists, "list" }, .{ pages, "page" }, .{ freed, "freed" }, .{ other, "other" },
+    };
+    for (tail) |t| {
+        if (t[0] == 0) continue;
+        try w.print("{s}{d} {s}", .{ if (any) ", " else "", t[0], t[1] });
+        any = true;
+    }
+    if (!any) try w.writeAll("nothing");
+    try w.writeAll("\n");
 }
 
 // -- tests ------------------------------------------------------------------
@@ -860,4 +1139,86 @@ test "a plan from the journal: lines by anchor and page, comments as notes or re
     try testing.expectEqual(@as(u32, 1), plan.drops[0].where.page);
     try testing.expectEqualStrings("f9", plan.drops[1].where.name);
     try testing.expect(plan.drops[1].anchor);
+}
+
+test "marks taken out of the file come back as the rows they went in as, and leave the file" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    // A highlight of two lines with a note and a reply, and a stroke.
+    var points = [_]Point{ .{ .x = 72, .y = 600 }, .{ .x = 120, .y = 620.5 }, .{ .x = 160, .y = 605 } };
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 72, .y0 = 700, .x1 = 300, .y1 = 712, .color = @constCast("#4c9ed9"), .anchor = @constCast("f1") }, 1);
+    _ = try lib.addMark("a.pdf", .{ .page = 0, .x0 = 72, .y0 = 686, .x1 = 200, .y1 = 698, .color = @constCast("#4c9ed9"), .anchor = @constCast("f1") }, 1);
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f1"), .text = @constCast("why") }, 1);
+    _ = try lib.addComment("a.pdf", .{ .anchor = @constCast("f1"), .nm = @constCast("f2"), .text = @constCast("because") }, 1);
+    _ = try lib.addStroke("a.pdf", .{ .points = &points, .width = 2.5, .color = @constCast("#e4572e"), .anchor = @constCast("f3") }, 1);
+
+    var doc = try Document.open(gpa, try fileWith("", &.{}));
+    defer doc.deinit();
+    var in = try saved(&doc, try planOf(a, lib, "a.pdf"));
+    defer in.deinit();
+    try lib.clearJournal("a.pdf");
+
+    const taken = try takeOut(a, lib, "a.pdf", &in, 2);
+    try testing.expectEqual(@as(usize, 2), taken.anchors);
+    try testing.expectEqual(@as(usize, 2), taken.comments);
+    try testing.expectEqual(@as(usize, 2), taken.plan.drops.len);
+
+    const rows = try lib.marks("a.pdf");
+    defer lib.freeMarks(rows, rows.len);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |r| {
+        try testing.expectEqualStrings("f1", r.anchor);
+        try testing.expectEqualStrings("#4c9ed9", r.color);
+        try testing.expectEqualStrings("highlight", r.style);
+    }
+    try testing.expectApproxEqAbs(@as(f32, 712), rows[0].y1, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 200), rows[1].x1, 0.01);
+    const ink = try lib.strokes("a.pdf");
+    defer lib.freeStrokes(ink, ink.len);
+    try testing.expectEqual(@as(usize, 1), ink.len);
+    try testing.expectEqualStrings("f3", ink[0].anchor);
+    try testing.expectEqualStrings("#e4572e", ink[0].color);
+    try testing.expectEqual(@as(f32, 2.5), ink[0].width);
+    try testing.expectEqual(@as(usize, 3), ink[0].points.len);
+    const said = try lib.comments("a.pdf");
+    defer lib.freeComments(said, said.len);
+    try testing.expectEqual(@as(usize, 2), said.len);
+    try testing.expectEqualStrings("why", said[0].text);
+    try testing.expectEqualStrings("f2", said[1].nm);
+    try testing.expectEqualStrings("f1", said[1].anchor);
+
+    // And the update leaves nothing of the reader's in the file.
+    var out = try saved(&in, taken.plan);
+    defer out.deinit();
+    try testing.expectEqual(@as(usize, 0), (try annotsOf(&out, a)).len);
+}
+
+test "a file's revisions are listed with their size and what each holds" {
+    const gpa = testing.allocator;
+    var doc = try Document.open(gpa, try fileWith("", &.{}));
+    defer doc.deinit();
+    var after = try saved(&doc, .{ .anchors = &.{.{
+        .where = .{ .name = "f1" },
+        .kind = .highlight,
+        .pieces = &.{.{ .page = 0, .lines = &.{.fromRect(72, 700, 300, 712)} }},
+    }} });
+    defer after.deinit();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try describeRevisions(gpa, after.bytes, &out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.startsWith(u8, text, "revision 1  "));
+    const second = std.mem.indexOf(u8, text, "revision 2  ").?;
+    const line = text[second..];
+    try testing.expect(std.mem.indexOf(u8, line, "fenrir's: 1 Highlight") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "form") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "page") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "revision "));
 }

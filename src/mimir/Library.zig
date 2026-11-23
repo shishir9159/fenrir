@@ -263,7 +263,8 @@ fn create(lib: *Library) Error!void {
         \\    path   TEXT PRIMARY KEY,
         \\    held   INTEGER NOT NULL,
         \\    tail   TEXT NOT NULL,
-        \\    bytes  BLOB NOT NULL
+        \\    bytes  BLOB NOT NULL,
+        \\    out    INTEGER NOT NULL DEFAULT 0
         \\) WITHOUT ROWID;
         \\PRAGMA user_version = 1;
         \\COMMIT;
@@ -1386,23 +1387,27 @@ pub const Appending = struct {
     tail: u64,
     /// The update, owned by the caller.
     bytes: []u8,
+    /// It took the document's marks out of the file rather than putting
+    /// them in: finished, it leaves the rows, which are the marks now.
+    out: bool = false,
 };
 
-pub fn recordAppend(lib: Library, path: []const u8, a: struct { held: u64, tail: u64, bytes: []const u8 }) Error!void {
+pub fn recordAppend(lib: Library, path: []const u8, a: struct { held: u64, tail: u64, bytes: []const u8, out: bool = false }) Error!void {
     if (lib.future) return;
     var hex: [16]u8 = undefined;
-    var s = try lib.db.prepare("INSERT OR REPLACE INTO appending (path, held, tail, bytes) VALUES (?1, ?2, ?3, ?4)");
+    var s = try lib.db.prepare("INSERT OR REPLACE INTO appending (path, held, tail, bytes, out) VALUES (?1, ?2, ?3, ?4, ?5)");
     defer s.finalize();
     s.bindText(1, path);
     s.bindInt(2, @intCast(a.held));
     s.bindText(3, std.fmt.bufPrint(&hex, "{x:0>16}", .{a.tail}) catch unreachable);
     s.bindBlob(4, a.bytes);
+    s.bindInt(5, @intFromBool(a.out));
     try s.exec();
 }
 
 /// The save a document's file was last left in the middle of, or null.
 pub fn appending(lib: Library, path: []const u8) Error!?Appending {
-    var s = try lib.db.prepare("SELECT held, tail, bytes FROM appending WHERE path = ?1");
+    var s = try lib.db.prepare("SELECT held, tail, bytes, out FROM appending WHERE path = ?1");
     defer s.finalize();
     s.bindText(1, path);
     if (!try s.step()) return null;
@@ -1410,7 +1415,25 @@ pub fn appending(lib: Library, path: []const u8) Error!?Appending {
         .held = @intCast(@max(0, s.columnInt(0))),
         .tail = std.fmt.parseInt(u64, s.columnText(1), 16) catch 0,
         .bytes = try lib.gpa.dupe(u8, s.columnBlob(2)),
+        .out = s.columnInt(3) != 0,
     };
+}
+
+/// Forgets what the journal said about the file's own annotations -- what
+/// was deleted of them, and the names given those that had none -- once
+/// the file holds none of the reader's: after its marks were taken out.
+pub fn forgetFile(lib: Library, path: []const u8) Error!void {
+    if (lib.future) return;
+    for ([_][]const u8{
+        "DELETE FROM gone WHERE path = ?1",
+        "DELETE FROM naming WHERE path = ?1",
+        "DELETE FROM appending WHERE path = ?1",
+    }) |sql| {
+        var s = try lib.db.prepare(sql);
+        defer s.finalize();
+        s.bindText(1, path);
+        try s.exec();
+    }
 }
 
 pub fn clearAppend(lib: Library, path: []const u8) Error!void {

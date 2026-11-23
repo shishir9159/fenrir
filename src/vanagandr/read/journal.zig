@@ -235,7 +235,7 @@ fn writeOut(
 ) Outcome {
     const now_stamp = watch.stat(io, path) orelse return .{ .refused = error.FileNotFound };
     if (!now_stamp.eql(held)) return .stale;
-    const bytes = save.write(gpa, io, lib, path, path, doc, plan, seed) catch |err| return .{ .refused = err };
+    const bytes = save.write(gpa, io, lib, path, path, doc, plan, seed, .in) catch |err| return .{ .refused = err };
     defer gpa.free(bytes);
     if (bytes.len == 0) return .unchanged;
     var got: Written = .{ .stamp = watch.stat(io, path) orelse .{}, .bytes = bytes.len };
