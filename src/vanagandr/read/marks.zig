@@ -1,7 +1,8 @@
 //! Marks and the comments on them: made from a selection or the caret,
-//! taken in hand and changed in edit mode, walked with `]a` and `]c`, written
-//! to the library, read back from it and from the file's own annotations,
-//! and drawn over the page.
+//! taken in hand and changed in edit mode, walked with `]a` and `]c`,
+//! journaled in the library, read back from it and from the file's own
+//! annotations, and drawn over the page. Writing the journal into the file
+//! is `journal.zig`'s.
 //!
 //! A file of its own so that all of it is in one place, and so that a build
 //! with no marks can leave the file out.
@@ -11,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const fenrir = @import("fenrir");
 
 const library = @import("../library.zig");
+const save = @import("../save.zig");
 const Library = library.Library;
 const Session = @import("Session.zig");
 const frame = @import("frame.zig");
@@ -38,7 +40,7 @@ const caps = fenrir.build_options;
 /// stored with no width, and the pen the reader starts with. About the weight
 /// of a fineliner against ten-point type, which is what somebody underlining
 /// a line of a paper is holding.
-pub const default_pen_width: f32 = 1.6;
+pub const default_pen_width: f32 = save.default_pen_width;
 
 /// What ink that names no colour is drawn in: a stroke stored without one,
 /// and the pen until a digit picks another. See `ink.penColor`.
@@ -609,6 +611,10 @@ fn writeEffects(s: *Session, retry: bool) void {
     var at: u32 = 0;
     while (at < s.bufferCount()) : (at += 1) {
         const b = s.buffer(at);
+        // Not while its save is out: the rows are being written into the
+        // file and cleared, and a row written now would be cleared with
+        // them unwritten. What comes meanwhile waits, queued.
+        if (s.disk(at).save == .posted) continue;
         const fresh = b.marks.takeEffects().len != 0;
         if (!fresh and !(retry and b.marks.owed() != 0)) continue;
         const was = b.marks.owed();

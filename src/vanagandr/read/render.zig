@@ -18,6 +18,7 @@ const Session = @import("Session.zig");
 const compare = @import("compare.zig");
 const cursor = @import("cursor.zig");
 const plugins_mod = @import("plugins.zig");
+const journal = @import("journal.zig");
 const reload = @import("reload.zig");
 const search_mod = @import("search.zig");
 
@@ -218,7 +219,8 @@ pub const Job = struct {
     /// for pixels that go straight in the bin. `.overlay` is a page of the
     /// first document of a comparison laid over its partner in the second.
     /// `.reload` is the buffer's file read again, and no page; see `install`.
-    pub const Want = enum { page, text, overlay, reload };
+    /// `.save` is its marks written into it; see `journal.install`.
+    pub const Want = enum { page, text, overlay, reload, save };
 
     pub fn eql(a: Job, b: Job) bool {
         return a.buffer == b.buffer and a.page == b.page and
@@ -261,6 +263,8 @@ pub const Rasteriser = struct {
         map: ?text.Page = null,
         /// A `.reload`'s, and nothing else's.
         reload: ?watch.Outcome = null,
+        /// A `.save`'s.
+        saved: if (caps.marks) ?journal.Outcome else void = if (caps.marks) null else {},
 
         const Result = union(Backend) {
             cpu: Image,
@@ -363,6 +367,10 @@ pub fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
         out.reload = watch.load(gpa, s.ctx.io, b.path, old, d.reload == .forced, page_options);
         return;
     }
+    if (caps.marks and job.want == .save) {
+        out.saved = journal.produce(s, job.buffer);
+        return;
+    }
 
     // Two pages and no text map: the cursor's map is a `.page` job's,
     // asked for separately when the cursor wants it.
@@ -404,6 +412,13 @@ pub fn discard(s: *Session, f: *Rasteriser.Finished) void {
         .refused => {},
     };
     f.reload = null;
+    if (caps.marks) {
+        if (f.saved) |*o| switch (o.*) {
+            .written => |*w| w.deinit(s.gpa),
+            else => {},
+        };
+        f.saved = null;
+    }
     if (f.map) |*m| m.deinit(s.gpa);
     f.map = null;
     const result = &(f.result orelse return);
@@ -744,6 +759,12 @@ pub fn collectPage(
         // thread's to free.
         const outcome = finished.reload orelse return null;
         reload.install(s, finished.job.buffer, outcome);
+        return null;
+    }
+    if (caps.marks and finished.job.want == .save) {
+        // Parked, as for a reload: nothing else was posted while it was
+        // out (`journal.jobFor`).
+        journal.install(s, finished.job.buffer, finished.saved orelse return null);
         return null;
     }
 

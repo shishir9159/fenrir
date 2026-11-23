@@ -2,8 +2,8 @@
 //!
 //! Two kinds, and one list. A highlight is a box over some words; a stroke is
 //! where a pen went. They are the same kind of *fact* -- something a person
-//! put on a page, in the page's own coordinates, which the reader keeps
-//! beside the document rather than writing into it -- and everything this
+//! put on a page, in the page's own coordinates, which goes into the PDF as
+//! an annotation when it is saved -- and everything this
 //! file does to one it does to the other: one revision number, one undo
 //! history, one order, one panel. A `kind` and a point list is what that
 //! costs, against a second list with a second history that `u` would have had

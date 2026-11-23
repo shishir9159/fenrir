@@ -21,6 +21,7 @@ const compare = @import("compare.zig");
 const cursor = @import("cursor.zig");
 const ink = @import("ink.zig");
 const interface = @import("interface.zig");
+const journal = @import("journal.zig");
 const marks = @import("marks.zig");
 const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
@@ -935,6 +936,11 @@ pub fn open(s: *Session, settings: Settings) !void {
         });
         marks.applyEffects(s);
     }
+    // Each document's journal into its file. The rasterising thread is
+    // stopped first, which hands every document to this thread: the save
+    // is the same job `:w` posts, with nobody left to post it to.
+    worker.stop();
+    if (caps.marks) journal.closing(s);
     s.rememberAll();
     ctx.note("{d} frames drawn, {d} pages prepared, {d} MiB uploaded", .{
         renderer.frames_drawn,

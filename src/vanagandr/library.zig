@@ -605,6 +605,9 @@ pub const config_usage =
     \\               what c leaves on the words: `highlight` or `arrow`
     \\      watch    `on` to follow a file another program rewrites; `off`,
     \\               the default, holds it so that none can
+    \\      store    `pdf`, the default: marks are written into the file on
+    \\               :w and when the reader closes it; `library` keeps
+    \\               them here and never writes the file
 ;
 
 pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
@@ -683,6 +686,11 @@ pub fn configRun(ctx: *Context, argv: []const []const u8) !void {
             if (std.mem.eql(u8, k, "watch")) {
                 if (!std.mem.eql(u8, v, "on") and !std.mem.eql(u8, v, "off"))
                     return ctx.fail("watch is on or off, not {s}", .{v});
+            }
+            // And whether the reader writes files at all.
+            if (std.mem.eql(u8, k, "store")) {
+                if (!std.mem.eql(u8, v, "pdf") and !std.mem.eql(u8, v, "library"))
+                    return ctx.fail("store is pdf or library, not {s}", .{v});
             }
             lib.set(k, v) catch |err| return ctx.fail("cannot set {s}: {t}", .{ k, err });
             ctx.out.print("{s} = {s}\n", .{ k, v }) catch {};

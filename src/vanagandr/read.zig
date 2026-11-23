@@ -79,6 +79,7 @@ const library = @import("library.zig");
 
 const Session = @import("read/Session.zig");
 const frame = @import("read/frame.zig");
+const journal = @import("read/journal.zig");
 const marks = @import("read/marks.zig");
 const plugins_mod = @import("read/plugins.zig");
 const reload = @import("read/reload.zig");
@@ -667,6 +668,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Session.Co
     // was last read to, and does not move where they will reopen. A bench
     // ends at the last page and must not leave the reader there.
     session.remembers_place = shot == null and comparison == null and bench == null;
+    session.writes_on_close = session.remembers_place;
     if (caps.compare) session.diff = comparison;
     // fenrir.toml's settings over the library's, for this session and never
     // written into it: the library is what was last clicked, the file is
@@ -682,6 +684,7 @@ pub fn runWith(ctx: *Context, typed: []const []const u8, comparison: ?Session.Co
     // chosen colour back on top of whichever theme was named.
     session.useTheme(written_theme orelse session.rememberedTheme());
     if (caps.marks) session.comment_style = marks.rememberedCommentStyle(&session);
+    if (caps.marks) session.store = journal.rememberedStore(&session);
     // Before the documents open: a document not watched is held from the
     // moment it is read.
     session.watching = comparison == null and (watch_flag or reload.rememberedWatch(&session));

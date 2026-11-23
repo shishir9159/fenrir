@@ -17,11 +17,12 @@
 //! `--clear` are how a list is trimmed.
 //!
 //! Marks and ink are the things here that are a *change to a document*
-//! rather than a note about reading it, and they are still kept here rather
-//! than written into the PDF: writing an annotation back means rewriting the
-//! file, and a reader should not modify what it was asked to display until
-//! someone asks it to. `fenrir` will grow a command that exports them as real
-//! `/Annots`; until then they live beside the document and not in it.
+//! rather than a note about reading it. **The PDF is modified by default**:
+//! they are journaled here as they settle and go into the file as one
+//! incremental update on `:w` and when the reader closes it, after which
+//! their rows are gone (`clearJournal`), the file holding them. With the
+//! `store` setting at `library`, or a document's own `store` saying so,
+//! the file is never written and the rows stay here for good.
 //!
 //! Ink is the same kind of fact as a mark and is kept the same way: a
 //! page, a colour, and geometry in that page's own user-space points. It has

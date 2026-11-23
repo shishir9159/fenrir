@@ -45,6 +45,7 @@ const cursor = @import("cursor.zig");
 const frame = @import("frame.zig");
 const ink = @import("ink.zig");
 const interface = @import("interface.zig");
+const journal = @import("journal.zig");
 const marks = @import("marks.zig");
 const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
@@ -278,6 +279,10 @@ library: ?LibraryIfStored = null,
 /// False for `--shot`: settings still apply, the reading position does
 /// not, and nothing is written back.
 remembers_place: bool = true,
+/// Whether closing writes each document's journal into its file. False
+/// for a shot, a bench and a comparison, which are scripts and views and
+/// not somebody reading, and in a test.
+writes_on_close: bool = false,
 
 /// Set when the loop should end, by `q` on the last window or by `Q`.
 quit: bool = false,
@@ -306,6 +311,11 @@ focus_comment: if (caps.marks) ?u64 else void = if (caps.marks) null else {},
 /// for a reader who wants no colour on the text. The `comment_anchor`
 /// setting, read when the reader starts and when it is changed.
 comment_style: if (caps.marks) Marks.Style else void = if (caps.marks) .highlight else {},
+/// Where a document's marks go when it does not say for itself: the
+/// `store` setting, read when the reader starts and when it is changed.
+store: if (caps.marks) journal.Store else void = if (caps.marks) .pdf else {},
+/// The save out with the rasterising thread, or null; see `journal.jobFor`.
+saving: if (caps.marks) ?journal.Saving else void = if (caps.marks) null else {},
 /// What note mode will write on enter. Set as it begins, because the
 /// keys that begin it mean different things: `a` the comment in hand,
 /// `c` a new one.
@@ -436,6 +446,9 @@ pub fn deinit(s: *Session) void {
     s.cmdline.deinit(s.gpa);
     if (caps.search) s.search.deinit(s.gpa);
     if (caps.marks) s.note.deinit(s.gpa);
+    if (caps.marks) {
+        if (s.saving) |*w| w.arena.deinit();
+    }
     s.recorded.deinit(s.gpa);
     s.tabs.deinit(s.gpa);
     var i: u32 = 0;
@@ -488,6 +501,15 @@ pub fn openBuffer(s: *Session, file: []const u8) !u32 {
     // that a write during the read is noticed. Watched, it is never held
     // open at all, see `watch.load`, and is listened to from before the
     // stamp, so that no write falls between the two.
+    // A save the reader died in the middle of is put right before the
+    // file is held, which would shut out the cutting back of a torn one.
+    if (caps.marks) {
+        if (absolutePath(s.ctx, gpa, file)) |key| {
+            defer gpa.free(key);
+            journal.repairAt(s, key);
+        }
+    }
+
     var on_disk: watch.Disk = .{};
     errdefer on_disk.deinit(gpa, s.io);
     if (s.io) |io| {
@@ -824,13 +846,13 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
         },
         .write => {
             if (!caps.marks) return s.absent(name);
+            // The library first, which is what the file is written from.
             marks.retryEffects(s);
             const left = marks.unsaved(s);
             if (left != 0) {
                 s.say("{d} changes the library still will not take -- kept, and tried again on the next", .{left});
-                return false;
             }
-            if (s.status.len == 0) s.say("every change is kept", .{});
+            return journal.write(s, v.buffer) and left == 0;
         },
         .page => {
             // `:page 12`, `:page +2`, `:page -1`.
@@ -1035,6 +1057,10 @@ fn setOption(s: *Session, args: []const u8) bool {
             s.say("watch = {s}", .{if (s.watching) "on" else "off"});
             return true;
         }
+        if (caps.marks and std.mem.eql(u8, args, "store")) {
+            s.say("store = {t}", .{s.store});
+            return true;
+        }
         if (!std.mem.eql(u8, args, "theme")) {
             s.say("no setting called {s}", .{args[0..@min(args.len, 48)]});
             return false;
@@ -1047,9 +1073,14 @@ fn setOption(s: *Session, args: []const u8) bool {
     const value = std.mem.trim(u8, args[eq + 1 ..], " \t");
     // Through the settings page's door, which checks it, applies it and
     // writes it down, so `:set` and a click cannot disagree.
-    if ((caps.marks and std.mem.eql(u8, name, "comment_anchor")) or std.mem.eql(u8, name, "watch")) {
+    const marked = caps.marks and (std.mem.eql(u8, name, "comment_anchor") or std.mem.eql(u8, name, "store"));
+    if (marked or std.mem.eql(u8, name, "watch")) {
         if (caps.marks and name[0] == 'c' and marks.commentStyleNamed(value) == null) {
             s.say("comment_anchor is highlight or arrow, not {s}", .{value[0..@min(value.len, 48)]});
+            return false;
+        }
+        if (caps.marks and name[0] == 's' and journal.storeNamed(value) == null) {
+            s.say("store is pdf or library, not {s}", .{value[0..@min(value.len, 48)]});
             return false;
         }
         if (name[0] == 'w' and !std.mem.eql(u8, value, "on") and !std.mem.eql(u8, value, "off")) {
@@ -1066,6 +1097,8 @@ fn setOption(s: *Session, args: []const u8) bool {
         // down where there is somewhere to write it.
         if (caps.marks and name[0] == 'c') {
             s.comment_style = marks.commentStyleNamed(value).?;
+        } else if (caps.marks and name[0] == 's') {
+            s.store = journal.storeNamed(value).?;
         } else reload.setWatching(s, std.mem.eql(u8, value, "on"));
         if (s.library) |l| l.set(name, value) catch {};
         s.say("{s} = {s}", .{ name, value });

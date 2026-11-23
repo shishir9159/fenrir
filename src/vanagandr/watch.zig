@@ -98,8 +98,17 @@ pub const Disk = struct {
     /// Seconds from the first notice of a change to the look that found it
     /// still, for `--time`.
     heard: f32 = 0,
+    /// The marks being written into the file: asked for by `:w`, or posted
+    /// to the rasterising thread, which owns the `Document` a save is made
+    /// from. Nothing looks at the file while one is posted: it is moving
+    /// because the reader is moving it.
+    save: Save = .none,
+    /// A save that found the file moved since it was read: asked for again
+    /// once the reload that reads it is in.
+    resave: bool = false,
 
     pub const Reload = enum { none, auto, forced };
+    pub const Save = enum { none, wanted, posted };
 
     /// `io` is null where nothing was ever held: in a test.
     pub fn deinit(d: *Disk, gpa: Allocator, io: ?Io) void {

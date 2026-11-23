@@ -21,6 +21,7 @@ const settings_page = @import("../settings.zig");
 const Session = @import("Session.zig");
 const reload = @import("reload.zig");
 const compare = @import("compare.zig");
+const journal = @import("journal.zig");
 const marks = @import("marks.zig");
 
 const galdr = fenrir.galdr;
@@ -124,6 +125,11 @@ pub fn changeSetting(s: *Session, c: settings_page.Change) void {
     } else if (std.mem.eql(u8, c.key, "comment_anchor")) {
         s.comment_style = if (c.value.len == 0) .highlight else marks.commentStyleNamed(c.value) orelse {
             s.say("comment_anchor is highlight or arrow, not {s}", .{c.value[0..@min(c.value.len, 48)]});
+            return;
+        };
+    } else if (std.mem.eql(u8, c.key, "store")) {
+        s.store = if (c.value.len == 0) .pdf else journal.storeNamed(c.value) orelse {
+            s.say("store is pdf or library, not {s}", .{c.value[0..@min(c.value.len, 48)]});
             return;
         };
     } else if (std.mem.eql(u8, c.key, "watch")) {

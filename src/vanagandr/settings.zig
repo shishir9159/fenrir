@@ -94,6 +94,12 @@ pub const builtin = [_]Option{
         .unset = "highlight",
     },
     .{
+        .key = "store",
+        .about = "where marks are kept: written into the pdf, or the library alone",
+        .choices = &.{ "pdf", "library" },
+        .unset = "pdf",
+    },
+    .{
         .key = "watch",
         .about = "follow a file another program rewrites; off holds it shut",
         .choices = &.{ "off", "on" },

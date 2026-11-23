@@ -22,6 +22,7 @@ const Slot = render.Slot;
 const msOf = frame.msOf;
 const compare = @import("compare.zig");
 const cursor = @import("cursor.zig");
+const journal = @import("journal.zig");
 const marks = @import("marks.zig");
 const plugins_mod = @import("plugins.zig");
 const search_mod = @import("search.zig");
@@ -99,8 +100,9 @@ pub fn poll(s: *Session, dt: f32) void {
             }
         }
         // Taken while a reload is pending too, so that a write during
-        // one is looked into after it.
-        if (!watch.tick(d, dt, said) or d.reload != .none) continue;
+        // one is looked into after it. Never acted on while a save is
+        // out: the file is moving because the reader is moving it.
+        if (!watch.tick(d, dt, said) or d.reload != .none or d.save == .posted) continue;
         const stamp = watch.stat(io, b.path) orelse continue;
         if (watch.due(d, stamp)) d.reload = .auto;
     }
@@ -117,12 +119,16 @@ fn reloadJob(s: *Session) ?Job {
 
 /// What the worker is asked for next.
 ///
-/// **While a reload is pending, nothing else.** A page asked of the old
-/// document after it would be drawn from a document `install` frees, and
-/// with nothing else posted the worker is parked when the reload comes
-/// back -- which is what lets `install` free it on this thread.
+/// **While a reload or a save is pending, nothing else.** A page asked of
+/// the old document after it would be drawn from a document `install`
+/// frees, and with nothing else posted the worker is parked when the job
+/// comes back -- which is what lets `install` free it on this thread. A
+/// reload goes first: a save waits for the file it would be written on.
 pub fn jobToPost(s: *Session) ?Job {
-    return reloadJob(s) orelse render.nextJob(s);
+    if (caps.marks) {
+        if (s.saving != null) return journal.jobFor(s);
+    }
+    return reloadJob(s) orelse (if (caps.marks) journal.jobFor(s) else null) orelse render.nextJob(s);
 }
 
 /// Puts what a reload read in place of what the buffer had: the
@@ -204,6 +210,11 @@ pub fn install(s: *Session, index: u32, outcome: watch.Outcome) void {
         marks.readAnnots(s, index, loaded.annots);
     }
     if (loaded.annots_arena) |*a| a.deinit();
+    // A save that found the file moved, made again on what is held now.
+    if (caps.marks and d.resave) {
+        d.resave = false;
+        d.save = .wanted;
+    }
 
     if (loaded.first) |page| showChange(s, index, page, loaded.down);
     if (caps.search and s.view().buffer == index and s.find.query().len != 0) search_mod.requery(s);

@@ -139,7 +139,9 @@ pub const Event = enum {
     /// phase three and `Session.useTheme` is the one place that would fire
     /// this, but nothing does yet.
     ThemeChanged,
-    /// **Reserved.** fenrir cannot write PDFs at all.
+    /// The marks were written into a document's file, by `:w` or as the
+    /// reader closed it. `{doc, path, title, pages}`. Not when only the
+    /// library took them, which is every change, as it settles.
     DocSave,
     /// **Reserved.** Annotations draw from appearance streams; none of them
     /// is interactive.
@@ -153,7 +155,7 @@ pub const Event = enum {
     /// plugin that never fires look identical from inside.
     pub fn fires(e: Event) bool {
         return switch (e) {
-            .ThemeChanged, .DocSave, .FormFieldFocus, .BeforeRedact => false,
+            .ThemeChanged, .FormFieldFocus, .BeforeRedact => false,
             else => true,
         };
     }
