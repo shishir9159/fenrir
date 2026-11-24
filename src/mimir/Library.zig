@@ -150,6 +150,13 @@ pub fn userVersion(lib: Library) Error!i64 {
 /// not a thing anybody can draw. Size is `Marks.simplify`'s to worry about,
 /// and it has far more of it to give than an encoding does.
 ///
+/// `patch` is a mark that hides words and sets others in their place: one
+/// row a piece, a piece being one hull on one page (`hlidskjalf.patch`),
+/// its box and the two corners its hull cuts off it, and the correction.
+/// The whole correction is on every piece of a patch, as the reader holds
+/// it: a patch across two columns is two rows with one text, and changing
+/// it changes both.
+///
 /// Every table names its document by `path` rather than by a key into
 /// `document` or `recent`, so that forgetting a recent file, or where a
 /// document was left, does not silently throw away what was written on it.
@@ -213,6 +220,25 @@ fn create(lib: *Library) Error!void {
         \\    created_at INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE INDEX IF NOT EXISTS ink_by_doc ON ink (path, page);
+        \\CREATE TABLE IF NOT EXISTS patch (
+        \\    id         INTEGER PRIMARY KEY,
+        \\    path       TEXT NOT NULL,
+        \\    page       INTEGER NOT NULL,
+        \\    x0         REAL NOT NULL,
+        \\    y0         REAL NOT NULL,
+        \\    x1         REAL NOT NULL,
+        \\    y1         REAL NOT NULL,
+        \\    head       REAL NOT NULL DEFAULT 0,
+        \\    tail       REAL NOT NULL DEFAULT 0,
+        \\    rise       REAL NOT NULL DEFAULT 0,
+        \\    fall       REAL NOT NULL DEFAULT 0,
+        \\    color      TEXT NOT NULL DEFAULT '',
+        \\    text       TEXT NOT NULL DEFAULT '',
+        \\    anchor     TEXT NOT NULL DEFAULT '',
+        \\    edit       INTEGER NOT NULL DEFAULT 0,
+        \\    created_at INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE INDEX IF NOT EXISTS patch_by_doc ON patch (path, page);
         \\CREATE TABLE IF NOT EXISTS document (
         \\    id      INTEGER PRIMARY KEY,
         \\    path    TEXT NOT NULL UNIQUE,
@@ -330,6 +356,7 @@ pub fn highestName(lib: Library, path: []const u8) Error!u64 {
     var s = try lib.db.prepare(
         \\SELECT anchor FROM mark WHERE path = ?1
         \\UNION SELECT anchor FROM ink WHERE path = ?1
+        \\UNION SELECT anchor FROM patch WHERE path = ?1
         \\UNION SELECT nm FROM comment WHERE path = ?1
         \\UNION SELECT nm FROM naming WHERE path = ?1
     );
@@ -371,6 +398,7 @@ pub fn renumber(lib: Library, path: []const u8, from: []const u8, to: []const u8
     const steps = [_][]const u8{
         "UPDATE mark SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
         "UPDATE ink SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
+        "UPDATE patch SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
         "UPDATE comment SET anchor = ?3 WHERE path = ?1 AND anchor = ?2",
         "UPDATE comment SET nm = ?3 WHERE path = ?1 AND nm = ?2",
         "UPDATE link SET from_nm = ?3 WHERE path = ?1 AND from_nm = ?2",
@@ -989,6 +1017,145 @@ pub fn freeStrokes(lib: Library, list: []Stroke, n: usize) void {
     if (list.len != 0) lib.gpa.free(list);
 }
 
+// -- patches ------------------------------------------------------------------
+
+/// One piece of a patch, as the file holds it: a box on a page, the corners
+/// its hull cuts off the box, and the correction.
+///
+/// In the page's own user-space points, for the reason a mark's box is.
+/// See `hlidskjalf/patch.zig` for what the four insets mean.
+pub const Patch = struct {
+    id: i64 = 0,
+    page: u32 = 0,
+    x0: f32 = 0,
+    y0: f32 = 0,
+    x1: f32 = 0,
+    y1: f32 = 0,
+    head: f32 = 0,
+    tail: f32 = 0,
+    rise: f32 = 0,
+    fall: f32 = 0,
+    /// `#rrggbb`, or empty for the reader's patch colour, which is paper.
+    color: []u8 = &.{},
+    /// What the patch says in place of the words under it. The whole of it,
+    /// on every piece.
+    text: []u8 = &.{},
+    /// As for a mark: the pieces of one patch share one.
+    anchor: []u8 = &.{},
+    /// As for a mark.
+    edit: bool = false,
+};
+
+/// The longest correction a patch holds, in bytes: what the reader lets be
+/// typed into one.
+pub const max_correction = 4096;
+
+pub fn addPatch(lib: Library, path: []const u8, p: Patch, now: i64) Error!i64 {
+    if (lib.future) return 0;
+    if (p.text.len > max_correction) return error.Failed;
+    var buf: [name_len]u8 = undefined;
+    const anchor = if (p.anchor.len != 0) p.anchor else try lib.nextName(path, &buf);
+    var s = try lib.db.prepare(
+        \\INSERT INTO patch (path, page, x0, y0, x1, y1, head, tail, rise, fall,
+        \\                   color, text, anchor, created_at, edit)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    s.bindInt(2, p.page);
+    for ([_]f32{ p.x0, p.y0, p.x1, p.y1, p.head, p.tail, p.rise, p.fall }, 3..) |v, at| s.bindFloat(@intCast(at), v);
+    s.bindText(11, p.color);
+    s.bindText(12, p.text);
+    s.bindText(13, anchor);
+    s.bindInt(14, now);
+    s.bindInt(15, @intFromBool(p.edit));
+    try s.exec();
+    return lib.db.lastInsertRowId();
+}
+
+/// Rewrites what can change about a piece once it exists: its colour and
+/// what it says. Where it is never changes -- a patch over other words is
+/// a different patch, and is removed and made again as one.
+pub fn updatePatch(lib: Library, id: i64, color: []const u8, text: []const u8) Error!void {
+    if (lib.future) return;
+    if (text.len > max_correction) return error.Failed;
+    var s = try lib.db.prepare("UPDATE patch SET color = ?2, text = ?3 WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    s.bindText(2, color);
+    s.bindText(3, text);
+    try s.exec();
+}
+
+pub fn removePatch(lib: Library, id: i64) Error!void {
+    if (lib.future) return;
+    var s = try lib.db.prepare("DELETE FROM patch WHERE id = ?1");
+    defer s.finalize();
+    s.bindInt(1, id);
+    try s.exec();
+}
+
+pub fn clearPatches(lib: Library, path: []const u8) Error!u32 {
+    if (lib.future) return 0;
+    var s = try lib.db.prepare("DELETE FROM patch WHERE path = ?1");
+    defer s.finalize();
+    s.bindText(1, path);
+    try s.exec();
+    return lib.db.changes();
+}
+
+/// Every piece of every patch on a document, oldest first: drawn in the
+/// order they were made, as marks are, so a later patch over an earlier
+/// one covers it.
+pub fn patches(lib: Library, path: []const u8) Error![]Patch {
+    var out: std.ArrayList(Patch) = .empty;
+    errdefer lib.freePatches(out.items, out.items.len);
+
+    var s = try lib.db.prepare(
+        \\SELECT id, page, x0, y0, x1, y1, head, tail, rise, fall, color, text, anchor
+        \\FROM patch WHERE path = ?1 ORDER BY id
+    );
+    defer s.finalize();
+    s.bindText(1, path);
+    while (try s.step()) {
+        const color = try lib.gpa.dupe(u8, s.columnText(10));
+        errdefer lib.gpa.free(color);
+        const text = try lib.gpa.dupe(u8, s.columnText(11));
+        errdefer lib.gpa.free(text);
+        const anchor = try lib.gpa.dupe(u8, s.columnText(12));
+        errdefer lib.gpa.free(anchor);
+        var v: [8]f32 = undefined;
+        for (&v, 2..) |*slot, at| slot.* = @floatCast(s.columnFloat(@intCast(at)));
+        try out.append(lib.gpa, .{
+            .id = s.columnInt(0),
+            .page = @intCast(@max(0, s.columnInt(1))),
+            .x0 = v[0],
+            .y0 = v[1],
+            .x1 = v[2],
+            .y1 = v[3],
+            .head = v[4],
+            .tail = v[5],
+            .rise = v[6],
+            .fall = v[7],
+            .color = color,
+            .text = text,
+            .anchor = anchor,
+        });
+    }
+    return out.toOwnedSlice(lib.gpa);
+}
+
+pub fn freePatch(lib: Library, p: Patch) void {
+    lib.gpa.free(p.color);
+    lib.gpa.free(p.text);
+    lib.gpa.free(p.anchor);
+}
+
+pub fn freePatches(lib: Library, list: []Patch, n: usize) void {
+    for (list[0..n]) |p| lib.freePatch(p);
+    if (list.len != 0) lib.gpa.free(list);
+}
+
 /// `x y x y ...`, two decimals, which is a hundredth of a point. See
 /// `create` for why this is text at all.
 ///
@@ -1325,6 +1492,7 @@ pub fn edits(lib: Library, path: []const u8) Error![][]u8 {
     var s = try lib.db.prepare(
         \\SELECT anchor FROM mark WHERE path = ?1 AND edit = 1
         \\UNION SELECT anchor FROM ink WHERE path = ?1 AND edit = 1
+        \\UNION SELECT anchor FROM patch WHERE path = ?1 AND edit = 1
         \\UNION SELECT nm FROM comment WHERE path = ?1 AND edit = 1
     );
     defer s.finalize();
@@ -1862,6 +2030,46 @@ test "a stroke's colour changes in place, and it keeps its anchor" {
     defer lib.freeStrokes(list, list.len);
     try testing.expectEqualStrings("#c04040", list[0].color);
     try testing.expectEqualStrings("f1", list[0].anchor);
+}
+
+test "a patch round-trips, its pieces under one anchor and one text" {
+    if (!Db.available) return error.SkipZigTest;
+    var lib = try memory();
+    defer lib.close();
+
+    const doc = "/papers/a.pdf";
+    const first = try lib.addPatch(doc, .{
+        .page = 2,
+        .x0 = 72,
+        .y0 = 654,
+        .x1 = 540,
+        .y1 = 700,
+        .head = 128,
+        .tail = 140,
+        .rise = 10,
+        .fall = 10,
+        .text = @constCast("the measured value"),
+        .anchor = @constCast("f4"),
+    }, 1);
+    _ = try lib.addPatch(doc, .{ .page = 2, .x0 = 320, .y0 = 690, .x1 = 540, .y1 = 700, .text = @constCast("the measured value"), .anchor = @constCast("f4") }, 2);
+
+    const got = try lib.patches(doc);
+    defer lib.freePatches(got, got.len);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(f32, 128), got[0].head);
+    try testing.expectEqual(@as(f32, 10), got[0].fall);
+    try testing.expectEqualStrings("f4", got[1].anchor);
+    try testing.expectEqualStrings("the measured value", got[1].text);
+    // The patch's name counts as handed out, like any anchor's.
+    try testing.expectEqual(@as(u64, 4), try lib.highestName(doc));
+
+    try lib.updatePatch(first, "#ff0000", "the value measured");
+    try lib.removePatch(got[1].id);
+    const after = try lib.patches(doc);
+    defer lib.freePatches(after, after.len);
+    try testing.expectEqual(@as(usize, 1), after.len);
+    try testing.expectEqualStrings("the value measured", after[0].text);
+    try testing.expectEqualStrings("#ff0000", after[0].color);
 }
 
 test "a name is f and base 36, and only fenrir's are counted" {

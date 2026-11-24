@@ -900,11 +900,13 @@ pub fn execFrom(s: *Session, raw: []const u8, from: Origin) bool {
                 // somebody highlighted seven sentences or drew seven
                 // lines, and those are the question being asked.
                 var strokes: usize = 0;
+                var pieces: usize = 0;
                 for (s.buffer(v.buffer).marks.items()) |m| {
                     if (m.kind == .ink) strokes += 1;
+                    if (m.kind == .patch) pieces += 1;
                 }
                 const all = s.buffer(v.buffer).marks.count();
-                s.say("{d} highlights and {d} lines of ink in this document", .{ all - strokes, strokes });
+                s.say("{d} highlights, {d} lines of ink and {d} pieces of patches in this document", .{ all - strokes - pieces, strokes, pieces });
             }
         },
         .mnext => if (caps.marks) marks.jumpMark(s, .{ .forwards = true }) else return s.absent(name),

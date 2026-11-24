@@ -450,7 +450,12 @@ pub fn panelRows(s: *Session, which: rails_mod.Panel) []const panels.Row {
                 // after it a step in, under it, saying only what they
                 // are: six rows of one comment would read as six.
                 const lead = said.len != 0 and b.marks.leads(s.gpa, i);
-                const what = if (m.kind == .ink) "ink" else m.style.label();
+                const what = switch (m.kind) {
+                    .block => m.style.label(),
+                    .ink => "ink",
+                    // What it says, which is the whole of what a patch is.
+                    .patch => if (m.text.len != 0) m.text else "patch",
+                };
                 s.rows.append(s.gpa, .{
                     // A row with nothing written on it still has to say
                     // something, and what it says is this panel's to
@@ -459,7 +464,7 @@ pub fn panelRows(s: *Session, which: rails_mod.Panel) []const panels.Row {
                     // it is, since its chip cannot.
                     .label = if (lead)
                         said[0].text
-                    else if (said.len != 0 or m.kind == .ink or m.style != .highlight)
+                    else if (said.len != 0 or m.kind != .block or m.style != .highlight)
                         what
                     else
                         "no comment",

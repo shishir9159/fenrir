@@ -46,6 +46,10 @@ pub const default_pen_width: f32 = save.default_pen_width;
 /// and the pen until a digit picks another. See `ink.penColor`.
 pub const ink_colour: Color = .{ .r = 0.13, .g = 0.19, .b = 0.35, .a = 1 };
 
+/// What a patch that names no colour is drawn in: paper, so that a
+/// correction reads as part of the page it corrects. A digit tints it.
+pub const patch_colour: Color = .white;
+
 /// The colour a digit names. `1` is the default highlight colour, which is
 /// the accent when the reader has chosen one, so the key a person reaches
 /// for first gives the colour they set; the rest are the named colours
@@ -110,7 +114,9 @@ pub fn markBoxes(s: *Session, buffer_index: u32, boxes: []const selection.PageBo
         while (i > 0) {
             i -= 1;
             const mark = b.marks.items()[i];
-            if (mark.page != pb.page) continue;
+            // A patch is not a way of marking the words under it, and
+            // marking them is not changing it: it stays, whole.
+            if (mark.page != pb.page or mark.kind == .patch) continue;
             const shared = mark.box.intersect(pb.box);
             if (shared.isEmpty()) continue;
             if (area(shared) < area(mark.box) * 0.5) continue;
@@ -152,6 +158,10 @@ pub fn toggleMark(s: *Session) void {
         .y = (v.cursor.caret.min_y + v.cursor.caret.max_y) * 0.5,
     };
     if (b.marks.at(v.cursor.page, at)) |index| {
+        if (b.marks.items()[index].kind == .patch) {
+            s.status = "the cursor is on a patch -- x in edit mode removes it";
+            return;
+        }
         b.marks.beginGroup();
         _ = b.marks.removeAt(s.gpa, index) catch {};
         return;
@@ -201,6 +211,8 @@ pub fn unhighlightSelection(s: *Session) void {
     while (i > 0) {
         i -= 1;
         const mark = b.marks.items()[i];
+        // Half a patch is not a correction; edit mode's x takes one whole.
+        if (mark.kind == .patch) continue;
         for (boxes.items) |pb| {
             if (pb.page != mark.page or mark.box.intersect(pb.box).isEmpty()) continue;
             _ = b.marks.removeAt(s.gpa, i) catch return;
@@ -414,9 +426,16 @@ pub fn recolourMark(s: *Session, colour: u8) void {
 pub fn restyleMark(s: *Session, style: Marks.Style) void {
     const i = focusedMarkIndex(s) orelse return;
     const b = s.buffer(s.view().buffer);
-    if (b.marks.items()[i].kind == .ink) {
-        s.status = "ink is drawn as it went -- only marked words have a style";
-        return;
+    switch (b.marks.items()[i].kind) {
+        .block => {},
+        .ink => {
+            s.status = "ink is drawn as it went -- only marked words have a style";
+            return;
+        },
+        .patch => {
+            s.status = "a patch is set in the page's own type -- only marked words have a style";
+            return;
+        },
     }
     b.marks.beginGroup();
     b.marks.restyle(s.gpa, i, style) catch {};
@@ -432,12 +451,25 @@ pub fn deleteMark(s: *Session) void {
     const i = focusedMarkIndex(s) orelse return;
     const b = s.buffer(s.view().buffer);
     const filter = markFilter(s);
-    const next = if (b.marks.jump(b.marks.items()[i], true, &filter)) |to| to.key else null;
+    const held = b.marks.items()[i];
+    // Past the other pieces of a patch, which go with this one.
+    var next: ?u64 = null;
+    var from = held;
+    var steps: usize = 0;
+    while (steps < b.marks.count()) : (steps += 1) {
+        const to = b.marks.jump(from, true, &filter) orelse break;
+        next = to.key;
+        const m = b.marks.byKey(to.key).?.*;
+        if (held.kind != .patch or m.anchor != held.anchor or to.key == held.key) break;
+        from = m;
+    }
 
     b.marks.beginGroup();
-    _ = b.marks.removeAt(s.gpa, i) catch return;
+    if (held.kind == .patch) {
+        _ = b.marks.removeAnchor(s.gpa, held.anchor) catch return;
+    } else _ = b.marks.removeAt(s.gpa, i) catch return;
 
-    if (next == null or next == s.focus_mark) {
+    if (next == null or next == s.focus_mark or b.marks.indexOf(next.?) == null) {
         s.focus_mark = null;
         s.keymap.mode = .normal;
         s.status = if (b.marks.count() == 0)
@@ -457,6 +489,7 @@ pub fn beginNote(s: *Session) void {
         s.keymap.mode = if (b.marks.count() == 0) .normal else .edit;
         return;
     };
+    if (b.marks.items()[i].kind == .patch) return noComment(s);
     s.note.clearRetainingCapacity();
     if (focusedComment(s)) |c| {
         const comment = b.marks.comments.items[c];
@@ -475,6 +508,7 @@ pub fn beginComment(s: *Session) void {
         s.keymap.mode = if (b.marks.count() == 0) .normal else .edit;
         return;
     };
+    if (b.marks.items()[i].kind == .patch) return noComment(s);
     s.note.clearRetainingCapacity();
     s.typing = .{ .new = b.marks.items()[i].anchor };
 }
@@ -501,6 +535,14 @@ pub fn commentSelection(s: *Session) void {
     focusMark(s, first.?.key);
     s.note.clearRetainingCapacity();
     s.typing = .{ .new = anchor };
+}
+
+/// A comment begun on a patch, which holds its correction and nothing
+/// else: a thought about a passage is a comment on it, not on its patch.
+fn noComment(s: *Session) void {
+    s.keymap.mode = .edit;
+    s.typing = null;
+    s.status = "a patch holds its correction and nothing else -- comment on the words with v and c";
 }
 
 /// A comment begun where no words are selected, or none are known yet.
@@ -695,6 +737,7 @@ fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) Library.Error!void {
             if (mark.saved()) switch (mark.kind) {
                 .block => try lib.removeMark(mark.id),
                 .ink => try lib.removeStroke(mark.id),
+                .patch => try lib.removePatch(mark.id),
             };
             if (!inFile(s, b, mark.anchor)) return;
             if (b.marks.lineCount(mark.anchor) != 0) return adopt(s, b, mark.anchor);
@@ -712,6 +755,7 @@ fn writeEffect(s: *Session, b: *Buffer, e: Marks.Effect) Library.Error!void {
             switch (mark.kind) {
                 .block => try lib.updateMark(mark.id, hexOf(mark.color, &hex), @tagName(mark.style)),
                 .ink => try lib.updateStroke(mark.id, hexOf(mark.color, &hex)),
+                .patch => try lib.updatePatch(mark.id, hexOf(mark.color, &hex), mark.text),
             }
         },
         .comment_insert => |key| {
@@ -761,6 +805,21 @@ fn insertRow(s: *Session, b: *Buffer, mark: Marks.Mark, edit: bool) Library.Erro
             .color = @constCast(hexOf(mark.color, &hex)),
             .width = mark.width,
             .points = @constCast(mark.points),
+            .anchor = @constCast(anchor),
+            .edit = edit,
+        }, now(s)),
+        .patch => lib.addPatch(b.path, .{
+            .page = mark.page,
+            .x0 = mark.box.min_x,
+            .y0 = mark.box.min_y,
+            .x1 = mark.box.max_x,
+            .y1 = mark.box.max_y,
+            .head = mark.insets.head,
+            .tail = mark.insets.tail,
+            .rise = mark.insets.rise,
+            .fall = mark.insets.fall,
+            .color = @constCast(hexOf(mark.color, &hex)),
+            .text = @constCast(mark.text),
             .anchor = @constCast(anchor),
             .edit = edit,
         }, now(s)),
@@ -897,6 +956,24 @@ pub fn loadMarks(s: *Session, index: u32) void {
             .width = if (k.width > 0) k.width else default_pen_width,
             .color = Library.parseColor(k.color) orelse ink_colour,
             .anchor = (nameOf(s, b, k.page, k.anchor) catch return) orelse 0,
+        }, true) catch return;
+    }
+
+    // Patches last of all: a patch is opaque, and covers whatever is under
+    // it, a highlight or ink included.
+    const patched = lib.patches(b.path) catch return;
+    defer lib.freePatches(patched, patched.len);
+
+    for (patched) |p| {
+        _ = b.marks.add(s.gpa, .{
+            .id = p.id,
+            .kind = .patch,
+            .page = p.page,
+            .box = .fromRect(p.x0, p.y0, p.x1, p.y1),
+            .insets = .{ .head = p.head, .tail = p.tail, .rise = p.rise, .fall = p.fall },
+            .text = p.text,
+            .color = Library.parseColor(p.color) orelse patch_colour,
+            .anchor = (nameOf(s, b, p.page, p.anchor) catch return) orelse 0,
         }, true) catch return;
     }
 
@@ -2483,6 +2560,65 @@ test "highlights come back out of the library the next time it is opened" {
     try testing.expectApproxEqAbs(@as(f32, 0), mark.color.g, 0.01);
     // Loading is not an edit, so closing again writes nothing back.
     try testing.expect(!reopened.buffer(0).marks.dirty);
+}
+
+test "a patch is written to the library, comes back, and is deleted whole" {
+    if (!fenrir.mimir.available) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+
+    var buf: [4]fenrir.Page = undefined;
+    var s = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&s);
+    try giveLibrary(&s, lib);
+    s.ctx = undefined;
+
+    const b = s.buffer(0);
+    const anchor = b.marks.newName();
+    b.marks.beginGroup();
+    for ([_]Bounds{ .fromRect(72, 654, 280, 700), .fromRect(320, 690, 540, 700) }) |box| {
+        _ = try b.marks.add(gpa, .{
+            .kind = .patch,
+            .page = 1,
+            .box = box,
+            .insets = .{ .head = 100, .tail = 90, .rise = 10, .fall = 10 },
+            .color = patch_colour,
+            .anchor = anchor,
+            .text = "the measured value",
+        }, false);
+    }
+    b.marks.beginGroup();
+    applyEffects(&s);
+
+    const rows = try lib.patches(b.path);
+    defer lib.freePatches(rows, rows.len);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings(rows[0].anchor, rows[1].anchor);
+    try testing.expectEqual(@as(f32, 100), rows[0].head);
+
+    // Read back, it is the same patch: one anchor, its hull, its words.
+    var reopened = try sessionOf(gpa, fakePages(&buf, 3), 1, 1000, 800);
+    defer closeSession(&reopened);
+    reopened.library = lib;
+    loadMarks(&reopened, 0);
+    const back = reopened.buffer(0).marks.items();
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqual(Marks.Kind.patch, back[0].kind);
+    try testing.expectEqual(back[0].anchor, back[1].anchor);
+    try testing.expectEqualStrings("the measured value", back[1].text);
+    try testing.expectEqual(@as(f32, 90), back[0].insets.tail);
+
+    // `x` in edit mode on either piece takes both, and the rows go.
+    s.keymap.mode = .edit;
+    focusMark(&s, b.marks.items()[1].key);
+    deleteMark(&s);
+    applyEffects(&s);
+    try testing.expectEqual(@as(usize, 0), b.marks.count());
+    const left = try lib.patches(b.path);
+    defer lib.freePatches(left, left.len);
+    try testing.expectEqual(@as(usize, 0), left.len);
 }
 
 test "a comment typed on a stroke is written to the library and comes back" {

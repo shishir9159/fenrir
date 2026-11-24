@@ -272,13 +272,14 @@ fn kindName(k: Marks.Kind) []const u8 {
     return switch (k) {
         .block => "block",
         .ink => "ink",
+        .patch => "patch",
     };
 }
 
-/// PDF's name for how a block is drawn, and nothing for ink, which has
-/// no style to report.
+/// PDF's name for how a block is drawn, and nothing for ink or a patch,
+/// which have no style to report.
 fn styleName(m: Marks.Mark) []const u8 {
-    return if (m.kind == .ink) "" else @tagName(m.style);
+    return if (m.kind != .block) "" else @tagName(m.style);
 }
 
 /// What a plugin calls the document in this buffer.

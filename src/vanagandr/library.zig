@@ -172,6 +172,7 @@ pub fn recentRun(ctx: *Context, argv: []const []const u8) !void {
 pub const marks_usage =
     \\fenrir marks <file> [--clear] [--add PAGE X0 Y0 X1 Y1 [COLOUR]]
     \\                    [--style STYLE] [--ink PAGE X Y X Y ... [COLOUR]]
+    \\                    [--patch PAGE X0 Y0 X1 Y1 TEXT]
     \\                    [--comment ANCHOR TEXT] [--link FROM TO [LABEL]]
     \\                    [--store pdf|library] [--bytes] [--db FILE]
     \\
@@ -192,6 +193,9 @@ pub const marks_usage =
     \\                                        or arrow
     \\    fenrir marks paper.pdf --ink 3 72 700 120 690 160 705 red
     \\                                        draw a stroke, the same way
+    \\    fenrir marks paper.pdf --patch 3 72 700 300 712 "the right words"
+    \\                                        hide the words in a box and set
+    \\                                        a correction in their place
     \\    fenrir marks paper.pdf --comment f3 "is this right?"
     \\                                        comment on the mark named f3
     \\    fenrir marks paper.pdf --link f3 f7 supports
@@ -227,6 +231,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
     var ink: std.ArrayList(fenrir.gelgja.Point) = .empty;
     defer ink.deinit(ctx.gpa);
     var comment: ?struct { anchor: []const u8, text: []const u8 } = null;
+    var patch: ?Library.Patch = null;
     var store: ?enum { pdf, library } = null;
     var bytes = false;
     var link: ?struct { from: []const u8, to: []const u8, label: []const u8 = "" } = null;
@@ -299,6 +304,27 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
                     return ctx.fail("{s} is not a colour: try a name or #rrggbb", .{colour});
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--patch")) {
+            // A box and nothing cut from it: a rectangle, as `V` makes. A
+            // hull with its corners cut is the reader's to make from words.
+            if (i + 6 >= argv.len) return ctx.fail("--patch needs PAGE X0 Y0 X1 Y1 TEXT", .{});
+            const page = std.fmt.parseInt(u32, argv[i + 1], 10) catch
+                return ctx.fail("--patch wants a page number, not '{s}'", .{argv[i + 1]});
+            if (page == 0) return ctx.fail("pages are numbered from 1", .{});
+            var box: [4]f32 = undefined;
+            for (&box, 0..) |*v, k| {
+                v.* = std.fmt.parseFloat(f32, argv[i + 2 + k]) catch
+                    return ctx.fail("--patch wants numbers, not '{s}'", .{argv[i + 2 + k]});
+            }
+            patch = .{
+                .page = page - 1,
+                .x0 = @min(box[0], box[2]),
+                .y0 = @min(box[1], box[3]),
+                .x1 = @max(box[0], box[2]),
+                .y1 = @max(box[1], box[3]),
+                .text = @constCast(argv[i + 6]),
+            };
+            i += 6;
         } else if (std.mem.eql(u8, arg, "--store")) {
             i += 1;
             if (i == argv.len) return ctx.fail("--store needs pdf or library", .{});
@@ -351,12 +377,14 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         // found ink on page four would rightly call that a bug.
         const n = lib.clearMarks(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         const k = lib.clearStrokes(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
+        const p = lib.clearPatches(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         // And what was written on them, which has nothing left to be about.
         const c = lib.clearComments(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
         const l = lib.clearLinks(key) catch |err| return ctx.fail("cannot clear: {t}", .{err});
-        ctx.out.print("removed {d} highlight{s}, {d} stroke{s}, {d} comment{s} and {d} link{s}\n", .{
+        ctx.out.print("removed {d} highlight{s}, {d} stroke{s}, {d} piece{s} of patches, {d} comment{s} and {d} link{s}\n", .{
             n, if (n == 1) "" else "s",
             k, if (k == 1) "" else "s",
+            p, if (p == 1) "" else "s",
             c, if (c == 1) "" else "s",
             l, if (l == 1) "" else "s",
         }) catch {};
@@ -414,8 +442,21 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         return;
     }
 
+    if (patch) |p| {
+        if (p.text.len > Library.max_correction) return ctx.fail("a patch says at most {d} bytes", .{Library.max_correction});
+        var row = p;
+        var anchor: [Library.name_len]u8 = undefined;
+        row.anchor = @constCast(try nextName(ctx, &lib, key, &anchor));
+        _ = lib.addPatch(key, row, now(ctx.io)) catch |err| return ctx.fail("cannot add: {t}", .{err});
+        ctx.out.print("added patch {s} on page {d}\n", .{ row.anchor, p.page + 1 }) catch {};
+        return;
+    }
+
     const list = lib.marks(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeMarks(list, list.len);
+
+    const patched = lib.patches(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
+    defer lib.freePatches(patched, patched.len);
 
     const strokes = lib.strokes(key) catch |err| return ctx.fail("cannot read them: {t}", .{err});
     defer lib.freeStrokes(strokes, strokes.len);
@@ -432,7 +473,7 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         defer ctx.gpa.free(id);
         ctx.out.print("id {s}\n", .{id}) catch {};
     }
-    if (list.len == 0 and strokes.len == 0 and said.len == 0) {
+    if (list.len == 0 and strokes.len == 0 and patched.len == 0 and said.len == 0) {
         ctx.out.print("no marks in {s}\n", .{name}) catch {};
         return;
     }
@@ -457,6 +498,16 @@ pub fn marksRun(ctx: *Context, argv: []const []const u8) !void {
         if (k.color.len != 0) ctx.out.print("  {s}", .{k.color}) catch {};
         if (k.width != 0) ctx.out.print("  w{d:.2}", .{k.width}) catch {};
         ctx.out.print("\n", .{}) catch {};
+    }
+    // A piece by its box, with the corners its hull cuts when it cuts any,
+    // and what the patch says.
+    for (patched) |p| {
+        ctx.out.print("page {d: >4}  patch ({d:.1}, {d:.1}) - ({d:.1}, {d:.1})  {s}", .{
+            p.page + 1, p.x0, p.y0, p.x1, p.y1, p.anchor,
+        }) catch {};
+        if (p.head != 0 or p.tail != 0) ctx.out.print("  cut {d:.1} {d:.1} {d:.1} {d:.1}", .{ p.head, p.tail, p.rise, p.fall }) catch {};
+        if (p.color.len != 0) ctx.out.print("  {s}", .{p.color}) catch {};
+        ctx.out.print("  \"{s}\"\n", .{p.text}) catch {};
     }
     // A comment by its own name and the anchor it hangs from, in the order
     // written, which is the order a thread reads in. The first on an anchor

@@ -1,13 +1,14 @@
 //! The marks on a document, the one copy of them, and their history.
 //!
-//! Two kinds, and one list. A highlight is a box over some words; a stroke is
-//! where a pen went. They are the same kind of *fact* -- something a person
+//! Three kinds, and one list. A highlight is a box over some words; a stroke
+//! is where a pen went; a patch hides some words and sets a correction in
+//! their place. They are the same kind of *fact* -- something a person
 //! put on a page, in the page's own coordinates, which goes into the PDF as
 //! an annotation when it is saved -- and everything this
-//! file does to one it does to the other: one revision number, one undo
-//! history, one order, one panel. A `kind` and a point list is what that
-//! costs, against a second list with a second history that `u` would have had
-//! to choose between.
+//! file does to one it does to the others: one revision number, one undo
+//! history, one order, one panel. A `kind`, a point list and a patch's text
+//! is what that costs, against a second list with a second history that `u`
+//! would have had to choose between.
 //!
 //! This is the whole of "the same document in two windows". A mark belongs to
 //! the *buffer*, never to a view, so there is exactly one list however many
@@ -87,6 +88,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const gelgja = @import("../gelgja.zig");
+const patch = @import("patch.zig");
 
 const Bounds = gelgja.Bounds;
 const Color = gelgja.Color;
@@ -94,14 +96,20 @@ const Point = gelgja.Point;
 
 const Marks = @This();
 
-/// What a mark is: a box over words, or a line a pen drew.
+/// What a mark is: a box over words, a line a pen drew, or a patch.
 ///
-/// A tag on the struct rather than a union, because every field but two is
+/// A tag on the struct rather than a union, because nearly every field is
 /// shared and the parts that walk this list -- undo, the effects queue,
-/// reading order, the panel -- want a `Mark` and not a switch. The two that
-/// are not shared are `points` and `width`, and both are empty on a block, as
-/// a mark nobody has commented on has no comments.
-pub const Kind = enum { block, ink };
+/// reading order, the panel -- want a `Mark` and not a switch. What is not
+/// shared is empty on the kinds it is not for, as a mark nobody has
+/// commented on has no comments: `points` and `width` are ink's, `insets`
+/// and `text` a patch's.
+///
+/// A patch is one piece a column a page (`patch.hulls`), and its pieces are
+/// the lines of one anchor, as a highlight's lines are. **A patch holds text
+/// and nothing else**: no comment is made on one, no image, no link. A
+/// thought about a passage is a comment; a correction of it is a patch.
+pub const Kind = enum { block, ink, patch };
 
 /// How a block marks its words: PDF's four text-markup subtypes, so that
 /// writing one into a file is a name and not a translation -- and an arrow,
@@ -156,8 +164,18 @@ pub const Mark = struct {
     /// The pen's width in those same points, so a stroke keeps its weight
     /// against the type it was drawn over at every zoom. Zero on a block.
     width: f32 = 0,
+    /// The corners a patch's hull cuts off `box`; see `patch.Insets`.
+    insets: patch.Insets = .{},
+    /// A patch's correction, the whole of it, on every piece. Owned by the
+    /// `Marks` it belongs to; see `owned`.
+    text: []const u8 = &.{},
 
     pub const unsaved: i64 = 0;
+
+    /// A patch's piece as its shape: the box with its two corners cut.
+    pub fn hull(m: Mark) patch.Hull {
+        return .{ .page = m.page, .box = m.box, .insets = m.insets };
+    }
 
     pub fn saved(m: Mark) bool {
         return m.id != unsaved;
@@ -172,7 +190,10 @@ pub const Mark = struct {
     /// is the distance to that line. `slack` is how far off it a pointer may
     /// still be, in user-space points, since nobody can hit a hairline.
     pub fn hits(m: Mark, p: Point, slack: f32) bool {
-        if (m.kind != .ink) return m.box.contains(p);
+        if (m.kind == .block) return m.box.contains(p);
+        // The hull and not its box, whose corners hold the words either
+        // side of the passage.
+        if (m.kind == .patch) return m.hull().contains(p);
         // The box first: it rejects most of the list for the cost of four
         // compares, and a point outside it cannot be near the line inside.
         const reach = m.width * 0.5 + slack;
@@ -502,6 +523,7 @@ pub fn add(m: *Marks, gpa: Allocator, mark: Mark, loading: bool) Allocator.Error
         fresh.points = try m.ownPoints(mark.points);
         fresh.box = inkBounds(fresh.points, fresh.width);
     }
+    if (mark.kind == .patch) fresh.text = try m.own(mark.text);
 
     try m.list.append(gpa, fresh);
     const index = m.list.items.len - 1;
@@ -680,14 +702,47 @@ pub fn recolour(m: *Marks, gpa: Allocator, index: usize, color: Color) Allocator
     try m.replace(gpa, index, before, after);
 }
 
-/// A block drawn another way. A stroke has no other way, and stays as it is.
+/// A block drawn another way. A stroke and a patch have no other way, and
+/// stay as they are.
 pub fn restyle(m: *Marks, gpa: Allocator, index: usize, style: Style) Allocator.Error!void {
     if (index >= m.list.items.len) return;
     const before = m.list.items[index];
-    if (before.kind == .ink or before.style == style) return;
+    if (before.kind != .block or before.style == style) return;
     var after = before;
     after.style = style;
     try m.replace(gpa, index, before, after);
+}
+
+/// A patch's correction, said again on every piece of it, in the group
+/// that is open.
+///
+/// Every piece carries the whole text, rather than the first piece alone,
+/// so that whichever piece is in hand, written, or read back on its own
+/// page says what the patch says.
+pub fn correct(m: *Marks, gpa: Allocator, anchor: u64, text: []const u8) Allocator.Error!void {
+    var owned: ?[]const u8 = null;
+    for (m.list.items, 0..) |before, i| {
+        if (before.anchor != anchor or before.kind != .patch) continue;
+        if (std.mem.eql(u8, before.text, text)) continue;
+        if (owned == null) owned = try m.own(text);
+        var after = before;
+        after.text = owned.?;
+        try m.replace(gpa, i, before, after);
+    }
+}
+
+/// Every line of an anchor, in the group that is open: a patch goes whole,
+/// since half a correction is not one.
+pub fn removeAnchor(m: *Marks, gpa: Allocator, anchor: u64) Allocator.Error!usize {
+    var gone: usize = 0;
+    var i = m.list.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (m.list.items[i].anchor != anchor) continue;
+        _ = try m.removeAt(gpa, i);
+        gone += 1;
+    }
+    return gone;
 }
 
 fn replace(m: *Marks, gpa: Allocator, index: usize, before: Mark, after: Mark) Allocator.Error!void {
@@ -1093,8 +1148,8 @@ pub const Swatch = struct { name: []const u8, color: Color };
 ///
 /// Typed as words. Words of one sort are alternatives, and every sort named
 /// must hold: `yellow green #question` is a yellow or green mark with a
-/// comment that says `#question`. The sorts are a swatch's name; a style, or
-/// `ink`; `commented`; and any other word, which a comment on the mark's
+/// comment that says `#question`. The sorts are a swatch's name; a style,
+/// `ink` or `patch`; `commented`; and any other word, which a comment on the mark's
 /// anchor must contain -- so a `#tag` is only a word, and needs no syntax of
 /// its own. Case is ignored.
 pub const Filter = struct {
@@ -1103,6 +1158,7 @@ pub const Filter = struct {
     terms: u8 = 0,
     styles: std.EnumSet(Style) = .empty,
     ink: bool = false,
+    patch: bool = false,
     commented: bool = false,
     colours: [max_terms]Color = undefined,
     colour_count: u8 = 0,
@@ -1119,6 +1175,8 @@ pub const Filter = struct {
                 f.styles.insert(s);
             } else if (std.ascii.eqlIgnoreCase(word, "ink")) {
                 f.ink = true;
+            } else if (std.ascii.eqlIgnoreCase(word, "patch")) {
+                f.patch = true;
             } else if (std.ascii.eqlIgnoreCase(word, "commented")) {
                 f.commented = true;
             } else if (swatchNamed(swatches, word)) |c| {
@@ -1138,8 +1196,13 @@ pub const Filter = struct {
 
     /// `written` is what was written on the mark's anchor: `Marks.said`.
     pub fn matches(f: *const Filter, m: Mark, written: []const Comment) bool {
-        if (f.ink or f.styles.count() != 0) {
-            if (!(if (m.kind == .ink) f.ink else f.styles.contains(m.style))) return false;
+        if (f.ink or f.patch or f.styles.count() != 0) {
+            const kept = switch (m.kind) {
+                .ink => f.ink,
+                .patch => f.patch,
+                .block => f.styles.contains(m.style),
+            };
+            if (!kept) return false;
         }
         if (f.colour_count != 0) {
             for (f.colours[0..f.colour_count]) |c| {
@@ -1844,6 +1907,54 @@ test "an empty group is not an undo step" {
     m.beginGroup();
     m.beginGroup();
     try testing.expect(!try m.undo(gpa));
+}
+
+test "a patch is hit on its hull, corrected on every piece, and goes whole" {
+    const gpa = testing.allocator;
+    var m: Marks = .{};
+    defer m.deinit(gpa);
+
+    // Two pieces, two columns, of one patch: the left a hexagon.
+    const anchor = m.newName();
+    m.beginGroup();
+    _ = try m.add(gpa, .{
+        .kind = .patch,
+        .box = box(72, 654, 280, 700),
+        .insets = .{ .head = 100, .tail = 90, .rise = 10, .fall = 10 },
+        .anchor = anchor,
+        .text = "teh",
+    }, false);
+    _ = try m.add(gpa, .{ .kind = .patch, .box = box(320, 690, 540, 700), .anchor = anchor, .text = "teh" }, false);
+    m.beginGroup();
+    m.clearEffects();
+
+    // Inside the box but in the corner the hull cuts: not the patch.
+    try testing.expectEqual(@as(?usize, null), m.at(0, .{ .x = 74, .y = 698 }));
+    try testing.expectEqual(@as(?usize, 0), m.at(0, .{ .x = 150, .y = 670 }));
+
+    try m.correct(gpa, anchor, "the");
+    m.beginGroup();
+    for (m.items()) |p| try testing.expectEqualStrings("the", p.text);
+    // One step, a row each to write.
+    try testing.expectEqual(@as(usize, 2), m.takeEffects().len);
+    m.clearEffects();
+    try testing.expect(try m.undo(gpa));
+    for (m.items()) |p| try testing.expectEqualStrings("teh", p.text);
+
+    // A patch has no style to change.
+    try m.restyle(gpa, 0, .underline);
+    try testing.expectEqual(Style.highlight, m.items()[0].style);
+
+    try testing.expectEqual(@as(usize, 2), try m.removeAnchor(gpa, anchor));
+    m.beginGroup();
+    try testing.expectEqual(@as(usize, 0), m.count());
+    try testing.expect(try m.undo(gpa));
+    try testing.expectEqual(@as(usize, 2), m.count());
+
+    // And the panel's filter names it.
+    const f: Filter = .parse("patch", &.{});
+    try testing.expect(f.matches(m.items()[0], &.{}));
+    try testing.expect(!f.matches(.{ .box = box(0, 0, 1, 1) }, &.{}));
 }
 
 test "a stroke is a mark, and its box is where the pen went plus the pen" {
