@@ -324,6 +324,91 @@ pub fn unicodeFor(f: *const Font, code: u32, buf: *[max_unicode]u8) []const u8 {
     return buf[0..len];
 }
 
+/// One character this font can set: what writing new text in it needs.
+pub const Letter = struct {
+    cp: u21,
+    /// The code that sets it, as `Code` has it, and how many bytes.
+    code: u32,
+    cid: u32,
+    len: u8,
+    /// In text space at size 1, as `advance` gives it.
+    advance: f32,
+};
+
+/// The most codes of a composite font `letters` reads: a CJK font's
+/// `/ToUnicode` can name tens of thousands, and a correction is typed one
+/// character at a time.
+const max_letters = 1 << 16;
+
+/// Every character this font can set, ascending by code point: what its
+/// codes mean (`unicodeFor`), turned round, for setting new text in the
+/// page's own type -- a patch's correction.
+///
+/// A code that means several characters -- a ligature -- or none is not a
+/// letter. Where two codes mean one character, the lower code is kept, so
+/// the choice is the same on every machine. A Type 3 font draws with
+/// content streams, not a program, and has none.
+pub fn letters(f: *const Font, gpa: Allocator) Allocator.Error![]Letter {
+    var out: std.ArrayList(Letter) = .empty;
+    errdefer out.deinit(gpa);
+    switch (f.kind) {
+        .type3 => return out.toOwnedSlice(gpa),
+        .simple => for (0..256) |i| try f.addLetter(gpa, &out, .{ .code = @intCast(i), .cid = @intCast(i), .len = 1 }),
+        .composite => for (f.to_unicode) |span| {
+            var c = span.low;
+            while (c <= span.high and out.items.len < max_letters) : (c += 1) {
+                // The code as the bytes a string would carry, and decoded
+                // the way a string is, so the CID is the CMap's.
+                const len: u8 = if (c > 0xffffff) 4 else if (c > 0xffff) 3 else 2;
+                var bytes: [4]u8 = undefined;
+                for (0..len) |k| bytes[k] = @truncate(c >> @intCast(8 * (len - 1 - k)));
+                const decoded = f.cmap.decode(bytes[0..len], 0);
+                if (decoded.len != len) continue;
+                try f.addLetter(gpa, &out, decoded);
+                if (c == std.math.maxInt(u32)) break;
+            }
+        },
+    }
+    const order = struct {
+        fn lt(_: void, a: Letter, b: Letter) bool {
+            return a.cp < b.cp or (a.cp == b.cp and a.code < b.code);
+        }
+    }.lt;
+    std.mem.sort(Letter, out.items, {}, order);
+    var kept: usize = 0;
+    for (out.items) |l| {
+        if (kept != 0 and out.items[kept - 1].cp == l.cp) continue;
+        out.items[kept] = l;
+        kept += 1;
+    }
+    out.shrinkRetainingCapacity(kept);
+    return out.toOwnedSlice(gpa);
+}
+
+fn addLetter(f: *const Font, gpa: Allocator, out: *std.ArrayList(Letter), code: Code) Allocator.Error!void {
+    var buf: [max_unicode]u8 = undefined;
+    const meaning = f.unicodeFor(code.code, &buf);
+    if (meaning.len == 0) return;
+    const view = std.unicode.Utf8View.init(meaning) catch return;
+    var it = view.iterator();
+    const cp = it.nextCodepoint() orelse return;
+    if (it.nextCodepoint() != null) return;
+    // A control character is nothing anybody types into a correction.
+    if (cp < 0x20) return;
+    try out.append(gpa, .{ .cp = cp, .code = code.code, .cid = code.cid, .len = code.len, .advance = @floatCast(f.advance(code)) });
+}
+
+/// The letter for `cp`, or null when the font cannot set it.
+pub fn letterFor(list: []const Letter, cp: u21) ?Letter {
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list[mid].cp < cp) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < list.len and list[lo].cp == cp) list[lo] else null;
+}
+
 // -- CMaps ------------------------------------------------------------------
 
 /// Enough of a CMap to split a string into codes and map them to CIDs
@@ -1100,6 +1185,24 @@ test "with no /ToUnicode the encoding chain answers, differences first" {
     try testing.expectEqualStrings("B", f.unicodeFor(0x42, &buf));
     // WinAnsi's high range, which Standard would have read differently.
     try testing.expectEqualStrings("\u{20AC}", f.unicodeFor(0x80, &buf));
+}
+
+test "a simple font's letters are its codes turned round, with their widths" {
+    var names: [256][]const u8 = @splat("");
+    // Two codes for one letter: the lower one sets it.
+    names[0x80] = "A";
+    var widths: [256]f32 = @splat(500);
+    widths['A'] = 722;
+    const f: Font = .{ .base_encoding = .win_ansi, .differences = &names, .first_char = 0, .widths = &widths };
+
+    const list = try f.letters(testing.allocator);
+    defer testing.allocator.free(list);
+    const a = letterFor(list, 'A').?;
+    try testing.expectEqual(@as(u32, 'A'), a.code);
+    try testing.expectApproxEqAbs(@as(f32, 0.722), a.advance, 1e-6);
+    try testing.expectEqual(@as(u32, 0xe9), letterFor(list, 0xe9).?.code);
+    try testing.expectEqual(@as(?Letter, null), letterFor(list, 0x4e2d));
+    for (list[1..], list[0 .. list.len - 1]) |b, prev| try testing.expect(prev.cp < b.cp);
 }
 
 test "a font that names no encoding still reads as ASCII" {

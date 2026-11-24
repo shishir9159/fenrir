@@ -19,6 +19,7 @@ const compare = @import("compare.zig");
 const cursor = @import("cursor.zig");
 const plugins_mod = @import("plugins.zig");
 const journal = @import("journal.zig");
+const patch = @import("patch.zig");
 const reload = @import("reload.zig");
 const search_mod = @import("search.zig");
 
@@ -220,7 +221,9 @@ pub const Job = struct {
     /// first document of a comparison laid over its partner in the second.
     /// `.reload` is the buffer's file read again, and no page; see `install`.
     /// `.save` is its marks written into it; see `journal.install`.
-    pub const Want = enum { page, text, overlay, reload, save };
+    /// `.font` is a font of the document made ready for a patch to be set
+    /// in, its object number in `page`; see `patch.take`.
+    pub const Want = enum { page, text, overlay, reload, save, font };
 
     pub fn eql(a: Job, b: Job) bool {
         return a.buffer == b.buffer and a.page == b.page and
@@ -265,6 +268,8 @@ pub const Rasteriser = struct {
         reload: ?watch.Outcome = null,
         /// A `.save`'s.
         saved: if (caps.marks) ?journal.Outcome else void = if (caps.marks) null else {},
+        /// A `.font`'s.
+        lettering: if (caps.marks) ?glyphmod.Lettering else void = if (caps.marks) null else {},
 
         const Result = union(Backend) {
             cpu: Image,
@@ -371,6 +376,12 @@ pub fn produce(s: *Session, job: Job, out: *Rasteriser.Finished) !void {
         out.saved = journal.produce(s, job.buffer);
         return;
     }
+    if (caps.marks and job.want == .font) {
+        // A font that will not come is a patch set in the interface's face,
+        // which `patch.take` is told by a null.
+        out.lettering = glyphmod.lettering(gpa, b.doc, s.ctx.io, s.facesOf(job.buffer), job.page) catch null;
+        return;
+    }
 
     // Two pages and no text map: the cursor's map is a `.page` job's,
     // asked for separately when the cursor wants it.
@@ -418,6 +429,8 @@ pub fn discard(s: *Session, f: *Rasteriser.Finished) void {
             else => {},
         };
         f.saved = null;
+        if (f.lettering) |*l| l.deinit(s.gpa);
+        f.lettering = null;
     }
     if (f.map) |*m| m.deinit(s.gpa);
     f.map = null;
@@ -592,6 +605,11 @@ pub fn firstMissing(s: *Session) ?Job {
 /// is never going to photograph.
 pub fn nextJob(s: *Session) ?Job {
     if (firstMissing(s)) |job| return job;
+    // A font for a patch on screen: one interpretation's worth of work at
+    // most, and the patch is drawn in the interface's face until it comes.
+    if (caps.marks) {
+        if (patch.fontJob(s)) |job| return job;
+    }
     // Text and no picture, so before the slots are counted: it takes none.
     if (!caps.marks) {
         if (caretAhead(s)) |job| return job;
@@ -765,6 +783,10 @@ pub fn collectPage(
         // Parked, as for a reload: nothing else was posted while it was
         // out (`journal.jobFor`).
         journal.install(s, finished.job.buffer, finished.saved orelse return null);
+        return null;
+    }
+    if (caps.marks and finished.job.want == .font) {
+        patch.take(s, finished.job, finished.lettering);
         return null;
     }
 

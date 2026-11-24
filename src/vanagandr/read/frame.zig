@@ -23,6 +23,7 @@ const ink = @import("ink.zig");
 const interface = @import("interface.zig");
 const journal = @import("journal.zig");
 const marks = @import("marks.zig");
+const patch = @import("patch.zig");
 const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
 const render = @import("render.zig");
@@ -296,6 +297,8 @@ fn composeView(s: *Session, v: *View, list: *DrawList, over: *DrawList) !void {
     if (caps.marks) {
         try marks.drawMarks(s, v, b, range, over);
         try ink.drawInk(s, v, b, range, over);
+        // Over both: a patch hides what is under it, a highlight included.
+        try patch.drawPatches(s, v, b, v.buffer, range, over);
     }
     if (caps.search) try search_mod.drawSearchHits(s, v, range, over);
 
@@ -793,6 +796,13 @@ pub fn open(s: *Session, settings: Settings) !void {
         );
         list.reset(extent);
         over.reset(extent);
+        // The atlas's frame begins before the page's, not with the
+        // interface's: a patch lays its correction into it while the page
+        // is composed, and an atlas cleared after that would leave those
+        // glyphs pointing at nothing.
+        if (caps.marks) {
+            if (s.chrome) |c| c.fonts.beginFrame();
+        }
         try compose(s, &list, &over);
         s.updateTitle(window);
 

@@ -71,6 +71,9 @@ const Binding = struct {
     /// True when the program came off this machine rather than out of the
     /// document. The shapes are a stand-in and the widths are still the PDF's.
     substituted: bool = false,
+    /// The program `face` was opened from, borrowed from `Cache.programs`:
+    /// what `lettering` copies for a face of the frame thread's own.
+    program: []const u8 = &.{},
 
     fn deinit(b: *Binding, gpa: Allocator) void {
         if (b.face) |*f| f.deinit(gpa);
@@ -423,6 +426,7 @@ pub const Fonts = struct {
         };
         try f.cache.programs.append(f.cache.gpa, entry);
         const program = entry.bytes;
+        b.program = program;
 
         b.face = tyr.open(f.cache.gpa, program, .{}) catch null;
         // The fallback backend opens anything and draws boxes. A box is worse
@@ -495,6 +499,79 @@ pub const Fonts = struct {
         b.differences = names;
     }
 };
+
+/// A page's font, made ready for setting new text in on another thread:
+/// what a patch's correction is drawn in, so that it reads in the type of
+/// the paragraph it corrects.
+///
+/// The program, copied, so the frame thread can open a face of its own
+/// from it -- a face here belongs to the rasterising thread -- and every
+/// character the font can set, with the glyph that sets it and its width
+/// from the PDF. The glyph comes through the chain a page's own codes take
+/// (`glyphFor`) from the code that means the character (`Font.letters`),
+/// and not through the program's cmap: a subset font's cmap, where it has
+/// one at all, maps the document's codes, which are not Unicode, and asked
+/// for an `e` it would set whatever the subset put at 0x65.
+pub const Lettering = struct {
+    program: []u8,
+    letters: []Letter,
+
+    pub const Letter = struct {
+        cp: u21,
+        glyph: tyr.GlyphIndex,
+        /// In ems, from the PDF's widths.
+        advance: f32,
+    };
+
+    pub fn deinit(l: *Lettering, gpa: Allocator) void {
+        gpa.free(l.program);
+        gpa.free(l.letters);
+        l.* = undefined;
+    }
+
+    pub fn find(l: Lettering, cp: u21) ?Letter {
+        var lo: usize = 0;
+        var hi: usize = l.letters.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (l.letters[mid].cp < cp) lo = mid + 1 else hi = mid;
+        }
+        return if (lo < l.letters.len and l.letters[lo].cp == cp) l.letters[lo] else null;
+    }
+};
+
+/// The lettering of the font dictionary numbered `object`, bound through
+/// the document's cache as a page that uses it would bind it. Null for a
+/// Type 3 font, which has no program, and for one with no program to open.
+/// On the thread that owns `doc`.
+pub fn lettering(gpa: Allocator, doc: *Document, io: ?std.Io, cache: *Cache, object: u32) !?Lettering {
+    if (object == 0) return null;
+    const dict = (try doc.fetch(.{ .num = object, .gen = 0 })).asDict() orelse return null;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const font = try fenrir.content.Font.load(arena.allocator(), doc, dict, object);
+    if (font.kind == .type3) return null;
+
+    const info = [1]DisplayList.FontInfo{.{ .object = object, .composite = font.kind == .composite }};
+    var fonts: Fonts = try .init(gpa, doc, .{ .fonts = &info }, io, cache);
+    defer fonts.deinit();
+    const b = fonts.bindings[0];
+    const face = b.face orelse return null;
+    if (b.program.len == 0) return null;
+
+    const codes = try font.letters(gpa);
+    defer gpa.free(codes);
+    var out: std.ArrayList(Lettering.Letter) = .empty;
+    errdefer out.deinit(gpa);
+    for (codes) |c| {
+        const glyph = fonts.glyphFor(b, face, if (b.composite) c.cid else c.code) orelse continue;
+        if (glyph == 0) continue;
+        try out.append(gpa, .{ .cp = c.cp, .glyph = glyph, .advance = c.advance });
+    }
+    const letters = try out.toOwnedSlice(gpa);
+    errdefer gpa.free(letters);
+    return .{ .program = try gpa.dupe(u8, b.program), .letters = letters };
+}
 
 /// One line per font: which backend opened it, how many glyphs it has, and
 /// how the encoding chain is set up.

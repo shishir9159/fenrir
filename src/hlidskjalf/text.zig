@@ -111,6 +111,9 @@ pub const Box = struct {
     space: bool = false,
     /// Which way the glyph's baseline runs, when it does not run across.
     turn: Turn = .none,
+    /// The font dictionary it was set in, by object number, or zero: what a
+    /// patch over it sets its correction in.
+    font: u32 = 0,
 
     pub fn isSpace(b: Box) bool {
         return b.space;
@@ -422,6 +425,7 @@ pub fn build(gpa: Allocator, list: DisplayList) Allocator.Error!Page {
                 .base = pen.y,
                 .space = meaning.len == 1 and meaning[0] == ' ',
                 .turn = turn,
+                .font = list.fontOf(run.font).object,
             });
         }
     }

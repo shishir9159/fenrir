@@ -47,6 +47,7 @@ const ink = @import("ink.zig");
 const interface = @import("interface.zig");
 const journal = @import("journal.zig");
 const marks = @import("marks.zig");
+const patch = @import("patch.zig");
 const plugins_mod = @import("plugins.zig");
 const reload = @import("reload.zig");
 const render = @import("render.zig");
@@ -433,9 +434,15 @@ order: if (caps.splits) std.ArrayList(u32) else void = if (caps.splits) .empty e
 borders: if (caps.splits) std.ArrayList(Bounds) else void = if (caps.splits) .empty else {},
 boxes: if (caps.marks) std.ArrayList(selection.PageBox) else void = if (caps.marks) .empty else {},
 
+/// The fonts patches are set in, and the lines their corrections are laid
+/// in, held between frames; see `patch.zig`.
+patches: if (caps.marks) patch.State else void = if (caps.marks) .{} else {},
+
 pub fn deinit(s: *Session) void {
     if (caps.compare) s.rerun.finish();
     if (s.chrome) |c| c.destroy();
+    // After the interface, whose fonts borrow the programs.
+    if (caps.marks) s.patches.deinit(s.gpa);
     // Before the buffers: a plugin's last handlers may still read them.
     if (s.plugins) |p| p.destroy();
     if (caps.lua) {
@@ -1636,6 +1643,7 @@ test {
     if (caps.marks) _ = ink;
     if (caps.panels) _ = interface;
     if (caps.marks) _ = marks;
+    if (caps.marks) _ = patch;
     _ = plugins_mod;
     _ = reload;
     _ = render;

@@ -90,6 +90,7 @@ pub fn closeSession(s: *Session) void {
     if (caps.marks) {
         s.stroking.deinit(s.gpa);
         s.note.deinit(s.gpa);
+        s.patches.deinit(s.gpa);
     }
     if (caps.lua) {
         s.comment_order.deinit(s.gpa);
