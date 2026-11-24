@@ -45,6 +45,7 @@ pub const View = @import("hlidskjalf/View.zig");
 pub const commands = @import("hlidskjalf/commands.zig");
 pub const diff = @import("hlidskjalf/diff.zig");
 pub const keys = @import("hlidskjalf/keys.zig");
+pub const patch = @import("hlidskjalf/patch.zig");
 pub const search = @import("hlidskjalf/search.zig");
 pub const text = @import("hlidskjalf/text.zig");
 
@@ -61,6 +62,7 @@ test {
     _ = commands;
     _ = diff;
     _ = keys;
+    _ = patch;
     _ = search;
     _ = text;
 }

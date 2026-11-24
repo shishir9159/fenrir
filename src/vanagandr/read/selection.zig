@@ -65,7 +65,9 @@ pub fn carryCursor(s: *Session, v: *View, at: View.Position) void {
 }
 
 /// One box on one page: what a selection and a highlight are made of.
-pub const PageBox = struct { page: u32, box: Bounds };
+/// `column` is the text map's for the line the box is on, which is where a
+/// patch's hull splits (`hlidskjalf.patch.hulls`); nothing else asks it.
+pub const PageBox = struct { page: u32, box: Bounds, column: u32 = 0 };
 
 /// The glyphs between two text positions, as one box per line per page.
 ///
@@ -105,7 +107,7 @@ pub fn selectionBoxes(
 
             var box: Bounds = .empty;
             for (glyphs[lo..hi]) |g| box = box.unionWith(g.box);
-            if (!box.isEmpty()) try out.append(s.gpa, .{ .page = page, .box = box });
+            if (!box.isEmpty()) try out.append(s.gpa, .{ .page = page, .box = box, .column = map.lines[line].column });
         }
     }
 }
